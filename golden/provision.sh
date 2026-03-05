@@ -14,7 +14,7 @@ EOF
 apt-get update
 apt-get install -y \
   build-essential git curl wget jq tmux htop \
-  libssl-dev libreadline-dev zlib1g-dev \
+  libssl-dev libreadline-dev zlib1g-dev libyaml-dev libffi-dev \
   unzip tar sudo openssh-server
 
 # GitHub CLI
@@ -36,6 +36,7 @@ echo "dev:dev" | chpasswd
 # mise (polyglot version manager)
 su - dev -c 'curl -fsSL https://mise.run | sh' || true
 su - dev -c 'echo "eval \"\$(~/.local/bin/mise activate bash)\"" >> ~/.bashrc' || true
+su - dev -c 'echo "export PATH=\"\$HOME/.local/bin:\$HOME/.local/share/mise/shims:\$PATH\"" >> ~/.profile' || true
 su - dev -c '~/.local/bin/mise use -g node@22' || true
 su - dev -c '~/.local/bin/mise use -g ruby@3.2' || true
 
