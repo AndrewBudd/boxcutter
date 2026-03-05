@@ -170,7 +170,7 @@ SSHEOF
 cat > "${WORK}/mnt/home/dev/.services" << 'EOF'
 # Declare services as name=port, one per line
 # Auto-discovered by boxcutter-proxy-sync
-# Exposed as https://<name>.<vm-name>.vm.lan
+# Accessible at http://<vm-ip>:<port>
 # example=3000
 EOF
 chown 1000:1000 "${WORK}/mnt/home/dev/.services"

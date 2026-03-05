@@ -17,7 +17,6 @@ packages:
   - curl
   - wget
   - debootstrap
-  - dnsmasq
   - e2fsprogs
   - iptables-persistent
   - bridge-utils

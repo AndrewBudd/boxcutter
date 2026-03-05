@@ -12,7 +12,7 @@ TARGET="${ARGS[1]}"
 host_headroom() {
   local ip=$1 port=$2
   ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=2 \
-    -p "$port" boxcutter@"$ip" status 2>/dev/null \
+    -p "$port" "$ip" status 2>/dev/null \
     | awk '/Headroom:/{print $2}' | tr -d 'GB'
 }
 
@@ -43,7 +43,7 @@ case "$ACTION" in
       exit 1
     fi
     echo "Routing to: ${name} (${ip})"
-    ssh -q -o StrictHostKeyChecking=no -p "$port" boxcutter@"$ip" new
+    ssh -q -o StrictHostKeyChecking=no -p "$port" "$ip" new
     ;;
 
   list)
@@ -52,7 +52,7 @@ case "$ACTION" in
       [[ "$name" =~ ^#.*$ ]] && continue
       [ -z "$ip" ] && continue
       echo "=== ${name} ==="
-      ssh -q -o StrictHostKeyChecking=no -p "$port" boxcutter@"$ip" list 2>/dev/null
+      ssh -q -o StrictHostKeyChecking=no -p "$port" "$ip" list 2>/dev/null
     done < "$HOSTS_FILE"
     ;;
 
@@ -63,7 +63,7 @@ case "$ACTION" in
       [[ "$name" =~ ^#.*$ ]] && continue
       [ -z "$ip" ] && continue
       STATUS=$(ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=2 \
-        -p "$port" boxcutter@"$ip" status 2>/dev/null)
+        -p "$port" "$ip" status 2>/dev/null)
       vms=$(echo "$STATUS" | awk '/VMs running:/{print $3}')
       headroom=$(echo "$STATUS" | awk '/Headroom:/{print $2}')
       printf "%-10s %-16s %-12s %-10s\n" "$name" "$ip" "${vms:-?}" "${headroom:-?}"
@@ -75,7 +75,7 @@ case "$ACTION" in
     HOST_NAME="${ARGS[1]}"
     VM_NAME="${ARGS[2]}"
     if [ -z "$VM_NAME" ]; then
-      echo "Usage: ssh boxcutter $ACTION <host-name> <vm-name>"
+      echo "Usage: ssh <host> $ACTION <host-name> <vm-name>"
       exit 1
     fi
     HOST_IP=$(awk -v h="$HOST_NAME" '$1==h{print $2}' "$HOSTS_FILE")
@@ -86,7 +86,7 @@ case "$ACTION" in
       exit 1
     fi
     ssh -q -o StrictHostKeyChecking=no -p "$HOST_PORT" \
-      boxcutter@"$HOST_IP" "$ACTION $VM_NAME"
+      "$HOST_IP" "$ACTION $VM_NAME"
     ;;
 
   help|*)
@@ -101,7 +101,7 @@ Commands:
   destroy <host> <vm>         Destroy VM on specific host
   logs <host> <vm>            Tail VM logs on specific host
 
-Usage: ssh boxcutter <command> [args]
+Usage: ssh <host> <command> [args]
 EOF
     ;;
 esac

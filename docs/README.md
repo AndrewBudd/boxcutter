@@ -107,16 +107,9 @@ The NSS module provides both `passwd` and `shadow` entries so PAM authentication
 
 Each VM runs Avahi and sets its hostname from the kernel `ip=` parameter at boot via a systemd oneshot service. VMs are discoverable as `<name>.local` on the LAN (if your network passes multicast).
 
-### Reverse proxy: Caddy with service discovery
+### Accessing VM services
 
-VMs can declare services in `~/.services`:
-
-```
-myapp=3000
-api=8080
-```
-
-A polling service (`boxcutter-proxy-sync`) SSHes into running VMs, reads their `.services` files, and generates Caddy reverse proxy configs. Services are exposed as `https://<service>.<vm-name>.vm.lan` with auto-provisioned TLS certificates.
+VMs have real LAN IPs, so any service running in a VM is directly reachable at `http://<vm-ip>:<port>` from any machine on the network. No port forwarding or reverse proxy configuration needed.
 
 ### VM names
 
@@ -352,7 +345,7 @@ boxcutter/
 │   ├── boxcutter-ctl        # VM lifecycle manager (create/start/stop/destroy)
 │   ├── boxcutter-ssh        # SSH ForceCommand dispatch (control interface)
 │   ├── boxcutter-net        # Bridge network setup inside Node VM
-│   ├── boxcutter-proxy-sync # Service discovery + Caddy config generator
+│   ├── boxcutter-proxy-sync # Service discovery (future)
 │   ├── boxcutter-gateway    # Multi-host gateway dispatch (future)
 │   └── boxcutter-names      # Random adjective-animal name generator
 ├── golden/                  # Golden image build
@@ -382,8 +375,8 @@ The golden image is a single ext4 file built in two phases:
 
 ## Security model
 
-- The `boxcutter` user on the Node VM has `ForceCommand` — it can only run `boxcutter-ssh`, never get a shell
-- The `ubuntu` user retains full admin access for maintenance
+- All SSH users on the Node VM (except `ubuntu` and `root`) have `ForceCommand` — they can only run `boxcutter-ssh`, never get a shell
+- The `ubuntu` user retains full admin access for maintenance via `ssh ubuntu@<host>`
 - VM users share the `dev` account (uid 1000) — isolation is at the VM level, not the user level
 - SSH keys are the only authentication method (password auth is disabled for SSH)
 - Each VM is a full Firecracker microVM with its own kernel — stronger isolation than containers

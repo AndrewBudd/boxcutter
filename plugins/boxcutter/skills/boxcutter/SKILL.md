@@ -68,6 +68,8 @@ Connect: ssh 192.168.2.200
 
 Parse both the **name** and **IP** from the output. The name appears after "VM ready:" and the IP appears after "Connect: ssh". You need the name for lifecycle commands (`stop`, `destroy`) and the IP for direct SSH access into the VM.
 
+Always give the user the VM's IP address. mDNS (`<name>.local`) is unreliable across networks, so always provide the IP as the primary way to connect.
+
 ## Connecting to a VM
 
 SSH directly to the VM's IP. No username needed — all users map to `dev` (uid 1000) with passwordless sudo.

@@ -1,8 +1,0 @@
-[Unit]
-Description=Boxcutter gateway (noop — gateway runs via SSH ForceCommand)
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/true
-RemainAfterExit=yes

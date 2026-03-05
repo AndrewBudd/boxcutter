@@ -134,18 +134,11 @@ ssh 192.168.2.100 destroy fox  # Destroy a VM
 ssh 192.168.2.100 adduser gh   # Import SSH keys from GitHub
 ```
 
-The same "accept any username" NSS trick runs on the Node VM too, so you don't need `ssh boxcutter@192.168.2.100` — just `ssh 192.168.2.100`.
+The same "accept any username" NSS trick runs on the Node VM too, so you don't need to specify a user — just `ssh 192.168.2.100`.
 
-## Service discovery and reverse proxy
+## Direct service access
 
-VMs can declare HTTP services in a `~/.services` file:
-
-```
-myapp=3000
-api=8080
-```
-
-A background service (`boxcutter-proxy-sync`) polls running VMs over SSH, reads their `.services` files, and generates Caddy reverse proxy configs. Services are exposed as `https://<service>.<vm-name>.vm.lan` with auto-provisioned internal TLS certificates.
+Since VMs have real LAN IPs, any service running in a VM is directly reachable. If `bold-fox` runs a web server on port 3000, hit it at `http://192.168.2.200:3000` from any machine on the network. No port forwarding, no reverse proxy configuration. The VM is a first-class network citizen.
 
 ## What I learned
 

@@ -47,7 +47,7 @@ su - dev -c 'export PATH="$HOME/.local/share/mise/shims:$PATH" && npm install -g
 cat > /home/dev/.services << 'EOF'
 # Declare services as name=port, one per line
 # Auto-discovered by boxcutter-proxy-sync
-# Exposed as https://<name>.<vm-name>.vm.lan
+# Accessible at http://<vm-ip>:<port>
 # example=3000
 EOF
 chown dev:dev /home/dev/.services

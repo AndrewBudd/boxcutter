@@ -1,6 +1,6 @@
 #!/bin/bash
 # Boxcutter Node VM setup — runs inside the Node VM
-# Installs Firecracker, networking, Caddy, dnsmasq, all management scripts.
+# Installs Firecracker, networking, Caddy, and all management scripts.
 set -e
 
 if [ "$EUID" -ne 0 ]; then
@@ -265,5 +265,5 @@ echo "  3. Start the VM:        sudo boxcutter-ctl start agent-1"
 echo "  4. Shell into it:       sudo boxcutter-ctl shell agent-1"
 echo ""
 echo "Start all services:"
-echo "  sudo systemctl start dnsmasq caddy boxcutter-net boxcutter-proxy-sync"
+echo "  sudo systemctl start caddy boxcutter-net boxcutter-proxy-sync"
 echo ""
