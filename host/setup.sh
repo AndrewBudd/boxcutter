@@ -11,6 +11,20 @@ mkdir -p "$IMAGES_DIR"
 
 echo "=== Boxcutter host setup ==="
 
+# --- Find local SSH key ---
+SSH_PUBKEY=""
+for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
+  if [ -f "$keyfile" ]; then
+    SSH_PUBKEY=$(cat "$keyfile")
+    break
+  fi
+done
+if [ -z "$SSH_PUBKEY" ]; then
+  echo "No SSH public key found. Generating one..."
+  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+  SSH_PUBKEY=$(cat ~/.ssh/id_ed25519.pub)
+fi
+
 # --- Install QEMU ---
 if ! command -v qemu-system-x86_64 &>/dev/null; then
   echo "Installing QEMU..."
@@ -41,19 +55,6 @@ fi
 
 # --- Generate cloud-init ISO ---
 echo "Generating cloud-init ISO..."
-SSH_PUBKEY=""
-for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
-  if [ -f "$keyfile" ]; then
-    SSH_PUBKEY=$(cat "$keyfile")
-    break
-  fi
-done
-if [ -z "$SSH_PUBKEY" ]; then
-  echo "No SSH public key found. Generating one..."
-  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
-  SSH_PUBKEY=$(cat ~/.ssh/id_ed25519.pub)
-fi
-
 CIDATA_DIR=$(mktemp -d)
 trap "rm -rf ${CIDATA_DIR}" EXIT
 

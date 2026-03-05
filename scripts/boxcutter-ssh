@@ -40,18 +40,38 @@ case "$ACTION" in
     exec $CTL destroy "$TARGET"
     ;;
   status)  exec $CTL status ;;
+  adduser)
+    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter adduser <github-username>"; exit 1; }
+    GH_USER="$TARGET"
+    echo "Fetching SSH keys for github.com/${GH_USER}..."
+    GH_KEYS=$(curl -sf "https://github.com/${GH_USER}.keys")
+    if [ -z "$GH_KEYS" ]; then
+      echo "Error: no keys found for '${GH_USER}' (check the username)"
+      exit 1
+    fi
+    KEY_COUNT=$(echo "$GH_KEYS" | wc -l)
+    # Add to boxcutter user's authorized_keys
+    echo "$GH_KEYS" >> ~/.ssh/authorized_keys
+    sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys
+    # Also update the trusted keys used when building golden images
+    echo "$GH_KEYS" | sudo tee -a /etc/boxcutter/authorized_keys > /dev/null
+    sudo sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys 2>/dev/null || true
+    echo "Added ${KEY_COUNT} key(s) for ${GH_USER}."
+    echo "They can now: ssh -p 2222 boxcutter@<host> list"
+    ;;
   help|*)
     cat << 'EOF'
 Boxcutter SSH control interface
 
 Commands:
-  new              Provision and start a new VM
-  list             List all VMs
-  shell <name>     SSH into VM
-  start <name>     Start a stopped VM
-  stop <name>      Stop a running VM
-  destroy <name>   Tear down a VM
-  status           Host capacity summary
+  new                       Provision and start a new VM
+  list                      List all VMs
+  shell <name>              SSH into VM
+  start <name>              Start a stopped VM
+  stop <name>               Stop a running VM
+  destroy <name>            Tear down a VM
+  status                    Host capacity summary
+  adduser <github-user>     Add SSH keys from GitHub
 
 Usage: ssh boxcutter <command> [args]
 EOF

@@ -131,7 +131,7 @@ systemctl enable boxcutter-proxy-sync
 echo ""
 echo "--- Setting up SSH control interface ---"
 useradd -r -m -s /bin/bash boxcutter 2>/dev/null || true
-echo "boxcutter ALL=(ALL) NOPASSWD: /usr/local/bin/boxcutter-ctl" > /etc/sudoers.d/boxcutter
+echo "boxcutter ALL=(ALL) NOPASSWD: /usr/local/bin/boxcutter-ctl, /usr/bin/tee -a /etc/boxcutter/authorized_keys, /usr/bin/sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys" > /etc/sudoers.d/boxcutter
 chmod 440 /etc/sudoers.d/boxcutter
 mkdir -p /home/boxcutter/.ssh
 touch /home/boxcutter/.ssh/authorized_keys

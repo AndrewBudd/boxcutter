@@ -314,7 +314,7 @@ cmd_shell() {
 
   local ip
   ip=$(jq -r '.ip' "${VM_DIR}/${name}/vm.json")
-  exec ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "dev@${ip}"
+  exec ssh -tt -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "dev@${ip}"
 }
 
 cmd_status() {
