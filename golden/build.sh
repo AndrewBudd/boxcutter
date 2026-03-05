@@ -39,7 +39,7 @@ mount -o loop "${WORK}/rootfs.ext4" "${WORK}/mnt"
 # Debootstrap Ubuntu Noble (minimal + essentials for SSH/network)
 echo "Running debootstrap (Ubuntu Noble)... this takes a few minutes."
 debootstrap \
-  --include=systemd,systemd-sysv,dbus,openssh-server,sudo,curl,wget,jq,git,iproute2,iputils-ping,ca-certificates,locales,gpgv,gnupg \
+  --include=systemd,systemd-sysv,dbus,openssh-server,sudo,curl,wget,jq,git,iproute2,iputils-ping,ca-certificates,locales,gpgv,gnupg,avahi-daemon,libnss-mdns \
   noble "${WORK}/mnt" http://archive.ubuntu.com/ubuntu
 
 echo "Debootstrap complete. Configuring base system..."
@@ -64,6 +64,25 @@ EOF
 
 # --- fstab ---
 echo "/dev/vda / ext4 defaults 0 1" > "${WORK}/mnt/etc/fstab"
+
+# --- Set hostname from kernel ip= parameter ---
+cat > "${WORK}/mnt/etc/systemd/system/set-hostname.service" << 'SVCEOF'
+[Unit]
+Description=Set hostname from kernel ip= parameter
+DefaultDependencies=no
+Before=avahi-daemon.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'H=$(cat /proc/cmdline | grep -oP "ip=[^:]*::[^:]*:[^:]*:\K[^:]+"); [ -n "$H" ] && hostnamectl set-hostname "$H"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+ln -sf /etc/systemd/system/set-hostname.service \
+  "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/set-hostname.service"
 
 # --- Fix slow boot: entropy + random seed ---
 # Firecracker VMs lack hardware RNG; systemd-random-seed blocks boot waiting for entropy.
@@ -122,6 +141,30 @@ fi
 chown -R 1000:1000 "${WORK}/mnt/home/dev/.ssh"
 chmod 700 "${WORK}/mnt/home/dev/.ssh"
 chmod 600 "${WORK}/mnt/home/dev/.ssh/authorized_keys"
+
+# --- Accept any SSH username (maps to dev) ---
+echo "Building NSS catchall module..."
+cp "${SRC:-$(dirname "$0")/..}/golden/nss_catchall.c" "${WORK}/mnt/tmp/nss_catchall.c" 2>/dev/null || \
+  cp "$(dirname "$0")/nss_catchall.c" "${WORK}/mnt/tmp/nss_catchall.c"
+chroot "${WORK}/mnt" bash -c 'apt-get install -y gcc libc6-dev >/dev/null 2>&1 && \
+  gcc -shared -fPIC -o /usr/lib/x86_64-linux-gnu/libnss_catchall.so.2 /tmp/nss_catchall.c && \
+  rm /tmp/nss_catchall.c && \
+  apt-get remove -y gcc >/dev/null 2>&1 || true'
+sed -i 's/^passwd:.*/passwd:         files catchall/' "${WORK}/mnt/etc/nsswitch.conf"
+sed -i 's/^shadow:.*/shadow:         files catchall/' "${WORK}/mnt/etc/nsswitch.conf"
+
+# SSH: accept any user's keys via AuthorizedKeysCommand
+cat > "${WORK}/mnt/usr/local/bin/auth-keys-any" << 'SCRIPT'
+#!/bin/bash
+cat /home/dev/.ssh/authorized_keys
+SCRIPT
+chmod 755 "${WORK}/mnt/usr/local/bin/auth-keys-any"
+
+mkdir -p "${WORK}/mnt/etc/ssh/sshd_config.d"
+cat > "${WORK}/mnt/etc/ssh/sshd_config.d/boxcutter.conf" << 'SSHEOF'
+AuthorizedKeysCommand /usr/local/bin/auth-keys-any %u
+AuthorizedKeysCommandUser root
+SSHEOF
 
 # --- Services declaration file ---
 cat > "${WORK}/mnt/home/dev/.services" << 'EOF'
