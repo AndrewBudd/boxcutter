@@ -49,22 +49,11 @@ mkdir -p "${WORK}/mnt/etc/systemd/system/getty.target.wants"
 ln -sf /lib/systemd/system/serial-getty@.service \
   "${WORK}/mnt/etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service"
 
-# --- Network: DHCP on eth0 via systemd-networkd ---
-mkdir -p "${WORK}/mnt/etc/systemd/network"
-cat > "${WORK}/mnt/etc/systemd/network/20-eth0.network" << 'EOF'
-[Match]
-Name=eth0
-
-[Network]
-DHCP=yes
-EOF
-
-# Enable systemd-networkd and SSH (not resolved — use static DNS for fast boot)
+# --- Network: kernel ip= handles everything, just enable SSH ---
+# No systemd-networkd needed — Firecracker VMs get their IP from kernel boot args
 mkdir -p "${WORK}/mnt/etc/systemd/system/multi-user.target.wants"
-for svc in systemd-networkd ssh; do
-  ln -sf "/lib/systemd/system/${svc}.service" \
-    "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/${svc}.service" 2>/dev/null || true
-done
+ln -sf /lib/systemd/system/ssh.service \
+  "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/ssh.service" 2>/dev/null || true
 
 # --- Hostname ---
 echo "boxcutter-vm" > "${WORK}/mnt/etc/hostname"
@@ -101,8 +90,8 @@ ln -sf /etc/systemd/system/seed-entropy.service \
 # --- DNS (static — no systemd-resolved for fast boot) ---
 rm -f "${WORK}/mnt/etc/resolv.conf"
 cat > "${WORK}/mnt/etc/resolv.conf" << 'EOF'
-nameserver 192.168.137.1
 nameserver 8.8.8.8
+nameserver 8.8.4.4
 EOF
 
 # --- Create dev user with passwordless sudo ---

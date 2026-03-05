@@ -77,21 +77,30 @@ cp "${SRC}/config/Caddyfile" /etc/caddy/Caddyfile
 systemctl enable caddy
 
 # -------------------------------------------------------------------
-# 4. Configure dnsmasq
+# 4. Network config for VM IP pool
 # -------------------------------------------------------------------
 echo ""
-echo "--- Configuring dnsmasq ---"
-# Disable systemd-resolved so dnsmasq can bind port 53
-if systemctl is-active systemd-resolved &>/dev/null; then
-  systemctl stop systemd-resolved
-  systemctl disable systemd-resolved
-  rm -f /etc/resolv.conf
-  echo "nameserver 8.8.8.8" > /etc/resolv.conf
-  echo "systemd-resolved disabled (dnsmasq will handle DNS)"
-fi
-cp "${SRC}/config/dnsmasq-bridge.conf" /etc/dnsmasq.d/boxcutter-bridge.conf
-mkdir -p /etc/boxcutter/dhcp-hosts
-systemctl enable dnsmasq
+echo "--- Detecting network config ---"
+# Auto-detect LAN settings from the current network
+DEFAULT_IF=$(ip route | awk '/^default/{print $5; exit}')
+CURRENT_IP=$(ip -4 addr show "$DEFAULT_IF" | awk '/inet /{print $2; exit}')
+CURRENT_GW=$(ip route | awk '/^default/{print $3; exit}')
+IP_PREFIX=$(echo "$CURRENT_IP" | cut -d. -f1-3)
+IP_CIDR=$(echo "$CURRENT_IP" | cut -d/ -f2)
+
+mkdir -p /etc/boxcutter
+cat > "${BOXCUTTER_HOME}/network.conf" <<NETEOF
+# Auto-detected LAN config (edit if needed)
+VM_IP_PREFIX=${IP_PREFIX}
+VM_IP_START=200
+VM_IP_END=250
+LAN_GW=${CURRENT_GW}
+LAN_CIDR=${IP_CIDR}
+LAN_DNS=8.8.8.8
+NETEOF
+echo "Network config written to ${BOXCUTTER_HOME}/network.conf"
+echo "  VM IP pool: ${IP_PREFIX}.200-250"
+echo "  Gateway: ${CURRENT_GW}"
 
 # -------------------------------------------------------------------
 # 5. Set up networking

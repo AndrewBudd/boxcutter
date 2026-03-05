@@ -20,13 +20,17 @@ if [ -f "$PID_FILE" ]; then
   pid=$(cat "$PID_FILE")
   if kill -0 "$pid" 2>/dev/null; then
     echo "Node VM already running (PID ${pid})"
-    echo "SSH: ssh -p ${DNAT_SSH} ubuntu@${HOST_TAP_IP}"
+    echo "SSH: ssh ubuntu@${NODE_IP}"
     exit 0
   fi
   rm -f "$PID_FILE"
 fi
 
-# Ensure TAP is up
+# Ensure bridge and TAP are up
+if ! ip link show "$BRIDGE" &>/dev/null; then
+  echo "Bridge ${BRIDGE} not found. Run host/setup.sh first."
+  exit 1
+fi
 if ! ip link show "$TAP_DEVICE" &>/dev/null; then
   echo "TAP device not found. Run host/setup.sh first."
   exit 1
@@ -36,8 +40,8 @@ DAEMON=false
 [ "${1:-}" = "--daemon" ] || [ "${1:-}" = "-d" ] && DAEMON=true
 
 echo "Starting Boxcutter Node VM..."
-echo "  vCPU: ${NODE_VCPU}, RAM: ${NODE_RAM}, Disk: ${NODE_DISK}"
-echo "  Network: ${TAP_DEVICE} → ${NODE_IP}"
+echo "  vCPU: ${NODE_VCPU}, RAM: ${NODE_RAM}"
+echo "  Network: ${BRIDGE} → ${NODE_IP}"
 echo ""
 
 QEMU_ARGS=(
@@ -56,7 +60,6 @@ QEMU_ARGS=(
 )
 
 if [ "$DAEMON" = true ]; then
-  # Background mode — replace serial + nographic with display none + log
   QEMU_DAEMON_ARGS=()
   for arg in "${QEMU_ARGS[@]}"; do
     case "$arg" in
@@ -70,7 +73,7 @@ if [ "$DAEMON" = true ]; then
   qemu-system-x86_64 "${QEMU_DAEMON_ARGS[@]}"
   echo "Node VM started in background (PID $(cat "$PID_FILE"))"
   echo "Console log: ${IMAGES_DIR}/node-console.log"
-  echo "SSH: ssh ubuntu@${HOST_TAP_IP}"
+  echo "SSH: ssh ubuntu@${NODE_IP}"
 else
   echo "Launching in foreground (Ctrl-A X to quit)..."
   echo ""

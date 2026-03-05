@@ -19,9 +19,10 @@ case "$ACTION" in
     [ -z "$NAME" ] && { echo "Error: could not generate unique name"; exit 1; }
     $CTL create "$NAME" "${ARGS[@]:1}"
     $CTL start "$NAME"
+    IP=$(jq -r '.ip' "/var/lib/boxcutter/vms/${NAME}/vm.json")
     echo ""
     echo "VM ready: ${NAME}"
-    echo "Connect: ssh ${NAME}.box"
+    echo "Connect: ssh dev@${IP}"
     ;;
   list)    exec $CTL list ;;
   shell)
