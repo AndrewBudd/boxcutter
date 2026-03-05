@@ -98,6 +98,10 @@ sudo iptables -A FORWARD -i "$TAP_DEVICE" -o "$HOST_INTERFACE" -j ACCEPT
 sudo iptables -C FORWARD -i "$HOST_INTERFACE" -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
 sudo iptables -A FORWARD -i "$HOST_INTERFACE" -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
+# Allow DNAT'd inbound traffic to reach the Node VM (Docker sets FORWARD policy to DROP)
+sudo iptables -C FORWARD -i "$HOST_INTERFACE" -o "$TAP_DEVICE" -d "$NODE_IP" -j ACCEPT 2>/dev/null || \
+sudo iptables -A FORWARD -i "$HOST_INTERFACE" -o "$TAP_DEVICE" -d "$NODE_IP" -j ACCEPT
+
 # DNAT: SSH
 sudo iptables -t nat -C PREROUTING -d "$HOST_LAN_IP" -p tcp --dport "$DNAT_SSH" -j DNAT --to-destination "${NODE_IP}:22" 2>/dev/null || \
 sudo iptables -t nat -A PREROUTING -d "$HOST_LAN_IP" -p tcp --dport "$DNAT_SSH" -j DNAT --to-destination "${NODE_IP}:22"

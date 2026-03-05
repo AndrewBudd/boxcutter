@@ -81,8 +81,14 @@ systemctl enable caddy
 # -------------------------------------------------------------------
 echo ""
 echo "--- Configuring dnsmasq ---"
-# Get the host LAN IP from the env file (passed via cloud-init or manual)
-# Default: resolve *.vm.lan to the Node VM's bridge IP for internal access
+# Disable systemd-resolved so dnsmasq can bind port 53
+if systemctl is-active systemd-resolved &>/dev/null; then
+  systemctl stop systemd-resolved
+  systemctl disable systemd-resolved
+  rm -f /etc/resolv.conf
+  echo "nameserver 8.8.8.8" > /etc/resolv.conf
+  echo "systemd-resolved disabled (dnsmasq will handle DNS)"
+fi
 cp "${SRC}/config/dnsmasq-bridge.conf" /etc/dnsmasq.d/boxcutter-bridge.conf
 mkdir -p /etc/boxcutter/dhcp-hosts
 systemctl enable dnsmasq
