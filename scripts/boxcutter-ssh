@@ -22,29 +22,29 @@ case "$ACTION" in
     IP=$(jq -r '.ip' "/var/lib/boxcutter/vms/${NAME}/vm.json")
     echo ""
     echo "VM ready: ${NAME}"
-    echo "Connect: ssh dev@${IP}"
+    echo "Connect: ssh ${IP}"
     ;;
   list)    exec $CTL list ;;
   shell)
-    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter shell <vm-name>"; exit 1; }
+    [ -z "$TARGET" ] && { echo "Usage: ssh <host> shell <vm-name>"; exit 1; }
     exec $CTL shell "$TARGET"
     ;;
   start)
-    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter start <vm-name>"; exit 1; }
+    [ -z "$TARGET" ] && { echo "Usage: ssh <host> start <vm-name>"; exit 1; }
     exec $CTL start "$TARGET"
     ;;
   stop)
-    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter stop <vm-name>"; exit 1; }
+    [ -z "$TARGET" ] && { echo "Usage: ssh <host> stop <vm-name>"; exit 1; }
     exec $CTL stop "$TARGET"
     ;;
   destroy)
-    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter destroy <vm-name>"; exit 1; }
+    [ -z "$TARGET" ] && { echo "Usage: ssh <host> destroy <vm-name>"; exit 1; }
     exec $CTL destroy "$TARGET"
     ;;
   status)  exec $CTL status ;;
   proxy)
     # Direct TCP tunnel to a VM's SSH port — used as ProxyCommand
-    [ -z "$TARGET" ] && { echo "Usage: ProxyCommand ssh boxcutter@host proxy <vm-name>" >&2; exit 1; }
+    [ -z "$TARGET" ] && { echo "Usage: ProxyCommand ssh <host> proxy <vm-name>" >&2; exit 1; }
     VM_DIR="/var/lib/boxcutter/vms"
     VM_NAME="${TARGET%.box}"
     [ -d "${VM_DIR}/${VM_NAME}" ] || { echo "VM '${VM_NAME}' does not exist." >&2; exit 1; }
@@ -52,7 +52,7 @@ case "$ACTION" in
     exec nc "$IP" 22
     ;;
   adduser)
-    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter adduser <github-username>"; exit 1; }
+    [ -z "$TARGET" ] && { echo "Usage: ssh <host> adduser <github-username>"; exit 1; }
     GH_USER="$TARGET"
     echo "Fetching SSH keys for github.com/${GH_USER}..."
     GH_KEYS=$(curl -sf "https://github.com/${GH_USER}.keys")
@@ -68,7 +68,7 @@ case "$ACTION" in
     echo "$GH_KEYS" | sudo tee -a /etc/boxcutter/authorized_keys > /dev/null
     sudo sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys 2>/dev/null || true
     echo "Added ${KEY_COUNT} key(s) for ${GH_USER}."
-    echo "They can now: ssh boxcutter@<host> list"
+    echo "They can now: ssh <host> list"
     ;;
   help|*)
     cat << 'EOF'
@@ -85,16 +85,9 @@ Commands:
   adduser <github-user>     Add SSH keys from GitHub
   proxy <name>              TCP tunnel to VM (for ProxyCommand)
 
-Usage: ssh boxcutter@<host> <command> [args]
+Usage: ssh <host> <command> [args]
 
-SSH config for direct VM access (add to ~/.ssh/config):
-  Host boxcutter
-      HostName <host-ip>
-      User boxcutter
-
-  Host *.box
-      User dev
-      ProxyCommand ssh boxcutter proxy %n
+Any SSH username works — no need to specify a user.
 EOF
     ;;
 esac

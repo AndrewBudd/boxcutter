@@ -168,9 +168,40 @@ if [ -f /etc/boxcutter/authorized_keys ]; then
   sort -u /home/boxcutter/.ssh/authorized_keys -o /home/boxcutter/.ssh/authorized_keys
 fi
 
+# --- Accept any SSH username (maps to boxcutter) ---
+echo "Building NSS catchall module for Node VM..."
+BOXCUTTER_UID=$(id -u boxcutter)
+BOXCUTTER_GID=$(id -g boxcutter)
+cp "${SRC}/golden/nss_catchall.c" /tmp/nss_catchall_node.c
+# Patch uid/gid/home for boxcutter user
+sed -i "s/result->pw_uid = 1000/result->pw_uid = ${BOXCUTTER_UID}/" /tmp/nss_catchall_node.c
+sed -i "s/result->pw_gid = 1000/result->pw_gid = ${BOXCUTTER_GID}/" /tmp/nss_catchall_node.c
+sed -i 's|/home/dev|/home/boxcutter|g' /tmp/nss_catchall_node.c
+# Add Node VM system users to the skip list
+sed -i 's/"avahi",/"avahi", "ubuntu", "caddy", "dnsmasq",/' /tmp/nss_catchall_node.c
+
+LIBDIR=$(gcc -print-multi-os-directory 2>/dev/null && echo /usr/lib/x86_64-linux-gnu || echo /usr/lib/x86_64-linux-gnu)
+apt-get install -y gcc libc6-dev > /dev/null 2>&1
+gcc -shared -fPIC -o /usr/lib/x86_64-linux-gnu/libnss_catchall.so.2 /tmp/nss_catchall_node.c
+rm /tmp/nss_catchall_node.c
+apt-get remove -y gcc > /dev/null 2>&1 || true
+
+sed -i 's/^passwd:.*/passwd:         files catchall/' /etc/nsswitch.conf
+sed -i 's/^shadow:.*/shadow:         files catchall/' /etc/nsswitch.conf
+
+# AuthorizedKeysCommand — serve boxcutter's keys for any user
+cat > /usr/local/bin/auth-keys-any << 'SCRIPT'
+#!/bin/bash
+cat /home/boxcutter/.ssh/authorized_keys
+SCRIPT
+chmod 755 /usr/local/bin/auth-keys-any
+
 mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/boxcutter.conf << 'EOF'
-Match User boxcutter
+AuthorizedKeysCommand /usr/local/bin/auth-keys-any %u
+AuthorizedKeysCommandUser root
+
+Match User !ubuntu,!root,*
     ForceCommand /usr/local/bin/boxcutter-ssh
     AllowTcpForwarding no
     X11Forwarding no

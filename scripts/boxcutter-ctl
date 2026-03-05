@@ -294,7 +294,7 @@ cmd_start() {
   echo $! > "${VM_DIR}/${name}/firecracker.pid"
 
   echo "  VM started (PID $(cat "${VM_DIR}/${name}/firecracker.pid"))"
-  echo "  SSH: ssh dev@${ip}"
+  echo "  SSH: ssh ${ip}"
 }
 
 cmd_stop() {
