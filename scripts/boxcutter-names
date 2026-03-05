@@ -1,0 +1,48 @@
+#!/bin/bash
+# Generate cute VM names: adjective-animal
+# Usage: boxcutter-names [generate|check <name>]
+
+ADJECTIVES=(
+  swift bold calm cool dark easy fair fast glad gold
+  keen kind lazy loud mint neat next pale pine pure
+  rare rich rosy sage slim soft tidy true warm wild
+  blue cozy dawn deep dusk foam glow hazy icy jade
+  lush mild opal pink plum ruby rust silk snow teal
+  tiny vast wavy wise zany aqua ashy airy bold buff
+  chic cozy deft drab edgy epic fizz foxy glad grim
+  hale holy idle inky iron jolly juicy lacy lithe lunar
+  merry misty mossy noble omega pastel perky plucky polar
+  quiet retro rusty salty sandy shiny silky sleek smoky
+  snowy solar spicy sunny tawny vivid wily witty woody
+)
+
+ANIMALS=(
+  fox owl cat bat elk yak emu ray bee ant cod doe
+  hen jay koi ram pug ape gnu kit asp roo doe cub
+  wolf bear duck frog goat hare lynx mink moth newt
+  seal swan toad vole wren carp crow deer dove fawn
+  finch gecko heron ibis koala lemur llama moose otter
+  panda quail raven robin shark sloth snail squid stork
+  tiger trout viper whale crane eagle egret finch flint
+  goose grebe hound hyena igloo mouse orion piper plover
+  prawn quokka racer robin shrew snipe stoat swift tapir
+  ferret falcon badger bobcat canary condor cougar coyote
+  donkey ermine falcon gopher hermit hornet iguana jackal
+  jaguar kitten magpie marmot merlin osprey parrot pelican
+  pigeon possum python rabbit raptor salmon turtle walrus
+  weasel gibbon hamster dolphin octopus penguin
+)
+
+case "${1:-generate}" in
+  generate)
+    ADJ=${ADJECTIVES[$((RANDOM % ${#ADJECTIVES[@]}))]}
+    ANIMAL=${ANIMALS[$((RANDOM % ${#ANIMALS[@]}))]}
+    echo "${ADJ}-${ANIMAL}"
+    ;;
+  check)
+    NAME="$2"
+    [ -z "$NAME" ] && exit 1
+    # Valid if it's lowercase alphanumeric + hyphens
+    [[ "$NAME" =~ ^[a-z][a-z0-9-]*$ ]] && exit 0 || exit 1
+    ;;
+esac

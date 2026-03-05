@@ -115,6 +115,7 @@ install -m 755 "${SRC}/scripts/boxcutter-ctl" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-proxy-sync" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-ssh" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-gateway" /usr/local/bin/
+install -m 755 "${SRC}/scripts/boxcutter-names" /usr/local/bin/
 
 # -------------------------------------------------------------------
 # 7. Systemd services

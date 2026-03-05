@@ -10,12 +10,13 @@ CTL="sudo /usr/local/bin/boxcutter-ctl"
 
 case "$ACTION" in
   new)
-    # Find next available agent-N name
-    IDX=1
-    while [ -d "/var/lib/boxcutter/vms/agent-${IDX}" ]; do
-      IDX=$((IDX + 1))
+    # Generate a unique cute name
+    NAME=""
+    for _ in $(seq 1 20); do
+      CANDIDATE=$(/usr/local/bin/boxcutter-names generate)
+      [ ! -d "/var/lib/boxcutter/vms/${CANDIDATE}" ] && { NAME="$CANDIDATE"; break; }
     done
-    NAME="agent-${IDX}"
+    [ -z "$NAME" ] && { echo "Error: could not generate unique name"; exit 1; }
     $CTL create "$NAME" "${ARGS[@]:1}"
     $CTL start "$NAME"
     echo ""
@@ -57,7 +58,7 @@ case "$ACTION" in
     echo "$GH_KEYS" | sudo tee -a /etc/boxcutter/authorized_keys > /dev/null
     sudo sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys 2>/dev/null || true
     echo "Added ${KEY_COUNT} key(s) for ${GH_USER}."
-    echo "They can now: ssh -p 2222 boxcutter@<host> list"
+    echo "They can now: ssh boxcutter@<host> list"
     ;;
   help|*)
     cat << 'EOF'
