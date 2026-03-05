@@ -21,7 +21,7 @@ case "$ACTION" in
     $CTL start "$NAME"
     echo ""
     echo "VM ready: ${NAME}"
-    echo "Shell: ssh boxcutter shell ${NAME}"
+    echo "Connect: ssh ${NAME}.box"
     ;;
   list)    exec $CTL list ;;
   shell)
@@ -41,6 +41,15 @@ case "$ACTION" in
     exec $CTL destroy "$TARGET"
     ;;
   status)  exec $CTL status ;;
+  proxy)
+    # Direct TCP tunnel to a VM's SSH port — used as ProxyCommand
+    [ -z "$TARGET" ] && { echo "Usage: ProxyCommand ssh boxcutter@host proxy <vm-name>" >&2; exit 1; }
+    VM_DIR="/var/lib/boxcutter/vms"
+    VM_NAME="${TARGET%.box}"
+    [ -d "${VM_DIR}/${VM_NAME}" ] || { echo "VM '${VM_NAME}' does not exist." >&2; exit 1; }
+    IP=$(jq -r '.ip' "${VM_DIR}/${VM_NAME}/vm.json")
+    exec nc "$IP" 22
+    ;;
   adduser)
     [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter adduser <github-username>"; exit 1; }
     GH_USER="$TARGET"
@@ -67,14 +76,24 @@ Boxcutter SSH control interface
 Commands:
   new                       Provision and start a new VM
   list                      List all VMs
-  shell <name>              SSH into VM
+  shell <name>              SSH into VM (use -t for interactive)
   start <name>              Start a stopped VM
   stop <name>               Stop a running VM
   destroy <name>            Tear down a VM
   status                    Host capacity summary
   adduser <github-user>     Add SSH keys from GitHub
+  proxy <name>              TCP tunnel to VM (for ProxyCommand)
 
-Usage: ssh boxcutter <command> [args]
+Usage: ssh boxcutter@<host> <command> [args]
+
+SSH config for direct VM access (add to ~/.ssh/config):
+  Host boxcutter
+      HostName <host-ip>
+      User boxcutter
+
+  Host *.box
+      User dev
+      ProxyCommand ssh boxcutter proxy %n
 EOF
     ;;
 esac
