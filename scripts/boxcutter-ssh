@@ -6,34 +6,40 @@ read -r -a ARGS <<< "${SSH_ORIGINAL_COMMAND:-help}"
 ACTION="${ARGS[0]}"
 TARGET="${ARGS[1]}"
 
+CTL="sudo /usr/local/bin/boxcutter-ctl"
+
 case "$ACTION" in
   new)
-    IDX=$(find /var/lib/boxcutter/vms -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-    NAME="agent-$((IDX + 1))"
-    boxcutter-ctl create "$NAME" "${ARGS[@]:1}"
-    boxcutter-ctl start "$NAME"
+    # Find next available agent-N name
+    IDX=1
+    while [ -d "/var/lib/boxcutter/vms/agent-${IDX}" ]; do
+      IDX=$((IDX + 1))
+    done
+    NAME="agent-${IDX}"
+    $CTL create "$NAME" "${ARGS[@]:1}"
+    $CTL start "$NAME"
     echo ""
     echo "VM ready: ${NAME}"
     echo "Shell: ssh boxcutter shell ${NAME}"
     ;;
-  list)    exec boxcutter-ctl list ;;
+  list)    exec $CTL list ;;
   shell)
     [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter shell <vm-name>"; exit 1; }
-    exec boxcutter-ctl shell "$TARGET"
+    exec $CTL shell "$TARGET"
     ;;
   start)
     [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter start <vm-name>"; exit 1; }
-    exec boxcutter-ctl start "$TARGET"
+    exec $CTL start "$TARGET"
     ;;
   stop)
     [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter stop <vm-name>"; exit 1; }
-    exec boxcutter-ctl stop "$TARGET"
+    exec $CTL stop "$TARGET"
     ;;
   destroy)
     [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter destroy <vm-name>"; exit 1; }
-    exec boxcutter-ctl destroy "$TARGET"
+    exec $CTL destroy "$TARGET"
     ;;
-  status)  exec boxcutter-ctl status ;;
+  status)  exec $CTL status ;;
   help|*)
     cat << 'EOF'
 Boxcutter SSH control interface

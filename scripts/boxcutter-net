@@ -9,6 +9,18 @@ BRIDGE_IP="${SUBNET}.1/24"
 
 case "${1:-up}" in
   up)
+    # Ensure device nodes exist (may be missing in VMs without full udev)
+    [ -e /dev/loop-control ] || mknod /dev/loop-control c 10 237
+    for i in $(seq 0 7); do
+      [ -b /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i
+    done
+    mkdir -p /dev/net
+    [ -e /dev/net/tun ] || mknod /dev/net/tun c 10 200
+    chmod 0666 /dev/net/tun
+    [ -e /dev/kvm ] || mknod /dev/kvm c 10 232
+    chmod 660 /dev/kvm
+    chgrp kvm /dev/kvm 2>/dev/null || true
+
     if ! ip link show "$BRIDGE" &>/dev/null; then
       ip link add name "$BRIDGE" type bridge
       ip addr add "$BRIDGE_IP" dev "$BRIDGE"

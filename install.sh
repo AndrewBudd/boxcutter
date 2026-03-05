@@ -50,7 +50,7 @@ echo "--- Downloading Firecracker kernel ---"
 mkdir -p "${BOXCUTTER_HOME}/kernel"
 KERNEL="${BOXCUTTER_HOME}/kernel/vmlinux"
 if [ ! -f "$KERNEL" ]; then
-  KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/${ARCH}/vmlinux-6.1.102"
+  KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/${ARCH}/vmlinux-6.1.128"
   echo "Downloading kernel..."
   curl -sL "$KERNEL_URL" -o "$KERNEL"
   echo "Kernel downloaded."
@@ -124,12 +124,33 @@ systemctl enable boxcutter-proxy-sync
 # -------------------------------------------------------------------
 echo ""
 echo "--- Setting up SSH control interface ---"
-useradd -r -m -s /usr/sbin/nologin boxcutter 2>/dev/null || true
+useradd -r -m -s /bin/bash boxcutter 2>/dev/null || true
+echo "boxcutter ALL=(ALL) NOPASSWD: /usr/local/bin/boxcutter-ctl" > /etc/sudoers.d/boxcutter
+chmod 440 /etc/sudoers.d/boxcutter
 mkdir -p /home/boxcutter/.ssh
 touch /home/boxcutter/.ssh/authorized_keys
 chmod 700 /home/boxcutter/.ssh
 chmod 600 /home/boxcutter/.ssh/authorized_keys
 chown -R boxcutter:boxcutter /home/boxcutter/.ssh
+
+# Seed trusted user keys from the ubuntu user (who provisioned this node)
+if [ ! -s /etc/boxcutter/authorized_keys ]; then
+  touch /etc/boxcutter/authorized_keys
+  # Import keys from the user who set up this node
+  for keyfile in /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys; do
+    if [ -f "$keyfile" ]; then
+      cat "$keyfile" >> /etc/boxcutter/authorized_keys
+    fi
+  done
+  # Deduplicate
+  sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys
+  echo "Trusted user keys seeded into /etc/boxcutter/authorized_keys"
+fi
+# Also add these keys to the boxcutter SSH user's authorized_keys
+if [ -f /etc/boxcutter/authorized_keys ]; then
+  cat /etc/boxcutter/authorized_keys >> /home/boxcutter/.ssh/authorized_keys
+  sort -u /home/boxcutter/.ssh/authorized_keys -o /home/boxcutter/.ssh/authorized_keys
+fi
 
 mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/boxcutter.conf << 'EOF'
@@ -152,7 +173,27 @@ if [ ! -f "${BOXCUTTER_HOME}/ssh/id_ed25519" ]; then
 fi
 
 # -------------------------------------------------------------------
-# 10. Create state directories
+# 10. Ensure loop devices work (needed for golden image build)
+# -------------------------------------------------------------------
+if [ ! -e /dev/loop-control ]; then
+  mknod /dev/loop-control c 10 237
+fi
+for i in $(seq 0 7); do
+  [ -b /dev/loop$i ] || mknod -m 660 /dev/loop$i b 7 $i
+done
+
+# Ensure /dev/net/tun exists (needed for TAP devices / Firecracker networking)
+mkdir -p /dev/net
+[ -e /dev/net/tun ] || mknod /dev/net/tun c 10 200
+chmod 0666 /dev/net/tun
+
+# Ensure /dev/kvm exists (needed for Firecracker)
+[ -e /dev/kvm ] || mknod /dev/kvm c 10 232
+chmod 660 /dev/kvm
+chgrp kvm /dev/kvm 2>/dev/null || true
+
+# -------------------------------------------------------------------
+# 11. Create state directories
 # -------------------------------------------------------------------
 mkdir -p "${BOXCUTTER_HOME}/vms"
 mkdir -p "${BOXCUTTER_HOME}/golden"

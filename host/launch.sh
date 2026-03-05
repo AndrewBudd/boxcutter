@@ -56,13 +56,21 @@ QEMU_ARGS=(
 )
 
 if [ "$DAEMON" = true ]; then
-  # Background mode — log serial to file
-  QEMU_ARGS=("${QEMU_ARGS[@]/%mon:stdio/file:${IMAGES_DIR}/node-console.log}")
-  QEMU_ARGS+=(-daemonize -pidfile "$PID_FILE")
-  qemu-system-x86_64 "${QEMU_ARGS[@]}"
+  # Background mode — replace serial + nographic with display none + log
+  QEMU_DAEMON_ARGS=()
+  for arg in "${QEMU_ARGS[@]}"; do
+    case "$arg" in
+      mon:stdio) continue ;;
+      -nographic) continue ;;
+      -serial) continue ;;
+      *) QEMU_DAEMON_ARGS+=("$arg") ;;
+    esac
+  done
+  QEMU_DAEMON_ARGS+=(-display none -serial "file:${IMAGES_DIR}/node-console.log" -daemonize -pidfile "$PID_FILE")
+  qemu-system-x86_64 "${QEMU_DAEMON_ARGS[@]}"
   echo "Node VM started in background (PID $(cat "$PID_FILE"))"
   echo "Console log: ${IMAGES_DIR}/node-console.log"
-  echo "SSH: ssh -p ${DNAT_SSH} ubuntu@${HOST_TAP_IP}"
+  echo "SSH: ssh ubuntu@${HOST_TAP_IP}"
 else
   echo "Launching in foreground (Ctrl-A X to quit)..."
   echo ""

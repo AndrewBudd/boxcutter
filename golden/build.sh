@@ -1,6 +1,13 @@
 #!/bin/bash
 # Build the golden rootfs ext4 image for Firecracker microVMs.
-# Uses debootstrap to create an Ubuntu Noble rootfs, then provisions it.
+#
+# Two-phase approach:
+#   Phase 1: debootstrap a minimal Ubuntu rootfs (this script)
+#   Phase 2: boot as Firecracker VM, SSH in, run provision.sh
+#
+# Usage:
+#   boxcutter-ctl golden build         # Phase 1 only (base image)
+#   boxcutter-ctl golden provision     # Phase 2 (boot + provision)
 set -e
 
 BOXCUTTER_HOME="/var/lib/boxcutter"
@@ -8,24 +15,15 @@ GOLDEN_DIR="${BOXCUTTER_HOME}/golden"
 OUTPUT="${GOLDEN_DIR}/rootfs.ext4"
 SIZE="${1:-25G}"
 
-# Find provision script
-PROVISION=""
-for p in "${GOLDEN_DIR}/provision.sh" "$(dirname "$0")/provision.sh" /mnt/boxcutter/golden/provision.sh; do
-  [ -f "$p" ] && PROVISION="$p" && break
-done
-
-echo "=== Building Firecracker golden rootfs ==="
+echo "=== Building Firecracker golden rootfs (Phase 1: base) ==="
 echo "Output: ${OUTPUT}"
 echo "Size:   ${SIZE}"
 echo ""
 
 WORK=$(mktemp -d)
 cleanup() {
-  umount "${WORK}/mnt/proc" 2>/dev/null || true
-  umount "${WORK}/mnt/sys" 2>/dev/null || true
-  umount "${WORK}/mnt/dev" 2>/dev/null || true
   umount "${WORK}/mnt" 2>/dev/null || true
-  rm -rf "${WORK}"
+  rm -rf "${WORK}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -38,13 +36,13 @@ mkfs.ext4 -F -q "${WORK}/rootfs.ext4"
 mkdir -p "${WORK}/mnt"
 mount -o loop "${WORK}/rootfs.ext4" "${WORK}/mnt"
 
-# Debootstrap Ubuntu Noble
+# Debootstrap Ubuntu Noble (minimal + essentials for SSH/network)
 echo "Running debootstrap (Ubuntu Noble)... this takes a few minutes."
 debootstrap \
-  --include=systemd,systemd-sysv,dbus,openssh-server,sudo,curl,wget,jq,git,iproute2,iputils-ping,ca-certificates,locales \
+  --include=systemd,systemd-sysv,dbus,openssh-server,sudo,curl,wget,jq,git,iproute2,iputils-ping,ca-certificates,locales,gpgv,gnupg \
   noble "${WORK}/mnt" http://archive.ubuntu.com/ubuntu
 
-echo "Debootstrap complete. Configuring system..."
+echo "Debootstrap complete. Configuring base system..."
 
 # --- Serial console ---
 mkdir -p "${WORK}/mnt/etc/systemd/system/getty.target.wants"
@@ -61,12 +59,12 @@ Name=eth0
 DHCP=yes
 EOF
 
-# Enable systemd-networkd and resolved
+# Enable systemd-networkd and SSH (not resolved — use static DNS for fast boot)
 mkdir -p "${WORK}/mnt/etc/systemd/system/multi-user.target.wants"
-ln -sf /lib/systemd/system/systemd-networkd.service \
-  "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
-ln -sf /lib/systemd/system/systemd-resolved.service \
-  "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"
+for svc in systemd-networkd ssh; do
+  ln -sf "/lib/systemd/system/${svc}.service" \
+    "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/${svc}.service" 2>/dev/null || true
+done
 
 # --- Hostname ---
 echo "boxcutter-vm" > "${WORK}/mnt/etc/hostname"
@@ -76,55 +74,90 @@ cat > "${WORK}/mnt/etc/hosts" << 'EOF'
 EOF
 
 # --- fstab ---
-cat > "${WORK}/mnt/etc/fstab" << 'EOF'
-/dev/vda / ext4 defaults 0 1
+echo "/dev/vda / ext4 defaults 0 1" > "${WORK}/mnt/etc/fstab"
+
+# --- Fix slow boot: entropy + random seed ---
+# Firecracker VMs lack hardware RNG; systemd-random-seed blocks boot waiting for entropy.
+# Mask the service and seed /dev/urandom via a oneshot service instead.
+chroot "${WORK}/mnt" systemctl mask systemd-random-seed.service
+cat > "${WORK}/mnt/etc/systemd/system/seed-entropy.service" << 'SVCEOF'
+[Unit]
+Description=Seed entropy from urandom at boot
+DefaultDependencies=no
+Before=sysinit.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/dd if=/dev/urandom of=/var/lib/systemd/random-seed bs=512 count=1 status=none
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+SVCEOF
+ln -sf /etc/systemd/system/seed-entropy.service \
+  "${WORK}/mnt/etc/systemd/system/sysinit.target.wants/seed-entropy.service"
+
+# --- DNS (static — no systemd-resolved for fast boot) ---
+rm -f "${WORK}/mnt/etc/resolv.conf"
+cat > "${WORK}/mnt/etc/resolv.conf" << 'EOF'
+nameserver 192.168.137.1
+nameserver 8.8.8.8
 EOF
 
-# --- DNS (for chroot, overridden by systemd-resolved at runtime) ---
-echo "nameserver 8.8.8.8" > "${WORK}/mnt/etc/resolv.conf"
+# --- Create dev user with passwordless sudo ---
+chroot "${WORK}/mnt" useradd -m -s /bin/bash -G sudo -u 1000 dev 2>/dev/null || true
+chroot "${WORK}/mnt" bash -c 'echo "dev:dev" | chpasswd'
+echo "dev ALL=(ALL) NOPASSWD:ALL" > "${WORK}/mnt/etc/sudoers.d/dev"
+chmod 440 "${WORK}/mnt/etc/sudoers.d/dev"
 
-# --- Enable SSH ---
-mkdir -p "${WORK}/mnt/etc/systemd/system/multi-user.target.wants"
-ln -sf /lib/systemd/system/ssh.service \
-  "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/ssh.service" 2>/dev/null || true
+# --- Set root password for serial console ---
+chroot "${WORK}/mnt" bash -c 'echo "root:root" | chpasswd'
 
-# --- Run provision script in chroot ---
-if [ -n "$PROVISION" ] && [ -f "$PROVISION" ]; then
-  echo "Running provision script..."
-  cp "$PROVISION" "${WORK}/mnt/tmp/provision.sh"
-  chmod +x "${WORK}/mnt/tmp/provision.sh"
-  mount --bind /proc "${WORK}/mnt/proc"
-  mount --bind /sys "${WORK}/mnt/sys"
-  mount --bind /dev "${WORK}/mnt/dev"
-  chroot "${WORK}/mnt" /tmp/provision.sh
-  umount "${WORK}/mnt/dev"
-  umount "${WORK}/mnt/sys"
-  umount "${WORK}/mnt/proc"
-  rm -f "${WORK}/mnt/tmp/provision.sh"
-fi
+# --- Inject SSH keys ---
+echo "Injecting SSH keys..."
+mkdir -p "${WORK}/mnt/home/dev/.ssh"
+touch "${WORK}/mnt/home/dev/.ssh/authorized_keys"
 
-# --- Inject SSH public key for node → VM access ---
+# Node's internal key (for boxcutter-ctl shell)
 if [ -f "${BOXCUTTER_HOME}/ssh/id_ed25519.pub" ]; then
-  echo "Injecting boxcutter SSH key..."
-  mkdir -p "${WORK}/mnt/home/dev/.ssh"
-  cp "${BOXCUTTER_HOME}/ssh/id_ed25519.pub" "${WORK}/mnt/home/dev/.ssh/authorized_keys"
-  # dev user is UID 1000 (created by provision.sh)
-  chown -R 1000:1000 "${WORK}/mnt/home/dev/.ssh"
-  chmod 700 "${WORK}/mnt/home/dev/.ssh"
-  chmod 600 "${WORK}/mnt/home/dev/.ssh/authorized_keys"
+  cat "${BOXCUTTER_HOME}/ssh/id_ed25519.pub" >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
 fi
+
+# User-provided trusted keys
+if [ -f /etc/boxcutter/authorized_keys ]; then
+  echo "  Adding user-trusted keys from /etc/boxcutter/authorized_keys"
+  cat /etc/boxcutter/authorized_keys >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
+fi
+
+chown -R 1000:1000 "${WORK}/mnt/home/dev/.ssh"
+chmod 700 "${WORK}/mnt/home/dev/.ssh"
+chmod 600 "${WORK}/mnt/home/dev/.ssh/authorized_keys"
+
+# --- Services declaration file ---
+cat > "${WORK}/mnt/home/dev/.services" << 'EOF'
+# Declare services as name=port, one per line
+# Auto-discovered by boxcutter-proxy-sync
+# Exposed as https://<name>.<vm-name>.vm.lan
+# example=3000
+EOF
+chown 1000:1000 "${WORK}/mnt/home/dev/.services"
 
 # --- Unmount and finalize ---
 umount "${WORK}/mnt"
 
-# Move to final location (atomic)
 mkdir -p "$GOLDEN_DIR"
 mv "${WORK}/rootfs.ext4" "$OUTPUT"
 
 ACTUAL_SIZE=$(du -h "$OUTPUT" | cut -f1)
 echo ""
-echo "=== Golden image built ==="
+echo "=== Golden base image built ==="
 echo "Path: ${OUTPUT}"
 echo "Size: ${ACTUAL_SIZE} used / ${SIZE} max"
 echo ""
-echo "Create a VM: boxcutter-ctl create agent-1"
+echo "The base image has Ubuntu + SSH + networking."
+echo "To install dev tools, boot as a VM and provision:"
+echo "  boxcutter-ctl golden provision"
+echo ""
+echo "Or create a VM directly (tools can be added later):"
+echo "  boxcutter-ctl create agent-1"

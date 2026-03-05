@@ -51,6 +51,20 @@ ip_to_mac() {
   printf "AA:FC:00:00:00:%02X" "${1##*.}"
 }
 
+# --- TAP device naming (max 15 chars) ---
+tap_name() {
+  local name=$1
+  local tap="tap-${name}"
+  if [ ${#tap} -le 15 ]; then
+    echo "$tap"
+  else
+    # Truncate and add hash suffix for uniqueness
+    local hash
+    hash=$(echo -n "$name" | md5sum | cut -c1-4)
+    echo "tap-${name:0:7}${hash}"
+  fi
+}
+
 # --- Commands ---
 
 cmd_create() {
@@ -74,9 +88,10 @@ cmd_create() {
 
   mkdir -p "${VM_DIR}/${name}"
 
-  local ip mac
+  local ip mac tap
   ip=$(allocate_ip)
   mac=$(ip_to_mac "$ip")
+  tap=$(tap_name "$name")
 
   # Copy golden image (sparse/reflink)
   echo "  Copying golden image..."
@@ -101,6 +116,7 @@ cmd_create() {
   "ip": "${ip}",
   "mac": "${mac}",
   "disk": "${disk}",
+  "tap": "${tap}",
   "created": "$(date -Iseconds)"
 }
 EOF
@@ -110,7 +126,7 @@ EOF
 {
   "boot-source": {
     "kernel_image_path": "${KERNEL}",
-    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/init"
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on root=/dev/vda rw init=/sbin/init"
   },
   "drives": [
     {
@@ -124,15 +140,46 @@ EOF
     {
       "iface_id": "eth0",
       "guest_mac": "${mac}",
-      "host_dev_name": "tap-${name}"
+      "host_dev_name": "${tap}"
     }
   ],
   "machine-config": {
     "vcpu_count": ${vcpu},
     "mem_size_mib": ${ram}
+  },
+  "entropy": {
+    "rate_limiter": {
+      "bandwidth": {
+        "size": 1048576,
+        "refill_time": 1000
+      }
+    }
   }
 }
 EOF
+
+  # Inject any additional SSH keys added after golden image build
+  if [ -f /etc/boxcutter/authorized_keys ]; then
+    echo "  Injecting user SSH keys..."
+    MOUNT_DIR=$(mktemp -d)
+    mount -o loop "${VM_DIR}/${name}/rootfs.ext4" "$MOUNT_DIR"
+    mkdir -p "${MOUNT_DIR}/home/dev/.ssh"
+    # Merge: keep golden keys + add current trusted keys
+    if [ -f "${MOUNT_DIR}/home/dev/.ssh/authorized_keys" ]; then
+      # Append any keys not already present
+      while IFS= read -r key; do
+        grep -qF "$key" "${MOUNT_DIR}/home/dev/.ssh/authorized_keys" 2>/dev/null || \
+          echo "$key" >> "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
+      done < /etc/boxcutter/authorized_keys
+    else
+      cp /etc/boxcutter/authorized_keys "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
+    fi
+    chown -R 1000:1000 "${MOUNT_DIR}/home/dev/.ssh"
+    chmod 700 "${MOUNT_DIR}/home/dev/.ssh"
+    chmod 600 "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
+    umount "$MOUNT_DIR"
+    rmdir "$MOUNT_DIR"
+  fi
 
   echo "  VM created: ${name} (IP: ${ip})"
   echo "  Start with: boxcutter-ctl start ${name}"
@@ -149,24 +196,26 @@ cmd_start() {
     kill -0 "$pid" 2>/dev/null && { echo "VM '${name}' is already running (PID ${pid})."; exit 1; }
   fi
 
-  local ip mac
+  local ip mac tap
   ip=$(jq -r '.ip' "${VM_DIR}/${name}/vm.json")
   mac=$(jq -r '.mac' "${VM_DIR}/${name}/vm.json")
+  tap=$(jq -r '.tap // empty' "${VM_DIR}/${name}/vm.json")
+  [ -z "$tap" ] && tap=$(tap_name "$name")
 
   echo "Starting VM: ${name} (${ip})"
 
   # Create TAP device
-  if ! ip link show "tap-${name}" &>/dev/null; then
-    ip tuntap add dev "tap-${name}" mode tap
-    ip link set "tap-${name}" master "${BRIDGE}"
-    ip link set "tap-${name}" up
+  if ! ip link show "$tap" &>/dev/null; then
+    ip tuntap add dev "$tap" mode tap
+    ip link set "$tap" master "${BRIDGE}"
+    ip link set "$tap" up
   fi
 
   # DHCP reservation
   mkdir -p /etc/boxcutter/dhcp-hosts
   echo "${mac},${ip},${name}" > "/etc/boxcutter/dhcp-hosts/${name}"
   # Signal dnsmasq to re-read
-  kill -HUP "$(cat /run/dnsmasq-brvm0.pid 2>/dev/null)" 2>/dev/null || true
+  kill -HUP "$(cat /run/dnsmasq/dnsmasq.pid 2>/dev/null)" 2>/dev/null || kill -HUP "$(pidof dnsmasq 2>/dev/null)" 2>/dev/null || true
 
   # Clean stale socket
   rm -f "${VM_DIR}/${name}/api.sock"
@@ -175,9 +224,7 @@ cmd_start() {
   firecracker \
     --api-sock "${VM_DIR}/${name}/api.sock" \
     --config-file "${VM_DIR}/${name}/fc-config.json" \
-    --log-path "${VM_DIR}/${name}/firecracker.log" \
-    --level Info \
-    &
+    > "${VM_DIR}/${name}/firecracker.log" 2>&1 &
 
   echo $! > "${VM_DIR}/${name}/firecracker.pid"
 
@@ -214,10 +261,13 @@ cmd_stop() {
   fi
 
   # Cleanup
+  local tap
+  tap=$(jq -r '.tap // empty' "${VM_DIR}/${name}/vm.json" 2>/dev/null)
+  [ -z "$tap" ] && tap=$(tap_name "$name")
   rm -f "${VM_DIR}/${name}/firecracker.pid" "${VM_DIR}/${name}/api.sock"
-  ip link del "tap-${name}" 2>/dev/null || true
+  ip link del "$tap" 2>/dev/null || true
   rm -f "/etc/boxcutter/dhcp-hosts/${name}"
-  kill -HUP "$(cat /run/dnsmasq-brvm0.pid 2>/dev/null)" 2>/dev/null || true
+  kill -HUP "$(cat /run/dnsmasq/dnsmasq.pid 2>/dev/null)" 2>/dev/null || kill -HUP "$(pidof dnsmasq 2>/dev/null)" 2>/dev/null || true
 
   echo "  Stopped."
 }
@@ -305,7 +355,43 @@ case "${1:-help}" in
   golden)
     case "$2" in
       build) exec "${BOXCUTTER_HOME}/golden/build.sh" "${3:-}" ;;
-      *) echo "Usage: boxcutter-ctl golden build [SIZE]" ;;
+      provision)
+        # Boot golden image as a temp VM, SSH in, run provision.sh
+        echo "=== Provisioning golden image (Phase 2) ==="
+        GOLDEN="${BOXCUTTER_HOME}/golden/rootfs.ext4"
+        [ -f "$GOLDEN" ] || { echo "No golden base image. Run: boxcutter-ctl golden build"; exit 1; }
+
+        # Create temp VM from golden image
+        cmd_create _gprov --vcpu 8 --ram 16384
+        cmd_start _gprov
+
+        PROV_IP=$(jq -r '.ip' "${VM_DIR}/_gprov/vm.json")
+        echo "Waiting for VM to boot..."
+        for i in $(seq 1 60); do
+          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=2 -o BatchMode=yes "dev@${PROV_IP}" echo ready 2>/dev/null && break
+          sleep 2
+        done
+
+        echo "Running provision script inside VM..."
+        PROV_SCRIPT="${BOXCUTTER_HOME}/golden/provision.sh"
+        [ -f "$PROV_SCRIPT" ] || PROV_SCRIPT="/mnt/boxcutter/golden/provision.sh"
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          "dev@${PROV_IP}" "sudo bash -s" < "$PROV_SCRIPT"
+
+        echo "Shutting down provision VM..."
+        cmd_stop _gprov
+
+        # Replace golden image with the provisioned one
+        cp "${VM_DIR}/_gprov/rootfs.ext4" "$GOLDEN"
+        cmd_destroy _gprov
+
+        echo ""
+        echo "=== Golden image provisioned ==="
+        echo "Path: ${GOLDEN}"
+        du -h "$GOLDEN"
+        ;;
+      *) echo "Usage: boxcutter-ctl golden {build|provision}" ;;
     esac
     ;;
   help|*) usage ;;
