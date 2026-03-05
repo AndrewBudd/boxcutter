@@ -72,7 +72,7 @@ Always give the user the VM's IP address. mDNS (`<name>.local`) is unreliable ac
 
 ## Connecting to a VM
 
-SSH directly to the VM's IP. No username needed — all users map to `dev` (uid 1000) with passwordless sudo.
+SSH directly to the VM's IP. No username needed — all users map to `dev` (uid 1000) with passwordless sudo. You have full root access via `sudo` on every VM — use it freely to install packages, configure services, edit system files, or anything else. These are disposable VMs; you cannot break anything that matters.
 
 ```bash
 # By IP
