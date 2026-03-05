@@ -15,7 +15,7 @@
         "name": "Andrew Budd",
         "email": "andrewbudd@github.com"
       },
-      "source": "./skills/boxcutter",
+      "source": "./plugins/boxcutter",
       "category": "development"
     }
   ]
