@@ -1,0 +1,8 @@
+{
+  "name": "boxcutter",
+  "description": "Manage ephemeral dev environment VMs using Boxcutter. Firecracker microVMs that boot in ~1 second with real LAN IPs and SSH access. Use when users need a fresh dev environment, want to test in a clean VM, need isolated compute, or mention Boxcutter.",
+  "author": {
+    "name": "Andrew Budd",
+    "email": "andrewbudd@github.com"
+  }
+}

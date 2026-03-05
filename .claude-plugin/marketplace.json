@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "boxcutter",
+  "description": "Boxcutter - ephemeral dev environment VMs powered by Firecracker microVMs",
+  "owner": {
+    "name": "Andrew Budd",
+    "email": "andrewbudd@github.com"
+  },
+  "plugins": [
+    {
+      "name": "boxcutter",
+      "description": "Manage ephemeral dev environment VMs using Boxcutter. Firecracker microVMs that boot in ~1 second with real LAN IPs and SSH access. Use when users need a fresh dev environment, want to test in a clean VM, need isolated compute, or mention Boxcutter.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Andrew Budd",
+        "email": "andrewbudd@github.com"
+      },
+      "source": "./skills/boxcutter",
+      "category": "development"
+    }
+  ]
+}
