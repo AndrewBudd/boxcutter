@@ -93,18 +93,35 @@ cmd_create() {
   mac=$(ip_to_mac "$ip")
   tap=$(tap_name "$name")
 
-  # Copy golden image (sparse/reflink)
-  echo "  Copying golden image..."
-  cp --reflink=auto --sparse=always "$GOLDEN" "${VM_DIR}/${name}/rootfs.ext4"
+  # Create COW snapshot of golden image
+  echo "  Creating copy-on-write snapshot..."
+  local golden_size cow_size
+  golden_size=$(stat -c%s "$GOLDEN")
+  local disk_bytes
+  disk_bytes=$(numfmt --from=iec "$disk" 2>/dev/null || echo "$golden_size")
+  [ "$disk_bytes" -lt "$golden_size" ] && disk_bytes=$golden_size
 
-  # Resize if larger than golden
-  local disk_bytes current_bytes
-  disk_bytes=$(numfmt --from=iec "$disk" 2>/dev/null || echo 0)
-  current_bytes=$(stat -c%s "${VM_DIR}/${name}/rootfs.ext4")
-  if [ "$disk_bytes" -gt "$current_bytes" ] 2>/dev/null; then
-    truncate -s "$disk" "${VM_DIR}/${name}/rootfs.ext4"
-    e2fsck -f -y "${VM_DIR}/${name}/rootfs.ext4" >/dev/null 2>&1 || true
-    resize2fs "${VM_DIR}/${name}/rootfs.ext4" >/dev/null 2>&1 || true
+  # Create sparse COW overlay file (only stores changes)
+  truncate -s "$disk_bytes" "${VM_DIR}/${name}/cow.img"
+
+  # Create dm-snapshot: golden (read-only base) + cow (writable overlay)
+  local base_loop cow_loop dm_name
+  dm_name="bc-${name}"
+  base_loop=$(losetup --find --show --read-only "$GOLDEN")
+  cow_loop=$(losetup --find --show "${VM_DIR}/${name}/cow.img")
+  local sectors=$(( disk_bytes / 512 ))
+
+  # Create snapshot (chunk size 8 = 4KB)
+  echo "0 ${sectors} snapshot ${base_loop} ${cow_loop} P 8" | dmsetup create "$dm_name"
+
+  # Record loop devices for cleanup
+  jq -n --arg base "$base_loop" --arg cow "$cow_loop" --arg dm "$dm_name" \
+    '{"base_loop": $base, "cow_loop": $cow, "dm_name": $dm}' > "${VM_DIR}/${name}/snapshot.json"
+
+  # If disk is larger than golden, resize the filesystem
+  if [ "$disk_bytes" -gt "$golden_size" ]; then
+    e2fsck -f -y "/dev/mapper/${dm_name}" >/dev/null 2>&1 || true
+    resize2fs "/dev/mapper/${dm_name}" >/dev/null 2>&1 || true
   fi
 
   # VM metadata
@@ -131,7 +148,7 @@ EOF
   "drives": [
     {
       "drive_id": "rootfs",
-      "path_on_host": "${VM_DIR}/${name}/rootfs.ext4",
+      "path_on_host": "/dev/mapper/bc-${name}",
       "is_root_device": true,
       "is_read_only": false
     }
@@ -162,7 +179,7 @@ EOF
   if [ -f /etc/boxcutter/authorized_keys ]; then
     echo "  Injecting user SSH keys..."
     MOUNT_DIR=$(mktemp -d)
-    mount -o loop "${VM_DIR}/${name}/rootfs.ext4" "$MOUNT_DIR"
+    mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
     mkdir -p "${MOUNT_DIR}/home/dev/.ssh"
     # Merge: keep golden keys + add current trusted keys
     if [ -f "${MOUNT_DIR}/home/dev/.ssh/authorized_keys" ]; then
@@ -203,6 +220,21 @@ cmd_start() {
   [ -z "$tap" ] && tap=$(tap_name "$name")
 
   echo "Starting VM: ${name} (${ip})"
+
+  # Ensure dm-snapshot is active
+  local dm_name="bc-${name}"
+  if [ ! -e "/dev/mapper/${dm_name}" ]; then
+    if [ -f "${VM_DIR}/${name}/cow.img" ]; then
+      local cow_size base_loop cow_loop sectors
+      cow_size=$(stat -c%s "${VM_DIR}/${name}/cow.img")
+      base_loop=$(losetup --find --show --read-only "$GOLDEN")
+      cow_loop=$(losetup --find --show "${VM_DIR}/${name}/cow.img")
+      sectors=$(( cow_size / 512 ))
+      echo "0 ${sectors} snapshot ${base_loop} ${cow_loop} P 8" | dmsetup create "$dm_name"
+      jq -n --arg base "$base_loop" --arg cow "$cow_loop" --arg dm "$dm_name" \
+        '{"base_loop": $base, "cow_loop": $cow, "dm_name": $dm}' > "${VM_DIR}/${name}/snapshot.json"
+    fi
+  fi
 
   # Create TAP device
   if ! ip link show "$tap" &>/dev/null; then
@@ -266,6 +298,21 @@ cmd_stop() {
   [ -z "$tap" ] && tap=$(tap_name "$name")
   rm -f "${VM_DIR}/${name}/firecracker.pid" "${VM_DIR}/${name}/api.sock"
   ip link del "$tap" 2>/dev/null || true
+
+  # Tear down dm-snapshot
+  local dm_name="bc-${name}"
+  if [ -e "/dev/mapper/${dm_name}" ]; then
+    dmsetup remove "$dm_name" 2>/dev/null || true
+  fi
+  if [ -f "${VM_DIR}/${name}/snapshot.json" ]; then
+    local base_loop cow_loop
+    base_loop=$(jq -r '.base_loop' "${VM_DIR}/${name}/snapshot.json")
+    cow_loop=$(jq -r '.cow_loop' "${VM_DIR}/${name}/snapshot.json")
+    losetup -d "$base_loop" 2>/dev/null || true
+    losetup -d "$cow_loop" 2>/dev/null || true
+    rm -f "${VM_DIR}/${name}/snapshot.json"
+  fi
+
   rm -f "/etc/boxcutter/dhcp-hosts/${name}"
   kill -HUP "$(cat /run/dnsmasq/dnsmasq.pid 2>/dev/null)" 2>/dev/null || kill -HUP "$(pidof dnsmasq 2>/dev/null)" 2>/dev/null || true
 
@@ -380,10 +427,16 @@ case "${1:-help}" in
           "dev@${PROV_IP}" "sudo bash -s" < "$PROV_SCRIPT"
 
         echo "Shutting down provision VM..."
-        cmd_stop _gprov
-
-        # Replace golden image with the provisioned one
-        cp "${VM_DIR}/_gprov/rootfs.ext4" "$GOLDEN"
+        # Merge COW snapshot back into a new golden image
+        local dm_name="bc-_gprov"
+        if [ -e "/dev/mapper/${dm_name}" ]; then
+          echo "Merging snapshot into golden image..."
+          dd if="/dev/mapper/${dm_name}" of="${GOLDEN}.new" bs=4M status=progress
+          cmd_stop _gprov
+          mv "${GOLDEN}.new" "$GOLDEN"
+        else
+          cmd_stop _gprov
+        fi
         cmd_destroy _gprov
 
         echo ""
