@@ -76,8 +76,8 @@ SSH directly to the VM's IP. No username needed — all users map to `dev` (uid 
 # By IP
 ssh <VM_IP>
 
-# By mDNS hostname (if the network supports multicast)
-ssh <name>.local
+# By mDNS hostname (if the network supports multicast DNS)
+ssh <name>.local    # e.g., ssh bold-fox.local
 
 # Run a command without an interactive session
 ssh <VM_IP> "command here"
@@ -134,25 +134,21 @@ scp -r myproject/ <VM_IP>:/home/dev/
 scp <VM_IP>:/home/dev/output.txt ./
 ```
 
-## Exposing HTTP services
+## Accessing services running in a VM
 
-If a VM runs an HTTP service, declare it in `~/.services` for automatic reverse proxy setup:
+VMs have real LAN IPs, so services are directly reachable from any machine on the same network. If a VM at 192.168.2.200 runs a server on port 3000, access it at `http://192.168.2.200:3000` from any machine on the LAN.
 
+From the user's local machine:
 ```bash
-ssh <VM_IP> "echo 'myapp=3000' >> ~/.services"
+curl http://<VM_IP>:3000
 ```
 
-Services are exposed as `https://<service>.<vm-name>.vm.lan` with auto-provisioned TLS.
-
-Multiple services can be declared:
-
+From inside the VM (after SSHing in):
 ```bash
-ssh <VM_IP> "cat > ~/.services << 'EOF'
-frontend=3000
-api=8080
-docs=4000
-EOF"
+curl http://localhost:3000
 ```
+
+The mDNS hostname also works: `http://<name>.local:3000` (if the network supports multicast).
 
 ## Workflow patterns
 
