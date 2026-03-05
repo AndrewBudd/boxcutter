@@ -1,54 +1,68 @@
 #!/bin/bash
+# Boxcutter Node VM setup — runs inside the Node VM
+# Installs Firecracker, networking, Caddy, dnsmasq, all management scripts.
 set -e
 
-# Boxcutter host bootstrap — run as root
-# Usage: sudo ./install.sh
-
 if [ "$EUID" -ne 0 ]; then
-  echo "Error: must run as root (sudo ./install.sh)"
+  echo "Error: must run as root"
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HOST_LAN_IP=$(ip route get 1.1.1.1 | awk '{print $7; exit}')
-
-echo "=== Boxcutter Host Bootstrap ==="
-echo "Host LAN IP: ${HOST_LAN_IP}"
-echo "Script dir:  ${SCRIPT_DIR}"
-echo ""
-
-# -------------------------------------------------------------------
-# Phase 1: Install SlicerVM
-# -------------------------------------------------------------------
-echo "=== Phase 1: Install SlicerVM ==="
-if ! command -v slicer &>/dev/null; then
-  curl -sLS https://get.slicervm.com | bash
-  echo "SlicerVM installed."
+# Determine source directory (9p mount or local)
+if [ -d /mnt/boxcutter/scripts ]; then
+  SRC="/mnt/boxcutter"
+elif [ -d "$(dirname "$0")/scripts" ]; then
+  SRC="$(cd "$(dirname "$0")" && pwd)"
 else
-  echo "SlicerVM already installed: $(slicer version)"
+  echo "Error: cannot find boxcutter source files"
+  exit 1
 fi
-slicer version
+
+BOXCUTTER_HOME="/var/lib/boxcutter"
+ARCH=$(uname -m)
+
+echo "=== Boxcutter Node VM Setup ==="
+echo "Source: ${SRC}"
+echo ""
 
 # -------------------------------------------------------------------
-# Phase 2: dnsmasq
+# 1. Install Firecracker
+# -------------------------------------------------------------------
+echo "--- Installing Firecracker ---"
+if ! command -v firecracker &>/dev/null; then
+  FC_VERSION="v1.12.0"
+  FC_URL="https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz"
+  echo "Downloading Firecracker ${FC_VERSION}..."
+  curl -sL "$FC_URL" | tar xz -C /tmp
+  mv "/tmp/release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/local/bin/firecracker
+  chmod +x /usr/local/bin/firecracker
+  rm -rf "/tmp/release-${FC_VERSION}-${ARCH}"
+  echo "Firecracker installed: $(firecracker --version 2>&1 | head -1)"
+else
+  echo "Firecracker already installed: $(firecracker --version 2>&1 | head -1)"
+fi
+
+# -------------------------------------------------------------------
+# 2. Download Firecracker kernel
 # -------------------------------------------------------------------
 echo ""
-echo "=== Phase 2: dnsmasq ==="
-apt-get update -qq
-apt-get install -y dnsmasq
-
-# Deploy config with substituted IP
-sed "s/HOST_LAN_IP_PLACEHOLDER/${HOST_LAN_IP}/g" \
-  "${SCRIPT_DIR}/config/dnsmasq-vm.conf" > /etc/dnsmasq.d/vm.conf
-
-systemctl enable --now dnsmasq
-echo "dnsmasq configured for *.vm.lan → ${HOST_LAN_IP}"
+echo "--- Downloading Firecracker kernel ---"
+mkdir -p "${BOXCUTTER_HOME}/kernel"
+KERNEL="${BOXCUTTER_HOME}/kernel/vmlinux"
+if [ ! -f "$KERNEL" ]; then
+  KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/${ARCH}/vmlinux-6.1.102"
+  echo "Downloading kernel..."
+  curl -sL "$KERNEL_URL" -o "$KERNEL"
+  echo "Kernel downloaded."
+else
+  echo "Kernel already present."
+fi
 
 # -------------------------------------------------------------------
-# Phase 3: Caddy
+# 3. Install Caddy
 # -------------------------------------------------------------------
 echo ""
-echo "=== Phase 3: Caddy ==="
+echo "--- Installing Caddy ---"
 if ! command -v caddy &>/dev/null; then
   apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
@@ -57,46 +71,59 @@ if ! command -v caddy &>/dev/null; then
     | tee /etc/apt/sources.list.d/caddy-stable.list
   apt-get update -qq
   apt-get install -y caddy
-else
-  echo "Caddy already installed: $(caddy version)"
 fi
-
 mkdir -p /etc/caddy/sites
-cp "${SCRIPT_DIR}/config/Caddyfile" /etc/caddy/Caddyfile
-systemctl enable --now caddy
-echo "Caddy configured."
+cp "${SRC}/config/Caddyfile" /etc/caddy/Caddyfile
+systemctl enable caddy
 
 # -------------------------------------------------------------------
-# Phase 4: SlicerVM config + systemd
+# 4. Configure dnsmasq
 # -------------------------------------------------------------------
 echo ""
-echo "=== Phase 4: SlicerVM config ==="
-mkdir -p /etc/boxcutter
-cp "${SCRIPT_DIR}/config/agent-dev.yaml" /etc/boxcutter/agent-dev.yaml
+echo "--- Configuring dnsmasq ---"
+# Get the host LAN IP from the env file (passed via cloud-init or manual)
+# Default: resolve *.vm.lan to the Node VM's bridge IP for internal access
+cp "${SRC}/config/dnsmasq-bridge.conf" /etc/dnsmasq.d/boxcutter-bridge.conf
+mkdir -p /etc/boxcutter/dhcp-hosts
+systemctl enable dnsmasq
 
-# Install systemd units
-cp "${SCRIPT_DIR}/systemd/boxcutter.service" /etc/systemd/system/
-cp "${SCRIPT_DIR}/systemd/boxcutter-proxy-sync.service" /etc/systemd/system/
-cp "${SCRIPT_DIR}/systemd/boxcutter-gateway.service" /etc/systemd/system/
+# -------------------------------------------------------------------
+# 5. Set up networking
+# -------------------------------------------------------------------
+echo ""
+echo "--- Setting up bridge network ---"
+install -m 755 "${SRC}/scripts/boxcutter-net" /usr/local/bin/
+cp "${SRC}/systemd/boxcutter-net.service" /etc/systemd/system/
 systemctl daemon-reload
-echo "SlicerVM config and systemd units installed."
+systemctl enable boxcutter-net
+
+# Run it now
+/usr/local/bin/boxcutter-net up
 
 # -------------------------------------------------------------------
-# Phase 6: Install scripts
+# 6. Install management scripts
 # -------------------------------------------------------------------
 echo ""
-echo "=== Phase 6: Install scripts ==="
-install -m 755 "${SCRIPT_DIR}/scripts/boxcutter-proxy-sync" /usr/local/bin/
-install -m 755 "${SCRIPT_DIR}/scripts/boxcutter-ssh" /usr/local/bin/
-install -m 755 "${SCRIPT_DIR}/scripts/boxcutter-gateway" /usr/local/bin/
-install -m 755 "${SCRIPT_DIR}/scripts/bootstrap-vm.sh" /usr/local/bin/boxcutter-bootstrap-vm
-echo "Scripts installed to /usr/local/bin/."
+echo "--- Installing boxcutter scripts ---"
+install -m 755 "${SRC}/scripts/boxcutter-ctl" /usr/local/bin/
+install -m 755 "${SRC}/scripts/boxcutter-proxy-sync" /usr/local/bin/
+install -m 755 "${SRC}/scripts/boxcutter-ssh" /usr/local/bin/
+install -m 755 "${SRC}/scripts/boxcutter-gateway" /usr/local/bin/
 
 # -------------------------------------------------------------------
-# Phase 7: SSH control interface
+# 7. Systemd services
 # -------------------------------------------------------------------
 echo ""
-echo "=== Phase 7: SSH control interface ==="
+echo "--- Installing systemd services ---"
+cp "${SRC}/systemd/boxcutter-proxy-sync.service" /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable boxcutter-proxy-sync
+
+# -------------------------------------------------------------------
+# 8. SSH control interface
+# -------------------------------------------------------------------
+echo ""
+echo "--- Setting up SSH control interface ---"
 useradd -r -m -s /usr/sbin/nologin boxcutter 2>/dev/null || true
 mkdir -p /home/boxcutter/.ssh
 touch /home/boxcutter/.ssh/authorized_keys
@@ -104,59 +131,51 @@ chmod 700 /home/boxcutter/.ssh
 chmod 600 /home/boxcutter/.ssh/authorized_keys
 chown -R boxcutter:boxcutter /home/boxcutter/.ssh
 
-# SSH ForceCommand config
+mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/boxcutter.conf << 'EOF'
 Match User boxcutter
     ForceCommand /usr/local/bin/boxcutter-ssh
     AllowTcpForwarding no
     X11Forwarding no
 EOF
-systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
-echo "SSH control interface configured."
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 # -------------------------------------------------------------------
-# Phase 8: Gateway host registry (single-host default)
+# 9. Generate SSH keypair for VM access
 # -------------------------------------------------------------------
 echo ""
-echo "=== Phase 8: Gateway host registry ==="
-if [ ! -f /etc/boxcutter/hosts ]; then
-  cat > /etc/boxcutter/hosts << EOF
-# name  ip               ssh_port
-$(hostname -s)  ${HOST_LAN_IP}    22
-EOF
-  echo "Default host registry created at /etc/boxcutter/hosts"
-else
-  echo "Host registry already exists."
+echo "--- Generating VM access SSH key ---"
+mkdir -p "${BOXCUTTER_HOME}/ssh"
+if [ ! -f "${BOXCUTTER_HOME}/ssh/id_ed25519" ]; then
+  ssh-keygen -t ed25519 -f "${BOXCUTTER_HOME}/ssh/id_ed25519" -N "" -q
+  echo "SSH keypair generated for VM access."
 fi
 
 # -------------------------------------------------------------------
-# Phase 10: Enable on boot
+# 10. Create state directories
 # -------------------------------------------------------------------
-echo ""
-echo "=== Phase 10: Enable services on boot ==="
-systemctl enable dnsmasq caddy boxcutter boxcutter-proxy-sync
-echo "All services enabled."
+mkdir -p "${BOXCUTTER_HOME}/vms"
+mkdir -p "${BOXCUTTER_HOME}/golden"
+
+# Copy golden image build scripts
+cp "${SRC}/golden/build.sh" "${BOXCUTTER_HOME}/golden/build.sh"
+cp "${SRC}/golden/provision.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
+chmod +x "${BOXCUTTER_HOME}/golden/build.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
 
 # -------------------------------------------------------------------
-# Summary
+# Done
 # -------------------------------------------------------------------
 echo ""
 echo "============================================"
-echo "  Boxcutter host bootstrap complete!"
+echo "  Boxcutter Node VM setup complete!"
 echo "============================================"
 echo ""
-echo "Host LAN IP: ${HOST_LAN_IP}"
-echo ""
 echo "Next steps:"
-echo "  1. Activate SlicerVM:  sudo slicer activate"
-echo "  2. Start the daemon:   sudo systemctl start boxcutter"
-echo "  3. Build golden image: sudo slicer vm shell agent-1 --uid 0"
-echo "     Then run: /usr/local/bin/boxcutter-bootstrap-vm"
-echo "  4. Export golden image: sudo slicer vm shutdown agent-1"
-echo "     sudo slicer disk export agent-1 -f ~/golden-agent.img --size 25G"
-echo "  5. Start proxy sync:   sudo systemctl start boxcutter-proxy-sync"
-echo "  6. Add SSH keys:       cat your_key >> /home/boxcutter/.ssh/authorized_keys"
+echo "  1. Build golden image:  sudo boxcutter-ctl golden build"
+echo "  2. Create a VM:         sudo boxcutter-ctl create agent-1"
+echo "  3. Start the VM:        sudo boxcutter-ctl start agent-1"
+echo "  4. Shell into it:       sudo boxcutter-ctl shell agent-1"
 echo ""
-echo "Export Caddy root cert for client trust:"
-echo "  sudo cp /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt ~/caddy-root.crt"
+echo "Start all services:"
+echo "  sudo systemctl start dnsmasq caddy boxcutter-net boxcutter-proxy-sync"
 echo ""

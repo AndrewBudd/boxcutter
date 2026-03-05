@@ -1,0 +1,12 @@
+[Unit]
+Description=Boxcutter VM bridge network (brvm0)
+Before=dnsmasq.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/boxcutter-net up
+ExecStop=/usr/local/bin/boxcutter-net down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

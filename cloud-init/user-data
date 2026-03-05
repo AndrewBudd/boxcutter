@@ -1,0 +1,36 @@
+#cloud-config
+
+hostname: boxcutter-node
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - SSH_PUBKEY_PLACEHOLDER
+
+package_update: true
+
+packages:
+  - jq
+  - curl
+  - wget
+  - debootstrap
+  - dnsmasq
+  - e2fsprogs
+  - iptables-persistent
+  - bridge-utils
+  - net-tools
+  - openssh-server
+  - ca-certificates
+  - gnupg
+
+runcmd:
+  # Mount the host repo via 9p
+  - mkdir -p /mnt/boxcutter
+  - mount -t 9p -o trans=virtio,version=9p2000.L,ro boxcutter /mnt/boxcutter
+  # Run the install script
+  - /mnt/boxcutter/install.sh
+  # Add 9p mount to fstab for convenience (optional, ro)
+  - echo 'boxcutter /mnt/boxcutter 9p trans=virtio,version=9p2000.L,ro,nofail 0 0' >> /etc/fstab

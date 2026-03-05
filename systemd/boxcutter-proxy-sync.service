@@ -1,5 +1,5 @@
 [Unit]
-Description=Boxcutter proxy sync (SlicerVM → Caddy)
+Description=Boxcutter proxy sync (VM services → Caddy)
 After=network.target caddy.service
 
 [Service]

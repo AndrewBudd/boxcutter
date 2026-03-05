@@ -1,0 +1,14 @@
+version: 2
+ethernets:
+  nodeif:
+    match:
+      macaddress: "NODE_MAC_PLACEHOLDER"
+    addresses:
+      - NODE_IP_PLACEHOLDER/NODE_CIDR_PLACEHOLDER
+    routes:
+      - to: default
+        via: HOST_TAP_IP_PLACEHOLDER
+    nameservers:
+      addresses:
+        - 8.8.8.8
+        - 8.8.4.4

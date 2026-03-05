@@ -1,0 +1,43 @@
+#!/bin/bash
+# Set up the bridge network for Firecracker VMs.
+# Creates brvm0, enables NAT, configures forwarding.
+set -e
+
+BRIDGE="brvm0"
+SUBNET="192.168.137"
+BRIDGE_IP="${SUBNET}.1/24"
+
+case "${1:-up}" in
+  up)
+    if ! ip link show "$BRIDGE" &>/dev/null; then
+      ip link add name "$BRIDGE" type bridge
+      ip addr add "$BRIDGE_IP" dev "$BRIDGE"
+      ip link set "$BRIDGE" up
+      echo "Bridge ${BRIDGE} created at ${BRIDGE_IP}"
+    else
+      echo "Bridge ${BRIDGE} already exists."
+    fi
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    # NAT outbound VM traffic
+    DEFAULT_IF=$(ip route | awk '/^default/{print $5; exit}')
+    if [ -n "$DEFAULT_IF" ]; then
+      iptables -t nat -C POSTROUTING -s ${SUBNET}.0/24 -o "$DEFAULT_IF" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s ${SUBNET}.0/24 -o "$DEFAULT_IF" -j MASQUERADE
+
+      iptables -C FORWARD -i "$BRIDGE" -o "$DEFAULT_IF" -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "$BRIDGE" -o "$DEFAULT_IF" -j ACCEPT
+
+      iptables -C FORWARD -i "$DEFAULT_IF" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "$DEFAULT_IF" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
+
+    echo "NAT configured (${SUBNET}.0/24 → ${DEFAULT_IF:-unknown})"
+    ;;
+
+  down)
+    ip link del "$BRIDGE" 2>/dev/null || true
+    echo "Bridge ${BRIDGE} removed."
+    ;;
+esac
