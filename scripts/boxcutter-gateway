@@ -1,0 +1,107 @@
+#!/bin/bash
+# Gateway SSH dispatch — runs on the gateway node
+# Wraps the per-host boxcutter-ssh interface with capacity-aware placement
+
+HOSTS_FILE="/etc/boxcutter/hosts"
+
+read -r -a ARGS <<< "${SSH_ORIGINAL_COMMAND:-help}"
+ACTION="${ARGS[0]}"
+TARGET="${ARGS[1]}"
+
+# Query a host's headroom (GB RAM free)
+host_headroom() {
+  local ip=$1 port=$2
+  ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=2 \
+    -p "$port" boxcutter@"$ip" status 2>/dev/null \
+    | awk '/Headroom:/{print $2}' | tr -d 'GB'
+}
+
+# Pick host with most RAM headroom
+best_host() {
+  local best_ip="" best_port="" best_score=0
+  while read -r name ip port; do
+    [[ "$name" =~ ^#.*$ ]] && continue
+    [ -z "$ip" ] && continue
+    score=$(host_headroom "$ip" "$port")
+    score=${score:-0}
+    if [ "$score" -gt "$best_score" ] 2>/dev/null; then
+      best_score=$score
+      best_ip=$ip
+      best_port=$port
+      best_name=$name
+    fi
+  done < "$HOSTS_FILE"
+  echo "$best_name $best_ip $best_port"
+}
+
+case "$ACTION" in
+  new)
+    echo "Finding best host..."
+    read -r name ip port <<< "$(best_host)"
+    if [ -z "$ip" ]; then
+      echo "Error: no available hosts"
+      exit 1
+    fi
+    echo "Routing to: ${name} (${ip})"
+    ssh -q -o StrictHostKeyChecking=no -p "$port" boxcutter@"$ip" new
+    ;;
+
+  list)
+    # List VMs across all hosts
+    while read -r name ip port; do
+      [[ "$name" =~ ^#.*$ ]] && continue
+      [ -z "$ip" ] && continue
+      echo "=== ${name} ==="
+      ssh -q -o StrictHostKeyChecking=no -p "$port" boxcutter@"$ip" list 2>/dev/null
+    done < "$HOSTS_FILE"
+    ;;
+
+  status)
+    # Capacity overview across all hosts
+    printf "%-10s %-16s %-12s %-10s\n" "HOST" "IP" "VMs" "HEADROOM"
+    while read -r name ip port; do
+      [[ "$name" =~ ^#.*$ ]] && continue
+      [ -z "$ip" ] && continue
+      STATUS=$(ssh -q -o StrictHostKeyChecking=no -o ConnectTimeout=2 \
+        -p "$port" boxcutter@"$ip" status 2>/dev/null)
+      vms=$(echo "$STATUS" | awk '/VMs running:/{print $3}')
+      headroom=$(echo "$STATUS" | awk '/Headroom:/{print $2}')
+      printf "%-10s %-16s %-12s %-10s\n" "$name" "$ip" "${vms:-?}" "${headroom:-?}"
+    done < "$HOSTS_FILE"
+    ;;
+
+  shell|destroy|logs)
+    # Pass through to the right host — caller specifies host prefix or we search
+    HOST_NAME="${ARGS[1]}"
+    VM_NAME="${ARGS[2]}"
+    if [ -z "$VM_NAME" ]; then
+      echo "Usage: ssh boxcutter $ACTION <host-name> <vm-name>"
+      exit 1
+    fi
+    HOST_IP=$(awk -v h="$HOST_NAME" '$1==h{print $2}' "$HOSTS_FILE")
+    HOST_PORT=$(awk -v h="$HOST_NAME" '$1==h{print $3}' "$HOSTS_FILE")
+    if [ -z "$HOST_IP" ]; then
+      echo "Unknown host: $HOST_NAME"
+      echo "Known hosts: $(awk '!/^#/{print $1}' "$HOSTS_FILE" | tr '\n' ' ')"
+      exit 1
+    fi
+    ssh -q -o StrictHostKeyChecking=no -p "$HOST_PORT" \
+      boxcutter@"$HOST_IP" "$ACTION $VM_NAME"
+    ;;
+
+  help|*)
+    cat << 'EOF'
+Boxcutter Gateway — multi-host control interface
+
+Commands:
+  new                         Provision VM on best available host
+  list                        List all VMs across all hosts
+  status                      Capacity overview of all hosts
+  shell <host> <vm>           Shell into VM on specific host
+  destroy <host> <vm>         Destroy VM on specific host
+  logs <host> <vm>            Tail VM logs on specific host
+
+Usage: ssh boxcutter <command> [args]
+EOF
+    ;;
+esac

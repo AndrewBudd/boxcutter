@@ -1,0 +1,19 @@
+config:
+  host_groups:
+    - name: agent
+      storage: image
+      storage_size: 25G
+      count: 1
+      vcpu: 4
+      ram_gb: 8
+      network:
+        bridge: brvm0
+        tap_prefix: agent
+        gateway: 192.168.137.1/24
+  image: "ghcr.io/openfaasltd/slicer-systemd:5.10.240-x86_64-latest"
+  hypervisor: firecracker
+  api:
+    port: 8080
+    bind_address: "127.0.0.1"
+    auth:
+      enabled: true

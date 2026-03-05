@@ -1,0 +1,23 @@
+# Binaries
+slicer
+firecracker
+firectl
+
+# VM images and exports
+*.img
+*.ext4
+*.squashfs
+golden-*.img
+
+# Auth tokens and secrets
+auth/
+token
+*.token
+*.pem
+*.key
+
+# Caddy generated certs (not the root CA - that's exported separately)
+.local/
+
+# OS
+.DS_Store

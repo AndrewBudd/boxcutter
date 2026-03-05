@@ -1,0 +1,76 @@
+#!/bin/bash
+# Boxcutter SSH control interface
+# $SSH_ORIGINAL_COMMAND is set by sshd to whatever the client passed after 'ssh boxcutter'
+
+SLICER_API="http://127.0.0.1:8080"
+TOKEN=$(cat /var/lib/slicer/auth/token)
+CMD_YAML="/etc/boxcutter/agent-dev.yaml"
+
+# Parse command and args
+read -r -a ARGS <<< "${SSH_ORIGINAL_COMMAND:-help}"
+ACTION="${ARGS[0]}"
+TARGET="${ARGS[1]}"
+
+api() { curl -s -H "Authorization: Bearer ${TOKEN}" "$@"; }
+
+case "$ACTION" in
+  new)
+    # Increment count in running config and reload, or create VM via API
+    echo "Provisioning new VM..."
+    RESULT=$(api -X POST "${SLICER_API}/vm" \
+      -H "Content-Type: application/json" \
+      -d '{"group":"agent"}')
+    HOSTNAME=$(echo "$RESULT" | jq -r '.hostname // "unknown"')
+    echo "VM ready: ${HOSTNAME}"
+    echo "Shell: ssh boxcutter shell ${HOSTNAME}"
+    ;;
+
+  list)
+    api "${SLICER_API}/nodes" | jq -r \
+      '.[] | "\(.hostname)\t\(.ip)\t\(.vcpu)vCPU \(.ram_gb)GB\t\(.status)"' \
+      | column -t
+    ;;
+
+  shell)
+    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter shell <vm-name>"; exit 1; }
+    exec slicer vm shell "$TARGET" --uid 1001  # dev user uid
+    ;;
+
+  destroy)
+    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter destroy <vm-name>"; exit 1; }
+    echo "Destroying ${TARGET}..."
+    api -X DELETE "${SLICER_API}/vm/${TARGET}"
+    echo "Done."
+    ;;
+
+  status)
+    TOTAL_RAM=$(free -g | awk '/^Mem:/{print $2}')
+    USED_RAM=$(api "${SLICER_API}/nodes" | jq '[.[].ram_gb] | add // 0')
+    VM_COUNT=$(api "${SLICER_API}/nodes" | jq 'length')
+    echo "Host: $(hostname)"
+    echo "VMs running: ${VM_COUNT}"
+    echo "RAM: ${USED_RAM}GB used / ${TOTAL_RAM}GB total"
+    echo "Headroom: $((TOTAL_RAM - USED_RAM))GB"
+    ;;
+
+  logs)
+    [ -z "$TARGET" ] && { echo "Usage: ssh boxcutter logs <vm-name>"; exit 1; }
+    slicer vm logs "$TARGET" --follow
+    ;;
+
+  help|*)
+    cat << 'EOF'
+Boxcutter SSH control interface
+
+Commands:
+  new              Provision a new VM
+  list             List running VMs
+  shell <name>     Attach to VM shell
+  destroy <name>   Tear down a VM
+  status           Host capacity summary
+  logs <name>      Tail VM console output
+
+Usage: ssh boxcutter <command> [args]
+EOF
+    ;;
+esac
