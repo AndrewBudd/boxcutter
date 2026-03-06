@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -32,6 +33,19 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 }
 
+// progressEvent is a NDJSON line streamed during VM creation.
+type progressEvent struct {
+	Phase   string `json:"phase"`
+	Message string `json:"message,omitempty"`
+	// Final result fields (only on phase="ready" or phase="error")
+	Name        string `json:"name,omitempty"`
+	TailscaleIP string `json:"tailscale_ip,omitempty"`
+	Mark        int    `json:"mark,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
 func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req vm.CreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -39,19 +53,46 @@ func (h *Handler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	flusher, canFlush := w.(http.Flusher)
+
+	// Set up streaming progress
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusCreated)
+
+	req.SetProgress(func(phase, message string) {
+		line, _ := json.Marshal(progressEvent{Phase: phase, Message: message})
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
+		}
+	})
+
 	resp, err := h.mgr.Create(&req)
 	if err != nil {
 		log.Printf("Create failed: %v", err)
-		if vm.IsCapacityError(err) {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
+		line, _ := json.Marshal(progressEvent{Phase: "error", Error: err.Error()})
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	writeJSON(w, resp)
+	// Final "ready" event with full response
+	line, _ := json.Marshal(progressEvent{
+		Phase:       "ready",
+		Message:     "VM ready",
+		Name:        resp.Name,
+		TailscaleIP: resp.TailscaleIP,
+		Mark:        resp.Mark,
+		Mode:        resp.Mode,
+		Status:      resp.Status,
+	})
+	fmt.Fprintf(w, "%s\n", line)
+	if canFlush {
+		flusher.Flush()
+	}
 }
 
 func (h *Handler) handleList(w http.ResponseWriter, r *http.Request) {
@@ -131,10 +172,10 @@ func (h *Handler) handleExport(w http.ResponseWriter, r *http.Request) {
 	info, _ := os.Stat(cowPath)
 
 	writeJSON(w, map[string]interface{}{
-		"name":       st.Name,
-		"cow_path":   cowPath,
-		"cow_bytes":  info.Size(),
-		"vm_state":   st,
+		"name":     st.Name,
+		"cow_path": cowPath,
+		"cow_bytes": info.Size(),
+		"vm_state": st,
 	})
 }
 

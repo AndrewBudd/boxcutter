@@ -32,6 +32,9 @@ func NewManager(cfg *config.Config, vmidClient *vmid.Client) *Manager {
 	return &Manager{cfg: cfg, vmid: vmidClient}
 }
 
+// ProgressFunc is called with phase updates during VM creation.
+type ProgressFunc func(phase, message string)
+
 // CreateRequest is the API input for creating a VM.
 type CreateRequest struct {
 	Name           string   `json:"name"`
@@ -41,6 +44,18 @@ type CreateRequest struct {
 	CloneURL       string   `json:"clone_url,omitempty"`
 	Mode           string   `json:"mode,omitempty"`
 	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
+
+	progressFn ProgressFunc `json:"-"`
+}
+
+func (r *CreateRequest) SetProgress(fn ProgressFunc) {
+	r.progressFn = fn
+}
+
+func (r *CreateRequest) progress(phase, message string) {
+	if r.progressFn != nil {
+		r.progressFn(phase, message)
+	}
 }
 
 // CreateResponse is returned after creating + starting a VM.
@@ -106,6 +121,7 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 	}
 
 	// Create COW snapshot
+	req.progress("snapshot", "Creating disk snapshot...")
 	ss, err := CreateSnapshot(vmDir, goldenPath, req.Disk)
 	if err != nil {
 		os.RemoveAll(vmDir)
@@ -158,7 +174,7 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 	}
 
 	// Start the VM
-	resp, err := m.startVM(st)
+	resp, err := m.startVM(st, req.progress)
 	if err != nil {
 		CleanupSnapshot(vmDir)
 		os.RemoveAll(vmDir)
@@ -188,10 +204,15 @@ func (m *Manager) Start(name string) (*CreateResponse, error) {
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
-	return m.startVM(st)
+	return m.startVM(st, nil)
 }
 
-func (m *Manager) startVM(st *VMState) (*CreateResponse, error) {
+func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, error) {
+	emit := func(phase, msg string) {
+		if progress != nil {
+			progress(phase, msg)
+		}
+	}
 	vmDir := VMDir(st.Name)
 
 	// Set up TAP + fwmark
@@ -210,6 +231,7 @@ func (m *Manager) startVM(st *VMState) (*CreateResponse, error) {
 	// Clean stale socket
 	os.Remove(filepath.Join(vmDir, "api.sock"))
 
+	emit("starting", "Starting Firecracker VM...")
 	// Launch Firecracker
 	logFile, _ := os.Create(filepath.Join(vmDir, "firecracker.log"))
 	cmd := exec.Command("firecracker",
@@ -245,12 +267,14 @@ func (m *Manager) startVM(st *VMState) (*CreateResponse, error) {
 	}
 
 	// Wait for SSH
+	emit("ssh", "Waiting for VM to boot...")
 	sshKey := m.cfg.SSH.PrivateKeyPath
 	if err := WaitForSSH(st.TAP, sshKey, 30*time.Second); err != nil {
 		log.Printf("Warning: SSH not ready for %s: %v", st.Name, err)
 	}
 
 	// Join Tailscale
+	emit("tailscale", "Joining Tailscale network...")
 	tsIP := m.joinTailscale(st)
 
 	// Register with vmid
@@ -266,11 +290,13 @@ func (m *Manager) startVM(st *VMState) (*CreateResponse, error) {
 
 	// Paranoid mode: inject proxy env
 	if st.Mode == "paranoid" {
+		emit("paranoid", "Configuring paranoid mode...")
 		m.injectProxyEnv(st)
 	}
 
 	// Clone repo if specified
 	if st.CloneURL != "" {
+		emit("clone", fmt.Sprintf("Cloning %s...", st.CloneURL))
 		m.cloneRepo(st)
 	}
 
@@ -859,5 +885,5 @@ func (m *Manager) ImportVM(st *VMState) (*CreateResponse, error) {
 		return nil, err
 	}
 
-	return m.startVM(st)
+	return m.startVM(st, nil)
 }

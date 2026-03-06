@@ -60,7 +60,24 @@ type ExportResponse struct {
 	VMState  json.RawMessage `json:"vm_state"`
 }
 
-func (c *Client) Create(req *CreateRequest) (*CreateResponse, error) {
+// ProgressEvent is a streamed progress line from the node agent.
+type ProgressEvent struct {
+	Phase       string `json:"phase"`
+	Message     string `json:"message,omitempty"`
+	Name        string `json:"name,omitempty"`
+	TailscaleIP string `json:"tailscale_ip,omitempty"`
+	Mark        int    `json:"mark,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// ProgressFunc is called for each progress event during VM creation.
+type ProgressFunc func(event *ProgressEvent)
+
+// CreateStreaming creates a VM and streams progress events via the callback.
+// Returns the final CreateResponse.
+func (c *Client) CreateStreaming(req *CreateRequest, progress ProgressFunc) (*CreateResponse, error) {
 	body, _ := json.Marshal(req)
 	resp, err := c.http.Post(c.baseURL+"/api/vms", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -68,14 +85,42 @@ func (c *Client) Create(req *CreateRequest) (*CreateResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 300 {
-		errBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("node create: %s (status %d)", string(errBody), resp.StatusCode)
+	// Read NDJSON stream
+	decoder := json.NewDecoder(resp.Body)
+	var lastEvent ProgressEvent
+	for decoder.More() {
+		var evt ProgressEvent
+		if err := decoder.Decode(&evt); err != nil {
+			break
+		}
+		lastEvent = evt
+		if progress != nil && evt.Phase != "ready" && evt.Phase != "error" {
+			progress(&evt)
+		}
 	}
 
-	var cr CreateResponse
-	json.NewDecoder(resp.Body).Decode(&cr)
-	return &cr, nil
+	if lastEvent.Phase == "error" {
+		return nil, fmt.Errorf("node create: %s", lastEvent.Error)
+	}
+
+	if lastEvent.Phase == "ready" {
+		if progress != nil {
+			progress(&lastEvent)
+		}
+		return &CreateResponse{
+			Name:        lastEvent.Name,
+			TailscaleIP: lastEvent.TailscaleIP,
+			Mark:        lastEvent.Mark,
+			Mode:        lastEvent.Mode,
+			Status:      lastEvent.Status,
+		}, nil
+	}
+
+	return nil, fmt.Errorf("node create: unexpected end of stream")
+}
+
+func (c *Client) Create(req *CreateRequest) (*CreateResponse, error) {
+	return c.CreateStreaming(req, nil)
 }
 
 func (c *Client) Destroy(name string) error {

@@ -130,23 +130,26 @@ func (h *Handler) cmdNew(args []string) int {
 		}
 	}
 
-	resp, err := h.post("/api/vms", body)
+	resp, err := h.postStream("/api/vms", body, func(evt map[string]interface{}) {
+		phase, _ := evt["phase"].(string)
+		message, _ := evt["message"].(string)
+		if phase != "ready" && phase != "error" && message != "" {
+			fmt.Printf("  → %s\n", message)
+		}
+	})
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return 1
 	}
 
-	var result map[string]interface{}
-	json.Unmarshal(resp, &result)
-
-	name, _ := result["name"].(string)
-	tsIP, _ := result["tailscale_ip"].(string)
-	nodeName, _ := result["node"].(string)
-	mode, _ := result["mode"].(string)
-	status, _ := result["status"].(string)
-	vcpu, _ := result["vcpu"].(float64)
-	ramMIB, _ := result["ram_mib"].(float64)
-	disk, _ := result["disk"].(string)
+	name, _ := resp["name"].(string)
+	tsIP, _ := resp["tailscale_ip"].(string)
+	nodeName, _ := resp["node"].(string)
+	mode, _ := resp["mode"].(string)
+	status, _ := resp["status"].(string)
+	vcpu, _ := resp["vcpu"].(float64)
+	ramMIB, _ := resp["ram_mib"].(float64)
+	disk, _ := resp["disk"].(string)
 
 	if mode == "" {
 		mode = "normal"
@@ -458,6 +461,47 @@ Usage: ssh <host> <command> [args]
 }
 
 // --- HTTP helpers ---
+
+// postStream sends a POST and reads NDJSON progress events.
+// Calls onProgress for each intermediate event.
+// Returns the final "ready" event as a map.
+func (h *Handler) postStream(path string, data interface{}, onProgress func(map[string]interface{})) (map[string]interface{}, error) {
+	var body io.Reader
+	if data != nil {
+		b, _ := json.Marshal(data)
+		body = strings.NewReader(string(b))
+	}
+	resp, err := http.Post(h.apiBase+path, "application/json", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	decoder := json.NewDecoder(resp.Body)
+	var last map[string]interface{}
+	for decoder.More() {
+		var evt map[string]interface{}
+		if err := decoder.Decode(&evt); err != nil {
+			break
+		}
+		phase, _ := evt["phase"].(string)
+		if phase == "error" {
+			errMsg, _ := evt["error"].(string)
+			return nil, fmt.Errorf("%s", errMsg)
+		}
+		if phase == "ready" {
+			last = evt
+		} else {
+			if onProgress != nil {
+				onProgress(evt)
+			}
+		}
+	}
+	if last == nil {
+		return nil, fmt.Errorf("no response from server")
+	}
+	return last, nil
+}
 
 func (h *Handler) get(path string) ([]byte, error) {
 	resp, err := http.Get(h.apiBase + path)

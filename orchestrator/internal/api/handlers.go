@@ -260,9 +260,25 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 	// Get current SSH keys to pass to node
 	sshKeys, _ := h.db.ListSSHKeys()
 
-	// Call node agent
+	// Set up streaming response
+	flusher, canFlush := w.(http.Flusher)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusCreated)
+
+	emitProgress := func(phase, message string) {
+		line, _ := json.Marshal(map[string]string{"phase": phase, "message": message})
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	emitProgress("scheduling", fmt.Sprintf("Scheduled on %s", targetNode.TailscaleName))
+
+	// Call node agent with streaming
 	client := node.NewClient(targetNode.APIAddr)
-	nodeResp, err := client.Create(&node.CreateRequest{
+	nodeResp, err := client.CreateStreaming(&node.CreateRequest{
 		Name:           req.Name,
 		VCPU:           req.VCPU,
 		RAMMIB:         req.RAMMIB,
@@ -270,9 +286,20 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		CloneURL:       req.CloneURL,
 		Mode:           req.Mode,
 		AuthorizedKeys: sshKeys,
+	}, func(evt *node.ProgressEvent) {
+		// Forward node progress events to client
+		line, _ := json.Marshal(evt)
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
+		}
 	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("node create failed: %v", err), http.StatusInternalServerError)
+		errEvt, _ := json.Marshal(map[string]string{"phase": "error", "error": err.Error()})
+		fmt.Fprintf(w, "%s\n", errEvt)
+		if canFlush {
+			flusher.Flush()
+		}
 		return
 	}
 
@@ -294,8 +321,9 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("VM created: %s on node %s (Tailscale: %s)", vm.Name, targetNode.ID, vm.TailscaleIP)
 
-	w.WriteHeader(http.StatusCreated)
-	writeJSON(w, map[string]interface{}{
+	// Final ready event
+	ready, _ := json.Marshal(map[string]interface{}{
+		"phase":        "ready",
 		"name":         vm.Name,
 		"node":         targetNode.TailscaleName,
 		"tailscale_ip": vm.TailscaleIP,
@@ -305,6 +333,10 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		"disk":         vm.Disk,
 		"status":       vm.Status,
 	})
+	fmt.Fprintf(w, "%s\n", ready)
+	if canFlush {
+		flusher.Flush()
+	}
 }
 
 func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
