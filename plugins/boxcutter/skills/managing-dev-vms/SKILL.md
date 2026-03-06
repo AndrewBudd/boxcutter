@@ -76,23 +76,23 @@ VM ready: bold-fox
 Connect: ssh 100.64.1.42
 ```
 
-Parse both the **name** and **Tailscale IP** from the output. The name appears after "VM ready:" and the IP appears after "Connect: ssh". You need the name for lifecycle commands (`stop`, `destroy`) and the Tailscale IP for direct SSH access into the VM.
+Parse the **name** and **Tailscale IP** from the output. The name appears after "VM ready:" and the IP appears after "Connect: ssh". You need the name for lifecycle commands (`stop`, `destroy`) and for SSH access — the VM name works as a hostname via MagicDNS (e.g., `ssh bold-fox`). The Tailscale IP also works (`ssh 100.64.1.42`).
 
-Always give the user the VM's Tailscale IP address.
+Prefer using the VM name as the hostname — it's shorter and more readable. Give the user both the name and the Tailscale IP.
 
 ## Connecting to a VM
 
-SSH directly to the VM's Tailscale IP. No username needed — all users map to `dev` (uid 1000) with passwordless sudo. You have full root access via `sudo` on every VM — use it freely to install packages, configure services, edit system files, or anything else. These are disposable VMs; you cannot break anything that matters.
+SSH directly to the VM by its name (via MagicDNS) or Tailscale IP. No username needed — all users map to `dev` (uid 1000) with passwordless sudo. You have full root access via `sudo` on every VM — use it freely to install packages, configure services, edit system files, or anything else. These are disposable VMs; you cannot break anything that matters.
 
 ```bash
-# By Tailscale IP
-ssh <TAILSCALE_IP>
+# By hostname (preferred — MagicDNS resolves the VM name)
+ssh bold-fox
 
-# By MagicDNS hostname (if MagicDNS is enabled on the tailnet)
-ssh <name>    # e.g., ssh bold-fox
+# By Tailscale IP (always works)
+ssh 100.64.1.42
 
 # Run a command without an interactive session
-ssh <TAILSCALE_IP> "command here"
+ssh bold-fox "command here"
 ```
 
 ### Waiting for SSH
@@ -100,7 +100,7 @@ ssh <TAILSCALE_IP> "command here"
 The `ssh HOST new` command waits for the VM to be fully booted and Tailscale-connected before returning. By the time you see the "VM ready" line, SSH should work immediately. If it doesn't connect on the first try (rare), retry once or twice:
 
 ```bash
-ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null <TAILSCALE_IP> echo ready
+ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null bold-fox echo ready
 ```
 
 ## Pre-installed tools
@@ -122,14 +122,14 @@ The `dev` user has passwordless sudo, so `sudo apt-get install ...` works withou
 Use mise for language runtimes:
 
 ```bash
-ssh <TAILSCALE_IP> "mise use -g python@3.12"
-ssh <TAILSCALE_IP> "mise use -g go@1.22"
+ssh bold-fox "mise use -g python@3.12"
+ssh bold-fox "mise use -g go@1.22"
 ```
 
 Use apt for system packages:
 
 ```bash
-ssh <TAILSCALE_IP> "sudo apt-get update && sudo apt-get install -y postgresql redis-server"
+ssh bold-fox "sudo apt-get update && sudo apt-get install -y postgresql redis-server"
 ```
 
 ## Copying files to/from a VM
@@ -138,28 +138,25 @@ Always use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` with sc
 
 ```bash
 # Copy a file to the VM
-scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null file.txt <TAILSCALE_IP>:/home/dev/
+scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null file.txt bold-fox:/home/dev/
 
 # Copy a directory
-scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null myproject/ <TAILSCALE_IP>:/home/dev/
+scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null myproject/ bold-fox:/home/dev/
 
 # Copy from the VM
-scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null <TAILSCALE_IP>:/home/dev/output.txt ./
+scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null bold-fox:/home/dev/output.txt ./
 ```
 
 ## Accessing services running in a VM
 
-VMs have Tailscale IPs, so services are directly reachable from any device on the tailnet. If a VM at 100.64.1.42 runs a server on port 3000, access it at `http://100.64.1.42:3000` from any device on the tailnet.
+Services running in a VM are directly reachable from any device on the tailnet using the VM's hostname or Tailscale IP.
 
-From the user's machine (on the same tailnet):
-```bash
-curl http://<TAILSCALE_IP>:3000
-```
-
-With MagicDNS:
 ```bash
 curl http://bold-fox:3000
+curl http://100.64.1.42:3000
 ```
+
+For HTTPS, see the TLS certificates section below.
 
 ## Workflow patterns
 
@@ -179,7 +176,7 @@ When the user needs an environment that persists across sessions:
 
 1. `ssh HOST new` — create the VM
 2. Set up tools and clone repos
-3. Save the VM name and Tailscale IP to memory so you can reconnect later
+3. Save the VM name to memory so you can reconnect later (the name is the hostname)
 4. Use `ssh HOST stop <name>` when not in use (preserves disk state)
 5. Use `ssh HOST start <name>` to resume
 
@@ -196,7 +193,7 @@ Tailscale can provision real Let's Encrypt TLS certificates for any VM on the ta
 After a VM is running and joined to Tailscale, get a cert for its MagicDNS name:
 
 ```bash
-ssh <TAILSCALE_IP> "sudo tailscale cert <vm-name>.<tailnet-name>.ts.net"
+ssh bold-fox "sudo tailscale cert bold-fox.<tailnet-name>.ts.net"
 ```
 
 This writes `.crt` and `.key` files to the current directory. The private key never leaves the VM. Certs last 90 days and must be manually renewed when obtained this way.
