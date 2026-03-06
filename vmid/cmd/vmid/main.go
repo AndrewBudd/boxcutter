@@ -50,9 +50,15 @@ func main() {
 	metaHandler.Register(vmMux)
 
 	identityMiddleware := middleware.Identity(reg)
+
+	// JWKS is public (needed by token verifiers outside VMs)
+	publicMux := http.NewServeMux()
+	publicMux.HandleFunc("GET /.well-known/jwks.json", metaHandler.HandleJWKS)
+	publicMux.Handle("/", identityMiddleware(vmMux))
+
 	vmServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Listen.VMPort),
-		Handler: identityMiddleware(vmMux),
+		Handler: publicMux,
 	}
 
 	// Admin server (Unix socket)
@@ -73,7 +79,7 @@ func main() {
 		log.Fatalf("listening on admin socket %s: %v", cfg.Listen.AdminSocket, err)
 	}
 	// Make socket accessible to boxcutter-ctl
-	os.Chmod(cfg.Listen.AdminSocket, 0660)
+	os.Chmod(cfg.Listen.AdminSocket, 0666)
 
 	adminServer := &http.Server{
 		Handler: adminMux,

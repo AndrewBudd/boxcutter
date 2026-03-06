@@ -8,7 +8,7 @@
 set -euo pipefail
 
 VMID_PORT="${VMID_PORT:-8775}"
-BRIDGE_IF="${BRIDGE_IF:-br0}"
+BRIDGE_IF="${BRIDGE_IF:-brvm0}"
 
 # Add the metadata IP to the bridge interface if not already present
 if ! ip addr show dev "$BRIDGE_IF" | grep -q 169.254.169.254; then

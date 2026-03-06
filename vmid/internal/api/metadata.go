@@ -104,6 +104,11 @@ func (h *MetadataHandler) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, h.jwt.JWKS())
 }
 
+// HandleJWKS is the exported version for use outside the identity middleware.
+func (h *MetadataHandler) HandleJWKS(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, h.jwt.JWKS())
+}
+
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
