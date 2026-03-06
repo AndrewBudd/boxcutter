@@ -1,0 +1,12 @@
+[Unit]
+Description=Boxcutter Orchestrator
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boxcutter-orchestrator -config /etc/boxcutter/boxcutter.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

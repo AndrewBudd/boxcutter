@@ -19,8 +19,8 @@ import (
 
 var (
 	listenAddr    = flag.String("listen", ":8080", "proxy listen address")
-	caCertPath    = flag.String("ca-cert", "/etc/boxcutter/ca.crt", "CA certificate for MITM")
-	caKeyPath     = flag.String("ca-key", "/etc/boxcutter/ca.key", "CA key for MITM")
+	caCertPath    = flag.String("ca-cert", "/etc/boxcutter/secrets/ca.crt", "CA certificate for MITM")
+	caKeyPath     = flag.String("ca-key", "/etc/boxcutter/secrets/ca.key", "CA key for MITM")
 	vmidSocket    = flag.String("vmid-socket", "/run/vmid/admin.sock", "vmid admin socket")
 	allowlistPath = flag.String("allowlist", "/etc/boxcutter/proxy-allowlist.conf", "egress allowlist for paranoid mode")
 )

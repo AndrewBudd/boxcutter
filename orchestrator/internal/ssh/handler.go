@@ -1,0 +1,406 @@
+package ssh
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+)
+
+// Handler dispatches SSH ForceCommand actions to the orchestrator HTTP API.
+type Handler struct {
+	apiBase string
+}
+
+func NewHandler(apiBase string) *Handler {
+	return &Handler{apiBase: apiBase}
+}
+
+// Run executes the SSH command and writes output to stdout.
+func (h *Handler) Run(args []string) int {
+	if len(args) == 0 {
+		h.printHelp()
+		return 0
+	}
+
+	action := args[0]
+	target := ""
+	if len(args) > 1 {
+		target = args[1]
+	}
+
+	switch action {
+	case "new":
+		return h.cmdNew(args[1:])
+	case "list":
+		return h.cmdList()
+	case "destroy":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> destroy <vm-name>")
+			return 1
+		}
+		return h.cmdDestroy(target)
+	case "stop":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> stop <vm-name>")
+			return 1
+		}
+		return h.cmdStop(target)
+	case "start":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> start <vm-name>")
+			return 1
+		}
+		return h.cmdStart(target)
+	case "status":
+		return h.cmdStatus()
+	case "nodes":
+		return h.cmdNodes()
+	case "drain":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> drain <node-id>")
+			return 1
+		}
+		return h.cmdDrain(target)
+	case "migrate":
+		return h.cmdMigrate(args[1:])
+	case "help":
+		h.printHelp()
+		return 0
+	default:
+		h.printHelp()
+		return 1
+	}
+}
+
+func (h *Handler) cmdNew(args []string) int {
+	body := map[string]interface{}{}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--clone":
+			if i+1 < len(args) {
+				body["clone_url"] = args[i+1]
+				i++
+			}
+		case "--vcpu":
+			if i+1 < len(args) {
+				var n int
+				fmt.Sscanf(args[i+1], "%d", &n)
+				body["vcpu"] = n
+				i++
+			}
+		case "--ram":
+			if i+1 < len(args) {
+				var n int
+				fmt.Sscanf(args[i+1], "%d", &n)
+				body["ram_mib"] = n
+				i++
+			}
+		case "--mode":
+			if i+1 < len(args) {
+				body["mode"] = args[i+1]
+				i++
+			}
+		case "--disk":
+			if i+1 < len(args) {
+				body["disk"] = args[i+1]
+				i++
+			}
+		case "--node":
+			if i+1 < len(args) {
+				body["node_id"] = args[i+1]
+				i++
+			}
+		}
+	}
+
+	resp, err := h.post("/api/vms", body)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+
+	var result map[string]interface{}
+	json.Unmarshal(resp, &result)
+
+	name, _ := result["name"].(string)
+	tsIP, _ := result["tailscale_ip"].(string)
+	nodeName, _ := result["node"].(string)
+
+	fmt.Println()
+	fmt.Printf("VM ready: %s\n", name)
+	if nodeName != "" {
+		fmt.Printf("Node: %s\n", nodeName)
+	}
+	if tsIP != "" {
+		fmt.Printf("Connect: ssh %s\n", tsIP)
+	} else {
+		fmt.Println("Connect: Tailscale IP pending (check with: ssh <host> list)")
+	}
+	return 0
+}
+
+func (h *Handler) cmdList() int {
+	resp, err := h.get("/api/vms")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+
+	var vms []map[string]interface{}
+	json.Unmarshal(resp, &vms)
+
+	fmt.Printf("%-20s %-18s %-12s %-8s %-8s %-8s %-8s\n",
+		"NAME", "TAILSCALE IP", "NODE", "MODE", "VCPU", "RAM", "STATUS")
+	for _, v := range vms {
+		name, _ := v["name"].(string)
+		tsIP, _ := v["tailscale_ip"].(string)
+		nodeName, _ := v["node_name"].(string)
+		mode, _ := v["mode"].(string)
+		vcpu, _ := v["vcpu"].(float64)
+		ramMIB, _ := v["ram_mib"].(float64)
+		status, _ := v["status"].(string)
+		if tsIP == "" {
+			tsIP = "-"
+		}
+
+		fmt.Printf("%-20s %-18s %-12s %-8s %-8.0f %-8s %-8s\n",
+			name, tsIP, nodeName, mode, vcpu, fmt.Sprintf("%.0fG", ramMIB/1024), status)
+	}
+	return 0
+}
+
+func (h *Handler) cmdDestroy(name string) int {
+	_, err := h.delete("/api/vms/" + name)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	fmt.Printf("VM '%s' destroyed.\n", name)
+	return 0
+}
+
+func (h *Handler) cmdStop(name string) int {
+	_, err := h.post("/api/vms/"+name+"/stop", nil)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	fmt.Printf("VM '%s' stopped.\n", name)
+	return 0
+}
+
+func (h *Handler) cmdStart(name string) int {
+	resp, err := h.post("/api/vms/"+name+"/start", nil)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var result map[string]interface{}
+	json.Unmarshal(resp, &result)
+	tsIP, _ := result["tailscale_ip"].(string)
+	fmt.Printf("VM '%s' started.\n", name)
+	if tsIP != "" {
+		fmt.Printf("Connect: ssh %s\n", tsIP)
+	}
+	return 0
+}
+
+func (h *Handler) cmdStatus() int {
+	resp, err := h.get("/api/health")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var result map[string]interface{}
+	json.Unmarshal(resp, &result)
+
+	nodesTotal, _ := result["nodes_total"].(float64)
+	nodesActive, _ := result["nodes_active"].(float64)
+	vmsTotal, _ := result["vms_total"].(float64)
+	ramTotal, _ := result["ram_total_mib"].(float64)
+	ramAlloc, _ := result["ram_allocated_mib"].(float64)
+
+	fmt.Printf("Nodes:    %.0f active / %.0f total\n", nodesActive, nodesTotal)
+	fmt.Printf("VMs:      %.0f\n", vmsTotal)
+	fmt.Printf("RAM:      %.0fGB allocated / %.0fGB total\n", ramAlloc/1024, ramTotal/1024)
+	fmt.Printf("Headroom: %.0fGB\n", (ramTotal-ramAlloc)/1024)
+	return 0
+}
+
+func (h *Handler) cmdNodes() int {
+	resp, err := h.get("/api/nodes")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+
+	var nodes []map[string]interface{}
+	json.Unmarshal(resp, &nodes)
+
+	fmt.Printf("%-12s %-20s %-18s %-8s %-10s %-10s %-8s\n",
+		"ID", "NAME", "TAILSCALE IP", "STATUS", "RAM USED", "RAM TOTAL", "VMs")
+	for _, n := range nodes {
+		id, _ := n["id"].(string)
+		name, _ := n["tailscale_name"].(string)
+		tsIP, _ := n["tailscale_ip"].(string)
+		status, _ := n["status"].(string)
+		ramAlloc, _ := n["ram_allocated_mib"].(float64)
+		ramTotal, _ := n["ram_total_mib"].(float64)
+		vmsRunning, _ := n["vms_running"].(float64)
+
+		fmt.Printf("%-12s %-20s %-18s %-8s %-10s %-10s %-8.0f\n",
+			id, name, tsIP, status,
+			fmt.Sprintf("%.0fG", ramAlloc/1024),
+			fmt.Sprintf("%.0fG", ramTotal/1024),
+			vmsRunning)
+	}
+	return 0
+}
+
+func (h *Handler) cmdDrain(nodeID string) int {
+	resp, err := h.post("/api/nodes/"+nodeID+"/drain", nil)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var result map[string]interface{}
+	json.Unmarshal(resp, &result)
+
+	total, _ := result["total"].(float64)
+	migrated, _ := result["migrated"].(float64)
+	failed, _ := result["failed"].(float64)
+
+	fmt.Printf("Node %s draining: %.0f/%.0f VMs migrated", nodeID, migrated, total)
+	if failed > 0 {
+		fmt.Printf(" (%.0f failed)", failed)
+	}
+	fmt.Println()
+	return 0
+}
+
+func (h *Handler) cmdMigrate(args []string) int {
+	if len(args) == 0 {
+		fmt.Println("Usage: ssh <host> migrate <vm-name> [--to <node-id>]")
+		return 1
+	}
+
+	vmName := args[0]
+	toNode := ""
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--to" && i+1 < len(args) {
+			toNode = args[i+1]
+			i++
+		}
+	}
+
+	body := map[string]interface{}{"vm": vmName}
+	if toNode != "" {
+		body["to"] = toNode
+	}
+
+	resp, err := h.post("/api/migrate", body)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var result map[string]interface{}
+	json.Unmarshal(resp, &result)
+
+	fromNode, _ := result["from_node"].(string)
+	toNodeResult, _ := result["to_node"].(string)
+	fmt.Printf("Migrated %s: %s → %s\n", vmName, fromNode, toNodeResult)
+	return 0
+}
+
+func (h *Handler) printHelp() {
+	fmt.Print(`Boxcutter — ephemeral dev environments
+
+Commands:
+  new [options]           Create and start a new VM
+    --clone <repo>          Clone repo on creation
+    --vcpu <N>              CPU cores (default: 4)
+    --ram <MiB>             RAM in MiB (default: 8192)
+    --disk <size>           Disk size (default: 50G)
+    --mode normal|paranoid  Network mode (default: normal)
+    --node <node-id>        Pin to specific node
+  list                    List all VMs
+  destroy <name>          Destroy a VM
+  stop <name>             Stop a running VM
+  start <name>            Start a stopped VM
+  status                  Cluster capacity summary
+  nodes                   List all nodes
+  drain <node-id>         Drain all VMs from a node
+  migrate <name> [--to <node-id>]
+                          Migrate VM to another node
+  help                    Show this help
+
+Usage: ssh <host> <command> [args]
+`)
+}
+
+// --- HTTP helpers ---
+
+func (h *Handler) get(path string) ([]byte, error) {
+	resp, err := http.Get(h.apiBase + path)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func (h *Handler) post(path string, data interface{}) ([]byte, error) {
+	var body io.Reader
+	if data != nil {
+		b, _ := json.Marshal(data)
+		body = strings.NewReader(string(b))
+	}
+	resp, err := http.Post(h.apiBase+path, "application/json", body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(respBody)))
+	}
+	return respBody, nil
+}
+
+func (h *Handler) delete(path string) ([]byte, error) {
+	req, _ := http.NewRequest("DELETE", h.apiBase+path, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+// Main is called from the boxcutter-ssh-orchestrator script.
+func Main() {
+	apiBase := os.Getenv("BOXCUTTER_API")
+	if apiBase == "" {
+		apiBase = "http://localhost:8801"
+	}
+
+	command := os.Getenv("SSH_ORIGINAL_COMMAND")
+	if command == "" {
+		command = "help"
+	}
+
+	args := strings.Fields(command)
+	handler := NewHandler(apiBase)
+	os.Exit(handler.Run(args))
+}

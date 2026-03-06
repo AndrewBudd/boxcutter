@@ -69,8 +69,8 @@ case "$ACTION" in
     echo "$GH_KEYS" >> ~/.ssh/authorized_keys
     sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys
     # Also update the trusted keys used when building golden images
-    echo "$GH_KEYS" | sudo tee -a /etc/boxcutter/authorized_keys > /dev/null
-    sudo sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys 2>/dev/null || true
+    echo "$GH_KEYS" | sudo tee -a /etc/boxcutter/secrets/authorized-keys > /dev/null
+    sudo sort -u /etc/boxcutter/secrets/authorized-keys -o /etc/boxcutter/secrets/authorized-keys 2>/dev/null || true
     echo "Added ${KEY_COUNT} key(s) for ${GH_USER}."
     echo "They can now: ssh <host> list"
     ;;

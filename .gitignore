@@ -21,5 +21,10 @@ tailscale-authkey
 *.sock
 *.log
 
+# Go build artifacts
+node/node
+orchestrator/orchestrator
+orchestrator/ssh
+
 # OS
 .DS_Store

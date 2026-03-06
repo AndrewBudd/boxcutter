@@ -6,8 +6,8 @@ BOXCUTTER_HOME="/var/lib/boxcutter"
 VM_DIR="${BOXCUTTER_HOME}/vms"
 KERNEL="${BOXCUTTER_HOME}/kernel/vmlinux"
 GOLDEN="${BOXCUTTER_HOME}/golden/rootfs.ext4"
-SSH_KEY="${BOXCUTTER_HOME}/ssh/id_ed25519"
-TS_AUTHKEY_FILE="/etc/boxcutter/tailscale-authkey"
+SSH_KEY="/etc/boxcutter/secrets/node-ssh.key"
+TS_AUTHKEY_FILE="/etc/boxcutter/secrets/tailscale-vm-authkey"
 VMID_SOCKET="/run/vmid/admin.sock"
 
 DEFAULT_VCPU=4
@@ -313,19 +313,19 @@ cmd_create() {
 EOF
 
   # Inject CA cert into rootfs for internal TLS
-  if [ -f /etc/boxcutter/ca.crt ]; then
+  if [ -f /etc/boxcutter/secrets/ca.crt ]; then
     echo "  Injecting CA cert..."
     MOUNT_DIR=$(mktemp -d)
     mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
     mkdir -p "${MOUNT_DIR}/usr/local/share/ca-certificates"
-    cp /etc/boxcutter/ca.crt "${MOUNT_DIR}/usr/local/share/ca-certificates/boxcutter-ca.crt"
+    cp /etc/boxcutter/secrets/ca.crt "${MOUNT_DIR}/usr/local/share/ca-certificates/boxcutter-ca.crt"
     chroot "$MOUNT_DIR" update-ca-certificates 2>/dev/null || true
     umount "$MOUNT_DIR"
     rmdir "$MOUNT_DIR"
   fi
 
   # Inject any additional SSH keys added after golden image build
-  if [ -f /etc/boxcutter/authorized_keys ]; then
+  if [ -f /etc/boxcutter/secrets/authorized-keys ]; then
     echo "  Injecting user SSH keys..."
     MOUNT_DIR=$(mktemp -d)
     mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
@@ -334,9 +334,9 @@ EOF
       while IFS= read -r key; do
         grep -qF "$key" "${MOUNT_DIR}/home/dev/.ssh/authorized_keys" 2>/dev/null || \
           echo "$key" >> "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-      done < /etc/boxcutter/authorized_keys
+      done < /etc/boxcutter/secrets/authorized-keys
     else
-      cp /etc/boxcutter/authorized_keys "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
+      cp /etc/boxcutter/secrets/authorized-keys "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
     fi
     chown -R 1000:1000 "${MOUNT_DIR}/home/dev/.ssh"
     chmod 700 "${MOUNT_DIR}/home/dev/.ssh"

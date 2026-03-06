@@ -90,14 +90,8 @@ fi
 systemctl enable tailscaled
 systemctl start tailscaled
 
-# The Node VM should be joined to Tailscale manually (not with the ephemeral VM key).
-# The ephemeral key at /etc/boxcutter/tailscale-authkey is for VMs only.
+# Tailscale join is handled by boxcutter-setup using the bundle auth key.
 mkdir -p /etc/boxcutter
-if ! tailscale status &>/dev/null; then
-  echo "Tailscale is installed but not connected."
-  echo "Join manually: sudo tailscale up --hostname=boxcutter"
-  echo "Then place the ephemeral VM auth key at /etc/boxcutter/tailscale-authkey"
-fi
 
 # Install socat (needed for vm_ssh TAP binding)
 apt-get install -y socat >/dev/null 2>&1 || true
@@ -135,30 +129,71 @@ install -m 755 "${SRC}/scripts/boxcutter-ssh" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-gateway" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-names" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-tls" /usr/local/bin/
+install -m 755 "${SRC}/scripts/boxcutter-setup" /usr/local/bin/
 
 # Ensure socat is installed (needed for vm_ssh TAP binding)
 apt-get install -y socat >/dev/null 2>&1 || true
 
 # -------------------------------------------------------------------
-# 7a. TLS infrastructure
+# 7a. Copy bootstrap bundle and run setup
 # -------------------------------------------------------------------
 echo ""
-echo "--- Setting up TLS infrastructure ---"
-/usr/local/bin/boxcutter-tls
+echo "--- Bootstrap bundle ---"
+BUNDLE_SRC="/mnt/boxcutter/.boxcutter"
+if [ -d "$BUNDLE_SRC" ]; then
+  mkdir -p /etc/boxcutter/secrets
+  # Copy config
+  cp "$BUNDLE_SRC/boxcutter.yaml" /etc/boxcutter/boxcutter.yaml
+  # Copy secrets (don't overwrite auto-generated ones)
+  for f in "$BUNDLE_SRC"/secrets/*; do
+    [ -f "$f" ] || continue
+    dest="/etc/boxcutter/secrets/$(basename "$f")"
+    if [ ! -f "$dest" ]; then
+      cp "$f" "$dest"
+    fi
+  done
+  chmod 600 /etc/boxcutter/secrets/*
+  echo "Bundle copied from ${BUNDLE_SRC}"
+else
+  echo "Warning: no bundle at ${BUNDLE_SRC} — manual setup required"
+fi
+
+echo ""
+echo "--- Running boxcutter-setup ---"
+/usr/local/bin/boxcutter-setup
 
 # -------------------------------------------------------------------
-# 7b. Build forward proxy
+# 7b. Build Go services
 # -------------------------------------------------------------------
 echo ""
-echo "--- Building forward proxy ---"
+echo "--- Building Go services ---"
+
+# Forward proxy
 PROXY_SRC="${BOXCUTTER_HOME}/proxy"
-if [ ! -d "$PROXY_SRC" ] && [ -d /mnt/boxcutter/proxy ]; then
-  PROXY_SRC="/mnt/boxcutter/proxy"
-fi
+[ ! -d "$PROXY_SRC" ] && [ -d /mnt/boxcutter/proxy ] && PROXY_SRC="/mnt/boxcutter/proxy"
 if [ -d "$PROXY_SRC" ]; then
   cd "$PROXY_SRC"
   go build -o /usr/local/bin/boxcutter-proxy ./cmd/proxy/
-  echo "Forward proxy built."
+  echo "  Forward proxy built."
+fi
+
+# Node agent
+NODE_SRC="${BOXCUTTER_HOME}/node"
+[ ! -d "$NODE_SRC" ] && [ -d /mnt/boxcutter/node ] && NODE_SRC="/mnt/boxcutter/node"
+if [ -d "$NODE_SRC" ]; then
+  cd "$NODE_SRC"
+  go build -o /usr/local/bin/boxcutter-node ./cmd/node/
+  echo "  Node agent built."
+fi
+
+# Orchestrator
+ORCH_SRC="${BOXCUTTER_HOME}/orchestrator"
+[ ! -d "$ORCH_SRC" ] && [ -d /mnt/boxcutter/orchestrator ] && ORCH_SRC="/mnt/boxcutter/orchestrator"
+if [ -d "$ORCH_SRC" ]; then
+  cd "$ORCH_SRC"
+  go build -o /usr/local/bin/boxcutter-orchestrator ./cmd/orchestrator/
+  go build -o /usr/local/bin/boxcutter-ssh-orchestrator ./cmd/ssh/
+  echo "  Orchestrator built."
 fi
 
 # Create default allowlist if it doesn't exist
@@ -191,8 +226,8 @@ fi
 if command -v derper &>/dev/null; then
   # Set up cert symlinks for derper (expects <hostname>.crt/.key)
   mkdir -p /etc/boxcutter/derp-certs
-  ln -sf /etc/boxcutter/leaf.crt /etc/boxcutter/derp-certs/10.0.0.1.crt
-  ln -sf /etc/boxcutter/leaf.key /etc/boxcutter/derp-certs/10.0.0.1.key
+  ln -sf /etc/boxcutter/secrets/leaf.crt /etc/boxcutter/derp-certs/10.0.0.1.crt
+  ln -sf /etc/boxcutter/secrets/leaf.key /etc/boxcutter/derp-certs/10.0.0.1.key
   echo "DERP relay ready."
 else
   echo "Warning: derper not installed (Go may not be available yet)"
@@ -206,10 +241,14 @@ echo "--- Installing systemd services ---"
 cp "${SRC}/systemd/boxcutter-proxy-sync.service" /etc/systemd/system/
 cp "${SRC}/systemd/boxcutter-proxy.service" /etc/systemd/system/
 cp "${SRC}/systemd/boxcutter-derper.service" /etc/systemd/system/
+cp "${SRC}/systemd/boxcutter-node.service" /etc/systemd/system/
+cp "${SRC}/systemd/boxcutter-orchestrator.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable boxcutter-proxy-sync
 systemctl enable boxcutter-proxy 2>/dev/null || true
 systemctl enable boxcutter-derper 2>/dev/null || true
+systemctl enable boxcutter-node 2>/dev/null || true
+systemctl enable boxcutter-orchestrator 2>/dev/null || true
 
 # -------------------------------------------------------------------
 # 9. SSH control interface
@@ -217,7 +256,7 @@ systemctl enable boxcutter-derper 2>/dev/null || true
 echo ""
 echo "--- Setting up SSH control interface ---"
 useradd -r -m -s /bin/bash boxcutter 2>/dev/null || true
-echo "boxcutter ALL=(ALL) NOPASSWD: /usr/local/bin/boxcutter-ctl, /usr/bin/tee -a /etc/boxcutter/authorized_keys, /usr/bin/sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys" > /etc/sudoers.d/boxcutter
+echo "boxcutter ALL=(ALL) NOPASSWD: /usr/local/bin/boxcutter-ctl, /usr/bin/tee -a /etc/boxcutter/secrets/authorized-keys, /usr/bin/sort -u /etc/boxcutter/secrets/authorized-keys -o /etc/boxcutter/secrets/authorized-keys" > /etc/sudoers.d/boxcutter
 chmod 440 /etc/sudoers.d/boxcutter
 mkdir -p /home/boxcutter/.ssh
 touch /home/boxcutter/.ssh/authorized_keys
@@ -225,23 +264,11 @@ chmod 700 /home/boxcutter/.ssh
 chmod 600 /home/boxcutter/.ssh/authorized_keys
 chown -R boxcutter:boxcutter /home/boxcutter/.ssh
 
-# Seed trusted user keys from the ubuntu user (who provisioned this node)
-if [ ! -s /etc/boxcutter/authorized_keys ]; then
-  touch /etc/boxcutter/authorized_keys
-  # Import keys from the user who set up this node
-  for keyfile in /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys; do
-    if [ -f "$keyfile" ]; then
-      cat "$keyfile" >> /etc/boxcutter/authorized_keys
-    fi
-  done
-  # Deduplicate
-  sort -u /etc/boxcutter/authorized_keys -o /etc/boxcutter/authorized_keys
-  echo "Trusted user keys seeded into /etc/boxcutter/authorized_keys"
-fi
-# Also add these keys to the boxcutter SSH user's authorized_keys
-if [ -f /etc/boxcutter/authorized_keys ]; then
-  cat /etc/boxcutter/authorized_keys >> /home/boxcutter/.ssh/authorized_keys
+# Sync authorized keys from bundle (boxcutter-setup already populated these)
+if [ -f /etc/boxcutter/secrets/authorized-keys ]; then
+  cat /etc/boxcutter/secrets/authorized-keys >> /home/boxcutter/.ssh/authorized_keys
   sort -u /home/boxcutter/.ssh/authorized_keys -o /home/boxcutter/.ssh/authorized_keys
+  echo "Authorized keys synced from bundle."
 fi
 
 # --- Accept any SSH username (maps to boxcutter) ---
@@ -285,15 +312,11 @@ EOF
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 # -------------------------------------------------------------------
-# 10. Generate SSH keypair for VM access
+# 10. VM access SSH key (handled by boxcutter-setup)
 # -------------------------------------------------------------------
 echo ""
-echo "--- Generating VM access SSH key ---"
-mkdir -p "${BOXCUTTER_HOME}/ssh"
-if [ ! -f "${BOXCUTTER_HOME}/ssh/id_ed25519" ]; then
-  ssh-keygen -t ed25519 -f "${BOXCUTTER_HOME}/ssh/id_ed25519" -N "" -q
-  echo "SSH keypair generated for VM access."
-fi
+echo "--- VM access SSH key ---"
+echo "SSH keypair managed at /etc/boxcutter/secrets/node-ssh.key (via boxcutter-setup)"
 
 # -------------------------------------------------------------------
 # 11. Ensure loop devices work (needed for golden image build)
@@ -327,9 +350,11 @@ cp "${SRC}/golden/provision.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
 cp "${SRC}/golden/nss_catchall.c" "${BOXCUTTER_HOME}/golden/nss_catchall.c"
 chmod +x "${BOXCUTTER_HOME}/golden/build.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
 
-# Copy vmid and proxy source for building
+# Copy Go source for building
 cp -r "${SRC}/vmid" "${BOXCUTTER_HOME}/vmid" 2>/dev/null || true
 cp -r "${SRC}/proxy" "${BOXCUTTER_HOME}/proxy" 2>/dev/null || true
+cp -r "${SRC}/node" "${BOXCUTTER_HOME}/node" 2>/dev/null || true
+cp -r "${SRC}/orchestrator" "${BOXCUTTER_HOME}/orchestrator" 2>/dev/null || true
 
 # -------------------------------------------------------------------
 # Done
@@ -340,12 +365,11 @@ echo "  Boxcutter Node VM setup complete!"
 echo "============================================"
 echo ""
 echo "Next steps:"
-echo "  1. Join Tailscale (Node VM): sudo tailscale up --hostname=boxcutter"
-echo "  2. Place ephemeral VM auth key: echo 'tskey-auth-...' | sudo tee /etc/boxcutter/tailscale-authkey"
-echo "  3. Build golden image:  sudo boxcutter-ctl golden build"
-echo "  4. Create a VM:         sudo boxcutter-ctl create agent-1"
-echo "  5. Start the VM:        sudo boxcutter-ctl start agent-1"
+echo "  1. Build golden image:  sudo boxcutter-ctl golden build"
+echo "  2. Provision image:     sudo boxcutter-ctl golden provision"
+echo "  3. Create a VM:         sudo boxcutter-ctl create agent-1"
+echo "  4. Start the VM:        sudo boxcutter-ctl start agent-1"
 echo ""
 echo "Start all services:"
-echo "  sudo systemctl start caddy boxcutter-net boxcutter-proxy-sync vmid boxcutter-proxy boxcutter-derper"
+echo "  sudo systemctl start caddy boxcutter-net vmid boxcutter-proxy boxcutter-proxy-sync boxcutter-derper boxcutter-node boxcutter-orchestrator"
 echo ""

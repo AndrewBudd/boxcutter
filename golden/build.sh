@@ -127,14 +127,14 @@ mkdir -p "${WORK}/mnt/home/dev/.ssh"
 touch "${WORK}/mnt/home/dev/.ssh/authorized_keys"
 
 # Node's internal key (for boxcutter-ctl shell)
-if [ -f "${BOXCUTTER_HOME}/ssh/id_ed25519.pub" ]; then
-  cat "${BOXCUTTER_HOME}/ssh/id_ed25519.pub" >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
+if [ -f /etc/boxcutter/secrets/node-ssh.pub ]; then
+  cat /etc/boxcutter/secrets/node-ssh.pub >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
 fi
 
 # User-provided trusted keys
-if [ -f /etc/boxcutter/authorized_keys ]; then
-  echo "  Adding user-trusted keys from /etc/boxcutter/authorized_keys"
-  cat /etc/boxcutter/authorized_keys >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
+if [ -f /etc/boxcutter/secrets/authorized-keys ]; then
+  echo "  Adding user-trusted keys from /etc/boxcutter/secrets/authorized-keys"
+  cat /etc/boxcutter/secrets/authorized-keys >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
 fi
 
 chown -R 1000:1000 "${WORK}/mnt/home/dev/.ssh"

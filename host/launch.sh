@@ -49,8 +49,6 @@ QEMU_ARGS=(
   -drive "file=${CLOUD_INIT},format=raw,if=virtio"
   -netdev "tap,id=net0,ifname=${TAP_DEVICE},script=no,downscript=no"
   -device "virtio-net-pci,netdev=net0,mac=${NODE_MAC}"
-  -fsdev "local,id=boxcutter_dev,path=${REPO_DIR},security_model=mapped-xattr,readonly=on"
-  -device "virtio-9p-pci,fsdev=boxcutter_dev,mount_tag=boxcutter"
   -serial mon:stdio
   -nographic
 )

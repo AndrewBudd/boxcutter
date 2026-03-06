@@ -1,8 +1,14 @@
-.PHONY: setup launch stop ssh status clean
+.PHONY: provision setup launch stop ssh status clean
 
 # --- Physical host targets ---
 
-setup:                ## Install QEMU, download cloud image, create TAP device + NAT
+provision:            ## Build binaries, package bundle, create cloud-init ISO + VM disk
+	@bash host/provision.sh --rebuild
+
+provision-iso:        ## Rebuild cloud-init ISO only (no disk rebuild)
+	@bash host/provision.sh
+
+setup:                ## Install QEMU, create TAP device + NAT (run once)
 	@bash host/setup.sh
 
 launch:               ## Start the Boxcutter Node VM (foreground)

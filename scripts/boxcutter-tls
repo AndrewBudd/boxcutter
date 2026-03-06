@@ -4,7 +4,7 @@
 # Idempotent — skips if certs already exist.
 set -e
 
-CERT_DIR="/etc/boxcutter"
+CERT_DIR="/etc/boxcutter/secrets"
 CA_CERT="${CERT_DIR}/ca.crt"
 CA_KEY="${CERT_DIR}/ca.key"
 LEAF_CERT="${CERT_DIR}/leaf.crt"
