@@ -20,11 +20,12 @@ type Config struct {
 }
 
 type OrchestratorConfig struct {
-	URL string `yaml:"url"` // e.g., http://boxcutter:8801
+	URL string `yaml:"url"` // e.g., http://192.168.50.2:8801
 }
 
 type NodeConfig struct {
 	Hostname string `yaml:"hostname"`
+	BridgeIP string `yaml:"bridge_ip"` // This node's IP on the host bridge (e.g., 192.168.50.3)
 }
 
 type TailscaleConfig struct {

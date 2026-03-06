@@ -58,18 +58,17 @@ else
   sudo ip addr add "${HOST_BRIDGE_IP}/${HOST_BRIDGE_CIDR}" dev "$BRIDGE_DEVICE" 2>/dev/null || true
 fi
 
-# --- Create TAP devices and attach to bridge ---
-for TAP in "$ORCH_TAP" "$NODE_TAP"; do
-  if ! ip link show "$TAP" &>/dev/null; then
-    sudo ip tuntap add dev "$TAP" mode tap user "$(whoami)"
-    sudo ip link set "$TAP" master "$BRIDGE_DEVICE"
-    sudo ip link set "$TAP" up
-    echo "TAP ${TAP} created and attached to ${BRIDGE_DEVICE}"
-  else
-    echo "TAP ${TAP} already exists."
-    sudo ip link set "$TAP" master "$BRIDGE_DEVICE" 2>/dev/null || true
-  fi
-done
+# --- Create orchestrator TAP device and attach to bridge ---
+# Node TAPs are created on demand by launch.sh
+if ! ip link show "$ORCH_TAP" &>/dev/null; then
+  sudo ip tuntap add dev "$ORCH_TAP" mode tap user "$(whoami)"
+  sudo ip link set "$ORCH_TAP" master "$BRIDGE_DEVICE"
+  sudo ip link set "$ORCH_TAP" up
+  echo "TAP ${ORCH_TAP} created and attached to ${BRIDGE_DEVICE}"
+else
+  echo "TAP ${ORCH_TAP} already exists."
+  sudo ip link set "$ORCH_TAP" master "$BRIDGE_DEVICE" 2>/dev/null || true
+fi
 
 # --- NAT: masquerade VM traffic to internet ---
 echo "Setting up NAT masquerade..."
@@ -86,8 +85,8 @@ sudo iptables -I FORWARD -o "$BRIDGE_DEVICE" -m state --state RELATED,ESTABLISHE
 echo ""
 echo "=== Host setup complete ==="
 echo "Bridge:        ${BRIDGE_DEVICE} (${HOST_BRIDGE_IP}/${HOST_BRIDGE_CIDR})"
-echo "TAP devices:   ${ORCH_TAP}, ${NODE_TAP}"
+echo "TAP devices:   ${ORCH_TAP} (node TAPs created on demand)"
 echo "Orchestrator:  ${ORCH_IP}"
-echo "Node (default): ${NODE_IP}"
+echo "Nodes:         ${NODE_SUBNET}.{3,4,...} (derived from node number)"
 echo ""
 echo "Next: make provision-orchestrator && make provision-node"

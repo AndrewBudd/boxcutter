@@ -91,44 +91,53 @@ func main() {
 func registerWithOrchestrator(cfg *config.Config, mgr *vm.Manager) {
 	orchURL := strings.TrimRight(cfg.Orchestrator.URL, "/")
 
-	// Get Tailscale IP
+	// Get Tailscale IP (non-blocking — start registration with bridge IP immediately)
 	var tailscaleIP string
-	for {
-		out, err := exec.Command("tailscale", "ip", "-4").Output()
-		if err == nil {
-			tailscaleIP = strings.TrimSpace(string(out))
-			if tailscaleIP != "" {
-				break
+	go func() {
+		for {
+			out, err := exec.Command("tailscale", "ip", "-4").Output()
+			if err == nil {
+				ip := strings.TrimSpace(string(out))
+				if ip != "" {
+					tailscaleIP = ip
+					return
+				}
 			}
+			time.Sleep(5 * time.Second)
 		}
-		log.Printf("orchestrator: waiting for tailscale IP...")
-		time.Sleep(10 * time.Second)
-	}
+	}()
 
 	hostname, _ := os.Hostname()
+	bridgeIP := cfg.Node.BridgeIP
 
 	// Get system info from manager health
 	health := mgr.Health()
 	ramTotal, _ := health["ram_total_mib"].(int)
 	vcpuTotal, _ := health["vcpu_total"].(int)
 
+	// api_addr uses bridge IP for direct host-local communication
 	regBody := map[string]interface{}{
 		"id":             hostname,
 		"tailscale_name": hostname,
 		"tailscale_ip":   tailscaleIP,
-		"api_addr":       fmt.Sprintf("%s:8800", tailscaleIP),
+		"bridge_ip":      bridgeIP,
+		"api_addr":       fmt.Sprintf("%s:8800", bridgeIP),
 		"ram_total_mib":  ramTotal,
 		"vcpu_total":     vcpuTotal,
 	}
 
 	// Retry registration every 10 seconds until successful
 	for {
+		// Update tailscale IP if it became available
+		if tailscaleIP != "" {
+			regBody["tailscale_ip"] = tailscaleIP
+		}
 		data, _ := json.Marshal(regBody)
 		resp, err := http.Post(orchURL+"/api/nodes/register", "application/json", bytes.NewReader(data))
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				log.Printf("orchestrator: registered as %s (tailscale_ip=%s)", hostname, tailscaleIP)
+				log.Printf("orchestrator: registered as %s (bridge=%s, tailscale=%s)", hostname, bridgeIP, tailscaleIP)
 				break
 			}
 			log.Printf("orchestrator: registration returned %d, retrying...", resp.StatusCode)

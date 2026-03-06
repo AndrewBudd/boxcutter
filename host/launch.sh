@@ -38,13 +38,20 @@ if [ "$VM_TYPE" = "orchestrator" ]; then
   IP="$ORCH_IP"
 else
   VM_NAME="${VM_NAME:-boxcutter-node-1}"
+  # Extract node number from name (boxcutter-node-N → N)
+  NODE_NUM="${VM_NAME##*-}"
+  if ! [[ "$NODE_NUM" =~ ^[0-9]+$ ]]; then
+    echo "Error: node name must end with a number (e.g. boxcutter-node-1)"
+    exit 1
+  fi
+  NODE_OCTET=$((NODE_IP_OFFSET + NODE_NUM))
   VCPU="$NODE_VCPU"
   RAM="$NODE_RAM"
   DISK="${IMAGES_DIR}/${VM_NAME}.qcow2"
   ISO="${IMAGES_DIR}/${VM_NAME}-cloud-init.iso"
-  TAP="$NODE_TAP"
-  MAC="$NODE_MAC"
-  IP="$NODE_IP"
+  TAP="tap-node${NODE_NUM}"
+  MAC="$(printf '52:54:00:00:00:%02x' "$NODE_OCTET")"
+  IP="${NODE_SUBNET}.${NODE_OCTET}"
 fi
 
 PID_FILE="${IMAGES_DIR}/${VM_NAME}.pid"

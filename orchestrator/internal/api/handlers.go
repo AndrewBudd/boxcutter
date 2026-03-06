@@ -493,15 +493,15 @@ func (h *Handler) migrateVM(vmName, fromNodeID, toNodeID string) error {
 		return fmt.Errorf("export failed: %w", err)
 	}
 
-	// 2. Transfer COW via rsync over Tailscale
+	// 2. Transfer COW via rsync over bridge network (direct, no Tailscale hop)
 	srcCowPath := exportResp.CowPath
 	dstCowDir := fmt.Sprintf("/var/lib/boxcutter/vms/%s/", vmName)
 
-	// Ensure target dir exists via ssh
-	rsyncDest := fmt.Sprintf("%s:%s", toNode.TailscaleIP, dstCowDir)
+	// Use bridge IPs for direct host-local transfer
+	rsyncDest := fmt.Sprintf("%s:%s", toNode.BridgeIP, dstCowDir)
 
-	log.Printf("Transferring COW image (%d bytes)...", exportResp.CowBytes)
-	cmd := exec.Command("ssh", toNode.TailscaleIP, "mkdir", "-p", dstCowDir)
+	log.Printf("Transferring COW image (%d bytes) via bridge...", exportResp.CowBytes)
+	cmd := exec.Command("ssh", toNode.BridgeIP, "mkdir", "-p", dstCowDir)
 	cmd.Run()
 
 	cmd = exec.Command("rsync", "--sparse", "-e", "ssh",

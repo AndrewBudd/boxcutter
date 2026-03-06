@@ -254,19 +254,26 @@ func (h *Handler) cmdNodes() int {
 	var nodes []map[string]interface{}
 	json.Unmarshal(resp, &nodes)
 
-	fmt.Printf("%-12s %-20s %-18s %-8s %-10s %-10s %-8s\n",
-		"ID", "NAME", "TAILSCALE IP", "STATUS", "RAM USED", "RAM TOTAL", "VMs")
+	fmt.Printf("%-12s %-20s %-16s %-16s %-8s %-10s %-10s %-4s\n",
+		"ID", "NAME", "BRIDGE IP", "TAILSCALE IP", "STATUS", "RAM USED", "RAM TOTAL", "VMs")
 	for _, n := range nodes {
 		id, _ := n["id"].(string)
 		name, _ := n["tailscale_name"].(string)
 		tsIP, _ := n["tailscale_ip"].(string)
+		bridgeIP, _ := n["bridge_ip"].(string)
 		status, _ := n["status"].(string)
 		ramAlloc, _ := n["ram_allocated_mib"].(float64)
 		ramTotal, _ := n["ram_total_mib"].(float64)
 		vmsRunning, _ := n["vms_running"].(float64)
+		if bridgeIP == "" {
+			bridgeIP = "-"
+		}
+		if tsIP == "" {
+			tsIP = "-"
+		}
 
-		fmt.Printf("%-12s %-20s %-18s %-8s %-10s %-10s %-8.0f\n",
-			id, name, tsIP, status,
+		fmt.Printf("%-12s %-20s %-16s %-16s %-8s %-10s %-10s %-4.0f\n",
+			id, name, bridgeIP, tsIP, status,
 			fmt.Sprintf("%.0fG", ramAlloc/1024),
 			fmt.Sprintf("%.0fG", ramTotal/1024),
 			vmsRunning)

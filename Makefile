@@ -38,8 +38,8 @@ launch-node-daemon:       ## Start a Node VM (background)
 stop-node:                ## Stop a Node VM
 	@bash host/stop.sh node
 
-ssh-node:                 ## SSH into a Node VM
-	@ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ubuntu@192.168.50.3
+ssh-node:                 ## SSH into Node VM 1 (use host/ssh.sh for others)
+	@bash host/ssh.sh node 1
 
 # --- Cluster ---
 

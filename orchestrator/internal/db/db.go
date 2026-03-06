@@ -45,6 +45,7 @@ func (db *DB) migrate() error {
 		id TEXT PRIMARY KEY,
 		tailscale_name TEXT NOT NULL,
 		tailscale_ip TEXT,
+		bridge_ip TEXT,
 		api_addr TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'active',
 		ram_total_mib INTEGER DEFAULT 0,
@@ -87,7 +88,14 @@ func (db *DB) migrate() error {
 	`
 
 	_, err := db.conn.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Migrate: add bridge_ip column if it doesn't exist (for existing databases)
+	db.conn.Exec(`ALTER TABLE nodes ADD COLUMN bridge_ip TEXT`)
+
+	return nil
 }
 
 // --- Node operations ---
@@ -96,6 +104,7 @@ type Node struct {
 	ID              string `json:"id"`
 	TailscaleName   string `json:"tailscale_name"`
 	TailscaleIP     string `json:"tailscale_ip"`
+	BridgeIP        string `json:"bridge_ip"`
 	APIAddr         string `json:"api_addr"`
 	Status          string `json:"status"`
 	RAMTotalMIB     int    `json:"ram_total_mib"`
@@ -108,10 +117,11 @@ type Node struct {
 
 func (db *DB) RegisterNode(n *Node) error {
 	_, err := db.conn.Exec(`
-		INSERT INTO nodes (id, tailscale_name, tailscale_ip, api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, last_heartbeat)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO nodes (id, tailscale_name, tailscale_ip, bridge_ip, api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, last_heartbeat)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			tailscale_ip=excluded.tailscale_ip,
+			bridge_ip=excluded.bridge_ip,
 			api_addr=excluded.api_addr,
 			status=excluded.status,
 			ram_total_mib=excluded.ram_total_mib,
@@ -119,7 +129,7 @@ func (db *DB) RegisterNode(n *Node) error {
 			ram_allocated_mib=excluded.ram_allocated_mib,
 			vms_running=excluded.vms_running,
 			last_heartbeat=excluded.last_heartbeat`,
-		n.ID, n.TailscaleName, n.TailscaleIP, n.APIAddr, n.Status,
+		n.ID, n.TailscaleName, n.TailscaleIP, n.BridgeIP, n.APIAddr, n.Status,
 		n.RAMTotalMIB, n.VCPUTotal, n.RAMAllocatedMIB, n.VMsRunning,
 		n.RegisteredAt, n.LastHeartbeat,
 	)
@@ -140,9 +150,9 @@ func (db *DB) SetNodeStatus(id, status string) error {
 }
 
 func (db *DB) GetNode(id string) (*Node, error) {
-	row := db.conn.QueryRow(`SELECT id, tailscale_name, tailscale_ip, api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, COALESCE(last_heartbeat,'') FROM nodes WHERE id=?`, id)
+	row := db.conn.QueryRow(`SELECT id, tailscale_name, COALESCE(tailscale_ip,''), COALESCE(bridge_ip,''), api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, COALESCE(last_heartbeat,'') FROM nodes WHERE id=?`, id)
 	var n Node
-	err := row.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.APIAddr, &n.Status,
+	err := row.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.BridgeIP, &n.APIAddr, &n.Status,
 		&n.RAMTotalMIB, &n.VCPUTotal, &n.RAMAllocatedMIB, &n.VMsRunning,
 		&n.RegisteredAt, &n.LastHeartbeat)
 	if err != nil {
@@ -152,7 +162,7 @@ func (db *DB) GetNode(id string) (*Node, error) {
 }
 
 func (db *DB) ListNodes() ([]*Node, error) {
-	rows, err := db.conn.Query(`SELECT id, tailscale_name, tailscale_ip, api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, COALESCE(last_heartbeat,'') FROM nodes ORDER BY id`)
+	rows, err := db.conn.Query(`SELECT id, tailscale_name, COALESCE(tailscale_ip,''), COALESCE(bridge_ip,''), api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, COALESCE(last_heartbeat,'') FROM nodes ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +171,7 @@ func (db *DB) ListNodes() ([]*Node, error) {
 	var nodes []*Node
 	for rows.Next() {
 		var n Node
-		if err := rows.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.APIAddr, &n.Status,
+		if err := rows.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.BridgeIP, &n.APIAddr, &n.Status,
 			&n.RAMTotalMIB, &n.VCPUTotal, &n.RAMAllocatedMIB, &n.VMsRunning,
 			&n.RegisteredAt, &n.LastHeartbeat); err != nil {
 			continue
@@ -178,7 +188,7 @@ func (db *DB) DeleteNode(id string) error {
 
 // ActiveNodes returns nodes with status "active".
 func (db *DB) ActiveNodes() ([]*Node, error) {
-	rows, err := db.conn.Query(`SELECT id, tailscale_name, tailscale_ip, api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, COALESCE(last_heartbeat,'') FROM nodes WHERE status='active' ORDER BY id`)
+	rows, err := db.conn.Query(`SELECT id, tailscale_name, COALESCE(tailscale_ip,''), COALESCE(bridge_ip,''), api_addr, status, ram_total_mib, vcpu_total, ram_allocated_mib, vms_running, registered_at, COALESCE(last_heartbeat,'') FROM nodes WHERE status='active' ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +197,7 @@ func (db *DB) ActiveNodes() ([]*Node, error) {
 	var nodes []*Node
 	for rows.Next() {
 		var n Node
-		if err := rows.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.APIAddr, &n.Status,
+		if err := rows.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.BridgeIP, &n.APIAddr, &n.Status,
 			&n.RAMTotalMIB, &n.VCPUTotal, &n.RAMAllocatedMIB, &n.VMsRunning,
 			&n.RegisteredAt, &n.LastHeartbeat); err != nil {
 			continue

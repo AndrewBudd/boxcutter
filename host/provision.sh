@@ -64,7 +64,17 @@ ensure_ubuntu_img() {
 # ======================================================================
 build_node() {
   local NAME="${VM_NAME:-boxcutter-node-1}"
+  # Derive per-node networking from name (boxcutter-node-N)
+  local NODE_NUM="${NAME##*-}"
+  if ! [[ "$NODE_NUM" =~ ^[0-9]+$ ]]; then
+    echo "Error: node name must end with a number (e.g. boxcutter-node-1)"
+    exit 1
+  fi
+  local NODE_OCTET=$((NODE_IP_OFFSET + NODE_NUM))
+  local THIS_NODE_IP="${NODE_SUBNET}.${NODE_OCTET}"
+  local THIS_NODE_MAC="$(printf '52:54:00:00:00:%02x' "$NODE_OCTET")"
   echo "=== Provisioning Node VM: ${NAME} ==="
+  echo "  Bridge IP: ${THIS_NODE_IP}, MAC: ${THIS_NODE_MAC}"
   echo "Bundle: ${BUNDLE_DIR}"
   echo ""
 
@@ -96,7 +106,11 @@ build_node() {
   cp "${REPO_DIR}/node/config/Caddyfile" "${PD}/config/" 2>/dev/null || true
   cp "${REPO_DIR}"/node/golden/build.sh "${REPO_DIR}"/node/golden/provision.sh "${REPO_DIR}"/node/golden/nss_catchall.c "${PD}/golden/"
 
-  cp "${BUNDLE_DIR}/boxcutter.yaml" "${PD}/bundle/"
+  # Template node-specific values into boxcutter.yaml
+  sed -e "s|BRIDGE_IP_PLACEHOLDER|${THIS_NODE_IP}|g" \
+      -e "s|ORCHESTRATOR_URL_PLACEHOLDER|http://${ORCH_IP}:8801|g" \
+      -e "s|HOSTNAME_PLACEHOLDER|${NAME}|g" \
+      "${BUNDLE_DIR}/boxcutter.yaml" > "${PD}/bundle/boxcutter.yaml"
   cp "${BUNDLE_DIR}"/secrets/* "${PD}/bundle/secrets/" 2>/dev/null || true
 
   local PAYLOAD_TAR="${BUILD_DIR}/payload.tar.gz"
@@ -260,10 +274,10 @@ instance-id: ${NAME}-$(date +%s)
 local-hostname: ${NAME}
 META
 
-  sed -e "s|NODE_IP_PLACEHOLDER|${NODE_IP}|" \
-      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_TAP_CIDR}|" \
-      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_TAP_IP}|" \
-      -e "s|NODE_MAC_PLACEHOLDER|${NODE_MAC}|" \
+  sed -e "s|NODE_IP_PLACEHOLDER|${THIS_NODE_IP}|" \
+      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_BRIDGE_CIDR}|" \
+      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_BRIDGE_IP}|" \
+      -e "s|NODE_MAC_PLACEHOLDER|${THIS_NODE_MAC}|" \
       "${REPO_DIR}/cloud-init/network-config" > "${CIDATA}/network-config"
 
   local ISO="${IMAGES_DIR}/${NAME}-cloud-init.iso"
@@ -458,8 +472,8 @@ META
 
   # Orchestrator uses its own network config (different IP/MAC)
   sed -e "s|NODE_IP_PLACEHOLDER|${ORCH_IP}|" \
-      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_TAP_CIDR}|" \
-      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_TAP_IP}|" \
+      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_BRIDGE_CIDR}|" \
+      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_BRIDGE_IP}|" \
       -e "s|NODE_MAC_PLACEHOLDER|${ORCH_MAC}|" \
       "${REPO_DIR}/cloud-init/network-config" > "${CIDATA}/network-config"
 
