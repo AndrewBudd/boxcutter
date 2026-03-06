@@ -95,7 +95,7 @@ systemctl start tailscaled
 mkdir -p /etc/boxcutter
 if ! tailscale status &>/dev/null; then
   echo "Tailscale is installed but not connected."
-  echo "Join manually: sudo tailscale up --hostname=boxcutter --ssh"
+  echo "Join manually: sudo tailscale up --hostname=boxcutter"
   echo "Then place the ephemeral VM auth key at /etc/boxcutter/tailscale-authkey"
 fi
 
