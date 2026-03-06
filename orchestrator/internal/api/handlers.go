@@ -218,8 +218,14 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = strings.TrimSpace(string(out))
 	}
+	if req.VCPU == 0 {
+		req.VCPU = 4
+	}
 	if req.RAMMIB == 0 {
 		req.RAMMIB = 8192
+	}
+	if req.Disk == "" {
+		req.Disk = "50G"
 	}
 
 	// Check if VM already exists
@@ -294,6 +300,9 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		"node":         targetNode.TailscaleName,
 		"tailscale_ip": vm.TailscaleIP,
 		"mode":         vm.Mode,
+		"vcpu":         vm.VCPU,
+		"ram_mib":      vm.RAMMIB,
+		"disk":         vm.Disk,
 		"status":       vm.Status,
 	})
 }

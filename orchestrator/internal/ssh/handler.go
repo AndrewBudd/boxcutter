@@ -142,16 +142,38 @@ func (h *Handler) cmdNew(args []string) int {
 	name, _ := result["name"].(string)
 	tsIP, _ := result["tailscale_ip"].(string)
 	nodeName, _ := result["node"].(string)
+	mode, _ := result["mode"].(string)
+	status, _ := result["status"].(string)
+	vcpu, _ := result["vcpu"].(float64)
+	ramMIB, _ := result["ram_mib"].(float64)
+	disk, _ := result["disk"].(string)
+
+	if mode == "" {
+		mode = "normal"
+	}
+	if status == "" {
+		status = "running"
+	}
 
 	fmt.Println()
-	fmt.Printf("VM ready: %s\n", name)
-	if nodeName != "" {
-		fmt.Printf("Node: %s\n", nodeName)
+	fmt.Printf("  Name:    %s\n", name)
+	fmt.Printf("  Node:    %s\n", nodeName)
+	if vcpu > 0 {
+		fmt.Printf("  vCPU:    %.0f\n", vcpu)
 	}
+	if ramMIB > 0 {
+		fmt.Printf("  RAM:     %.0fG\n", ramMIB/1024)
+	}
+	if disk != "" {
+		fmt.Printf("  Disk:    %s\n", disk)
+	}
+	fmt.Printf("  Mode:    %s\n", mode)
+	fmt.Printf("  Status:  %s\n", status)
+	fmt.Println()
 	if tsIP != "" {
-		fmt.Printf("Connect: ssh %s\n", tsIP)
+		fmt.Printf("  Connect: ssh %s\n", tsIP)
 	} else {
-		fmt.Println("Connect: Tailscale IP pending (check with: ssh <host> list)")
+		fmt.Println("  Tailscale IP pending — check with: ssh <host> list")
 	}
 	return 0
 }
