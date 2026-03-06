@@ -1,18 +1,19 @@
 ---
-name: boxcutter
+name: managing-dev-vms
 description: >
-  Manage ephemeral dev environment VMs using Boxcutter. Boxcutter runs Firecracker
-  microVMs that boot in ~1 second with Tailscale IPs and SSH access. Use this skill
-  whenever the user needs a fresh development environment, wants to test something
-  in a clean VM, needs an isolated machine for running builds or scripts, wants to
-  spin up a throwaway environment, or mentions Boxcutter, VMs, or dev environments.
-  Also use when the user asks to "try something in a clean environment", "set up a
-  dev box", "run this somewhere safe", or needs any kind of ephemeral compute.
+  Manages ephemeral dev environment VMs via SSH. Creates, lists, starts, stops, and
+  destroys Firecracker microVMs that boot in ~5 seconds with Tailscale networking,
+  pre-installed dev tools (Node.js, Ruby, git, Claude Code), and passwordless sudo.
+  Triggers on: spinning up a VM, creating a dev environment, testing in a clean machine,
+  running something in isolation, setting up a dev box, ephemeral compute, throwaway
+  environments, sandboxed execution, "try this somewhere safe", "fresh environment",
+  "clean VM", or any mention of Boxcutter. Also triggers when the user needs to SSH
+  into a remote dev machine, check VM status, or manage VM lifecycle.
 ---
 
 # Boxcutter
 
-Boxcutter provides ephemeral dev environment VMs powered by Firecracker microVMs. VMs boot in about one second, join Tailscale automatically for network access, and come pre-loaded with common dev tools. They're disposable — create one, use it, destroy it.
+Boxcutter provides ephemeral dev environment VMs powered by Firecracker microVMs. VMs boot in about five seconds (including Tailscale join), get a routable Tailscale IP, and come pre-loaded with common dev tools. They're disposable — create one, use it, destroy it.
 
 ## Finding your Boxcutter host
 
@@ -185,6 +186,32 @@ When the user needs an environment that persists across sessions:
 ### Running untrusted or experimental code
 
 VMs are isolated Firecracker microVMs with their own kernel. They're a good place to run code you don't fully trust, test destructive operations, or experiment with system-level changes. VMs are also isolated from each other on the internal network.
+
+## TLS certificates for VM services
+
+Tailscale can provision real Let's Encrypt TLS certificates for any VM on the tailnet. This requires HTTPS to be enabled in the Tailscale admin console (one-time setup at https://login.tailscale.com/admin/dns).
+
+### Using `tailscale cert`
+
+After a VM is running and joined to Tailscale, get a cert for its MagicDNS name:
+
+```bash
+ssh <TAILSCALE_IP> "sudo tailscale cert <vm-name>.<tailnet-name>.ts.net"
+```
+
+This writes `.crt` and `.key` files to the current directory. The private key never leaves the VM. Certs last 90 days and must be manually renewed when obtained this way.
+
+### Automatic certs with Caddy
+
+Caddy 2.5+ natively fetches TLS certs from the local Tailscale daemon for `*.ts.net` domains — zero configuration needed. A Caddyfile like this just works:
+
+```
+bold-fox.tail038cc3.ts.net {
+    reverse_proxy localhost:3000
+}
+```
+
+Caddy handles cert provisioning and renewal automatically. It needs access to the Tailscale socket (run as root or grant the caddy user access).
 
 ## Important things to know
 
