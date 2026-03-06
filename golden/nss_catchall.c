@@ -28,16 +28,19 @@ static int is_system_user(const char *name) {
 enum nss_status _nss_catchall_getpwnam_r(const char *name, struct passwd *result,
                                           char *buffer, size_t buflen, int *errnop) {
     if (is_system_user(name)) return NSS_STATUS_NOTFOUND;
+    static const char homedir[] = "/home/dev";
+    static const char shell[] = "/bin/bash";
     size_t namelen = strlen(name) + 1;
-    if (buflen < namelen + 20) { *errnop = ERANGE; return NSS_STATUS_TRYAGAIN; }
+    size_t needed = namelen + sizeof(homedir) + sizeof(shell);
+    if (buflen < needed) { *errnop = ERANGE; return NSS_STATUS_TRYAGAIN; }
     char *p = buffer;
     memcpy(p, name, namelen); result->pw_name = p; p += namelen;
     result->pw_passwd = "x";
     result->pw_uid = 1000;
     result->pw_gid = 1000;
     result->pw_gecos = "";
-    memcpy(p, "/home/dev", 10); result->pw_dir = p; p += 10;
-    memcpy(p, "/bin/bash", 10); result->pw_shell = p;
+    memcpy(p, homedir, sizeof(homedir)); result->pw_dir = p; p += sizeof(homedir);
+    memcpy(p, shell, sizeof(shell)); result->pw_shell = p;
     return NSS_STATUS_SUCCESS;
 }
 
