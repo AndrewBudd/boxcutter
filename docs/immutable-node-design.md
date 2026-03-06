@@ -1,14 +1,20 @@
 # Multi-Host Architecture Design
 
+## Status
+
+This document builds on the existing single-node boxcutter implementation. The networking layer (internal bridge + Tailscale overlay), vmid (VM Identity & Token Broker), device-mapper COW snapshots, and the SSH control interface are all implemented and working. This design extends the system to support multiple physical hosts, VM migration, centralized storage, and standardized configuration.
+
+---
+
 ## Core Design Principles
 
-1. **All VMs have the same IP.** Every Firecracker VM is 10.0.0.2 with gateway 10.0.0.1, inside its own network namespace. No IP management anywhere. VM images are perfectly portable between nodes.
-2. **Multi-host from day one.** The orchestrator, nodes, and storage are designed to span physical hosts.
-3. **VM state preservation matters.** Migration means moving a running VM's disk state to another node with zero data loss. Tailscale identity (and thus IP) survives migration.
-4. **Nodes are immutable and replaceable.** To upgrade, spin up a new node, migrate VMs off the old, destroy the old.
-5. **Tailscale is the trusted network.** All inter-component communication (orchestrator ↔ nodes) happens over Tailscale. Policies ensure nodes can talk to each other but VMs cannot reach nodes (except the metadata IP on their own node).
-6. **Go for all new services.** Orchestrator, node agent, and vmid are Go.
-7. **Secrets are bootstrapped, not distributed.** All credentials come from a single, standardized config bundle provided at setup time. The orchestrator does not distribute secrets at runtime.
+1. **Multi-host from day one.** The orchestrator, nodes, and storage are designed to span physical hosts.
+2. **VM state preservation matters.** Migration means moving a running VM's disk state to another node with zero data loss. Tailscale identity (and thus IP) survives migration.
+3. **Nodes are immutable and replaceable.** To upgrade, spin up a new node, migrate VMs off the old, destroy the old.
+4. **Tailscale is the trusted network.** All inter-component communication (orchestrator ↔ nodes) happens over Tailscale. Policies ensure nodes can talk to each other but VMs cannot reach nodes (except the metadata IP on their own node).
+5. **Go for all new services.** Orchestrator and node agent are Go.
+6. **Secrets are bootstrapped, not distributed.** All credentials come from a single, standardized config bundle provided at setup time. The orchestrator does not distribute secrets at runtime.
+7. **Build on what works.** The existing bridge networking, vmid, COW snapshots, and SSH interface are proven. Extend, don't replace.
 
 ---
 
@@ -33,12 +39,105 @@
 
 ### Components
 
-| Component | Language | Runs on | Tailscale name |
-|-----------|----------|---------|----------------|
-| Orchestrator | Go | Any host (or small VM) | `boxcutter` |
-| Node agent | Go | Each QEMU node VM | `bc-<id>` |
-| vmid | Go | Each node (current code, per-node) | — (internal only) |
-| TrueNAS | — | Dedicated NAS box or VM | `truenas` (or similar) |
+| Component | Language | Runs on | Tailscale name | Status |
+|-----------|----------|---------|----------------|--------|
+| Orchestrator | Go | Any host (or small VM) | `boxcutter` | **Planned** |
+| Node agent | Go | Each QEMU node VM | `bc-<id>` | **Planned** (replaces bash scripts) |
+| vmid | Go | Each node (per-node) | — (internal only) | **Implemented** |
+| boxcutter-ctl | Bash | Each node | — | **Implemented** (to be subsumed by node agent) |
+| boxcutter-net | Bash | Each node | — | **Implemented** |
+| TrueNAS | — | Dedicated NAS box or VM | `truenas` (or similar) | **Planned** |
+
+---
+
+## Current Networking Architecture (Implemented)
+
+The networking layer is implemented and working. Each node VM runs an internal bridge with per-VM TAP devices and Tailscale overlay for external access.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Physical Host                                       │
+│                                                     │
+│  tap-node0 (10.0.0.1/30) ──→ Node VM               │
+│                                                     │
+│  ┌───────────────────────────────────────────────┐  │
+│  │  Node VM (QEMU/KVM) — 10.0.0.2               │  │
+│  │  Tailscale: 100.x.x.x                        │  │
+│  │                                               │  │
+│  │  brvm0 bridge (10.0.1.1/24)                   │  │
+│  │  ├── tap-bold-fox   ──→  10.0.1.200           │  │
+│  │  ├── tap-calm-otter ──→  10.0.1.201           │  │
+│  │  └── tap-wild-heron ──→  10.0.1.202           │  │
+│  │  (ebtables FORWARD DROP: VM isolation)        │  │
+│  │                                               │  │
+│  │  vmid (port 8775) ← 169.254.169.254 redirect │  │
+│  │  Identifies VMs by source IP (10.0.1.x)       │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+### How It Works
+
+- **Internal bridge** (`brvm0`, 10.0.1.0/24): Each VM gets a unique internal IP (10.0.1.200+) via TAP device on the bridge
+- **VM isolation**: ebtables `FORWARD DROP` prevents VM-to-VM communication at Layer 2. Only the Node VM can reach VMs directly
+- **Internet access**: NAT from bridge subnet to Node VM's uplink interface
+- **Tailscale overlay**: Each VM joins Tailscale at boot (ephemeral key, never stored on disk), getting a stable 100.x.x.x IP reachable from anywhere
+- **Instant networking**: Kernel `ip=` boot parameter — no DHCP, no network manager
+- **Metadata service**: iptables PREROUTING redirects 169.254.169.254:80 → vmid:8775. vmid identifies VMs by source IP (10.0.1.x)
+
+### What This Architecture Already Provides
+
+| Concern | How it's handled |
+|---------|-----------------|
+| VM isolation | ebtables FORWARD DROP (kernel-enforced L2 isolation) |
+| Internet access | NAT to uplink |
+| External reachability | Tailscale overlay (100.x.x.x) |
+| VM identity | vmid source-IP lookup (unique 10.0.1.x per VM) |
+| Name resolution | Tailscale MagicDNS (ssh bold-fox) |
+| Fast boot | Kernel ip= parameter, no DHCP |
+| Auth key security | Key stays on Node VM, provisioned via SSH, never on VM disk |
+
+### Networking Implications for Multi-Host
+
+The bridge model works well for single-node operation. For multi-host, the key consideration is **migration**: when a VM moves between nodes, it needs a new internal IP on the destination node's bridge. This is acceptable because:
+
+1. The internal IP is ephemeral — it's only used for Node→VM communication and vmid identity
+2. The Tailscale IP (100.x.x.x) is the VM's stable identity and survives migration (state lives in `/var/lib/tailscale/` on the VM's rootfs)
+3. The destination node just allocates the next free IP from its local pool
+4. vmid on the destination node registers the VM with its new internal IP
+
+No networking changes are required to support multi-host. Each node runs its own bridge independently.
+
+---
+
+## vmid (Implemented)
+
+vmid is the VM Identity & Token Broker service, already implemented in Go and running per-node.
+
+### What It Does
+
+- **Identity**: Identifies VMs by source IP on the internal bridge (10.0.1.x → VM name)
+- **JWT tokens**: Mints audience-scoped ES256 tokens signed with a per-deployment ECDSA key
+- **GitHub tokens**: Policy-based GitHub App installation tokens for repo access
+- **JWKS endpoint**: Public key endpoint at `/.well-known/jwks.json` for external token verification
+
+### Interfaces
+
+**VM-facing API** (via 169.254.169.254 redirect):
+- `GET /identity` — VM record (vm_id, ip, labels)
+- `GET /token?audience=<aud>` — Mint JWT token
+- `GET /token/github` — Mint GitHub App token
+- `GET /.well-known/jwks.json` — Public JWKS (no auth required)
+
+**Admin API** (Unix socket at `/run/vmid/admin.sock`, node-local only):
+- `POST /internal/vms` — Register VM (id, ip, github_repo)
+- `DELETE /internal/vms/{id}` — Deregister VM
+- `GET /internal/vms` — List registered VMs
+- `POST /internal/vms/{id}/github-token` — Mint token on behalf of VM (used by boxcutter-ctl during clone)
+
+### Multi-Host Consideration
+
+vmid runs per-node with no changes needed. Each node's vmid has its own registry of local VMs. For consistent JWT verification across nodes, all nodes share the same ECDSA signing key (distributed via the bootstrap bundle).
 
 ---
 
@@ -46,7 +145,7 @@
 
 ### The Problem
 
-Today, secrets are scattered across 5+ locations with no standard structure:
+Today, secrets are scattered across multiple locations with no standard structure:
 
 | Secret | Current location | How it gets there |
 |--------|-----------------|-------------------|
@@ -58,7 +157,7 @@ Today, secrets are scattered across 5+ locations with no standard structure:
 | JWT signing key | `/etc/vmid/jwt-key.pem` | Auto-generated or manual |
 | TrueNAS API key | nowhere yet | — |
 
-This means spinning up a new node requires manually placing files in multiple locations, knowing which paths each component expects, and hoping nothing was forgotten. It's fragile and undocumented.
+This means spinning up a new node requires manually placing files in multiple locations, knowing which paths each component expects, and hoping nothing was forgotten.
 
 ### The Solution: `boxcutter.yaml` + `/etc/boxcutter/secrets/`
 
@@ -159,62 +258,6 @@ Operator creates bundle:
               authorized-keys goes into golden image
 ```
 
-### Provisioning a New Deployment (Day 1)
-
-```bash
-# 1. Create the bootstrap bundle
-mkdir -p /etc/boxcutter/secrets
-
-# 2. Generate or place Tailscale auth keys
-#    - Node key: reusable, NOT ephemeral (nodes are long-lived)
-#    - VM key: reusable, ephemeral (VMs auto-remove on disconnect)
-echo "tskey-auth-..." > /etc/boxcutter/secrets/tailscale-node-authkey
-echo "tskey-auth-..." > /etc/boxcutter/secrets/tailscale-vm-authkey
-
-# 3. Generate SSH keypair for node→VM access
-ssh-keygen -t ed25519 -f /etc/boxcutter/secrets/node-ssh.key -N "" -q
-
-# 4. Add human SSH public keys
-cat ~/.ssh/id_ed25519.pub > /etc/boxcutter/secrets/authorized-keys
-# Add more keys as needed:
-# curl https://github.com/username.keys >> /etc/boxcutter/secrets/authorized-keys
-
-# 5. (Optional) Place GitHub App key
-cp ~/downloads/github-app.pem /etc/boxcutter/secrets/github-app.pem
-
-# 6. (Optional) Place TrueNAS API key
-echo "1-abc123..." > /etc/boxcutter/secrets/truenas-api-key
-
-# 7. Write boxcutter.yaml (or copy template and edit)
-cp boxcutter.yaml.template /etc/boxcutter/boxcutter.yaml
-$EDITOR /etc/boxcutter/boxcutter.yaml
-
-# 8. Run setup
-boxcutter-setup   # reads /etc/boxcutter/boxcutter.yaml, provisions everything
-```
-
-### Provisioning a New Node (Day N)
-
-When the orchestrator creates a new node VM, it packages the bootstrap bundle into the cloud-init ISO. The node boots, reads `boxcutter.yaml`, and has everything it needs.
-
-```
-Orchestrator:
-  1. Read /etc/boxcutter/boxcutter.yaml
-  2. Read /etc/boxcutter/secrets/*
-  3. Generate cloud-init ISO with:
-     - boxcutter.yaml (full config)
-     - secrets/ directory (all secrets)
-     - node-specific params (node ID, assigned at creation time)
-  4. Launch QEMU with cloud-init ISO
-
-Node VM boot:
-  1. Cloud-init unpacks /etc/boxcutter/boxcutter.yaml + secrets/
-  2. Node agent starts, reads boxcutter.yaml
-  3. Joins Tailscale using tailscale-node-authkey
-  4. Registers with orchestrator
-  5. Ready to accept VMs
-```
-
 ### Key Requirement: Two Tailscale Auth Keys
 
 The current system uses one Tailscale auth key for VMs. The new system needs two:
@@ -237,14 +280,6 @@ Both are generated at https://login.tailscale.com/admin/settings/keys. They expi
 | JWT signing key | Never expires (regenerate to revoke) | External services can't verify old tokens. |
 | TrueNAS API key | Manual rotation | Storage provisioning fails. Existing VMs unaffected. |
 
-**Rotation process:** Update the file in `/etc/boxcutter/secrets/`, then:
-- For Tailscale keys: Restart node agents (they'll re-read on next VM creation)
-- For SSH keys: Rebuild golden image + update authorized-keys on running VMs
-- For GitHub/JWT keys: Restart vmid on each node
-- For TrueNAS key: Restart node agents
-
-The orchestrator could have a `ssh boxcutter rotate <secret>` command that pushes updated secrets to nodes and restarts the relevant services.
-
 ### What's Auto-Generated vs. Required
 
 | Secret | Required at setup? | Auto-generated? |
@@ -258,118 +293,6 @@ The orchestrator could have a `ssh boxcutter rotate <secret>` command that pushe
 | TrueNAS API key | No (optional) | No — comes from TrueNAS |
 
 **Minimum viable bootstrap:** Tailscale VM authkey + one SSH public key in authorized-keys. Everything else is optional or auto-generated.
-
----
-
-## Networking: Same IP, Network Namespaces
-
-### The Problem
-
-If VMs have unique IPs, migration requires IP reassignment. The VM image contains network state. IP pools must be managed per-node. This is unnecessary complexity.
-
-### The Solution
-
-Every VM gets the exact same network configuration:
-- VM IP: `10.0.0.2/30`
-- Gateway: `10.0.0.1`
-- DNS: `8.8.8.8`
-
-This works because each VM lives inside its own **Linux network namespace** on the node. The namespace provides complete isolation — each one has its own routing table, its own TAP device, its own iptables rules. There's no shared bridge.
-
-### Per-VM Network Setup
-
-```
-Node host network
-│
-├── netns: vm-bold-fox
-│   ├── tap0 (10.0.0.1/30)  ←── Firecracker connects here
-│   │     └── VM sees: eth0 = 10.0.0.2/30, gw 10.0.0.1
-│   ├── veth-bf-i (10.0.0.5/30) ←→ veth-bf-o (10.0.0.6/30) in host
-│   ├── iptables MASQUERADE on veth-bf-i for outbound internet
-│   └── DNAT 169.254.169.254 → vmid on host
-│
-├── netns: vm-calm-bear
-│   ├── tap0 (10.0.0.1/30)
-│   ├── veth-cb-i ←→ veth-cb-o in host
-│   ├── iptables MASQUERADE
-│   └── DNAT 169.254.169.254 → vmid
-│
-└── host network
-    ├── veth-bf-o (10.0.0.6/30) → routed to internet
-    ├── veth-cb-o (10.0.0.10/30) → routed to internet
-    └── MASQUERADE to uplink
-```
-
-### Setup Steps (per VM)
-
-```bash
-# 1. Create network namespace
-ip netns add vm-${NAME}
-
-# 2. Create TAP device inside namespace (for Firecracker)
-ip netns exec vm-${NAME} ip tuntap add tap0 mode tap
-ip netns exec vm-${NAME} ip addr add 10.0.0.1/30 dev tap0
-ip netns exec vm-${NAME} ip link set tap0 up
-
-# 3. Create veth pair for internet access
-ip link add veth-${SHORT}-i type veth peer name veth-${SHORT}-o
-ip link set veth-${SHORT}-i netns vm-${NAME}
-
-# 4. Configure veth inside namespace
-ip netns exec vm-${NAME} ip addr add 10.0.0.5/30 dev veth-${SHORT}-i
-ip netns exec vm-${NAME} ip link set veth-${SHORT}-i up
-ip netns exec vm-${NAME} ip route add default via 10.0.0.6
-
-# 5. Configure veth on host side
-ip addr add 10.0.0.6/30 dev veth-${SHORT}-o
-ip link set veth-${SHORT}-o up
-
-# 6. NAT inside namespace (VM → internet)
-ip netns exec vm-${NAME} iptables -t nat -A POSTROUTING -o veth-${SHORT}-i -j MASQUERADE
-
-# 7. NAT on host (namespace → real internet)
-iptables -t nat -A POSTROUTING -s 10.0.0.5/30 -o ${UPLINK} -j MASQUERADE
-
-# 8. Metadata service redirect (inside namespace)
-ip netns exec vm-${NAME} ip addr add 169.254.169.254/32 dev lo
-ip netns exec vm-${NAME} iptables -t nat -A PREROUTING -d 169.254.169.254 -p tcp --dport 80 \
-    -j DNAT --to-destination ${VMID_IP}:8775
-
-# 9. Firecracker runs inside the namespace
-ip netns exec vm-${NAME} firecracker --config-file fc-config.json ...
-```
-
-### Kernel Boot Args
-
-Every VM gets the identical `ip=` parameter:
-
-```
-ip=10.0.0.2::10.0.0.1:255.255.255.252:${HOSTNAME}:eth0:off:8.8.8.8
-```
-
-The only per-VM variation is the hostname, which is injected by the node agent at boot time and doesn't affect the network configuration.
-
-### Why Not a Bridge?
-
-The current design uses a shared bridge (`brvm0`) with unique IPs. That model requires:
-- IP pool management per node
-- ebtables/iptables for VM isolation
-- IP reassignment on migration
-
-With network namespaces:
-- No IP management at all
-- Isolation is structural (namespaces are kernel-enforced)
-- Every VM image is identical — perfectly portable
-- Metadata service routing is per-VM (cleaner than shared bridge DNAT)
-
-### Veth Address Allocation
-
-Each VM needs a unique veth address pair on the host side. Use a simple formula:
-- VM slot index N (0-based, assigned at creation time on this node)
-- Inside namespace: `10.0.0.5/30` (always the same)
-- Host side: `10.0.N.1/30` and namespace side `10.0.N.2/30` for the veth pair
-
-The slot is ephemeral and node-local — it's just for routing, not identity. On migration, the new node assigns a new slot.
 
 ---
 
@@ -401,9 +324,8 @@ Node (local NVMe)
 - Each node caches the golden image locally at boot time (or on first use)
 - Cache is a simple `rsync` from NFS mount to local disk
 - Node agent checks golden image hash on startup; re-syncs if TrueNAS has a newer version
-- Multiple golden image versions are supported (old VMs keep referencing old golden until migrated/rebuilt)
 
-**VM COW layer (local NVMe):**
+**VM COW layer (local NVMe) — already implemented:**
 - Device-mapper snapshot on local disk (current mechanism, unchanged)
 - Fast I/O — no network in the hot path
 - `truncate -s 50G cow.img` → losetup → dmsetup (same as today)
@@ -420,21 +342,12 @@ Node (local NVMe)
   # Target pulls from TrueNAS staging
   rsync --sparse /mnt/truenas-staging/bold-fox/cow.img /var/lib/boxcutter/vms/bold-fox/cow.img
   ```
-- TrueNAS staging area is an NFS mount on each node, used only during migration
-- Staging files are cleaned up after migration completes
-
-**Golden image builds:**
-1. Build happens on any node (orchestrator picks one)
-2. Result pushed to TrueNAS NFS: `rsync rootfs.ext4 /mnt/truenas-golden/rootfs-v3.ext4`
-3. Orchestrator records new golden version in its database
-4. Nodes pull new golden on next boot or when told to refresh
 
 ### Golden Image Versioning
 
 COW snapshots are tied to a specific golden base image. The orchestrator tracks which golden version each VM uses:
 
 ```sql
--- In orchestrator SQLite
 CREATE TABLE golden_images (
     version TEXT PRIMARY KEY,      -- "v3-2026-03-06-abc123"
     nfs_path TEXT,                 -- "rootfs-v3.ext4"
@@ -442,22 +355,17 @@ CREATE TABLE golden_images (
     created_at TEXT,
     active BOOLEAN                 -- default for new VMs
 );
-
--- In vms table
-ALTER TABLE vms ADD COLUMN golden_version TEXT;
 ```
 
-Old golden images are retained on TrueNAS until no VMs reference them. The orchestrator's `golden gc` command cleans up unreferenced versions.
+### Migration and Internal IP Reassignment
 
-### Migration Duration
+When a VM migrates between nodes, the destination node:
+1. Allocates the next free internal IP from its local pool (10.0.1.x)
+2. Rewrites the kernel boot args with the new internal IP
+3. Registers the VM with its local vmid using the new IP
+4. The Tailscale IP (100.x.x.x) is preserved — state lives in `/var/lib/tailscale/` on the COW image
 
-COW images are sparse. A VM with 50GB allocated disk but 2GB actual writes only transfers ~2GB.
-
-| Actual data written | rsync over 1GbE | rsync over 10GbE |
-|---------------------|-----------------|------------------|
-| 1GB | ~10s | ~1s |
-| 5GB | ~45s | ~5s |
-| 20GB | ~3min | ~20s |
+The internal IP is ephemeral infrastructure; the Tailscale IP is the VM's stable identity.
 
 ---
 
@@ -542,7 +450,7 @@ GET    /api/nodes                  List all nodes with capacity
 
 ### SSH Interface
 
-The orchestrator gets the `boxcutter` Tailscale hostname and runs sshd with ForceCommand:
+The orchestrator gets the `boxcutter` Tailscale hostname and runs sshd with ForceCommand (same pattern as current boxcutter-ssh, extended for multi-node):
 
 ```
 ssh boxcutter new [--clone repo] [--vcpu N] [--ram MiB]
@@ -580,11 +488,14 @@ ssh boxcutter migrate <name> [--to <node-id>]
 
 ### Responsibilities
 
+Replaces the current bash scripts (`boxcutter-ctl`, `boxcutter-net`, `boxcutter-ssh`) with a single Go binary.
+
 - **VM lifecycle**: Create, start, stop, destroy Firecracker VMs
-- **Network namespace management**: Set up per-VM namespaces
-- **Storage management**: Device-mapper snapshots on local disk
-- **Tailscale provisioning**: Join VMs to Tailscale on start
-- **vmid**: Run metadata service for VMs (existing code)
+- **Bridge management**: Set up brvm0 bridge, TAP devices, ebtables isolation (same as current boxcutter-net)
+- **IP allocation**: Allocate internal IPs from the 10.0.1.200-250 pool (same as current boxcutter-ctl)
+- **Storage management**: Device-mapper snapshots on local disk (same as current)
+- **Tailscale provisioning**: Join VMs to Tailscale on start (same as current)
+- **vmid coordination**: Register/deregister VMs with vmid via admin socket (same as current)
 - **Health reporting**: Heartbeat to orchestrator
 - **Migration support**: Export/import VM state
 - **Golden image cache**: Sync from TrueNAS NFS on boot
@@ -614,8 +525,8 @@ GET    /api/health                  Node health + capacity
 1. Node VM boots (QEMU, cloud-init)
 2. Cloud-init unpacks `/etc/boxcutter/boxcutter.yaml` + `secrets/`
 3. Node agent starts (systemd), reads `boxcutter.yaml`
-4. Syncs golden image from TrueNAS NFS (if configured)
-5. Sets up base networking (IP forwarding, NAT to uplink)
+4. Sets up bridge network (brvm0, ebtables isolation, NAT — same as current boxcutter-net)
+5. Syncs golden image from TrueNAS NFS (if configured)
 6. Joins Tailscale as `bc-<id>` using `tailscale-node-authkey`
 7. Starts vmid (metadata service)
 8. Registers with orchestrator: `POST orchestrator/api/nodes/register`
@@ -623,39 +534,45 @@ GET    /api/health                  Node health + capacity
 
 ### VM Create Flow (on Node)
 
+This is the same flow as current `boxcutter-ctl create` + `start`, translated to Go:
+
 ```
 1. Receive POST /api/vms { name: "bold-fox", vcpu: 4, ram_mib: 8192, ... }
 
-2. Create network namespace
-   ip netns add vm-bold-fox
-   [set up tap0, veth pair, NAT, metadata DNAT — see networking section]
+2. Allocate internal IP from pool (10.0.1.200-250)
+   Same logic as current allocate_ip() in boxcutter-ctl
 
-3. Create storage (local device-mapper)
+3. Create TAP device on bridge
+   ip tuntap add dev tap-bold-fox mode tap
+   ip link set tap-bold-fox master brvm0
+   ip link set tap-bold-fox up
+
+4. Create storage (local device-mapper)
    truncate -s 50G cow.img
    losetup + dmsetup create bc-bold-fox (COW on cached golden)
 
-4. Inject SSH keys into rootfs
+5. Inject SSH keys into rootfs
    Read authorized_keys_path and public_key_path from boxcutter.yaml
    mount block device → copy keys → umount
 
-5. Write fc-config.json
-   kernel boot args: ip=10.0.0.2::10.0.0.1:255.255.255.252:bold-fox:eth0:off:8.8.8.8
+6. Write fc-config.json
+   kernel boot args: ip=10.0.1.200::10.0.1.1:255.255.255.0:bold-fox:eth0:off:8.8.8.8
    drive: /dev/mapper/bc-bold-fox
-   network: tap0 in namespace
+   network: tap-bold-fox
 
-6. Launch Firecracker inside namespace
-   ip netns exec vm-bold-fox firecracker --config-file fc-config.json
+7. Launch Firecracker
+   firecracker --config-file fc-config.json
 
-7. Wait for SSH ready (poll 10.0.0.2 from inside namespace)
-   ip netns exec vm-bold-fox ssh -i <node-ssh.key> dev@10.0.0.2 echo ready
+8. Wait for SSH ready (poll internal IP)
+   ssh -i <node-ssh.key> dev@10.0.1.200 echo ready
 
-8. Join Tailscale (using vm_authkey from boxcutter.yaml)
-   ip netns exec vm-bold-fox ssh dev@10.0.0.2 \
-     "sudo tailscale up --authkey=<vm-authkey> --hostname=bold-fox"
+9. Join Tailscale (using vm_authkey from boxcutter.yaml)
+   ssh dev@10.0.1.200 "sudo tailscale up --authkey=<vm-authkey> --hostname=bold-fox"
 
-9. Get Tailscale IP, register with vmid
+10. Register with vmid (admin socket)
+    POST /internal/vms { vm_id: "bold-fox", ip: "10.0.1.200" }
 
-10. Report back to orchestrator: { tailscale_ip: "100.x.x.x", status: "running" }
+11. Report back to orchestrator: { tailscale_ip: "100.x.x.x", status: "running" }
 ```
 
 ---
@@ -674,15 +591,18 @@ Orchestrator                     Node A (source)              Node B (target)
      │<── { export_path, size } ─────┤                            │
      │                               │                            │
      ├── POST /vms/bold-fox/import ──────────────────────────────>│
-     │                               │                            ├── Set up netns
+     │                               │                            ├── Allocate new internal IP
+     │                               │                            ├── Create TAP on bridge
      │                               │                            ├── Set up dm-snapshot (with received COW)
+     │                               │                            ├── Update kernel boot args (new IP)
      │                               │                            ├── Start Firecracker
      │                               │                            ├── Tailscale rejoins (identity in COW)
+     │                               │                            ├── Register with local vmid
      │<──────────────────────────────────── { tailscale_ip } ─────┤
      │                               │                            │
      ├── Update VM record ───────────────────────────────────────>│
      ├── DELETE /vms/bold-fox ───────>│                            │
-     │                               ├── Cleanup netns + storage  │
+     │                               ├── Cleanup TAP + storage    │
      │                               │                            │
 ```
 
@@ -693,6 +613,8 @@ The Tailscale node state lives in `/var/lib/tailscale/` on the VM's rootfs. Sinc
 - Rejoins the tailnet with the same node key
 - Gets the same Tailscale IP and hostname
 - Users see zero disruption
+
+The internal IP (10.0.1.x) changes — it's whatever the destination node allocates. But this is invisible to users since all access is via Tailscale IP or MagicDNS hostname.
 
 ### Transfer Methods
 
@@ -711,6 +633,16 @@ rsync --sparse cow.img /mnt/truenas-staging/bold-fox/cow.img
 # Target pulls from TrueNAS staging
 rsync --sparse /mnt/truenas-staging/bold-fox/cow.img /var/lib/boxcutter/vms/bold-fox/cow.img
 ```
+
+### Migration Duration
+
+COW images are sparse. A VM with 50GB allocated disk but 2GB actual writes only transfers ~2GB.
+
+| Actual data written | rsync over 1GbE | rsync over 10GbE |
+|---------------------|-----------------|------------------|
+| 1GB | ~10s | ~1s |
+| 5GB | ~45s | ~5s |
+| 20GB | ~3min | ~20s |
 
 ---
 
@@ -740,41 +672,6 @@ rsync --sparse /mnt/truenas-staging/bold-fox/cow.img /var/lib/boxcutter/vms/bold
 
 ---
 
-## vmid (Per-Node, Unchanged Architecture)
-
-vmid continues to run per-node with its current design:
-- Identity middleware: looks up VM by source IP
-- JWT tokens: audience-scoped, signed with key from `boxcutter.yaml` jwt.key_path
-- GitHub tokens: policy-based, using GitHub App config from `boxcutter.yaml`
-
-### Change: IP-Based Lookup with Namespaces
-
-With all VMs at 10.0.0.2, vmid can't identify VMs by source IP alone. Solution: each namespace SNATs metadata requests to a unique source IP before forwarding to vmid.
-
-```bash
-# In namespace for VM slot N:
-iptables -t nat -A POSTROUTING -d ${VMID_IP} -j SNAT --to-source 10.0.${SLOT}.2
-```
-
-vmid sees requests from 10.0.0.2, 10.0.1.2, 10.0.2.2, etc. The node agent registers VMs with their SNAT IP. This requires zero changes to vmid's identity middleware — it already looks up by source IP.
-
-### vmid Config Migration
-
-vmid currently reads `/etc/vmid/config.yaml`. Updated to read from `boxcutter.yaml` instead:
-
-```go
-// Old: separate vmid config
-cfg := vmid.LoadConfig("/etc/vmid/config.yaml")
-
-// New: read from boxcutter.yaml
-bcCfg := boxcutter.LoadConfig("/etc/boxcutter/boxcutter.yaml")
-cfg := bcCfg.ToVmidConfig()
-```
-
-The JWT key path, GitHub App config, and listen addresses all come from `boxcutter.yaml`. No separate vmid config file.
-
----
-
 ## Implementation Plan
 
 ### Phase 1: Bootstrap Bundle + Config Standardization
@@ -784,60 +681,49 @@ Standardize all secrets and configuration into `boxcutter.yaml` + `/etc/boxcutte
 **Changes:**
 - Define `boxcutter.yaml` schema (Go struct)
 - Write `boxcutter-setup` tool that validates the bundle and provisions the local system
-- Migrate install.sh to read from `boxcutter.yaml` instead of hardcoded paths
-- Migrate vmid to read GitHub/JWT config from `boxcutter.yaml`
-- Add `boxcutter.yaml.template` to the repo
+- Migrate `boxcutter-ctl` to read secret paths from `boxcutter.yaml` instead of hardcoded locations
+- Migrate vmid to read GitHub/JWT config from `boxcutter.yaml` (currently reads `/etc/vmid/config.yaml`)
+- Add `boxcutter.yaml.template` to the repo (already done)
 - Update cloud-init to deliver the bundle
 
 **Deliverable:** Single config file drives all provisioning. New deployment = fill in template + run setup.
 
-### Phase 2: Network Namespace Foundation
+### Phase 2: Node Agent (Go)
 
-Replace the shared bridge model with per-VM network namespaces.
-
-**Changes:**
-- New Go package: `internal/netns` — create/destroy namespaces, TAP, veth, iptables
-- Update VM lifecycle to use namespaces
-- Firecracker launches inside `ip netns exec vm-${NAME}`
-- vmid: register VMs with SNAT IP
-- Remove: bridge creation, IP allocation, `allocate_ip()`, `ip_to_mac()`
-
-**Deliverable:** Single-node boxcutter with per-VM namespaces. All VMs are 10.0.0.2.
-
-### Phase 3: Node Agent
-
-Extract VM lifecycle management from bash into a Go HTTP service.
+Extract VM lifecycle management from bash into a Go HTTP service that wraps the existing networking and storage patterns.
 
 **New binary:** `boxcutter-node` (Go)
 - HTTP API for VM CRUD
-- Calls Firecracker, manages namespaces, manages storage
+- Manages bridge setup (same as boxcutter-net: brvm0, ebtables, NAT)
+- Manages IP allocation (same as boxcutter-ctl: 10.0.1.200-250 pool)
+- Manages TAP devices, dm-snapshots, Firecracker lifecycle
+- Coordinates with vmid via admin socket
 - Reports capacity and health
-- Subsumes `boxcutter-ctl` functionality
 - Reads all config from `boxcutter.yaml`
 
-**vmid integration:** Node agent embeds or co-starts vmid.
+**vmid integration:** Node agent co-starts vmid (or embeds it).
 
-**Deliverable:** Node is controllable via HTTP API.
+**Deliverable:** Node is controllable via HTTP API. Bash scripts become optional/deprecated.
 
-### Phase 4: Orchestrator
+### Phase 3: Orchestrator
 
 The central brain.
 
 **New binary:** `boxcutter-orchestrator` (Go)
-- SSH control interface (replaces `boxcutter-ssh`)
+- SSH control interface (extends current `boxcutter-ssh` for multi-node)
 - Node registry + heartbeat
 - VM registry (SQLite)
 - Scheduling: pick best node for `new`
-- Command routing: `list` aggregates, `destroy` routes
+- Command routing: `list` aggregates across nodes, `destroy` routes to correct node
 - Packages bootstrap bundle into cloud-init for new nodes
 
 **Deliverable:** Users SSH to orchestrator. VMs created across nodes.
 
-### Phase 5: Migration
+### Phase 4: Migration
 
 **Node agent additions:**
 - `POST /api/vms/{name}/export` — stop VM, prepare COW for transfer
-- `POST /api/vms/{name}/import` — receive COW, start VM
+- `POST /api/vms/{name}/import` — receive COW, allocate new internal IP, start VM
 
 **Orchestrator additions:**
 - `POST /api/migrate` — orchestrate export → transfer → import
@@ -847,7 +733,7 @@ The central brain.
 
 **Deliverable:** VMs move between nodes. Tailscale identity preserved. Nodes can be drained and retired.
 
-### Phase 6: TrueNAS Integration
+### Phase 5: TrueNAS Integration
 
 **Golden image management:**
 - NFS mount from TrueNAS for golden images
@@ -863,23 +749,25 @@ The central brain.
 
 ---
 
-## Key Differences from Previous Design
+## What Changes vs. What Stays
 
-| Aspect | Previous Design | This Design |
-|--------|----------------|-------------|
-| VM networking | Shared bridge, unique IPs (10.0.1.x) | Per-VM namespace, all 10.0.0.2 |
-| IP management | Pool allocation per node | None — all VMs identical |
-| VM isolation | ebtables FORWARD DROP | Kernel namespaces (structural) |
-| Multi-host | "Design for, implement later" | Multi-host from day one |
-| Orchestrator location | Physical host | Anywhere on Tailscale |
-| Storage (hot path) | Local device-mapper | Local device-mapper (unchanged) |
-| Storage (golden) | Local only | TrueNAS NFS (centralized) |
-| Migration transfer | rsync only | rsync + TrueNAS staging fallback |
-| Node communication | SSH-based | HTTP API over Tailscale |
-| State preservation | Secondary concern | Primary concern |
-| Secrets management | Scattered, ad-hoc | Single `boxcutter.yaml` + `secrets/` bundle |
-| Provisioning | Manual file placement | `boxcutter-setup` from standardized bundle |
-| Tailscale auth keys | One key for everything | Separate node key + VM key |
+| Aspect | Current (single-node) | Multi-host design | Changes? |
+|--------|----------------------|-------------------|----------|
+| VM networking | Bridge (brvm0, 10.0.1.x, ebtables) | Same per-node bridge | **No change** |
+| IP allocation | Pool 10.0.1.200-250 per node | Same pool per node | **No change** |
+| VM isolation | ebtables FORWARD DROP | Same | **No change** |
+| Tailscale overlay | Per-VM ephemeral join | Same | **No change** |
+| vmid | Go service, source-IP identity | Same, per-node | **No change** |
+| Device-mapper COW | Local snapshots | Same | **No change** |
+| Kernel ip= boot | Static per-VM | Same | **No change** |
+| Metadata redirect | 169.254.169.254 → vmid | Same | **No change** |
+| Control interface | `boxcutter-ssh` on node | Orchestrator SSH (multi-node aware) | **Extended** |
+| VM lifecycle | `boxcutter-ctl` (bash) | Node agent (Go HTTP API) | **Rewritten** |
+| Bridge setup | `boxcutter-net` (bash) | Node agent (Go) | **Subsumed** |
+| Secrets | Scattered files | `boxcutter.yaml` + `secrets/` | **Standardized** |
+| Golden images | Local only | TrueNAS NFS (centralized) | **New** |
+| Migration | N/A | rsync + TrueNAS staging | **New** |
+| Multi-node scheduling | N/A | Orchestrator | **New** |
 
 ---
 
@@ -901,7 +789,7 @@ Where do golden image builds happen?
 - On any node (orchestrator picks one)
 - On the orchestrator itself
 
-Recommendation: On any node. The orchestrator picks a node, tells it to build, then the result is pushed to TrueNAS NFS.
+Recommendation: On any node. The orchestrator picks a node, tells it to build, then the result is pushed to TrueNAS NFS. This is the same pattern as current `boxcutter-ctl golden build/provision`, just triggered remotely.
 
 ### Q3: Node auto-scaling
 
