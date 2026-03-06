@@ -235,8 +235,8 @@ SSH into the Node VM and set up Tailscale:
 ```bash
 ssh ubuntu@10.0.0.2
 
-# Join the Node VM to Tailscale (interactive login — this is a persistent node)
-sudo tailscale up --hostname=boxcutter --ssh
+# Join the Node VM to Tailscale (this is a persistent node, not ephemeral)
+sudo tailscale up --hostname=boxcutter
 
 # Place the ephemeral VM auth key (used to provision disposable VMs)
 echo 'tskey-auth-XXXXXXX' | sudo tee /etc/boxcutter/tailscale-authkey

@@ -74,7 +74,7 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'H=$(cat /proc/cmdline | grep -oP "ip=[^:]*::[^:]*:[^:]*:\K[^:]+"); [ -n "$H" ] && hostnamectl set-hostname "$H" && sed -i "s/127.0.1.1.*/127.0.1.1 $H/" /etc/hosts'
+ExecStart=/bin/bash -c 'H=$(cat /proc/cmdline | grep -oP "ip=[^:]*::[^:]*:[^:]*:\K[^:]+"); [ -n "$H" ] && echo "$H" > /etc/hostname && hostname "$H" && sed -i "s/127.0.1.1.*/127.0.1.1 $H/" /etc/hosts'
 RemainAfterExit=yes
 
 [Install]
