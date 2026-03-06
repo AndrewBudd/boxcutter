@@ -37,6 +37,10 @@ echo "dev:dev" | chpasswd
 su - dev -c 'curl -fsSL https://mise.run | sh' || true
 su - dev -c 'echo "eval \"\$(~/.local/bin/mise activate bash)\"" >> ~/.bashrc' || true
 su - dev -c 'echo "export PATH=\"\$HOME/.local/bin:\$HOME/.local/share/mise/shims:\$PATH\"" >> ~/.profile' || true
+# Ensure mise shims are in PATH for non-interactive SSH commands
+# (.bashrc has a guard that exits early for non-interactive shells,
+#  and .profile is only sourced for login shells)
+su - dev -c 'sed -i "2i export PATH=\"\$HOME/.local/bin:\$HOME/.local/share/mise/shims:\$PATH\"" ~/.bashrc' || true
 su - dev -c '~/.local/bin/mise use -g node@22' || true
 su - dev -c '~/.local/bin/mise use -g ruby@3.2' || true
 
