@@ -1,0 +1,77 @@
+# boxcutter.yaml — single config file for the entire deployment
+#
+# Place this at /etc/boxcutter/boxcutter.yaml along with the secrets/ directory.
+# See docs/immutable-node-design.md for full documentation.
+#
+# Minimum required: tailscale.vm_authkey_path + ssh.authorized_keys_path
+
+# Tailscale
+tailscale:
+  # Auth key for node VMs joining the tailnet
+  # Type: reusable, NOT ephemeral (nodes are long-lived)
+  # Generate at: https://login.tailscale.com/admin/settings/keys
+  node_authkey_path: /etc/boxcutter/secrets/tailscale-node-authkey
+
+  # Auth key for resource VMs joining the tailnet
+  # Type: reusable, ephemeral (VMs auto-remove on disconnect)
+  vm_authkey_path: /etc/boxcutter/secrets/tailscale-vm-authkey
+
+  # Orchestrator's stable hostname on the tailnet
+  orchestrator_hostname: boxcutter
+
+  # Node hostname prefix (nodes become <prefix>-<id>, e.g., bc-a1b2c3)
+  node_hostname_prefix: bc
+
+# SSH
+ssh:
+  # Keypair for node-to-VM SSH access
+  # Auto-generated on first boot if absent
+  private_key_path: /etc/boxcutter/secrets/node-ssh.key
+  public_key_path: /etc/boxcutter/secrets/node-ssh.pub
+
+  # Public keys of humans who can SSH to VMs and the orchestrator
+  # One key per line, same format as ~/.ssh/authorized_keys
+  authorized_keys_path: /etc/boxcutter/secrets/authorized-keys
+
+# GitHub App (optional — enables GitHub token minting for VMs)
+github:
+  enabled: false
+  # app_id: 123456
+  # installation_id: 789012
+  # private_key_path: /etc/boxcutter/secrets/github-app.pem
+
+# JWT (vmid token signing)
+jwt:
+  # ECDSA P-256 key for signing JWT tokens issued by vmid.
+  # Auto-generated if absent. Share the same key across all nodes so external
+  # services can verify tokens from any node using the same JWKS.
+  key_path: /etc/boxcutter/secrets/jwt-signing.pem
+  ttl: 10m
+
+# Storage
+storage:
+  # Golden image source (TrueNAS NFS)
+  # Set to empty string to skip NFS and manage golden images locally
+  golden_nfs_path: ""
+  # golden_nfs_path: "truenas:/mnt/pool/boxcutter/golden"
+
+  # Local cache of golden image on each node
+  golden_local_path: /var/lib/boxcutter/golden/rootfs.ext4
+
+  # Migration staging area on TrueNAS NFS (optional)
+  # Used as fallback when direct node-to-node rsync is slow
+  staging_nfs_path: ""
+  # staging_nfs_path: "truenas:/mnt/pool/boxcutter/staging"
+
+# TrueNAS (optional)
+truenas:
+  enabled: false
+  # host: truenas
+  # api_key_path: /etc/boxcutter/secrets/truenas-api-key
+
+# VM defaults
+vm_defaults:
+  vcpu: 4
+  ram_mib: 8192
+  disk: 50G
+  dns: 8.8.8.8
