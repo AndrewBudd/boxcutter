@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh GitHub token every 30 minutes
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

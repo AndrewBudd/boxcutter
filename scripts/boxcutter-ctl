@@ -10,6 +10,7 @@ BRIDGE="brvm0"
 SSH_KEY="${BOXCUTTER_HOME}/ssh/id_ed25519"
 CONF="${BOXCUTTER_HOME}/network.conf"
 TS_AUTHKEY_FILE="/etc/boxcutter/tailscale-authkey"
+VMID_SOCKET="/run/vmid/admin.sock"
 
 DEFAULT_VCPU=4
 DEFAULT_RAM_MIB=8192
@@ -32,7 +33,7 @@ usage() {
 boxcutter-ctl — Firecracker microVM manager
 
 Commands:
-  create <name> [--vcpu N] [--ram MiB] [--disk SIZE]
+  create <name> [--vcpu N] [--ram MiB] [--disk SIZE] [--clone REPO]
   start <name>
   stop <name>
   destroy <name>
@@ -126,17 +127,56 @@ get_tailscale_ip() {
 }
 
 
+# --- vmid helpers ---
+
+vmid_register() {
+  local vm_id=$1 ip=$2 github_repo=${3:-}
+  [ -S "$VMID_SOCKET" ] || return 0
+  local payload
+  payload=$(jq -n --arg id "$vm_id" --arg ip "$ip" --arg repo "$github_repo" \
+    '{vm_id: $id, ip: $ip} + (if $repo != "" then {github_repo: $repo} else {} end)')
+  curl -sf --unix-socket "$VMID_SOCKET" \
+    -X POST http://localhost/internal/vms \
+    -H 'Content-Type: application/json' \
+    -d "$payload" >/dev/null 2>&1 || true
+}
+
+vmid_deregister() {
+  local vm_id=$1
+  [ -S "$VMID_SOCKET" ] || return 0
+  curl -sf --unix-socket "$VMID_SOCKET" \
+    -X DELETE "http://localhost/internal/vms/${vm_id}" >/dev/null 2>&1 || true
+}
+
+# Parse a git clone URL (SSH or HTTPS) into owner/repo format
+parse_repo_url() {
+  local url=$1
+  # SSH: git@github.com:owner/repo.git
+  if [[ "$url" =~ ^git@[^:]+:(.+)$ ]]; then
+    echo "${BASH_REMATCH[1]}" | sed 's/\.git$//'
+    return
+  fi
+  # HTTPS: https://github.com/owner/repo.git
+  if [[ "$url" =~ ^https?://[^/]+/(.+)$ ]]; then
+    echo "${BASH_REMATCH[1]}" | sed 's/\.git$//'
+    return
+  fi
+  # Already owner/repo format
+  echo "$url"
+}
+
 # --- Commands ---
 
 cmd_create() {
   local name=$1; shift
-  local vcpu=$DEFAULT_VCPU ram=$DEFAULT_RAM_MIB disk=$DEFAULT_DISK
+  local vcpu=$DEFAULT_VCPU ram=$DEFAULT_RAM_MIB disk=$DEFAULT_DISK clone_url=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --vcpu) vcpu=$2; shift 2 ;;
-      --ram)  ram=$2; shift 2 ;;
-      --disk) disk=$2; shift 2 ;;
+      --vcpu)  vcpu=$2; shift 2 ;;
+      --ram)   ram=$2; shift 2 ;;
+      --disk)  disk=$2; shift 2 ;;
+      --clone) clone_url=$2; shift 2 ;;
       *) echo "Unknown option: $1"; exit 1 ;;
     esac
   done
@@ -188,19 +228,28 @@ cmd_create() {
   # Kernel ip= parameter for instant static networking (internal network)
   local boot_ip="ip=${ip}::${VM_GW}:${netmask}:${name}:eth0:off:${VM_DNS}"
 
+  # Parse clone URL to owner/repo if provided
+  local github_repo=""
+  if [ -n "$clone_url" ]; then
+    github_repo=$(parse_repo_url "$clone_url")
+  fi
+
   # VM metadata
-  cat > "${VM_DIR}/${name}/vm.json" <<EOF
-{
-  "name": "${name}",
-  "vcpu": ${vcpu},
-  "ram_mib": ${ram},
-  "internal_ip": "${ip}",
-  "mac": "${mac}",
-  "disk": "${disk}",
-  "tap": "${tap}",
-  "created": "$(date -Iseconds)"
-}
-EOF
+  local vm_json
+  vm_json=$(jq -n \
+    --arg name "$name" \
+    --argjson vcpu "$vcpu" \
+    --argjson ram "$ram" \
+    --arg ip "$ip" \
+    --arg mac "$mac" \
+    --arg disk "$disk" \
+    --arg tap "$tap" \
+    --arg created "$(date -Iseconds)" \
+    --arg clone_url "$clone_url" \
+    --arg github_repo "$github_repo" \
+    '{name: $name, vcpu: $vcpu, ram_mib: $ram, internal_ip: $ip, mac: $mac, disk: $disk, tap: $tap, created: $created} +
+     (if $clone_url != "" then {clone_url: $clone_url, github_repo: $github_repo} else {} end)')
+  echo "$vm_json" > "${VM_DIR}/${name}/vm.json"
 
   # Firecracker config
   cat > "${VM_DIR}/${name}/fc-config.json" <<EOF
@@ -359,6 +408,25 @@ cmd_start() {
       echo "  Warning: No Tailscale auth key at ${TS_AUTHKEY_FILE}"
       echo "  VM is accessible internally at ${ip}"
     fi
+
+    # Register with vmid
+    local github_repo
+    github_repo=$(jq -r '.github_repo // ""' "${VM_DIR}/${name}/vm.json")
+    vmid_register "$name" "$ip" "$github_repo"
+
+    # Clone repo if --clone was specified
+    local clone_url
+    clone_url=$(jq -r '.clone_url // ""' "${VM_DIR}/${name}/vm.json")
+    if [ -n "$clone_url" ]; then
+      echo "  Cloning ${clone_url}..."
+      # Wait for gh-token-refresh to run (triggered on boot)
+      sleep 2
+      # Trigger a token refresh so gh auth is ready for the clone
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+        "/usr/local/bin/gh-token-refresh 2>/dev/null; git clone '${clone_url}' ~/project" 2>/dev/null || \
+        echo "  Warning: clone failed (repo may require auth — it will work after token refresh)"
+    fi
   else
     echo "  Internal VM — skipping Tailscale"
     echo "  SSH (internal): ssh ${ip}"
@@ -425,6 +493,9 @@ cmd_destroy() {
   local name=$1
   [ -z "$name" ] && { echo "Usage: boxcutter-ctl destroy <name>"; exit 1; }
   [ -d "${VM_DIR}/${name}" ] || { echo "VM '${name}' does not exist."; exit 1; }
+
+  # Deregister from vmid
+  vmid_deregister "$name"
 
   # Stop if running (ephemeral Tailscale key auto-removes disconnected nodes)
   if [ -f "${VM_DIR}/${name}/firecracker.pid" ]; then
@@ -515,7 +586,7 @@ cmd_status() {
 # --- Main ---
 
 case "${1:-help}" in
-  create)  shift; cmd_create "$@" ;;
+  create|new)  shift; cmd_create "$@" ;;
   start)   cmd_start "$2" ;;
   stop)    cmd_stop "$2" ;;
   destroy) cmd_destroy "$2" ;;

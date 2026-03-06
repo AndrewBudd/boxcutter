@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh GitHub token from vmid
+
+[Service]
+Type=oneshot
+User=dev
+ExecStart=/usr/local/bin/gh-token-refresh
+Environment=HOME=/home/dev

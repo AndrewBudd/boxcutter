@@ -1,0 +1,30 @@
+listen:
+  vm_port: 8775
+  admin_socket: /run/vmid/admin.sock
+
+jwt:
+  ttl: "10m"
+  # key_path: /etc/vmid/jwt-key.pem  # optional; auto-generates if omitted
+
+# Optional: GitHub App integration
+# github:
+#   app_id: 123456
+#   installation_id: 789012
+#   private_key_path: /etc/vmid/github-app.pem
+#   repo_cache_ttl: "15m"
+
+# Optional: label-based policies for GitHub token scoping
+# policies:
+#   - match:
+#       labels:
+#         env: ci
+#     github:
+#       repositories:
+#         - "myorg/*"
+#       permissions:
+#         contents: read
+#         pull_requests: write
+
+log:
+  level: info
+  format: json
