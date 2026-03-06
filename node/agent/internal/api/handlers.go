@@ -1,12 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -30,6 +32,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/start", h.handleStart)
 	mux.HandleFunc("POST /api/vms/{name}/export", h.handleExport)
 	mux.HandleFunc("POST /api/vms/{name}/import", h.handleImport)
+	mux.HandleFunc("POST /api/vms/{name}/import-snapshot", h.handleImportSnapshot)
+	mux.HandleFunc("POST /api/vms/{name}/migrate", h.handleMigrate)
+	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
+	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
+	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 }
 
@@ -251,6 +258,130 @@ func (h *Handler) handleImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, resp)
+}
+
+func (h *Handler) handleImportSnapshot(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+
+	// COW + vm.snap + vm.mem already transferred to disk via tar.
+	// We just need the VM state metadata to set up TAP/fwmark/vmid.
+	var st vm.VMState
+	if err := json.NewDecoder(r.Body).Decode(&st); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	st.Name = name
+
+	resp, err := h.mgr.ImportSnapshot(&st)
+	if err != nil {
+		log.Printf("Import snapshot failed for %s: %v", name, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+
+	var req struct {
+		TargetAddr     string `json:"target_addr"`
+		TargetBridgeIP string `json:"target_bridge_ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.TargetAddr == "" || req.TargetBridgeIP == "" {
+		http.Error(w, "target_addr and target_bridge_ip are required", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := h.mgr.MigrateVM(name, req.TargetAddr, req.TargetBridgeIP)
+	if err != nil {
+		log.Printf("Migration failed for %s: %v", name, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, resp)
+}
+
+func (h *Handler) handleGoldenVersions(w http.ResponseWriter, r *http.Request) {
+	versions := vm.ListGoldenVersions(h.mgr.GoldenDir())
+	writeJSON(w, map[string]interface{}{
+		"versions": versions,
+	})
+}
+
+func (h *Handler) handleGoldenCheck(w http.ResponseWriter, r *http.Request) {
+	version := r.PathValue("version")
+	if version == "" {
+		version = strings.TrimPrefix(r.URL.Path, "/api/golden/")
+	}
+	if vm.HasGoldenVersion(h.mgr.GoldenDir(), version) {
+		writeJSON(w, map[string]string{"version": version, "status": "available"})
+	} else {
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+func (h *Handler) handleGoldenBuild(w http.ResponseWriter, r *http.Request) {
+	goldenPath := h.mgr.GoldenPath()
+	if _, err := os.Stat(goldenPath); err == nil {
+		writeJSON(w, map[string]string{"status": "already_exists"})
+		return
+	}
+
+	buildScript := filepath.Join(filepath.Dir(goldenPath), "build.sh")
+	if _, err := os.Stat(buildScript); err != nil {
+		http.Error(w, "build script not found", http.StatusNotFound)
+		return
+	}
+
+	flusher, canFlush := w.(http.Flusher)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+
+	emit := func(phase, message string) {
+		line, _ := json.Marshal(progressEvent{Phase: phase, Message: message})
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	emit("building", "Building golden image...")
+	log.Printf("Golden image build started")
+
+	cmd := exec.Command("bash", buildScript)
+	stdout, _ := cmd.StdoutPipe()
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		emit("error", err.Error())
+		return
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		emit("building", scanner.Text())
+	}
+
+	if err := cmd.Wait(); err != nil {
+		log.Printf("Golden image build failed: %v", err)
+		emit("error", fmt.Sprintf("build failed: %v", err))
+		return
+	}
+
+	log.Printf("Golden image build complete")
+	emit("ready", "Golden image ready")
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {

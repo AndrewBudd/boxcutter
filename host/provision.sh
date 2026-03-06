@@ -225,6 +225,19 @@ write_files:
         [ -f /root/go/bin/derper ] && mv /root/go/bin/derper /usr/local/bin/derper
       fi
 
+      # Cluster SSH key: allows nodes to SSH to each other for migration
+      if [ -f /etc/boxcutter/secrets/cluster-ssh.key ]; then
+        mkdir -p /root/.ssh
+        cp /etc/boxcutter/secrets/cluster-ssh.key /root/.ssh/cluster-ssh.key
+        chmod 600 /root/.ssh/cluster-ssh.key
+        printf '%s\n' 'Host 192.168.50.*' '  IdentityFile /root/.ssh/cluster-ssh.key' '  User ubuntu' '  StrictHostKeyChecking no' '  UserKnownHostsFile /dev/null' > /root/.ssh/config
+        chmod 600 /root/.ssh/config
+        # Add cluster pubkey to ubuntu's authorized_keys
+        if [ -f /etc/boxcutter/secrets/cluster-ssh.key.pub ]; then
+          cat /etc/boxcutter/secrets/cluster-ssh.key.pub >> /home/ubuntu/.ssh/authorized_keys
+        fi
+      fi
+
       # boxcutter-setup (generates secrets, joins Tailscale, generates vmid config)
       /usr/local/bin/boxcutter-setup
 

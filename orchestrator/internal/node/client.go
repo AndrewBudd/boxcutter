@@ -50,6 +50,7 @@ type HealthResponse struct {
 	RAMFreeMIB      int    `json:"ram_free_mib"`
 	VMsTotal        int    `json:"vms_total"`
 	VMsRunning      int    `json:"vms_running"`
+	GoldenReady     bool   `json:"golden_ready"`
 	Status          string `json:"status"`
 }
 
@@ -176,6 +177,31 @@ func (c *Client) Health() (*HealthResponse, error) {
 	return &hr, nil
 }
 
+// BuildGolden triggers a golden image build on the node, streaming progress.
+func (c *Client) BuildGolden(progress func(phase, message string)) error {
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Post(c.baseURL+"/api/golden/build", "", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	decoder := json.NewDecoder(resp.Body)
+	for decoder.More() {
+		var evt ProgressEvent
+		if err := decoder.Decode(&evt); err != nil {
+			break
+		}
+		if evt.Phase == "error" {
+			return fmt.Errorf("%s", evt.Message)
+		}
+		if progress != nil {
+			progress(evt.Phase, evt.Message)
+		}
+	}
+	return nil
+}
+
 func (c *Client) Export(name string) (*ExportResponse, error) {
 	resp, err := c.http.Post(c.baseURL+"/api/vms/"+name+"/export", "", nil)
 	if err != nil {
@@ -204,6 +230,111 @@ func (c *Client) Import(name string, vmState json.RawMessage) (*CreateResponse, 
 	var cr CreateResponse
 	json.NewDecoder(resp.Body).Decode(&cr)
 	return &cr, nil
+}
+
+type MigrateRequest struct {
+	TargetAddr     string `json:"target_addr"`
+	TargetBridgeIP string `json:"target_bridge_ip"`
+}
+
+type MigrateResponse struct {
+	Name        string `json:"name"`
+	TailscaleIP string `json:"tailscale_ip,omitempty"`
+	Mark        int    `json:"mark"`
+	TargetNode  string `json:"target_node"`
+	Status      string `json:"status"`
+}
+
+func (c *Client) Migrate(name string, req *MigrateRequest) (*MigrateResponse, error) {
+	body, _ := json.Marshal(req)
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+name+"/migrate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("migrate request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("migrate: %s", string(errBody))
+	}
+	var mr MigrateResponse
+	json.NewDecoder(resp.Body).Decode(&mr)
+	return &mr, nil
+}
+
+// VMDetail is the full VM info returned by the node agent.
+type VMDetail struct {
+	Name        string `json:"name"`
+	TailscaleIP string `json:"tailscale_ip"`
+	Mark        int    `json:"mark"`
+	Mode        string `json:"mode"`
+	VCPU        int    `json:"vcpu"`
+	RAMMIB      int    `json:"ram_mib"`
+	Disk        string `json:"disk"`
+	Status      string `json:"status"`
+}
+
+// FastClient is a node client with a short timeout for non-critical queries.
+type FastClient struct {
+	baseURL string
+	http    *http.Client
+}
+
+func NewFastClient(apiAddr string) *FastClient {
+	return &FastClient{
+		baseURL: "http://" + apiAddr,
+		http:    &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+// GetVM fetches detail for a single VM from the node. Returns nil on any error.
+func (c *FastClient) GetVM(name string) *VMDetail {
+	resp, err := c.http.Get(c.baseURL + "/api/vms/" + name)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil
+	}
+	// Node returns {"vm": {...}, "status": "..."}
+	var result struct {
+		VM     VMDetail `json:"vm"`
+		Status string   `json:"status"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&result) != nil {
+		return nil
+	}
+	result.VM.Status = result.Status
+	return &result.VM
+}
+
+// ListVMs fetches all VMs from the node. Returns nil on any error.
+func (c *FastClient) ListVMs() []VMDetail {
+	resp, err := c.http.Get(c.baseURL + "/api/vms")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil
+	}
+	var vms []VMDetail
+	json.NewDecoder(resp.Body).Decode(&vms)
+	return vms
+}
+
+// Health fetches health from the node. Returns nil on any error.
+func (c *FastClient) Health() *HealthResponse {
+	resp, err := c.http.Get(c.baseURL + "/api/health")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var hr HealthResponse
+	if json.NewDecoder(resp.Body).Decode(&hr) != nil {
+		return nil
+	}
+	return &hr
 }
 
 func (c *Client) ListVMs() ([]json.RawMessage, error) {

@@ -186,6 +186,38 @@ EOF
 # the auth key is never stored on the VM's disk)
 chroot "${WORK}/mnt" systemctl enable tailscaled 2>/dev/null || true
 
+# --- vsock listener for migration nudges ---
+echo "Building vsock listener..."
+cp "${SRC:-$(dirname "$0")/..}/golden/vsock_listen.c" "${WORK}/mnt/tmp/vsock_listen.c" 2>/dev/null || \
+  cp "$(dirname "$0")/vsock_listen.c" "${WORK}/mnt/tmp/vsock_listen.c"
+chroot "${WORK}/mnt" bash -c 'gcc -o /usr/local/bin/boxcutter-vsock-listen /tmp/vsock_listen.c && rm /tmp/vsock_listen.c'
+
+# Nudge script: re-establish tailscale network path after migration
+cat > "${WORK}/mnt/usr/local/bin/boxcutter-nudge" << 'SCRIPT'
+#!/bin/bash
+# Called via vsock after snapshot migration to nudge tailscale.
+# Force STUN re-probing to discover the new network path.
+tailscale netcheck >/dev/null 2>&1 &
+SCRIPT
+chmod 755 "${WORK}/mnt/usr/local/bin/boxcutter-nudge"
+
+# Systemd service for vsock listener
+cat > "${WORK}/mnt/etc/systemd/system/boxcutter-vsock.service" << 'SVCEOF'
+[Unit]
+Description=Boxcutter vsock listener
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boxcutter-vsock-listen
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+chroot "${WORK}/mnt" systemctl enable boxcutter-vsock 2>/dev/null || true
+
 # --- Services declaration file ---
 cat > "${WORK}/mnt/home/dev/.services" << 'EOF'
 # Declare services as name=port, one per line
@@ -199,18 +231,26 @@ chown 1000:1000 "${WORK}/mnt/home/dev/.services"
 umount "${WORK}/mnt"
 
 mkdir -p "$GOLDEN_DIR"
-mv "${WORK}/rootfs.ext4" "$OUTPUT"
 
-ACTUAL_SIZE=$(du -h "$OUTPUT" | cut -f1)
+# Version the golden image by SHA256
+GOLDEN_SHA=$(sha256sum "${WORK}/rootfs.ext4" | cut -c1-12)
+VERSIONED="${GOLDEN_DIR}/${GOLDEN_SHA}.ext4"
+
+mv "${WORK}/rootfs.ext4" "$VERSIONED"
+
+# Symlink rootfs.ext4 → current version
+ln -sf "${GOLDEN_SHA}.ext4" "$OUTPUT"
+
+# Write version metadata
+echo "$GOLDEN_SHA" > "${GOLDEN_DIR}/current-version"
+
+ACTUAL_SIZE=$(du -h "$VERSIONED" | cut -f1)
 echo ""
 echo "=== Golden base image built ==="
-echo "Path: ${OUTPUT}"
-echo "Size: ${ACTUAL_SIZE} used / ${SIZE} max"
+echo "Version: ${GOLDEN_SHA}"
+echo "Path:    ${VERSIONED}"
+echo "Size:    ${ACTUAL_SIZE} used / ${SIZE} max"
 echo ""
-echo "The base image has Ubuntu + SSH + Tailscale."
-echo "To install dev tools, boot as a VM and provision:"
-echo "  boxcutter-ctl golden provision"
-echo ""
-echo "Or create a VM directly (tools can be added later):"
+echo "Or create a VM directly:"
 echo "  boxcutter-ctl create agent-1"
 echo ""

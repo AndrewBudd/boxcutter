@@ -145,6 +145,73 @@ func CleanupSnapshot(vmDir string) {
 	os.Remove(filepath.Join(vmDir, "snapshot.json"))
 }
 
+// resolveGoldenVersion reads the current golden version from the golden directory.
+// If versioning hasn't been set up yet (legacy), returns "unversioned".
+func resolveGoldenVersion(goldenPath string) string {
+	goldenDir := filepath.Dir(goldenPath)
+	verFile := filepath.Join(goldenDir, "current-version")
+	data, err := os.ReadFile(verFile)
+	if err != nil {
+		return "unversioned"
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// GoldenPathForVersion returns the path to a specific golden version's image.
+// Falls back to the default golden path if version is "unversioned" or not found.
+func GoldenPathForVersion(goldenDir, version string) string {
+	if version == "" || version == "unversioned" {
+		return filepath.Join(goldenDir, "rootfs.ext4")
+	}
+	versioned := filepath.Join(goldenDir, version+".ext4")
+	if _, err := os.Stat(versioned); err == nil {
+		return versioned
+	}
+	// Fall back to default
+	return filepath.Join(goldenDir, "rootfs.ext4")
+}
+
+// ListGoldenVersions returns all golden image versions available on this node.
+func ListGoldenVersions(goldenDir string) []string {
+	entries, err := os.ReadDir(goldenDir)
+	if err != nil {
+		return nil
+	}
+	var versions []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".ext4") && name != "rootfs.ext4" {
+			versions = append(versions, strings.TrimSuffix(name, ".ext4"))
+		}
+	}
+	return versions
+}
+
+// HasGoldenVersion checks if a specific golden version exists on this node.
+func HasGoldenVersion(goldenDir, version string) bool {
+	if version == "" || version == "unversioned" {
+		_, err := os.Stat(filepath.Join(goldenDir, "rootfs.ext4"))
+		return err == nil
+	}
+	_, err := os.Stat(filepath.Join(goldenDir, version+".ext4"))
+	return err == nil
+}
+
+// GoldenVersionUsers returns the names of VMs using a specific golden version.
+func GoldenVersionUsers(version string) []string {
+	vms, err := ListVMs()
+	if err != nil {
+		return nil
+	}
+	var users []string
+	for _, vm := range vms {
+		if vm.GoldenVer == version {
+			users = append(users, vm.Name)
+		}
+	}
+	return users
+}
+
 func runShell(cmd string) error {
 	return run("bash", "-c", cmd)
 }

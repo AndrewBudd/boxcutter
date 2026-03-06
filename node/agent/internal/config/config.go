@@ -88,8 +88,8 @@ func Load(path string) (*Config, error) {
 			GoldenLocalPath: "/var/lib/boxcutter/golden/rootfs.ext4",
 		},
 		VMDefaults: VMDefaults{
-			VCPU:   4,
-			RAMMIB: 8192,
+			VCPU:   2,
+			RAMMIB: 2048,
 			Disk:   "50G",
 			DNS:    "8.8.8.8",
 			Mode:   "normal",

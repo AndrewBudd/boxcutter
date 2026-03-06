@@ -74,6 +74,9 @@ func main() {
 		}
 	}()
 
+	// Restart VMs that were running before node restarted
+	go mgr.RestartAll()
+
 	// Register with orchestrator if configured
 	if cfg.Orchestrator.URL != "" {
 		go registerWithOrchestrator(cfg, mgr)

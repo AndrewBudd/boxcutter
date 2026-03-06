@@ -1,9 +1,12 @@
 package vm
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,6 +110,9 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 		return nil, fmt.Errorf("golden image not found at %s", goldenPath)
 	}
 
+	// Resolve golden version
+	goldenVer := resolveGoldenVersion(goldenPath)
+
 	os.MkdirAll(vmDir, 0755)
 
 	// Allocate mark
@@ -142,6 +148,7 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 		Created:    time.Now().Format(time.RFC3339),
 		CloneURL:   req.CloneURL,
 		GitHubRepo: githubRepo,
+		GoldenVer:  goldenVer,
 	}
 	if err := SaveVMState(vmDir, st); err != nil {
 		CleanupSnapshot(vmDir)
@@ -156,22 +163,8 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 		return nil, err
 	}
 
-	// Inject CA cert into rootfs
-	m.injectCACert(st)
-
-	// Inject SSH keys into rootfs
-	if len(req.AuthorizedKeys) > 0 {
-		// Write orchestrator-provided keys to a temp file
-		tmpFile, err := os.CreateTemp("", "bc-authkeys-")
-		if err == nil {
-			tmpFile.WriteString(strings.Join(req.AuthorizedKeys, "\n") + "\n")
-			tmpFile.Close()
-			m.injectSSHKeysFromPath(st, tmpFile.Name())
-			os.Remove(tmpFile.Name())
-		}
-	} else {
-		m.injectSSHKeys(st)
-	}
+	// Inject CA cert + SSH keys in a single mount
+	m.prepareRootfs(st, req.AuthorizedKeys)
 
 	// Start the VM
 	resp, err := m.startVM(st, req.progress)
@@ -199,8 +192,13 @@ func (m *Manager) Start(name string) (*CreateResponse, error) {
 		return nil, fmt.Errorf("VM '%s' is already running", name)
 	}
 
-	// Ensure dm-snapshot is active
-	if err := EnsureSnapshot(vmDir, m.cfg.Storage.GoldenLocalPath); err != nil {
+	// Clean up stale TAP/rules from previous runs (idempotent)
+	TeardownTAP(st.TAP, st.Mark)
+	CleanupSnapshot(vmDir)
+
+	// Ensure dm-snapshot is active (resolve golden version for this VM)
+	goldenPath := m.goldenPathForVM(st)
+	if err := EnsureSnapshot(vmDir, goldenPath); err != nil {
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
@@ -228,8 +226,9 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 		}
 	}
 
-	// Clean stale socket
+	// Clean stale sockets
 	os.Remove(filepath.Join(vmDir, "api.sock"))
+	os.Remove(filepath.Join(vmDir, "vsock.sock"))
 
 	emit("starting", "Starting Firecracker VM...")
 	// Launch Firecracker
@@ -297,7 +296,9 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 	// Clone repo if specified
 	if st.CloneURL != "" {
 		emit("clone", fmt.Sprintf("Cloning %s...", st.CloneURL))
-		m.cloneRepo(st)
+		if err := m.cloneRepo(st); err != nil {
+			emit("clone_failed", fmt.Sprintf("Warning: %s", err))
+		}
 	}
 
 	// Update state with Tailscale IP
@@ -450,6 +451,100 @@ func (m *Manager) List() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
+// RestartAll restarts all VMs found on disk. Called on node agent startup
+// to recover VMs after a node reboot.
+func (m *Manager) RestartAll() {
+	vms, err := ListVMs()
+	if err != nil || len(vms) == 0 {
+		return
+	}
+
+	log.Printf("Found %d VM(s) on disk, restarting...", len(vms))
+
+	// Brief delay to let systemd finish killing orphaned Firecracker processes
+	// from the previous agent run (they may still be alive during cgroup cleanup)
+	time.Sleep(2 * time.Second)
+
+	for _, st := range vms {
+		vmDir := VMDir(st.Name)
+		if IsRunning(vmDir) {
+			log.Printf("  %s: already running, skipping", st.Name)
+			continue
+		}
+
+		goldenPath := m.goldenPathForVM(st)
+		if _, err := os.Stat(goldenPath); err != nil {
+			log.Printf("  %s: golden image %s not found, skipping", st.Name, st.GoldenVer)
+			continue
+		}
+
+		// Clean up stale TAP/rules/snapshot from previous run
+		TeardownTAP(st.TAP, st.Mark)
+		CleanupSnapshot(vmDir)
+
+		if err := EnsureSnapshot(vmDir, goldenPath); err != nil {
+			log.Printf("  %s: snapshot failed: %v", st.Name, err)
+			continue
+		}
+
+		if err := writeFirecrackerConfig(vmDir, st); err != nil {
+			log.Printf("  %s: config failed: %v", st.Name, err)
+			continue
+		}
+
+		resp, err := m.startVM(st, nil)
+		if err != nil {
+			log.Printf("  %s: start failed: %v", st.Name, err)
+			continue
+		}
+		log.Printf("  %s: restarted (mark=%d, tailscale=%s)", st.Name, resp.Mark, resp.TailscaleIP)
+	}
+}
+
+// GoldenPath returns the path to the golden rootfs image.
+func (m *Manager) GoldenPath() string {
+	return m.cfg.Storage.GoldenLocalPath
+}
+
+// GoldenDir returns the directory containing golden images.
+func (m *Manager) GoldenDir() string {
+	return filepath.Dir(m.cfg.Storage.GoldenLocalPath)
+}
+
+// goldenPathForVM resolves the golden image path for a specific VM's version.
+func (m *Manager) goldenPathForVM(st *VMState) string {
+	return GoldenPathForVersion(m.GoldenDir(), st.GoldenVer)
+}
+
+// GCGoldenImages removes golden images that no VM depends on,
+// keeping the current version.
+func (m *Manager) GCGoldenImages() []string {
+	goldenDir := m.GoldenDir()
+	current := resolveGoldenVersion(m.cfg.Storage.GoldenLocalPath)
+
+	// Collect all versions in use by VMs
+	vms, _ := ListVMs()
+	inUse := make(map[string]bool)
+	inUse[current] = true // always keep current
+	for _, v := range vms {
+		if v.GoldenVer != "" {
+			inUse[v.GoldenVer] = true
+		}
+	}
+
+	var removed []string
+	for _, ver := range ListGoldenVersions(goldenDir) {
+		if !inUse[ver] {
+			path := filepath.Join(goldenDir, ver+".ext4")
+			if os.Remove(path) == nil {
+				removed = append(removed, ver)
+				log.Printf("GC: removed unused golden image %s", ver)
+			}
+		}
+	}
+	return removed
+}
+
 // Health returns node health and capacity info.
 func (m *Manager) Health() map[string]interface{} {
 	vms, _ := ListVMs()
@@ -480,6 +575,12 @@ func (m *Manager) Health() map[string]interface{} {
 	out, _ = runOutput("nproc")
 	fmt.Sscanf(out, "%d", &cpuCount)
 
+	// Check golden image
+	goldenReady := false
+	if _, err := os.Stat(m.cfg.Storage.GoldenLocalPath); err == nil {
+		goldenReady = true
+	}
+
 	return map[string]interface{}{
 		"hostname":          hostname,
 		"vcpu_total":        cpuCount,
@@ -488,6 +589,7 @@ func (m *Manager) Health() map[string]interface{} {
 		"ram_free_mib":      sysRAM - totalRAM,
 		"vms_total":         len(vms),
 		"vms_running":       running,
+		"golden_ready":      goldenReady,
 		"status":            "active",
 	}
 }
@@ -533,6 +635,10 @@ func writeFirecrackerConfig(vmDir string, st *VMState) error {
 			"vcpu_count":  st.VCPU,
 			"mem_size_mib": st.RAMMIB,
 		},
+		"vsock": map[string]interface{}{
+			"guest_cid": 3,
+			"uds_path":  filepath.Join(vmDir, "vsock.sock"),
+		},
 		"entropy": map[string]interface{}{
 			"rate_limiter": map[string]interface{}{
 				"bandwidth": map[string]int{
@@ -548,6 +654,70 @@ func writeFirecrackerConfig(vmDir string, st *VMState) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(vmDir, "fc-config.json"), data, 0644)
+}
+
+// prepareRootfs mounts the rootfs once and injects CA cert + SSH keys.
+func (m *Manager) prepareRootfs(st *VMState, authorizedKeys []string) {
+	dmName := "bc-" + st.Name
+	mountDir, err := os.MkdirTemp("", "bc-mount-")
+	if err != nil {
+		return
+	}
+	defer os.RemoveAll(mountDir)
+
+	if run("mount", "/dev/mapper/"+dmName, mountDir) != nil {
+		return
+	}
+	defer run("umount", mountDir)
+
+	// CA cert
+	caCert := m.cfg.TLS.CACertPath
+	if _, err := os.Stat(caCert); err == nil {
+		caDir := filepath.Join(mountDir, "usr/local/share/ca-certificates")
+		os.MkdirAll(caDir, 0755)
+		run("cp", caCert, filepath.Join(caDir, "boxcutter-ca.crt"))
+		run("chroot", mountDir, "update-ca-certificates")
+	}
+
+	// SSH keys
+	sshDir := filepath.Join(mountDir, "home/dev/.ssh")
+	os.MkdirAll(sshDir, 0700)
+	existingKeysPath := filepath.Join(sshDir, "authorized_keys")
+	existingKeys, _ := os.ReadFile(existingKeysPath)
+
+	keySet := make(map[string]bool)
+	for _, k := range strings.Split(string(existingKeys), "\n") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keySet[k] = true
+		}
+	}
+
+	// Add keys from provided list or from config file
+	if len(authorizedKeys) > 0 {
+		for _, k := range authorizedKeys {
+			k = strings.TrimSpace(k)
+			if k != "" {
+				keySet[k] = true
+			}
+		}
+	} else if authKeysFile := m.cfg.SSH.AuthorizedKeysPath; authKeysFile != "" {
+		if newKeys, err := os.ReadFile(authKeysFile); err == nil {
+			for _, k := range strings.Split(string(newKeys), "\n") {
+				k = strings.TrimSpace(k)
+				if k != "" {
+					keySet[k] = true
+				}
+			}
+		}
+	}
+
+	var merged []string
+	for k := range keySet {
+		merged = append(merged, k)
+	}
+	os.WriteFile(existingKeysPath, []byte(strings.Join(merged, "\n")+"\n"), 0600)
+	run("chown", "-R", "1000:1000", sshDir)
 }
 
 func (m *Manager) injectCACert(st *VMState) {
@@ -664,7 +834,7 @@ PROXYEOF`
 	VMSSH(st.TAP, sshKey, "sudo bash -c '"+proxyScript+"'")
 }
 
-func (m *Manager) cloneRepo(st *VMState) {
+func (m *Manager) cloneRepo(st *VMState) error {
 	sshKey := m.cfg.SSH.PrivateKeyPath
 
 	// Try to get GitHub token
@@ -688,7 +858,7 @@ func (m *Manager) cloneRepo(st *VMState) {
 	out, err := VMSSH(st.TAP, sshKey, fmt.Sprintf("git clone '%s' ~/project 2>&1", cloneURL))
 	if err != nil {
 		log.Printf("Clone failed for %s: %s", st.Name, out)
-		return
+		return fmt.Errorf("clone failed: %s", strings.TrimSpace(out))
 	}
 
 	if ghToken != "" {
@@ -707,6 +877,7 @@ git config --global credential.helper '!f() { echo username=x-access-token; echo
 	}
 
 	log.Printf("VM %s: cloned %s", st.Name, st.CloneURL)
+	return nil
 }
 
 // CapacityError indicates the node cannot accept more VMs.
@@ -829,6 +1000,7 @@ func parseRepoURL(url string) string {
 }
 
 // ExportVM stops a VM and returns the path to its COW image for transfer.
+// Used as fallback when snapshot-based migration isn't possible.
 func (m *Manager) ExportVM(name string) (string, *VMState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -857,6 +1029,306 @@ func (m *Manager) ExportVM(name string) (string, *VMState, error) {
 	return cowPath, st, nil
 }
 
+// MigrateVM migrates a VM to another node using Firecracker snapshots.
+// The VM is paused (not stopped), its state is snapshotted, and it resumes
+// on the target node with all processes and memory intact.
+//
+// Flow:
+//   Phase 1 (VM running):  Pre-stage golden image + create target dirs
+//   Phase 2 (VM paused):   Snapshot → transfer COW + snapshot + mem → load on target
+//   Phase 3:               Cleanup source
+func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateResponse, error) {
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+
+	clusterKey := "/root/.ssh/cluster-ssh.key"
+	dstVMDir := fmt.Sprintf("/var/lib/boxcutter/vms/%s/", name)
+
+	// --- Phase 1: Pre-stage while VM is still running ---
+	log.Printf("Migrating %s to %s: pre-staging (VM still running)", name, targetAddr)
+
+	// 1a. Transfer golden image if needed (this is the slow part)
+	if st.GoldenVer != "" && st.GoldenVer != "unversioned" {
+		if err := m.ensureTargetHasGolden(st.GoldenVer, targetAddr, targetBridgeIP); err != nil {
+			return nil, fmt.Errorf("golden transfer: %w", err)
+		}
+	}
+
+	// 1b. Create destination directory on target
+	mkdirCmd := exec.Command("ssh",
+		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", dstVMDir)
+	if out, err := mkdirCmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
+	}
+
+	// --- Phase 2: Pause + Snapshot + Transfer (downtime starts) ---
+	downtimeStart := time.Now()
+
+	if !IsRunning(vmDir) {
+		return nil, fmt.Errorf("VM '%s' is not running — cannot snapshot", name)
+	}
+
+	// 2a. Pause the VM (freezes vCPUs instantly, sub-millisecond)
+	log.Printf("Migrating %s: pausing VM (downtime starts)", name)
+	if err := fcPause(vmDir); err != nil {
+		return nil, fmt.Errorf("pause: %w", err)
+	}
+
+	// 2b. Create Firecracker snapshot (writes vm.snap + vm.mem)
+	_, memPath, err := fcSnapshot(vmDir)
+	if err != nil {
+		// Resume VM on failure so we don't leave it frozen
+		fcResume(vmDir)
+		return nil, fmt.Errorf("snapshot: %w", err)
+	}
+
+	memInfo, _ := os.Stat(memPath)
+	memSize := int64(0)
+	if memInfo != nil {
+		memSize = memInfo.Size()
+	}
+
+	// 2c. Stream COW + snapshot + mem to target using tar --sparse (uncompressed)
+	// On a local bridge, raw throughput beats CPU-bound compression
+	log.Printf("Migrating %s: transferring snapshot (snap + mem + cow)", name)
+	tarCmd := fmt.Sprintf(
+		"sudo tar --sparse -cf - -C %s cow.img vm.snap vm.mem | ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+		vmDir, clusterKey, targetBridgeIP, dstVMDir)
+	streamCmd := exec.Command("bash", "-c", tarCmd)
+	if out, err := streamCmd.CombinedOutput(); err != nil {
+		// Resume VM on failure
+		fcResume(vmDir)
+		return nil, fmt.Errorf("transfer: %s: %w", string(out), err)
+	}
+
+	// 2d. Stop the source VM now that data is transferred
+	// Deregister from vmid first
+	if m.vmid != nil {
+		m.vmid.Deregister(name)
+	}
+	m.stopVM(name)
+
+	// 2e. Load snapshot on target node (import-snapshot endpoint)
+	stJSON, _ := json.Marshal(st)
+	targetClient := &http.Client{Timeout: 5 * time.Minute}
+	importURL := fmt.Sprintf("http://%s/api/vms/%s/import-snapshot", targetAddr, name)
+	resp, err := targetClient.Post(importURL, "application/json", bytes.NewReader(stJSON))
+	if err != nil {
+		return nil, fmt.Errorf("import-snapshot request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("import-snapshot failed: %s", string(body))
+	}
+
+	var importResp CreateResponse
+	json.NewDecoder(resp.Body).Decode(&importResp)
+
+	downtime := time.Since(downtimeStart)
+	log.Printf("Migration complete: %s → %s (mem: %d bytes, downtime: %s, IP: %s)",
+		name, targetAddr, memSize, downtime.Round(time.Millisecond), importResp.TailscaleIP)
+
+	// --- Phase 3: Cleanup source ---
+	os.RemoveAll(vmDir)
+
+	return &MigrateResponse{
+		Name:        importResp.Name,
+		TailscaleIP: importResp.TailscaleIP,
+		Mark:        importResp.Mark,
+		TargetNode:  targetAddr,
+		Status:      "migrated",
+	}, nil
+}
+
+// ImportSnapshot loads a VM from a Firecracker snapshot on this node.
+// The COW, vm.snap, and vm.mem files must already be in the VM directory.
+// This resumes the VM exactly where it was paused — no reboot.
+func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	vmDir := VMDir(st.Name)
+	os.MkdirAll(vmDir, 0755)
+
+	// Reallocate mark/TAP on this node
+	existingMarks := m.collectExistingMarks()
+	st.Mark = AllocateMark(st.Name, existingMarks)
+	st.TAP = TAPName(st.Name)
+
+	if err := SaveVMState(vmDir, st); err != nil {
+		return nil, err
+	}
+
+	// Set up dm-snapshot from golden + COW (same block device path as source)
+	goldenPath := m.goldenPathForVM(st)
+	if err := EnsureSnapshot(vmDir, goldenPath); err != nil {
+		return nil, fmt.Errorf("ensuring snapshot: %w", err)
+	}
+
+	// Set up TAP + fwmark routing
+	if err := SetupTAP(st.TAP, st.Mark); err != nil {
+		return nil, fmt.Errorf("setting up TAP: %w", err)
+	}
+
+	if st.Mode == "paranoid" {
+		if err := SetupParanoidMode(st.TAP); err != nil {
+			TeardownTAP(st.TAP, st.Mark)
+			return nil, fmt.Errorf("paranoid mode: %w", err)
+		}
+	}
+
+	// Clean stale sockets
+	os.Remove(filepath.Join(vmDir, "api.sock"))
+	os.Remove(filepath.Join(vmDir, "vsock.sock"))
+
+	// Launch Firecracker with just an API socket (no config — snapshot provides everything)
+	logFile, _ := os.Create(filepath.Join(vmDir, "firecracker.log"))
+	cmd := exec.Command("firecracker", "--api-sock", filepath.Join(vmDir, "api.sock"))
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		TeardownTAP(st.TAP, st.Mark)
+		return nil, fmt.Errorf("starting firecracker: %w", err)
+	}
+	logFile.Close()
+
+	os.WriteFile(filepath.Join(vmDir, "firecracker.pid"),
+		[]byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
+	go cmd.Wait()
+
+	// Wait for API socket to be ready
+	sockPath := filepath.Join(vmDir, "api.sock")
+	for i := 0; i < 50; i++ {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Load the snapshot — this restores VM state and resumes execution
+	snapPath := filepath.Join(vmDir, "vm.snap")
+	memPath := filepath.Join(vmDir, "vm.mem")
+
+	loadBody := map[string]interface{}{
+		"snapshot_path":        snapPath,
+		"mem_backend": map[string]string{
+			"backend_type":  "File",
+			"backend_path":  memPath,
+		},
+		"enable_diff_snapshots": false,
+		"resume_vm":             true,
+	}
+	if err := fcPut(vmDir, "/snapshot/load", loadBody); err != nil {
+		// Kill Firecracker on failure
+		cmd.Process.Kill()
+		os.Remove(filepath.Join(vmDir, "firecracker.pid"))
+		TeardownTAP(st.TAP, st.Mark)
+		return nil, fmt.Errorf("loading snapshot: %w", err)
+	}
+
+	log.Printf("VM %s resumed from snapshot (PID %d, mark %d)", st.Name, cmd.Process.Pid, st.Mark)
+
+	// Register with vmid
+	if m.vmid != nil {
+		m.vmid.Register(&vmid.RegisterRequest{
+			VMID:       st.Name,
+			IP:         "10.0.0.2",
+			Mark:       st.Mark,
+			Mode:       st.Mode,
+			GitHubRepo: st.GitHubRepo,
+		})
+	}
+
+	// Nudge Tailscale to re-establish its network path through the new node.
+	// Uses vsock (host→guest channel) — no SSH/network dependency needed.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		for i := 0; i < 5; i++ {
+			if err := fcVsockNudge(vmDir, 52); err == nil {
+				log.Printf("VM %s: vsock nudge sent for network path update", st.Name)
+				return
+			}
+			time.Sleep(time.Second)
+		}
+		log.Printf("Warning: vsock nudge failed for %s after migration", st.Name)
+	}()
+
+	// Clean up snapshot files (no longer needed after load)
+	os.Remove(snapPath)
+	os.Remove(memPath)
+
+	return &CreateResponse{
+		Name:        st.Name,
+		TailscaleIP: st.TailscaleIP,
+		Mark:        st.Mark,
+		Mode:        st.Mode,
+		Status:      "running",
+	}, nil
+}
+
+// ensureTargetHasGolden checks if the target node has the required golden image
+// version, and rsyncs it over if not.
+func (m *Manager) ensureTargetHasGolden(version, targetAddr, targetBridgeIP string) error {
+	// Check if target has this version
+	checkURL := fmt.Sprintf("http://%s/api/golden/%s", targetAddr, version)
+	resp, err := http.Get(checkURL)
+	if err != nil {
+		return fmt.Errorf("checking target golden: %w", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("Target node already has golden %s", version)
+		return nil
+	}
+
+	// Transfer golden image to target
+	goldenPath := GoldenPathForVersion(m.GoldenDir(), version)
+	if _, err := os.Stat(goldenPath); err != nil {
+		return fmt.Errorf("local golden image not found: %s", goldenPath)
+	}
+
+	log.Printf("Transferring golden image %s to %s", version, targetBridgeIP)
+
+	clusterKey := "/root/.ssh/cluster-ssh.key"
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
+	goldenDir := "/var/lib/boxcutter/golden/"
+
+	// Ensure target golden dir exists
+	mkdirCmd := exec.Command("ssh",
+		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", goldenDir)
+	if out, err := mkdirCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mkdir golden on target: %s: %w", string(out), err)
+	}
+
+	rsyncDest := fmt.Sprintf("ubuntu@%s:%s%s.ext4", targetBridgeIP, goldenDir, version)
+	rsyncCmd := exec.Command("rsync", "--sparse", "--whole-file", "--compress", "--rsync-path", "sudo rsync",
+		"-e", sshOpts, goldenPath, rsyncDest)
+	if out, err := rsyncCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("rsync golden: %s: %w", string(out), err)
+	}
+
+	log.Printf("Golden image %s transferred to %s", version, targetBridgeIP)
+	return nil
+}
+
+// MigrateResponse is the result of a migration.
+type MigrateResponse struct {
+	Name        string `json:"name"`
+	TailscaleIP string `json:"tailscale_ip,omitempty"`
+	Mark        int    `json:"mark"`
+	TargetNode  string `json:"target_node"`
+	Status      string `json:"status"`
+}
+
 // ImportVM receives a VM state and starts it. The COW image must already
 // be at the expected path.
 func (m *Manager) ImportVM(st *VMState) (*CreateResponse, error) {
@@ -875,8 +1347,9 @@ func (m *Manager) ImportVM(st *VMState) (*CreateResponse, error) {
 		return nil, err
 	}
 
-	// Ensure snapshot is active
-	if err := EnsureSnapshot(vmDir, m.cfg.Storage.GoldenLocalPath); err != nil {
+	// Ensure snapshot is active (use VM's golden version)
+	goldenPath := m.goldenPathForVM(st)
+	if err := EnsureSnapshot(vmDir, goldenPath); err != nil {
 		return nil, err
 	}
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 // VMState is the persistent state for a VM, stored as vm.json.
@@ -108,13 +109,9 @@ func IsRunning(vmDir string) bool {
 		return false
 	}
 	var pid int
-	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
+	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil || pid <= 0 {
 		return false
 	}
 	// Signal 0 tests if process exists
-	return process.Signal(nil) == nil
+	return syscall.Kill(pid, 0) == nil
 }

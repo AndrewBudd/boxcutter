@@ -15,7 +15,7 @@ func VMSSH(tap, sshKey string, args ...string) (string, error) {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "LogLevel=ERROR",
-		"-o", "ConnectTimeout=5",
+		"-o", "ConnectTimeout=2",
 		"-o", "BatchMode=yes",
 		"dev@10.0.0.2",
 	}

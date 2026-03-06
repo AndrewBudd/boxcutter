@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 )
 
@@ -170,11 +171,17 @@ func (h *Handler) cmdNew(args []string) int {
 	if disk != "" {
 		fmt.Printf("  Disk:    %s\n", disk)
 	}
+	if tsIP != "" {
+		fmt.Printf("  IP:      %s\n", tsIP)
+		if fqdn := tailnetFQDN(name); fqdn != "" {
+			fmt.Printf("  FQDN:    %s\n", fqdn)
+		}
+	}
 	fmt.Printf("  Mode:    %s\n", mode)
 	fmt.Printf("  Status:  %s\n", status)
 	fmt.Println()
 	if tsIP != "" {
-		fmt.Printf("  Connect: ssh %s\n", tsIP)
+		fmt.Printf("  Connect: ssh %s\n", name)
 	} else {
 		fmt.Println("  Tailscale IP pending — check with: ssh <host> list")
 	}
@@ -297,11 +304,19 @@ func (h *Handler) cmdNodes() int {
 			tsIP = "-"
 		}
 
-		fmt.Printf("%-12s %-20s %-16s %-16s %-8s %-10s %-10s %-4.0f\n",
+		// Show "-" for nodes we can't reach
+		ramUsedStr := "-"
+		ramTotalStr := "-"
+		vmsStr := "-"
+		if ramTotal > 0 {
+			ramUsedStr = fmt.Sprintf("%.0fG", ramAlloc/1024)
+			ramTotalStr = fmt.Sprintf("%.0fG", ramTotal/1024)
+			vmsStr = fmt.Sprintf("%.0f", vmsRunning)
+		}
+
+		fmt.Printf("%-12s %-20s %-16s %-16s %-8s %-10s %-10s %-4s\n",
 			id, name, bridgeIP, tsIP, status,
-			fmt.Sprintf("%.0fG", ramAlloc/1024),
-			fmt.Sprintf("%.0fG", ramTotal/1024),
-			vmsRunning)
+			ramUsedStr, ramTotalStr, vmsStr)
 	}
 	return 0
 }
@@ -436,8 +451,8 @@ func (h *Handler) printHelp() {
 Commands:
   new [options]           Create and start a new VM
     --clone <repo>          Clone repo on creation
-    --vcpu <N>              CPU cores (default: 4)
-    --ram <MiB>             RAM in MiB (default: 8192)
+    --vcpu <N>              CPU cores (default: 2)
+    --ram <MiB>             RAM in MiB (default: 2048)
     --disk <size>           Disk size (default: 50G)
     --mode normal|paranoid  Network mode (default: normal)
     --node <node-id>        Pin to specific node
@@ -546,6 +561,21 @@ func (h *Handler) delete(path string) ([]byte, error) {
 		return nil, fmt.Errorf("%s", strings.TrimSpace(string(body)))
 	}
 	return body, nil
+}
+
+// tailnetFQDN returns name.tailnet.ts.net by querying local Tailscale.
+func tailnetFQDN(name string) string {
+	out, err := exec.Command("tailscale", "status", "--json").Output()
+	if err != nil {
+		return ""
+	}
+	var status struct {
+		MagicDNSSuffix string `json:"MagicDNSSuffix"`
+	}
+	if json.Unmarshal(out, &status) != nil || status.MagicDNSSuffix == "" {
+		return ""
+	}
+	return name + "." + status.MagicDNSSuffix
 }
 
 // Main is called from the boxcutter-ssh-orchestrator script.
