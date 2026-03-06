@@ -147,6 +147,25 @@ func registerWithOrchestrator(cfg *config.Config, mgr *vm.Manager) {
 		time.Sleep(10 * time.Second)
 	}
 
+	// If Tailscale IP wasn't ready at registration time, re-register once it is
+	if tailscaleIP == "" {
+		go func() {
+			for {
+				time.Sleep(5 * time.Second)
+				if tailscaleIP != "" {
+					regBody["tailscale_ip"] = tailscaleIP
+					data, _ := json.Marshal(regBody)
+					resp, err := http.Post(orchURL+"/api/nodes/register", "application/json", bytes.NewReader(data))
+					if err == nil {
+						resp.Body.Close()
+						log.Printf("orchestrator: updated registration with tailscale_ip=%s", tailscaleIP)
+					}
+					return
+				}
+			}
+		}()
+	}
+
 	// Start heartbeat loop
 	go heartbeatLoop(orchURL, hostname, mgr)
 }
