@@ -2,7 +2,9 @@
 
 ## Status
 
-This document builds on the existing single-node boxcutter implementation. The networking layer (internal bridge + Tailscale overlay), vmid (VM Identity & Token Broker), device-mapper COW snapshots, and the SSH control interface are all implemented and working. This design extends the system to support multiple physical hosts, VM migration, centralized storage, and standardized configuration.
+This document builds on the existing single-node boxcutter implementation. The networking layer (per-TAP fwmark routing, same-IP VMs), vmid (fwmark-based VM identity), sentinel token store, forward proxy, internal TLS, device-mapper COW snapshots, and the SSH control interface are all implemented and working. This design extends the system to support multiple physical hosts, VM migration, centralized storage, and standardized configuration.
+
+For full details on the current networking implementation, see [network-architecture.md](network-architecture.md).
 
 ---
 
@@ -11,10 +13,10 @@ This document builds on the existing single-node boxcutter implementation. The n
 1. **Multi-host from day one.** The orchestrator, nodes, and storage are designed to span physical hosts.
 2. **VM state preservation matters.** Migration means moving a running VM's disk state to another node with zero data loss. Tailscale identity (and thus IP) survives migration.
 3. **Nodes are immutable and replaceable.** To upgrade, spin up a new node, migrate VMs off the old, destroy the old.
-4. **Tailscale is the trusted network.** All inter-component communication (orchestrator ↔ nodes) happens over Tailscale. Policies ensure nodes can talk to each other but VMs cannot reach nodes (except the metadata IP on their own node).
+4. **Tailscale is the trusted network.** All inter-component communication (orchestrator ↔ nodes) happens over Tailscale. Policies ensure nodes can talk to each other but VMs cannot reach nodes (except via their own TAP gateway).
 5. **Go for all new services.** Orchestrator and node agent are Go.
 6. **Secrets are bootstrapped, not distributed.** All credentials come from a single, standardized config bundle provided at setup time. The orchestrator does not distribute secrets at runtime.
-7. **Build on what works.** The existing bridge networking, vmid, COW snapshots, and SSH interface are proven. Extend, don't replace.
+7. **Build on what works.** The existing per-TAP networking, vmid, COW snapshots, proxy, and SSH interface are proven. Extend, don't replace.
 
 ---
 
@@ -43,7 +45,8 @@ This document builds on the existing single-node boxcutter implementation. The n
 |-----------|----------|---------|----------------|--------|
 | Orchestrator | Go | Any host (or small VM) | `boxcutter` | **Planned** |
 | Node agent | Go | Each QEMU node VM | `bc-<id>` | **Planned** (replaces bash scripts) |
-| vmid | Go | Each node (per-node) | — (internal only) | **Implemented** |
+| vmid | Go | Each node (per-node) | — (port 80, internal) | **Implemented** |
+| boxcutter-proxy | Go | Each node (per-node) | — (port 8080, internal) | **Implemented** |
 | boxcutter-ctl | Bash | Each node | — | **Implemented** (to be subsumed by node agent) |
 | boxcutter-net | Bash | Each node | — | **Implemented** |
 | TrueNAS | — | Dedicated NAS box or VM | `truenas` (or similar) | **Planned** |
@@ -52,92 +55,114 @@ This document builds on the existing single-node boxcutter implementation. The n
 
 ## Current Networking Architecture (Implemented)
 
-The networking layer is implemented and working. Each node VM runs an internal bridge with per-VM TAP devices and Tailscale overlay for external access.
+The networking layer is implemented and working. Every VM gets the same IP address (10.0.0.2) on an isolated point-to-point TAP link. Linux fwmark-based policy routing handles return traffic. There is no shared bridge.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Physical Host                                       │
-│                                                     │
-│  tap-node0 (10.0.0.1/30) ──→ Node VM               │
-│                                                     │
-│  ┌───────────────────────────────────────────────┐  │
-│  │  Node VM (QEMU/KVM) — 10.0.0.2               │  │
-│  │  Tailscale: 100.x.x.x                        │  │
-│  │                                               │  │
-│  │  brvm0 bridge (10.0.1.1/24)                   │  │
-│  │  ├── tap-bold-fox   ──→  10.0.1.200           │  │
-│  │  ├── tap-calm-otter ──→  10.0.1.201           │  │
-│  │  └── tap-wild-heron ──→  10.0.1.202           │  │
-│  │  (ebtables FORWARD DROP: VM isolation)        │  │
-│  │                                               │  │
-│  │  vmid (port 8775) ← 169.254.169.254 redirect │  │
-│  │  Identifies VMs by source IP (10.0.1.x)       │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Physical Host                                                │
+│                                                              │
+│  tap-node0 (192.168.50.1/30) ──→ Node VM                    │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Node VM (QEMU/KVM) — 192.168.50.2                    │  │
+│  │  Tailscale: 100.x.x.x                                │  │
+│  │                                                        │  │
+│  │  Per-VM isolated TAP links (no shared bridge):         │  │
+│  │    tap-bold-fox   10.0.0.1 ↔ 10.0.0.2  mark: 41022   │  │
+│  │    tap-calm-otter 10.0.0.1 ↔ 10.0.0.2  mark: 8193    │  │
+│  │                                                        │  │
+│  │  Services:                                             │  │
+│  │    vmid           :80   (fwmark-based VM identity)     │  │
+│  │    boxcutter-proxy :8080 (MITM proxy, sentinel swap)   │  │
+│  │    derper          :443  (Tailscale DERP relay)         │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### How It Works
 
-- **Internal bridge** (`brvm0`, 10.0.1.0/24): Each VM gets a unique internal IP (10.0.1.200+) via TAP device on the bridge
-- **VM isolation**: ebtables `FORWARD DROP` prevents VM-to-VM communication at Layer 2. Only the Node VM can reach VMs directly
-- **Internet access**: NAT from bridge subnet to Node VM's uplink interface
-- **Tailscale overlay**: Each VM joins Tailscale at boot (ephemeral key, never stored on disk), getting a stable 100.x.x.x IP reachable from anywhere
-- **Instant networking**: Kernel `ip=` boot parameter — no DHCP, no network manager
-- **Metadata service**: iptables PREROUTING redirects 169.254.169.254:80 → vmid:8775. vmid identifies VMs by source IP (10.0.1.x)
+- **Per-TAP point-to-point links**: Each VM gets its own TAP with `10.0.0.1 peer 10.0.0.2`. No bridge, no IP pool, no MAC conflicts
+- **fwmark policy routing**: Each VM gets a unique mark (CRC32 of name, range 1–65535). iptables mangle marks packets per-TAP; CONNMARK saves/restores marks in conntrack so return traffic routes to the correct TAP
+- **VM isolation**: No shared L2 domain — each VM only sees its point-to-point link to 10.0.0.1. VMs cannot reach each other
+- **Internet access**: NAT masquerade for 10.0.0.2/32 on the uplink interface
+- **Tailscale overlay**: Each VM joins Tailscale at boot (ephemeral key, never stored on disk), getting a stable 100.x.x.x IP
+- **Instant networking**: Kernel `ip=10.0.0.2::10.0.0.1:255.255.255.252:hostname:eth0:off:8.8.8.8`
+- **SSH to VMs**: `socat - TCP:10.0.0.2:22,so-bindtodevice=tap-<name>` (SO_BINDTODEVICE binds to specific TAP)
+- **Normal/paranoid modes**: Normal VMs have direct internet; paranoid VMs route through the MITM proxy with sentinel token swapping
 
 ### What This Architecture Already Provides
 
 | Concern | How it's handled |
 |---------|-----------------|
-| VM isolation | ebtables FORWARD DROP (kernel-enforced L2 isolation) |
-| Internet access | NAT to uplink |
+| VM isolation | Per-TAP point-to-point (no shared L2, no routes between TAPs) |
+| Internet access | NAT masquerade + fwmark policy routing |
 | External reachability | Tailscale overlay (100.x.x.x) |
-| VM identity | vmid source-IP lookup (unique 10.0.1.x per VM) |
+| VM identity | vmid reads fwmark via `getsockopt(SO_MARK)` on accepted TCP connections |
 | Name resolution | Tailscale MagicDNS (ssh bold-fox) |
 | Fast boot | Kernel ip= parameter, no DHCP |
-| Auth key security | Key stays on Node VM, provisioned via SSH, never on VM disk |
+| Auth key security | Key stays on Node VM, provisioned via SSH over TAP, never on VM disk |
+| Credential isolation | Paranoid mode: sentinel tokens + MITM proxy, real creds never touch VM |
+| Internal TLS | EC P-256 CA + leaf cert, CA injected per-VM at create time |
 
 ### Networking Implications for Multi-Host
 
-The bridge model works well for single-node operation. For multi-host, the key consideration is **migration**: when a VM moves between nodes, it needs a new internal IP on the destination node's bridge. This is acceptable because:
+The per-TAP same-IP model makes multi-host migration **simpler** than a bridge model:
 
-1. The internal IP is ephemeral — it's only used for Node→VM communication and vmid identity
-2. The Tailscale IP (100.x.x.x) is the VM's stable identity and survives migration (state lives in `/var/lib/tailscale/` on the VM's rootfs)
-3. The destination node just allocates the next free IP from its local pool
-4. vmid on the destination node registers the VM with its new internal IP
+1. **No IP reassignment needed.** Every VM is 10.0.0.2 everywhere. The destination node creates a new TAP with the same point-to-point addressing.
+2. **Mark can be preserved or regenerated.** The destination node can reuse the same mark (if no collision with local VMs) or allocate a new one — the mark is internal infrastructure, not part of the VM's identity.
+3. **The Tailscale IP** (100.x.x.x) is the VM's stable identity and survives migration (state lives in `/var/lib/tailscale/` on the VM's rootfs).
+4. **vmid registration** just needs the new mark — `POST /internal/vms` with the VM's name and assigned mark.
 
-No networking changes are required to support multi-host. Each node runs its own bridge independently.
+No networking changes are required to support multi-host. Each node runs its own TAP infrastructure independently.
 
 ---
 
 ## vmid (Implemented)
 
-vmid is the VM Identity & Token Broker service, already implemented in Go and running per-node.
+vmid is the VM Identity & Token Broker service, implemented in Go and running per-node on port 80.
 
 ### What It Does
 
-- **Identity**: Identifies VMs by source IP on the internal bridge (10.0.1.x → VM name)
+- **Identity**: Identifies VMs by fwmark read via `getsockopt(SO_MARK)` on accepted TCP connections (requires `net.ipv4.tcp_fwmark_accept=1`)
 - **JWT tokens**: Mints audience-scoped ES256 tokens signed with a per-deployment ECDSA key
 - **GitHub tokens**: Policy-based GitHub App installation tokens for repo access
+- **Sentinel tokens**: In-memory one-time-use token store for paranoid mode credential wrapping
 - **JWKS endpoint**: Public key endpoint at `/.well-known/jwks.json` for external token verification
 
 ### Interfaces
 
-**VM-facing API** (via 169.254.169.254 redirect):
-- `GET /identity` — VM record (vm_id, ip, labels)
+**VM-facing API** (VMs reach vmid at `http://10.0.0.1/` — their TAP gateway):
+- `GET /` — Metadata root (VM ID, available endpoints)
+- `GET /identity` — VM record (vm_id, mark, mode)
 - `GET /token?audience=<aud>` — Mint JWT token
-- `GET /token/github` — Mint GitHub App token
+- `GET /token/github` — Mint GitHub App token (sentinel-wrapped in paranoid mode)
 - `GET /.well-known/jwks.json` — Public JWKS (no auth required)
 
 **Admin API** (Unix socket at `/run/vmid/admin.sock`, node-local only):
-- `POST /internal/vms` — Register VM (id, ip, github_repo)
-- `DELETE /internal/vms/{id}` — Deregister VM
+- `POST /internal/vms` — Register VM (id, mark, mode, github_repo)
+- `DELETE /internal/vms/{id}` — Deregister VM (purges sentinels)
 - `GET /internal/vms` — List registered VMs
-- `POST /internal/vms/{id}/github-token` — Mint token on behalf of VM (used by boxcutter-ctl during clone)
+- `GET /internal/sentinel/{sentinel}` — Swap sentinel for real token (used by proxy)
 
 ### Multi-Host Consideration
 
-vmid runs per-node with no changes needed. Each node's vmid has its own registry of local VMs. For consistent JWT verification across nodes, all nodes share the same ECDSA signing key (distributed via the bootstrap bundle).
+vmid runs per-node with no changes needed. Each node's vmid has its own registry of local VMs and its own sentinel store. For consistent JWT verification across nodes, all nodes share the same ECDSA signing key (distributed via the bootstrap bundle).
+
+---
+
+## Forward Proxy (Implemented)
+
+boxcutter-proxy is a Go binary using `elazarl/goproxy`, running per-node on port 8080.
+
+### What It Does
+
+- **MITM HTTPS**: Uses the internal CA cert to intercept and inspect HTTPS traffic
+- **Sentinel token swapping**: Scans Authorization headers, resolves sentinels via vmid admin socket, replaces with real credentials before forwarding
+- **Egress allowlist**: Restricts which domains paranoid VMs can reach
+
+### Multi-Host Consideration
+
+Runs per-node with no changes needed. Each node's proxy resolves sentinels against the local vmid's sentinel store.
 
 ---
 
@@ -152,12 +177,13 @@ Today, secrets are scattered across multiple locations with no standard structur
 | Tailscale auth key (VMs) | `/etc/boxcutter/tailscale-authkey` | Manual placement |
 | SSH keypair (node→VM) | `/var/lib/boxcutter/ssh/id_ed25519` | Auto-generated by install.sh |
 | User SSH public keys | `/etc/boxcutter/authorized_keys` | Seeded from cloud-init, then manual |
-| GitHub App private key | `/etc/vmid/github-app.pem` | Manual placement |
+| GitHub App private key | Referenced in `/etc/vmid/config.yaml` | Manual placement |
 | GitHub App ID + Install ID | `/etc/vmid/config.yaml` | Manual edit |
-| JWT signing key | `/etc/vmid/jwt-key.pem` | Auto-generated or manual |
+| JWT signing key | Auto-generated by vmid | Auto-generated |
+| Internal CA + leaf cert | `/etc/boxcutter/ca.{crt,key}`, `leaf.{crt,key}` | Auto-generated by boxcutter-tls |
 | TrueNAS API key | nowhere yet | — |
 
-This means spinning up a new node requires manually placing files in multiple locations, knowing which paths each component expects, and hoping nothing was forgotten.
+This means spinning up a new node requires manually placing files in multiple locations, knowing which paths each component expects, and hoping nothing was forgotten. **We experienced this firsthand: a Node VM rebuild lost all manually-placed secrets (Tailscale auth key, GitHub App config) because they weren't part of any reproducible provisioning.**
 
 ### The Solution: `boxcutter.yaml` + `/etc/boxcutter/secrets/`
 
@@ -176,6 +202,8 @@ A single config file (`boxcutter.yaml`) defines the entire deployment. A single 
     ├── authorized-keys               # SSH public keys of all humans who can access the system
     ├── github-app.pem                # GitHub App RSA private key (optional)
     ├── jwt-signing.pem               # ECDSA P-256 key for vmid JWT signing (optional, auto-gen if absent)
+    ├── ca.crt                        # Internal CA cert (auto-gen if absent)
+    ├── ca.key                        # Internal CA key (auto-gen if absent)
     └── truenas-api-key               # TrueNAS REST API key (optional)
 ```
 
@@ -216,20 +244,26 @@ jwt:
   key_path: /etc/boxcutter/secrets/jwt-signing.pem
   ttl: 10m
 
+# TLS (internal CA for MITM proxy)
+tls:
+  # Auto-generated if absent. Share CA across nodes so VMs trust any node's proxy.
+  ca_cert_path: /etc/boxcutter/secrets/ca.crt
+  ca_key_path: /etc/boxcutter/secrets/ca.key
+
 # Storage
 storage:
-  # Golden image source
-  golden_nfs_path: "truenas:/mnt/pool/boxcutter/golden"
-  # Local cache of golden image on each node
+  # Golden image source (TrueNAS NFS)
+  golden_nfs_path: ""
+  # golden_nfs_path: "truenas:/mnt/pool/boxcutter/golden"
   golden_local_path: /var/lib/boxcutter/golden/rootfs.ext4
-  # Migration staging area on TrueNAS
-  staging_nfs_path: "truenas:/mnt/pool/boxcutter/staging"
+  # Migration staging area on TrueNAS NFS (optional)
+  staging_nfs_path: ""
 
-# TrueNAS (optional — for NFS golden images and migration staging)
+# TrueNAS (optional)
 truenas:
   enabled: false
-  host: truenas
-  api_key_path: /etc/boxcutter/secrets/truenas-api-key
+  # host: truenas
+  # api_key_path: /etc/boxcutter/secrets/truenas-api-key
 
 # VM defaults
 vm_defaults:
@@ -237,6 +271,7 @@ vm_defaults:
   ram_mib: 8192
   disk: 50G
   dns: 8.8.8.8
+  mode: normal    # "normal" or "paranoid"
 ```
 
 ### How the Bootstrap Bundle Flows
@@ -253,9 +288,10 @@ Operator creates bundle:
          │    into the cloud-init ISO when creating a new node VM.
          │    Node agent reads boxcutter.yaml at startup.
          │
-         └──> Golden image build reads bundle for SSH key injection
+         └──> Golden image build reads bundle for SSH key + CA cert injection
               Public key from node-ssh.pub goes into golden image
               authorized-keys goes into golden image
+              CA cert injected per-VM at create time (not baked into golden)
 ```
 
 ### Key Requirement: Two Tailscale Auth Keys
@@ -278,6 +314,7 @@ Both are generated at https://login.tailscale.com/admin/settings/keys. They expi
 | GitHub App key | Never expires (unless revoked) | GitHub token minting fails. VMs can't push to repos. |
 | SSH keys | Manual rotation | Old keys lose access. Inject new keys via golden image rebuild + authorized-keys update. |
 | JWT signing key | Never expires (regenerate to revoke) | External services can't verify old tokens. |
+| Internal CA | 10-year validity | Proxy MITM fails. Regenerate + rebuild golden images. |
 | TrueNAS API key | Manual rotation | Storage provisioning fails. Existing VMs unaffected. |
 
 ### What's Auto-Generated vs. Required
@@ -290,6 +327,7 @@ Both are generated at https://login.tailscale.com/admin/settings/keys. They expi
 | Authorized keys | **Yes** (at least one human key) | No — operator provides |
 | GitHub App key | No (optional) | No — comes from GitHub |
 | JWT signing key | No | **Yes** — auto-generated if absent |
+| Internal CA + leaf cert | No | **Yes** — auto-generated by boxcutter-tls if absent |
 | TrueNAS API key | No (optional) | No — comes from TrueNAS |
 
 **Minimum viable bootstrap:** Tailscale VM authkey + one SSH public key in authorized-keys. Everything else is optional or auto-generated.
@@ -313,7 +351,7 @@ Node (local NVMe)
 │   └── rootfs.ext4             (cached copy from TrueNAS NFS)
 ├── /var/lib/boxcutter/vms/bold-fox/
 │   ├── cow.img                 (device-mapper COW snapshot, local)
-│   ├── vm.json
+│   ├── vm.json                 (name, mark, mode, tap, mac, resources)
 │   └── fc-config.json
 ```
 
@@ -357,15 +395,18 @@ CREATE TABLE golden_images (
 );
 ```
 
-### Migration and Internal IP Reassignment
+### Migration — No IP Reassignment Needed
 
-When a VM migrates between nodes, the destination node:
-1. Allocates the next free internal IP from its local pool (10.0.1.x)
-2. Rewrites the kernel boot args with the new internal IP
-3. Registers the VM with its local vmid using the new IP
-4. The Tailscale IP (100.x.x.x) is preserved — state lives in `/var/lib/tailscale/` on the COW image
+Since every VM is 10.0.0.2 on every node, migration is straightforward:
 
-The internal IP is ephemeral infrastructure; the Tailscale IP is the VM's stable identity.
+1. Stop VM on source node, tear down TAP + fwmark rules
+2. Transfer COW image to destination node (rsync --sparse)
+3. Destination node: allocate mark, create TAP, set up fwmark routing (same as `setup_vm_tap()`)
+4. Boot Firecracker with the received COW image — kernel boot args are identical (`ip=10.0.0.2::10.0.0.1:...`)
+5. Register with local vmid (new mark)
+6. Tailscale rejoins automatically — identity preserved in `/var/lib/tailscale/` on the COW image
+
+No kernel boot args need rewriting. No internal IP changes. The only thing that changes is the fwmark, which is internal infrastructure.
 
 ---
 
@@ -375,7 +416,7 @@ The internal IP is ephemeral infrastructure; the Tailscale IP is the VM's stable
 
 - **SSH control interface**: Users `ssh boxcutter new/list/destroy/status`
 - **Node registry**: Track all nodes, their IDs, capacity, health, version
-- **VM registry**: Track all VMs — name, which node, Tailscale IP, resource allocation, golden image version
+- **VM registry**: Track all VMs — name, which node, Tailscale IP, resource allocation, golden image version, mode
 - **Scheduling**: Place new VMs on nodes with capacity
 - **Migration**: Orchestrate VM moves between nodes
 - **Node lifecycle**: Create, drain, retire nodes
@@ -404,6 +445,8 @@ CREATE TABLE vms (
     name TEXT PRIMARY KEY,         -- "bold-fox"
     node_id TEXT REFERENCES nodes(id),
     tailscale_ip TEXT,
+    mark INTEGER,                  -- fwmark on current node
+    mode TEXT,                     -- "normal" or "paranoid"
     vcpu INTEGER,
     ram_mib INTEGER,
     disk TEXT,
@@ -453,7 +496,7 @@ GET    /api/nodes                  List all nodes with capacity
 The orchestrator gets the `boxcutter` Tailscale hostname and runs sshd with ForceCommand (same pattern as current boxcutter-ssh, extended for multi-node):
 
 ```
-ssh boxcutter new [--clone repo] [--vcpu N] [--ram MiB]
+ssh boxcutter new [--clone repo] [--vcpu N] [--ram MiB] [--mode normal|paranoid]
 ssh boxcutter list
 ssh boxcutter destroy <name>
 ssh boxcutter status
@@ -466,9 +509,9 @@ ssh boxcutter migrate <name> [--to <node-id>]
 `new` flow:
 1. Generate name (boxcutter-names)
 2. Pick best node (most headroom, or specific node if requested)
-3. Call node agent API: `POST /api/vms` with name, resources, clone_url
-4. Node creates VM, starts it, joins Tailscale
-5. Node reports back: Tailscale IP, status
+3. Call node agent API: `POST /api/vms` with name, resources, clone_url, mode
+4. Node creates VM (allocate mark, create TAP, dm-snapshot, inject CA cert + SSH keys), starts it, joins Tailscale
+5. Node reports back: Tailscale IP, mark, status
 6. Orchestrator records VM, returns info to user
 
 `shell` flow:
@@ -479,7 +522,7 @@ ssh boxcutter migrate <name> [--to <node-id>]
 `destroy` flow:
 1. Look up VM → find node
 2. Call node agent: `DELETE /api/vms/{name}`
-3. Node stops VM, cleans up storage
+3. Node stops VM, tears down TAP + fwmark rules, deregisters from vmid (purges sentinels), cleans up storage
 4. Orchestrator removes VM record
 
 ---
@@ -491,11 +534,13 @@ ssh boxcutter migrate <name> [--to <node-id>]
 Replaces the current bash scripts (`boxcutter-ctl`, `boxcutter-net`, `boxcutter-ssh`) with a single Go binary.
 
 - **VM lifecycle**: Create, start, stop, destroy Firecracker VMs
-- **Bridge management**: Set up brvm0 bridge, TAP devices, ebtables isolation (same as current boxcutter-net)
-- **IP allocation**: Allocate internal IPs from the 10.0.1.200-250 pool (same as current boxcutter-ctl)
+- **TAP + fwmark management**: Per-VM TAP creation, iptables mangle rules, ip rule/route policy routing (same as current `setup_vm_tap()` / `teardown_vm_tap()`)
+- **Mark allocation**: CRC32-based mark allocation with collision detection (same as current `allocate_mark()`)
 - **Storage management**: Device-mapper snapshots on local disk (same as current)
-- **Tailscale provisioning**: Join VMs to Tailscale on start (same as current)
-- **vmid coordination**: Register/deregister VMs with vmid via admin socket (same as current)
+- **Tailscale provisioning**: Join VMs to Tailscale on start via `vm_ssh()` (socat SO_BINDTODEVICE)
+- **vmid coordination**: Register/deregister VMs with vmid via admin socket (including mark and mode)
+- **Paranoid mode**: iptables FORWARD rules to block direct internet, proxy env injection
+- **CA cert injection**: Mount rootfs at create time, inject CA cert, run update-ca-certificates
 - **Health reporting**: Heartbeat to orchestrator
 - **Migration support**: Export/import VM state
 - **Golden image cache**: Sync from TrueNAS NFS on boot
@@ -512,7 +557,7 @@ HTTP server, listening on Tailscale interface:
 POST   /api/vms                     Create + start VM
 DELETE /api/vms/{name}              Stop + destroy VM
 GET    /api/vms                     List VMs on this node
-GET    /api/vms/{name}              VM details
+GET    /api/vms/{name}              VM details (mark, mode, tailscale_ip)
 POST   /api/vms/{name}/stop        Stop VM (keep state)
 POST   /api/vms/{name}/start       Start stopped VM
 POST   /api/vms/{name}/export      Stop + prepare COW for transfer
@@ -525,54 +570,68 @@ GET    /api/health                  Node health + capacity
 1. Node VM boots (QEMU, cloud-init)
 2. Cloud-init unpacks `/etc/boxcutter/boxcutter.yaml` + `secrets/`
 3. Node agent starts (systemd), reads `boxcutter.yaml`
-4. Sets up bridge network (brvm0, ebtables isolation, NAT — same as current boxcutter-net)
-5. Syncs golden image from TrueNAS NFS (if configured)
-6. Joins Tailscale as `bc-<id>` using `tailscale-node-authkey`
-7. Starts vmid (metadata service)
-8. Registers with orchestrator: `POST orchestrator/api/nodes/register`
-9. Begins accepting API calls
+4. Sets up one-time network infrastructure (fwmark CONNMARK rules, NAT, `tcp_fwmark_accept=1` — same as current boxcutter-net)
+5. Generates TLS certs if absent (same as current boxcutter-tls)
+6. Syncs golden image from TrueNAS NFS (if configured)
+7. Joins Tailscale as `bc-<id>` using `tailscale-node-authkey`
+8. Starts vmid (metadata service, port 80) and boxcutter-proxy (port 8080)
+9. Registers with orchestrator: `POST orchestrator/api/nodes/register`
+10. Begins accepting API calls
 
 ### VM Create Flow (on Node)
 
 This is the same flow as current `boxcutter-ctl create` + `start`, translated to Go:
 
 ```
-1. Receive POST /api/vms { name: "bold-fox", vcpu: 4, ram_mib: 8192, ... }
+1. Receive POST /api/vms { name: "bold-fox", vcpu: 4, ram_mib: 8192, mode: "normal" }
 
-2. Allocate internal IP from pool (10.0.1.200-250)
-   Same logic as current allocate_ip() in boxcutter-ctl
+2. Allocate mark (CRC32 of name % 65535 + 1, collision check)
+   Same logic as current allocate_mark() in boxcutter-ctl
 
-3. Create TAP device on bridge
-   ip tuntap add dev tap-bold-fox mode tap
-   ip link set tap-bold-fox master brvm0
-   ip link set tap-bold-fox up
-
-4. Create storage (local device-mapper)
+3. Create storage (local device-mapper)
    truncate -s 50G cow.img
    losetup + dmsetup create bc-bold-fox (COW on cached golden)
 
-5. Inject SSH keys into rootfs
-   Read authorized_keys_path and public_key_path from boxcutter.yaml
-   mount block device → copy keys → umount
+4. Inject CA cert + SSH keys into rootfs
+   Mount dm device, copy ca.crt to /usr/local/share/ca-certificates/,
+   chroot update-ca-certificates, copy authorized_keys
 
-6. Write fc-config.json
-   kernel boot args: ip=10.0.1.200::10.0.1.1:255.255.255.0:bold-fox:eth0:off:8.8.8.8
+5. Write fc-config.json
+   kernel boot args: ip=10.0.0.2::10.0.0.1:255.255.255.252:bold-fox:eth0:off:8.8.8.8
    drive: /dev/mapper/bc-bold-fox
    network: tap-bold-fox
+   MAC: AA:FC:00:00:00:01 (fixed — no shared L2)
 
-7. Launch Firecracker
+6. Create TAP with fwmark routing (setup_vm_tap)
+   ip tuntap add dev tap-bold-fox mode tap
+   ip addr add 10.0.0.1 peer 10.0.0.2 dev tap-bold-fox
+   ip link set tap-bold-fox up
+   iptables -t mangle -I PREROUTING 2 -i tap-bold-fox -j MARK --set-mark <mark>
+   ip rule add fwmark <mark> lookup <mark> priority <10000 + mark % 20000>
+   ip route add 10.0.0.2 dev tap-bold-fox table <mark>
+   ip route add default via <gw> dev <uplink> table <mark>
+   iptables -I FORWARD -i tap-bold-fox -j ACCEPT
+
+7. If paranoid mode:
+   iptables -I FORWARD -i tap-bold-fox -d 10.0.0.1/32 -p tcp --dport 8080 -j ACCEPT
+   iptables -I FORWARD -i tap-bold-fox ! -d 10.0.0.0/24 -j DROP
+
+8. Launch Firecracker
    firecracker --config-file fc-config.json
 
-8. Wait for SSH ready (poll internal IP)
-   ssh -i <node-ssh.key> dev@10.0.1.200 echo ready
+9. Wait for SSH ready (poll via socat SO_BINDTODEVICE)
+   vm_ssh tap-bold-fox echo ready
 
-9. Join Tailscale (using vm_authkey from boxcutter.yaml)
-   ssh dev@10.0.1.200 "sudo tailscale up --authkey=<vm-authkey> --hostname=bold-fox"
+10. Join Tailscale (using vm_authkey from boxcutter.yaml)
+    vm_ssh tap-bold-fox "sudo tailscale up --authkey=<vm-authkey> --hostname=bold-fox"
 
-10. Register with vmid (admin socket)
-    POST /internal/vms { vm_id: "bold-fox", ip: "10.0.1.200" }
+11. Register with vmid (admin socket)
+    POST /internal/vms { vm_id: "bold-fox", ip: "10.0.0.2", mark: <mark>, mode: "normal" }
 
-11. Report back to orchestrator: { tailscale_ip: "100.x.x.x", status: "running" }
+12. If paranoid mode: inject proxy environment
+    vm_ssh tap-bold-fox "write /etc/profile.d/boxcutter-proxy.sh"
+
+13. Report back to orchestrator: { tailscale_ip: "100.x.x.x", mark: <mark>, status: "running" }
 ```
 
 ---
@@ -585,26 +644,39 @@ This is the same flow as current `boxcutter-ctl create` + `start`, translated to
 Orchestrator                     Node A (source)              Node B (target)
      │                               │                            │
      ├── POST /vms/bold-fox/export ──>│                            │
+     │                               ├── Deregister from vmid     │
      │                               ├── Stop Firecracker         │
+     │                               ├── Tear down TAP + fwmark   │
      │                               ├── Flush COW to disk        │
      │                               ├── rsync cow.img ──────────>│ (direct or via TrueNAS)
      │<── { export_path, size } ─────┤                            │
      │                               │                            │
      ├── POST /vms/bold-fox/import ──────────────────────────────>│
-     │                               │                            ├── Allocate new internal IP
-     │                               │                            ├── Create TAP on bridge
+     │                               │                            ├── Allocate mark
+     │                               │                            ├── Create TAP + fwmark routing
      │                               │                            ├── Set up dm-snapshot (with received COW)
-     │                               │                            ├── Update kernel boot args (new IP)
-     │                               │                            ├── Start Firecracker
+     │                               │                            ├── Start Firecracker (same boot args)
      │                               │                            ├── Tailscale rejoins (identity in COW)
-     │                               │                            ├── Register with local vmid
+     │                               │                            ├── Register with local vmid (new mark)
      │<──────────────────────────────────── { tailscale_ip } ─────┤
      │                               │                            │
      ├── Update VM record ───────────────────────────────────────>│
      ├── DELETE /vms/bold-fox ───────>│                            │
-     │                               ├── Cleanup TAP + storage    │
+     │                               ├── Cleanup storage          │
      │                               │                            │
 ```
+
+### Why Same-IP Makes Migration Simpler
+
+With the old bridge model, migration required:
+- Allocating a new internal IP on the destination node's bridge
+- Rewriting kernel boot args with the new IP
+- The VM would see a different gateway, different netmask
+
+With per-TAP same-IP:
+- Every VM is always 10.0.0.2 with gateway 10.0.0.1 on a /30
+- Kernel boot args are identical across nodes — no rewriting needed
+- The only per-node state is the fwmark, which is allocated on arrival
 
 ### Tailscale Identity Preservation
 
@@ -613,8 +685,6 @@ The Tailscale node state lives in `/var/lib/tailscale/` on the VM's rootfs. Sinc
 - Rejoins the tailnet with the same node key
 - Gets the same Tailscale IP and hostname
 - Users see zero disruption
-
-The internal IP (10.0.1.x) changes — it's whatever the destination node allocates. But this is invisible to users since all access is via Tailscale IP or MagicDNS hostname.
 
 ### Transfer Methods
 
@@ -683,8 +753,9 @@ Standardize all secrets and configuration into `boxcutter.yaml` + `/etc/boxcutte
 - Write `boxcutter-setup` tool that validates the bundle and provisions the local system
 - Migrate `boxcutter-ctl` to read secret paths from `boxcutter.yaml` instead of hardcoded locations
 - Migrate vmid to read GitHub/JWT config from `boxcutter.yaml` (currently reads `/etc/vmid/config.yaml`)
-- Add `boxcutter.yaml.template` to the repo (already done)
+- Update `boxcutter.yaml.template` to include TLS and mode defaults
 - Update cloud-init to deliver the bundle
+- Include CA cert in bootstrap bundle (shared across nodes so VMs trust any node's proxy)
 
 **Deliverable:** Single config file drives all provisioning. New deployment = fill in template + run setup.
 
@@ -694,14 +765,16 @@ Extract VM lifecycle management from bash into a Go HTTP service that wraps the 
 
 **New binary:** `boxcutter-node` (Go)
 - HTTP API for VM CRUD
-- Manages bridge setup (same as boxcutter-net: brvm0, ebtables, NAT)
-- Manages IP allocation (same as boxcutter-ctl: 10.0.1.200-250 pool)
-- Manages TAP devices, dm-snapshots, Firecracker lifecycle
-- Coordinates with vmid via admin socket
+- Manages per-TAP fwmark routing (same as boxcutter-net + boxcutter-ctl: TAP creation, iptables mangle, ip rule/route, CONNMARK)
+- Manages mark allocation (CRC32 with collision detection)
+- Manages dm-snapshots, Firecracker lifecycle
+- Coordinates with vmid via admin socket (register with mark + mode)
+- Manages paranoid mode (iptables FORWARD rules, proxy env injection)
+- Manages CA cert injection at create time
 - Reports capacity and health
 - Reads all config from `boxcutter.yaml`
 
-**vmid integration:** Node agent co-starts vmid (or embeds it).
+**vmid integration:** Node agent co-starts vmid (or embeds it). The proxy could also be embedded.
 
 **Deliverable:** Node is controllable via HTTP API. Bash scripts become optional/deprecated.
 
@@ -712,7 +785,7 @@ The central brain.
 **New binary:** `boxcutter-orchestrator` (Go)
 - SSH control interface (extends current `boxcutter-ssh` for multi-node)
 - Node registry + heartbeat
-- VM registry (SQLite)
+- VM registry (SQLite) — includes mark and mode
 - Scheduling: pick best node for `new`
 - Command routing: `list` aggregates across nodes, `destroy` routes to correct node
 - Packages bootstrap bundle into cloud-init for new nodes
@@ -722,8 +795,8 @@ The central brain.
 ### Phase 4: Migration
 
 **Node agent additions:**
-- `POST /api/vms/{name}/export` — stop VM, prepare COW for transfer
-- `POST /api/vms/{name}/import` — receive COW, allocate new internal IP, start VM
+- `POST /api/vms/{name}/export` — deregister from vmid, stop VM, tear down TAP + fwmark, prepare COW for transfer
+- `POST /api/vms/{name}/import` — receive COW, allocate mark, create TAP + fwmark routing, start VM, register with vmid
 
 **Orchestrator additions:**
 - `POST /api/migrate` — orchestrate export → transfer → import
@@ -753,17 +826,21 @@ The central brain.
 
 | Aspect | Current (single-node) | Multi-host design | Changes? |
 |--------|----------------------|-------------------|----------|
-| VM networking | Bridge (brvm0, 10.0.1.x, ebtables) | Same per-node bridge | **No change** |
-| IP allocation | Pool 10.0.1.200-250 per node | Same pool per node | **No change** |
-| VM isolation | ebtables FORWARD DROP | Same | **No change** |
+| VM networking | Per-TAP point-to-point (10.0.0.1 ↔ 10.0.0.2) | Same per-node | **No change** |
+| Mark allocation | CRC32 of name, 1–65535 | Same per-node | **No change** |
+| VM isolation | No shared L2 (isolated TAPs) | Same | **No change** |
+| fwmark routing | CONNMARK save/restore + per-mark policy routes | Same | **No change** |
 | Tailscale overlay | Per-VM ephemeral join | Same | **No change** |
-| vmid | Go service, source-IP identity | Same, per-node | **No change** |
+| vmid | Go service, fwmark-based identity, port 80 | Same, per-node | **No change** |
+| Sentinel tokens | In-memory store, one-time swap via proxy | Same, per-node | **No change** |
+| Forward proxy | MITM HTTPS, sentinel swapping, port 8080 | Same, per-node | **No change** |
+| Internal TLS | CA + leaf cert, per-VM CA injection | CA shared across nodes via bundle | **Minor** |
 | Device-mapper COW | Local snapshots | Same | **No change** |
-| Kernel ip= boot | Static per-VM | Same | **No change** |
-| Metadata redirect | 169.254.169.254 → vmid | Same | **No change** |
+| Kernel ip= boot | `10.0.0.2::10.0.0.1:...:eth0:off:8.8.8.8` | Same (no rewrite on migration) | **No change** |
+| Normal/paranoid modes | Per-VM iptables + proxy env | Same | **No change** |
 | Control interface | `boxcutter-ssh` on node | Orchestrator SSH (multi-node aware) | **Extended** |
 | VM lifecycle | `boxcutter-ctl` (bash) | Node agent (Go HTTP API) | **Rewritten** |
-| Bridge setup | `boxcutter-net` (bash) | Node agent (Go) | **Subsumed** |
+| Network setup | `boxcutter-net` (bash) | Node agent (Go) | **Subsumed** |
 | Secrets | Scattered files | `boxcutter.yaml` + `secrets/` | **Standardized** |
 | Golden images | Local only | TrueNAS NFS (centralized) | **New** |
 | Migration | N/A | rsync + TrueNAS staging | **New** |
@@ -809,3 +886,7 @@ Options:
 - (c) Orchestrator SSHes to physical hosts to deliver bundle
 
 Recommendation: (b) — TrueNAS NFS is already available to all hosts. The bundle (minus the actual secret files, which are small) can live on a restricted NFS share.
+
+### Q5: Shared CA across nodes
+
+For paranoid mode to work across migration (VM trusts proxy on any node), all nodes must share the same internal CA. The CA keypair should be part of the bootstrap bundle. Leaf certs (with IP SAN 10.0.0.1) can be generated per-node since all nodes use the same gateway IP.
