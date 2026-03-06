@@ -76,6 +76,7 @@ if ! ip link show "$TAP" &>/dev/null; then
   sudo ip link set "$TAP" master "$BRIDGE_DEVICE"
   sudo ip link set "$TAP" up
 else
+  sudo ip link set "$TAP" master "$BRIDGE_DEVICE" 2>/dev/null || true
   sudo ip link set "$TAP" up
 fi
 

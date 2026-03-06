@@ -145,9 +145,12 @@ chmod 600 "${WORK}/mnt/home/dev/.ssh/authorized_keys"
 echo "Building NSS catchall module..."
 cp "${SRC:-$(dirname "$0")/..}/golden/nss_catchall.c" "${WORK}/mnt/tmp/nss_catchall.c" 2>/dev/null || \
   cp "$(dirname "$0")/nss_catchall.c" "${WORK}/mnt/tmp/nss_catchall.c"
+cp "${SRC:-$(dirname "$0")/..}/golden/vsock_listen.c" "${WORK}/mnt/tmp/vsock_listen.c" 2>/dev/null || \
+  cp "$(dirname "$0")/vsock_listen.c" "${WORK}/mnt/tmp/vsock_listen.c"
 chroot "${WORK}/mnt" bash -c 'apt-get install -y gcc libc6-dev >/dev/null 2>&1 && \
   gcc -shared -fPIC -o /usr/lib/x86_64-linux-gnu/libnss_catchall.so.2 /tmp/nss_catchall.c && \
-  rm /tmp/nss_catchall.c && \
+  gcc -o /usr/local/bin/boxcutter-vsock-listen /tmp/vsock_listen.c && \
+  rm /tmp/nss_catchall.c /tmp/vsock_listen.c && \
   apt-get remove -y gcc >/dev/null 2>&1 || true'
 sed -i 's/^passwd:.*/passwd:         files catchall/' "${WORK}/mnt/etc/nsswitch.conf"
 sed -i 's/^shadow:.*/shadow:         files catchall/' "${WORK}/mnt/etc/nsswitch.conf"
@@ -187,10 +190,7 @@ EOF
 chroot "${WORK}/mnt" systemctl enable tailscaled 2>/dev/null || true
 
 # --- vsock listener for migration nudges ---
-echo "Building vsock listener..."
-cp "${SRC:-$(dirname "$0")/..}/golden/vsock_listen.c" "${WORK}/mnt/tmp/vsock_listen.c" 2>/dev/null || \
-  cp "$(dirname "$0")/vsock_listen.c" "${WORK}/mnt/tmp/vsock_listen.c"
-chroot "${WORK}/mnt" bash -c 'gcc -o /usr/local/bin/boxcutter-vsock-listen /tmp/vsock_listen.c && rm /tmp/vsock_listen.c'
+# (vsock_listen.c was compiled above alongside nss_catchall.c before gcc removal)
 
 # Nudge script: re-establish tailscale network path after migration
 cat > "${WORK}/mnt/usr/local/bin/boxcutter-nudge" << 'SCRIPT'

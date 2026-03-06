@@ -104,7 +104,7 @@ build_node() {
 
   cp "${REPO_DIR}"/node/systemd/*.service "${PD}/systemd/"
   cp "${REPO_DIR}/node/config/Caddyfile" "${PD}/config/" 2>/dev/null || true
-  cp "${REPO_DIR}"/node/golden/build.sh "${REPO_DIR}"/node/golden/provision.sh "${REPO_DIR}"/node/golden/nss_catchall.c "${PD}/golden/"
+  cp "${REPO_DIR}"/node/golden/build.sh "${REPO_DIR}"/node/golden/provision.sh "${REPO_DIR}"/node/golden/nss_catchall.c "${REPO_DIR}"/node/golden/vsock_listen.c "${PD}/golden/"
 
   # Template node-specific values into boxcutter.yaml
   sed -e "s|BRIDGE_IP_PLACEHOLDER|${THIS_NODE_IP}|g" \
