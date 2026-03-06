@@ -66,6 +66,20 @@ func (h *Handler) Run(args []string) int {
 		return h.cmdDrain(target)
 	case "migrate":
 		return h.cmdMigrate(args[1:])
+	case "adduser":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> adduser <github-username>")
+			return 1
+		}
+		return h.cmdAddUser(target)
+	case "removeuser":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> removeuser <github-username>")
+			return 1
+		}
+		return h.cmdRemoveUser(target)
+	case "keys":
+		return h.cmdListKeys()
 	case "help":
 		h.printHelp()
 		return 0
@@ -315,6 +329,75 @@ func (h *Handler) cmdMigrate(args []string) int {
 	return 0
 }
 
+func (h *Handler) cmdAddUser(githubUser string) int {
+	// Fetch SSH keys from GitHub
+	resp, err := http.Get(fmt.Sprintf("https://github.com/%s.keys", githubUser))
+	if err != nil {
+		fmt.Printf("Error fetching keys: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	keysStr := strings.TrimSpace(string(body))
+	if keysStr == "" {
+		fmt.Printf("No SSH keys found for GitHub user '%s'\n", githubUser)
+		return 1
+	}
+
+	keys := strings.Split(keysStr, "\n")
+	data := map[string]interface{}{
+		"github_user": githubUser,
+		"keys":        keys,
+	}
+
+	result, err := h.post("/api/keys/add", data)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var res map[string]interface{}
+	json.Unmarshal(result, &res)
+	added, _ := res["keys_added"].(float64)
+	fmt.Printf("Added %.0f key(s) for %s. New VMs will include these keys.\n", added, githubUser)
+	return 0
+}
+
+func (h *Handler) cmdRemoveUser(githubUser string) int {
+	_, err := h.delete("/api/keys/" + githubUser)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	fmt.Printf("Removed keys for %s.\n", githubUser)
+	return 0
+}
+
+func (h *Handler) cmdListKeys() int {
+	resp, err := h.get("/api/keys")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var keys []map[string]interface{}
+	json.Unmarshal(resp, &keys)
+
+	if len(keys) == 0 {
+		fmt.Println("No SSH keys configured. Use: ssh <host> adduser <github-username>")
+		return 0
+	}
+
+	fmt.Printf("%-20s %-50s\n", "GITHUB USER", "KEY (truncated)")
+	for _, k := range keys {
+		user, _ := k["github_user"].(string)
+		pubkey, _ := k["public_key"].(string)
+		if len(pubkey) > 50 {
+			pubkey = pubkey[:47] + "..."
+		}
+		fmt.Printf("%-20s %-50s\n", user, pubkey)
+	}
+	return 0
+}
+
 func (h *Handler) printHelp() {
 	fmt.Print(`Boxcutter — ephemeral dev environments
 
@@ -335,6 +418,10 @@ Commands:
   drain <node-id>         Drain all VMs from a node
   migrate <name> [--to <node-id>]
                           Migrate VM to another node
+  adduser <github-user>   Add SSH keys from GitHub (for new VMs)
+  removeuser <github-user>
+                          Remove SSH keys for a user
+  keys                    List all configured SSH keys
   help                    Show this help
 
 Usage: ssh <host> <command> [args]

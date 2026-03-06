@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install QEMU and dependencies on the physical host.
-# Download Ubuntu cloud image. Create TAP device with NAT.
+# Download Ubuntu cloud image. Create bridge with NAT.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -44,71 +44,50 @@ else
   echo "Ubuntu cloud image already present."
 fi
 
-# --- Create Node VM disk (COW on cloud image) ---
-NODE_DISK_FILE="${IMAGES_DIR}/node.qcow2"
-if [ ! -f "$NODE_DISK_FILE" ]; then
-  echo "Creating Node VM disk (${NODE_DISK})..."
-  qemu-img create -f qcow2 -b "$UBUNTU_IMG" -F qcow2 "$NODE_DISK_FILE" "$NODE_DISK"
-else
-  echo "Node VM disk already exists."
-fi
-
-# --- Generate cloud-init ISO ---
-echo "Generating cloud-init ISO..."
-CIDATA_DIR=$(mktemp -d)
-trap "rm -rf ${CIDATA_DIR}" EXIT
-
-# Substitute SSH key into user-data
-sed "s|SSH_PUBKEY_PLACEHOLDER|${SSH_PUBKEY}|" \
-  "${SCRIPT_DIR}/../cloud-init/user-data" > "${CIDATA_DIR}/user-data"
-cp "${SCRIPT_DIR}/../cloud-init/meta-data" "${CIDATA_DIR}/meta-data"
-
-# Substitute network config
-sed -e "s|NODE_IP_PLACEHOLDER|${NODE_IP}|" \
-    -e "s|NODE_CIDR_PLACEHOLDER|${HOST_TAP_CIDR}|" \
-    -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_TAP_IP}|" \
-    -e "s|NODE_MAC_PLACEHOLDER|${NODE_MAC}|" \
-    "${SCRIPT_DIR}/../cloud-init/network-config" > "${CIDATA_DIR}/network-config"
-
-genisoimage -output "${IMAGES_DIR}/cloud-init.iso" \
-  -volid cidata -joliet -rock \
-  "${CIDATA_DIR}/user-data" "${CIDATA_DIR}/meta-data" "${CIDATA_DIR}/network-config" \
-  2>/dev/null
-
-# --- Set up TAP device with NAT ---
-echo "Setting up TAP device (${TAP_DEVICE}) with NAT..."
+# --- Set up bridge device ---
+echo "Setting up bridge ${BRIDGE_DEVICE}..."
 sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-if ! ip link show "$TAP_DEVICE" &>/dev/null; then
-  sudo ip tuntap add dev "$TAP_DEVICE" mode tap user "$(whoami)"
-  sudo ip link set "$TAP_DEVICE" up
-  sudo ip addr add "${HOST_TAP_IP}/${HOST_TAP_CIDR}" dev "$TAP_DEVICE" 2>/dev/null || true
-  echo "TAP device ${TAP_DEVICE} created (${HOST_TAP_IP}/${HOST_TAP_CIDR})"
+if ! ip link show "$BRIDGE_DEVICE" &>/dev/null; then
+  sudo ip link add name "$BRIDGE_DEVICE" type bridge
+  sudo ip addr add "${HOST_BRIDGE_IP}/${HOST_BRIDGE_CIDR}" dev "$BRIDGE_DEVICE"
+  sudo ip link set "$BRIDGE_DEVICE" up
+  echo "Bridge ${BRIDGE_DEVICE} created (${HOST_BRIDGE_IP}/${HOST_BRIDGE_CIDR})"
 else
-  echo "TAP device already exists."
-  # Ensure IP is assigned
-  sudo ip addr add "${HOST_TAP_IP}/${HOST_TAP_CIDR}" dev "$TAP_DEVICE" 2>/dev/null || true
+  echo "Bridge ${BRIDGE_DEVICE} already exists."
+  sudo ip addr add "${HOST_BRIDGE_IP}/${HOST_BRIDGE_CIDR}" dev "$BRIDGE_DEVICE" 2>/dev/null || true
 fi
 
-# --- NAT: masquerade Node VM traffic to internet ---
+# --- Create TAP devices and attach to bridge ---
+for TAP in "$ORCH_TAP" "$NODE_TAP"; do
+  if ! ip link show "$TAP" &>/dev/null; then
+    sudo ip tuntap add dev "$TAP" mode tap user "$(whoami)"
+    sudo ip link set "$TAP" master "$BRIDGE_DEVICE"
+    sudo ip link set "$TAP" up
+    echo "TAP ${TAP} created and attached to ${BRIDGE_DEVICE}"
+  else
+    echo "TAP ${TAP} already exists."
+    sudo ip link set "$TAP" master "$BRIDGE_DEVICE" 2>/dev/null || true
+  fi
+done
+
+# --- NAT: masquerade VM traffic to internet ---
 echo "Setting up NAT masquerade..."
-sudo iptables -t nat -C POSTROUTING -s "${HOST_TAP_IP}/${HOST_TAP_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || \
-sudo iptables -t nat -A POSTROUTING -s "${HOST_TAP_IP}/${HOST_TAP_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE
+SUBNET="${HOST_BRIDGE_IP}/${HOST_BRIDGE_CIDR}"
+sudo iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || \
+sudo iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE
 
-# Forward traffic from TAP
-sudo iptables -C FORWARD -i "$TAP_DEVICE" -j ACCEPT 2>/dev/null || \
-sudo iptables -I FORWARD -i "$TAP_DEVICE" -j ACCEPT
-sudo iptables -C FORWARD -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-sudo iptables -I FORWARD -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT
-
-# Route VM traffic through the Node VM
-sudo ip route replace 10.0.0.2/32 via "$NODE_IP" dev "$TAP_DEVICE" 2>/dev/null || true
+# Forward traffic from bridge
+sudo iptables -C FORWARD -i "$BRIDGE_DEVICE" -j ACCEPT 2>/dev/null || \
+sudo iptables -I FORWARD -i "$BRIDGE_DEVICE" -j ACCEPT
+sudo iptables -C FORWARD -o "$BRIDGE_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+sudo iptables -I FORWARD -o "$BRIDGE_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 echo ""
 echo "=== Host setup complete ==="
-echo "Node VM disk: ${IMAGES_DIR}/node.qcow2"
-echo "Cloud-init:   ${IMAGES_DIR}/cloud-init.iso"
-echo "TAP device:   ${TAP_DEVICE} (${HOST_TAP_IP}/${HOST_TAP_CIDR})"
-echo "Node VM IP:   ${NODE_IP} (internal — access via Tailscale)"
+echo "Bridge:        ${BRIDGE_DEVICE} (${HOST_BRIDGE_IP}/${HOST_BRIDGE_CIDR})"
+echo "TAP devices:   ${ORCH_TAP}, ${NODE_TAP}"
+echo "Orchestrator:  ${ORCH_IP}"
+echo "Node (default): ${NODE_IP}"
 echo ""
-echo "Next: ./host/launch.sh"
+echo "Next: make provision-orchestrator && make provision-node"

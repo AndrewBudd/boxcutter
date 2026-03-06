@@ -22,9 +22,14 @@ tailscale-authkey
 *.log
 
 # Go build artifacts
-node/node
+node/agent/node
+node/proxy/proxy
+node/vmid/vmid
 orchestrator/orchestrator
 orchestrator/ssh
+
+# Bootstrap bundle (secrets)
+.boxcutter/
 
 # OS
 .DS_Store

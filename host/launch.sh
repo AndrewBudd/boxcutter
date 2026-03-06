@@ -1,54 +1,91 @@
 #!/bin/bash
-# Launch the Boxcutter Node VM with QEMU/KVM
+# Launch a Boxcutter VM with QEMU/KVM
+# Usage: bash host/launch.sh <orchestrator|node> [NAME] [--daemon]
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/boxcutter.env"
 
 IMAGES_DIR="${SCRIPT_DIR}/../.images"
-REPO_DIR="${SCRIPT_DIR}/.."
 
-NODE_DISK="${IMAGES_DIR}/node.qcow2"
-CLOUD_INIT="${IMAGES_DIR}/cloud-init.iso"
-PID_FILE="${IMAGES_DIR}/node.pid"
+VM_TYPE="${1:-}"
+shift || true
 
-[ -f "$NODE_DISK" ] || { echo "Node VM disk not found. Run host/setup.sh first."; exit 1; }
-[ -f "$CLOUD_INIT" ] || { echo "Cloud-init ISO not found. Run host/setup.sh first."; exit 1; }
+if [ "$VM_TYPE" != "orchestrator" ] && [ "$VM_TYPE" != "node" ]; then
+  echo "Usage: bash host/launch.sh <orchestrator|node> [NAME] [--daemon]"
+  exit 1
+fi
+
+# Parse args
+DAEMON=false
+VM_NAME=""
+for arg in "$@"; do
+  case "$arg" in
+    --daemon|-d) DAEMON=true ;;
+    *) [ -z "$VM_NAME" ] && VM_NAME="$arg" ;;
+  esac
+done
+
+# Set VM-specific parameters
+if [ "$VM_TYPE" = "orchestrator" ]; then
+  VM_NAME="orchestrator"
+  VCPU="$ORCH_VCPU"
+  RAM="$ORCH_RAM"
+  DISK="${IMAGES_DIR}/orchestrator.qcow2"
+  ISO="${IMAGES_DIR}/orchestrator-cloud-init.iso"
+  TAP="$ORCH_TAP"
+  MAC="$ORCH_MAC"
+  IP="$ORCH_IP"
+else
+  VM_NAME="${VM_NAME:-boxcutter-node-1}"
+  VCPU="$NODE_VCPU"
+  RAM="$NODE_RAM"
+  DISK="${IMAGES_DIR}/${VM_NAME}.qcow2"
+  ISO="${IMAGES_DIR}/${VM_NAME}-cloud-init.iso"
+  TAP="$NODE_TAP"
+  MAC="$NODE_MAC"
+  IP="$NODE_IP"
+fi
+
+PID_FILE="${IMAGES_DIR}/${VM_NAME}.pid"
+
+[ -f "$DISK" ] || { echo "VM disk not found: $DISK. Run: make provision-${VM_TYPE}"; exit 1; }
+[ -f "$ISO" ] || { echo "Cloud-init ISO not found: $ISO. Run: make provision-${VM_TYPE}"; exit 1; }
 
 # Check if already running
 if [ -f "$PID_FILE" ]; then
   pid=$(cat "$PID_FILE")
   if kill -0 "$pid" 2>/dev/null; then
-    echo "Node VM already running (PID ${pid})"
-    echo "SSH: ssh ubuntu@${NODE_IP}"
+    echo "${VM_NAME} already running (PID ${pid})"
     exit 0
   fi
   rm -f "$PID_FILE"
 fi
 
-# Ensure TAP device is up
-if ! ip link show "$TAP_DEVICE" &>/dev/null; then
-  echo "TAP device not found. Run host/setup.sh first."
-  exit 1
+# Ensure TAP device is up and attached to bridge
+if ! ip link show "$TAP" &>/dev/null; then
+  echo "Creating TAP device ${TAP}..."
+  sudo ip tuntap add dev "$TAP" mode tap user "$(whoami)"
+  sudo ip link set "$TAP" master "$BRIDGE_DEVICE"
+  sudo ip link set "$TAP" up
+else
+  sudo ip link set "$TAP" up
 fi
 
-DAEMON=false
-[ "${1:-}" = "--daemon" ] || [ "${1:-}" = "-d" ] && DAEMON=true
-
-echo "Starting Boxcutter Node VM..."
-echo "  vCPU: ${NODE_VCPU}, RAM: ${NODE_RAM}"
-echo "  Network: ${TAP_DEVICE} (${HOST_TAP_IP} → ${NODE_IP})"
+echo "Starting ${VM_NAME} (${VM_TYPE})..."
+echo "  vCPU: ${VCPU}, RAM: ${RAM}"
+echo "  Network: ${TAP} (${HOST_BRIDGE_IP} → ${IP})"
 echo ""
 
 QEMU_ARGS=(
   -enable-kvm
   -cpu host
-  -smp "${NODE_VCPU}"
-  -m "${NODE_RAM}"
-  -drive "file=${NODE_DISK},format=qcow2,if=virtio"
-  -drive "file=${CLOUD_INIT},format=raw,if=virtio"
-  -netdev "tap,id=net0,ifname=${TAP_DEVICE},script=no,downscript=no"
-  -device "virtio-net-pci,netdev=net0,mac=${NODE_MAC}"
+  -smp "${VCPU}"
+  -m "${RAM}"
+  -drive "file=${DISK},format=qcow2,if=virtio"
+  -drive "file=${ISO},format=raw,if=virtio"
+  -netdev "tap,id=net0,ifname=${TAP},script=no,downscript=no"
+  -device "virtio-net-pci,netdev=net0,mac=${MAC}"
   -serial mon:stdio
   -nographic
 )
@@ -63,11 +100,11 @@ if [ "$DAEMON" = true ]; then
       *) QEMU_DAEMON_ARGS+=("$arg") ;;
     esac
   done
-  QEMU_DAEMON_ARGS+=(-display none -serial "file:${IMAGES_DIR}/node-console.log" -daemonize -pidfile "$PID_FILE")
+  QEMU_DAEMON_ARGS+=(-display none -serial "file:${IMAGES_DIR}/${VM_NAME}-console.log" -daemonize -pidfile "$PID_FILE")
   qemu-system-x86_64 "${QEMU_DAEMON_ARGS[@]}"
-  echo "Node VM started in background (PID $(cat "$PID_FILE"))"
-  echo "Console log: ${IMAGES_DIR}/node-console.log"
-  echo "SSH: ssh ubuntu@${NODE_IP}"
+  echo "${VM_NAME} started in background (PID $(cat "$PID_FILE"))"
+  echo "Console log: ${IMAGES_DIR}/${VM_NAME}-console.log"
+  echo "SSH: ssh ubuntu@${IP}"
 else
   echo "Launching in foreground (Ctrl-A X to quit)..."
   echo ""

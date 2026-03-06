@@ -42,6 +42,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// Migration
 	mux.HandleFunc("POST /api/migrate", h.handleMigrate)
 
+	// SSH keys
+	mux.HandleFunc("POST /api/keys/add", h.handleAddKeys)
+	mux.HandleFunc("GET /api/keys", h.handleListKeys)
+	mux.HandleFunc("DELETE /api/keys/{user}", h.handleDeleteKeys)
+
 	// Health
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -246,15 +251,19 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Get current SSH keys to pass to node
+	sshKeys, _ := h.db.ListSSHKeys()
+
 	// Call node agent
 	client := node.NewClient(targetNode.APIAddr)
 	nodeResp, err := client.Create(&node.CreateRequest{
-		Name:     req.Name,
-		VCPU:     req.VCPU,
-		RAMMIB:   req.RAMMIB,
-		Disk:     req.Disk,
-		CloneURL: req.CloneURL,
-		Mode:     req.Mode,
+		Name:           req.Name,
+		VCPU:           req.VCPU,
+		RAMMIB:         req.RAMMIB,
+		Disk:           req.Disk,
+		CloneURL:       req.CloneURL,
+		Mode:           req.Mode,
+		AuthorizedKeys: sshKeys,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("node create failed: %v", err), http.StatusInternalServerError)
@@ -541,6 +550,58 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"ram_total_mib":     totalRAM,
 		"ram_allocated_mib": allocRAM,
 	})
+}
+
+// --- SSH key handlers ---
+
+type addKeysRequest struct {
+	GitHubUser string   `json:"github_user"`
+	Keys       []string `json:"keys"`
+}
+
+func (h *Handler) handleAddKeys(w http.ResponseWriter, r *http.Request) {
+	var req addKeysRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.GitHubUser == "" || len(req.Keys) == 0 {
+		http.Error(w, "github_user and keys are required", http.StatusBadRequest)
+		return
+	}
+
+	added, err := h.db.AddSSHKeys(req.GitHubUser, req.Keys, time.Now().Format(time.RFC3339))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Added %d SSH key(s) for %s", added, req.GitHubUser)
+	writeJSON(w, map[string]interface{}{
+		"github_user": req.GitHubUser,
+		"keys_added":  added,
+	})
+}
+
+func (h *Handler) handleListKeys(w http.ResponseWriter, r *http.Request) {
+	entries, err := h.db.ListSSHKeyEntries()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, entries)
+}
+
+func (h *Handler) handleDeleteKeys(w http.ResponseWriter, r *http.Request) {
+	user := r.PathValue("user")
+	if user == "" {
+		user = extractName(r.URL.Path, "/api/keys/")
+	}
+	if err := h.db.DeleteSSHKeysByUser(user); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- Helpers ---

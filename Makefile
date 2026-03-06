@@ -1,38 +1,69 @@
-.PHONY: provision setup launch stop ssh status clean
+.PHONY: help provision-node provision-orchestrator launch-node launch-orchestrator \
+       stop-node stop-orchestrator ssh-node ssh-orchestrator status clean
 
-# --- Physical host targets ---
+# --- Orchestrator ---
 
-provision:            ## Build binaries, package bundle, create cloud-init ISO + VM disk
-	@bash host/provision.sh --rebuild
+provision-orchestrator:   ## Build orchestrator binaries + cloud-init ISO + VM disk
+	@bash host/provision.sh orchestrator --rebuild
 
-provision-iso:        ## Rebuild cloud-init ISO only (no disk rebuild)
-	@bash host/provision.sh
+provision-orchestrator-iso: ## Rebuild orchestrator cloud-init ISO only
+	@bash host/provision.sh orchestrator
 
-setup:                ## Install QEMU, create TAP device + NAT (run once)
-	@bash host/setup.sh
+launch-orchestrator:      ## Start the Orchestrator VM (foreground)
+	@bash host/launch.sh orchestrator
 
-launch:               ## Start the Boxcutter Node VM (foreground)
-	@bash host/launch.sh
+launch-orchestrator-daemon: ## Start the Orchestrator VM (background)
+	@bash host/launch.sh orchestrator --daemon
 
-launch-daemon:        ## Start the Boxcutter Node VM (background)
-	@bash host/launch.sh --daemon
+stop-orchestrator:        ## Stop the Orchestrator VM
+	@bash host/stop.sh orchestrator
 
-stop:                 ## Stop the Node VM
-	@bash host/stop.sh
+ssh-orchestrator:         ## SSH into the Orchestrator VM
+	@ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ubuntu@192.168.50.2
 
-ssh:                  ## SSH into the Node VM
-	@bash host/ssh.sh
+# --- Node ---
 
-status:               ## Show Node VM status
-	@if [ -f .images/node.pid ] && kill -0 $$(cat .images/node.pid) 2>/dev/null; then \
-		echo "Node VM: running (PID $$(cat .images/node.pid))"; \
+provision-node:           ## Build node binaries + cloud-init ISO + VM disk
+	@bash host/provision.sh node --rebuild
+
+provision-node-iso:       ## Rebuild node cloud-init ISO only
+	@bash host/provision.sh node
+
+launch-node:              ## Start a Node VM (foreground)
+	@bash host/launch.sh node
+
+launch-node-daemon:       ## Start a Node VM (background)
+	@bash host/launch.sh node --daemon
+
+stop-node:                ## Stop a Node VM
+	@bash host/stop.sh node
+
+ssh-node:                 ## SSH into a Node VM
+	@ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ubuntu@192.168.50.3
+
+# --- Cluster ---
+
+status:                   ## Show VM status
+	@echo "=== Orchestrator ===" ; \
+	if [ -f .images/orchestrator.pid ] && kill -0 $$(cat .images/orchestrator.pid) 2>/dev/null; then \
+		echo "  running (PID $$(cat .images/orchestrator.pid))"; \
 	else \
-		echo "Node VM: stopped"; \
-	fi
+		echo "  stopped"; \
+	fi ; \
+	echo "=== Nodes ===" ; \
+	for f in .images/boxcutter-node-*.pid; do \
+		[ -f "$$f" ] || continue; \
+		name=$$(basename "$$f" .pid); \
+		if kill -0 $$(cat "$$f") 2>/dev/null; then \
+			echo "  $$name: running (PID $$(cat "$$f"))"; \
+		else \
+			echo "  $$name: stopped (stale)"; \
+		fi; \
+	done
 
-clean:                ## Remove generated images (keeps cloud image download)
-	rm -f .images/node.qcow2 .images/cloud-init.iso .images/node.pid
+clean:                    ## Remove generated images (keeps cloud image download)
+	rm -f .images/*.qcow2 .images/*-cloud-init.iso .images/*.pid .images/*.log
 
-help:                 ## Show this help
+help:                     ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'

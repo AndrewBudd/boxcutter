@@ -25,12 +25,13 @@ func NewClient(apiAddr string) *Client {
 }
 
 type CreateRequest struct {
-	Name     string `json:"name"`
-	VCPU     int    `json:"vcpu,omitempty"`
-	RAMMIB   int    `json:"ram_mib,omitempty"`
-	Disk     string `json:"disk,omitempty"`
-	CloneURL string `json:"clone_url,omitempty"`
-	Mode     string `json:"mode,omitempty"`
+	Name           string   `json:"name"`
+	VCPU           int      `json:"vcpu,omitempty"`
+	RAMMIB         int      `json:"ram_mib,omitempty"`
+	Disk           string   `json:"disk,omitempty"`
+	CloneURL       string   `json:"clone_url,omitempty"`
+	Mode           string   `json:"mode,omitempty"`
+	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
 }
 
 type CreateResponse struct {

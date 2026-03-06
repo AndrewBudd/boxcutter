@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -75,6 +76,13 @@ func (db *DB) migrate() error {
 		sha256 TEXT,
 		created_at TEXT,
 		active BOOLEAN DEFAULT 0
+	);
+
+	CREATE TABLE IF NOT EXISTS ssh_keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		github_user TEXT NOT NULL,
+		public_key TEXT NOT NULL UNIQUE,
+		added_at TEXT NOT NULL
 	);
 	`
 
@@ -282,5 +290,68 @@ func (db *DB) ListVMsByNode(nodeID string) ([]*VM, error) {
 
 func (db *DB) DeleteVM(name string) error {
 	_, err := db.conn.Exec(`DELETE FROM vms WHERE name=?`, name)
+	return err
+}
+
+// --- SSH key operations ---
+
+type SSHKey struct {
+	ID         int    `json:"id"`
+	GitHubUser string `json:"github_user"`
+	PublicKey  string `json:"public_key"`
+	AddedAt    string `json:"added_at"`
+}
+
+func (db *DB) AddSSHKeys(githubUser string, keys []string, addedAt string) (int, error) {
+	added := 0
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		_, err := db.conn.Exec(
+			`INSERT OR IGNORE INTO ssh_keys (github_user, public_key, added_at) VALUES (?, ?, ?)`,
+			githubUser, k, addedAt)
+		if err == nil {
+			added++
+		}
+	}
+	return added, nil
+}
+
+func (db *DB) ListSSHKeys() ([]string, error) {
+	rows, err := db.conn.Query(`SELECT public_key FROM ssh_keys ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if rows.Scan(&k) == nil {
+			keys = append(keys, k)
+		}
+	}
+	return keys, nil
+}
+
+func (db *DB) ListSSHKeyEntries() ([]*SSHKey, error) {
+	rows, err := db.conn.Query(`SELECT id, github_user, public_key, added_at FROM ssh_keys ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []*SSHKey
+	for rows.Next() {
+		var k SSHKey
+		if rows.Scan(&k.ID, &k.GitHubUser, &k.PublicKey, &k.AddedAt) == nil {
+			keys = append(keys, &k)
+		}
+	}
+	return keys, nil
+}
+
+func (db *DB) DeleteSSHKeysByUser(githubUser string) error {
+	_, err := db.conn.Exec(`DELETE FROM ssh_keys WHERE github_user=?`, githubUser)
 	return err
 }
