@@ -651,7 +651,11 @@ func (m *Manager) cloneRepo(st *VMState) {
 	}
 
 	cloneURL := st.CloneURL
-	if ghToken != "" {
+	// Expand shorthand owner/repo to full GitHub URL
+	if !strings.Contains(cloneURL, "://") && !strings.HasPrefix(cloneURL, "git@") {
+		cloneURL = fmt.Sprintf("https://github.com/%s.git", cloneURL)
+	}
+	if ghToken != "" && st.GitHubRepo != "" {
 		cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s.git", ghToken, st.GitHubRepo)
 	}
 
