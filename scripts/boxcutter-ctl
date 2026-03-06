@@ -403,14 +403,18 @@ cmd_stop() {
   # Tear down dm-snapshot
   local dm_name="bc-${name}"
   if [ -e "/dev/mapper/${dm_name}" ]; then
-    dmsetup remove "$dm_name" 2>/dev/null || true
+    # Wait for kernel to release the device after firecracker exits
+    for _ in $(seq 1 5); do
+      dmsetup remove "$dm_name" 2>/dev/null && break
+      sleep 1
+    done
   fi
   if [ -f "${VM_DIR}/${name}/snapshot.json" ]; then
     local base_loop cow_loop
     base_loop=$(jq -r '.base_loop' "${VM_DIR}/${name}/snapshot.json")
     cow_loop=$(jq -r '.cow_loop' "${VM_DIR}/${name}/snapshot.json")
-    losetup -d "$base_loop" 2>/dev/null || true
     losetup -d "$cow_loop" 2>/dev/null || true
+    losetup -d "$base_loop" 2>/dev/null || true
     rm -f "${VM_DIR}/${name}/snapshot.json"
   fi
 
