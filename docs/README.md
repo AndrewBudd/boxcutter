@@ -2,21 +2,23 @@
 
 Ephemeral dev environments on bare metal. Spin up a VM in under a second.
 
-Boxcutter runs [Firecracker](https://firecracker-microvm.github.io/) microVMs inside a QEMU/KVM Node VM on a physical Linux machine. Each microVM gets a real LAN IP, an mDNS hostname, and is directly SSH-accessible with any username.
+Boxcutter runs [Firecracker](https://firecracker-microvm.github.io/) microVMs inside a QEMU/KVM Node VM on a physical Linux machine. Each microVM joins [Tailscale](https://tailscale.com/) automatically, making it accessible from anywhere on your tailnet — not just your LAN.
 
 ```
-$ ssh 192.168.2.100 new
+$ ssh boxcutter new
 
 Creating VM: bold-fox (4 vCPU, 8GB RAM, 50G disk)
   Creating copy-on-write snapshot...
-  VM created: bold-fox (IP: 192.168.2.200)
-Starting VM: bold-fox (192.168.2.200)
+  VM created: bold-fox (internal: 10.0.1.200)
+Starting VM: bold-fox (internal: 10.0.1.200)
   VM started (PID 12847)
+  Waiting for Tailscale...
+  Tailscale IP: 100.64.1.42
 
 VM ready: bold-fox
-Connect: ssh 192.168.2.200
+Connect: ssh 100.64.1.42
 
-$ ssh bold-fox.local
+$ ssh bold-fox
 dev@bold-fox:~$
 ```
 
@@ -26,54 +28,57 @@ dev@bold-fox:~$
 ┌─────────────────────────────────────────────────────┐
 │  Physical Host (Ubuntu 24.04)                       │
 │                                                     │
+│  enp34s0 (physical NIC) ──→ internet (NAT)          │
+│  tap-node0 (10.0.0.1/30) ──→ Node VM               │
+│                                                     │
 │  ┌───────────────────────────────────────────────┐  │
-│  │  br0 bridge (192.168.2.124)                   │  │
-│  │  ├── enp34s0 (physical NIC)                   │  │
-│  │  └── tap-node0                                │  │
-│  └───────────────────────────────────────────────┘  │
-│           │                                         │
-│  ┌────────┴──────────────────────────────────────┐  │
-│  │  Node VM (QEMU/KVM) — 192.168.2.100           │  │
+│  │  Node VM (QEMU/KVM) — 10.0.0.2               │  │
+│  │  Tailscale: 100.x.x.x (boxcutter)       │  │
 │  │                                               │  │
 │  │  ┌─────────────────────────────────────────┐  │  │
-│  │  │  brvm0 bridge                           │  │  │
-│  │  │  ├── ens3 (virtio NIC → tap-node0)      │  │  │
-│  │  │  ├── tap-bold-fox   ──→  192.168.2.200  │  │  │
-│  │  │  ├── tap-calm-otter ──→  192.168.2.201  │  │  │
-│  │  │  └── tap-wild-heron ──→  192.168.2.202  │  │  │
+│  │  │  brvm0 bridge (10.0.1.1/24)             │  │  │
+│  │  │  ├── tap-bold-fox   ──→  10.0.1.200     │  │  │
+│  │  │  ├── tap-calm-otter ──→  10.0.1.201     │  │  │
+│  │  │  └── tap-wild-heron ──→  10.0.1.202     │  │  │
+│  │  │  (VM isolation: VMs cannot talk to       │  │  │
+│  │  │   each other on this bridge)             │  │  │
 │  │  └─────────────────────────────────────────┘  │  │
 │  │                                               │  │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐      │  │
 │  │  │bold-fox  │ │calm-otter│ │wild-heron│      │  │
 │  │  │Firecrackr│ │Firecrackr│ │Firecrackr│      │  │
 │  │  │4cpu/8GB  │ │4cpu/8GB  │ │4cpu/8GB  │      │  │
+│  │  │TS:100.x  │ │TS:100.x  │ │TS:100.x  │      │  │
 │  │  └──────────┘ └──────────┘ └──────────┘      │  │
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
           │
-     LAN / Router (192.168.2.1)
+     Internet (via host NAT)
+     Tailscale overlay network
 ```
 
 There are three layers:
 
-1. **Physical host** — runs QEMU, hosts the bridge to LAN
-2. **Node VM** — Ubuntu VM that runs Firecracker, manages microVMs
-3. **Firecracker microVMs** — lightweight VMs where developers work
+1. **Physical host** — runs QEMU, provides NAT to internet
+2. **Node VM** — Ubuntu VM that runs Firecracker, manages microVMs, joins Tailscale
+3. **Firecracker microVMs** — lightweight VMs where developers work, each joins Tailscale
 
 The Node VM exists because Firecracker requires KVM and a Linux host with specific kernel features. Running it in a QEMU VM with nested virtualization isolates all Firecracker state from the physical host.
 
 ## How it works
 
-### Networking: LAN bridging with kernel ip=
+### Networking: Tailscale overlay
 
-Every VM gets a real IP on your LAN. No NAT, no port forwarding, no DHCP.
+VMs have internal-only IPs (10.0.1.0/24) that are not routable from outside the Node VM. Instead, each VM joins Tailscale at boot, getting a stable Tailscale IP that's reachable from any device on your tailnet.
 
-The physical host creates a bridge (`br0`) that includes the physical NIC and a TAP device for the Node VM. Inside the Node VM, a second bridge (`brvm0`) connects the Node VM's NIC with TAP devices for each Firecracker microVM.
+The physical host creates a TAP device with a point-to-point link (10.0.0.0/30) to the Node VM. Inside the Node VM, an internal bridge (`brvm0`) connects TAP devices for each Firecracker microVM. NAT provides internet access for the VMs.
 
-Firecracker VMs get their IP configuration via the kernel `ip=` boot parameter:
+**VM isolation:** VMs cannot communicate with each other on the internal bridge. Only the Node VM can reach VMs directly. VM-to-VM communication goes through Tailscale (if needed), which means it's subject to Tailscale ACLs.
+
+Firecracker VMs get their internal IP configuration via the kernel `ip=` boot parameter:
 
 ```
-ip=192.168.2.200::192.168.2.1:255.255.255.0:bold-fox:eth0:off:8.8.8.8
+ip=10.0.1.200::10.0.1.1:255.255.255.0:bold-fox:eth0:off:8.8.8.8
 ```
 
 This provides networking before init even starts — zero DHCP wait, instant connectivity.
@@ -103,13 +108,13 @@ This is implemented with two components:
 
 The NSS module provides both `passwd` and `shadow` entries so PAM authentication succeeds for synthetic users.
 
-### Name resolution: mDNS via Avahi
+### Name resolution: Tailscale MagicDNS
 
-Each VM runs Avahi and sets its hostname from the kernel `ip=` parameter at boot via a systemd oneshot service. VMs are discoverable as `<name>.local` on the LAN (if your network passes multicast).
+Each VM registers with Tailscale using its name as the hostname. With MagicDNS enabled on your tailnet, you can `ssh bold-fox` from any device on the tailnet.
 
 ### Accessing VM services
 
-VMs have real LAN IPs, so any service running in a VM is directly reachable at `http://<vm-ip>:<port>` from any machine on the network. No port forwarding or reverse proxy configuration needed.
+VMs are accessible via their Tailscale IPs, so any service running in a VM is directly reachable at `http://<tailscale-ip>:<port>` from any device on your tailnet. With MagicDNS, you can also use `http://bold-fox:<port>`.
 
 ### VM names
 
@@ -122,13 +127,23 @@ VMs get randomly generated adjective-animal names: `bold-fox`, `calm-otter`, `wi
 - **CPU:** x86_64 processor with hardware virtualization (Intel VT-x or AMD-V). Nested virtualization must be supported and enabled — Firecracker runs inside a QEMU VM and needs KVM access.
 - **RAM:** 16 GB minimum. The Node VM and its microVMs share this pool. Each microVM defaults to 8GB, so more RAM = more simultaneous VMs. A 64GB machine comfortably runs 5-6 VMs with room to spare.
 - **Disk:** 50 GB minimum. The golden image is ~4GB, and each VM's COW overlay starts small but grows with use. 150GB+ recommended if you expect many VMs with large workloads.
-- **Network:** Ethernet connection to a LAN. Boxcutter bridges VMs onto your network — they need real LAN IPs. Wi-Fi won't work for the bridge (Linux can't bridge Wi-Fi interfaces in managed mode).
+- **Network:** Internet connectivity (for Tailscale). Unlike the previous bridged architecture, Wi-Fi works fine since VMs connect via Tailscale overlay, not LAN bridging.
 
 ### Software
 
 - **Ubuntu 24.04** on the physical host (tested; other Debian-based distros likely work)
 - **sudo access** on the host machine
 - **SSH key** on the host (setup will generate one if you don't have one)
+- **Tailscale account** with a reusable auth key
+
+### Tailscale setup
+
+1. Create a Tailscale account at https://tailscale.com/
+2. Generate an auth key at https://login.tailscale.com/admin/settings/keys
+   - Check **"Reusable"** — each VM uses this key to join
+   - Check **"Ephemeral"** — nodes auto-remove from the tailnet when they disconnect (perfect for disposable VMs)
+   - The key expires after 90 days; you'll need to rotate it
+3. Enable MagicDNS at https://login.tailscale.com/admin/dns (optional but recommended)
 
 ### Verify KVM support
 
@@ -157,18 +172,6 @@ sudo modprobe kvm_amd nested=1
 echo "options kvm_amd nested=1" | sudo tee /etc/modprobe.d/kvm-nested.conf
 ```
 
-### Network planning
-
-You need to reserve a block of IP addresses on your LAN for VMs. These should be outside your router's DHCP range to avoid conflicts.
-
-For example, if your LAN is `192.168.2.0/24`:
-- Router: `192.168.2.1`
-- Your host: `192.168.2.124` (whatever it currently is)
-- Node VM: `192.168.2.100` (pick a free static IP)
-- VM pool: `192.168.2.200` - `192.168.2.250` (51 VMs max)
-
-Make sure your router's DHCP range doesn't overlap with the Node VM IP or the VM pool.
-
 ## Installation
 
 ### Step 1: Clone and configure
@@ -186,17 +189,8 @@ NODE_VCPU=12          # Number of vCPUs (leave 2-4 for the host)
 NODE_RAM=48G          # RAM (leave 4-8GB for the host)
 NODE_DISK=150G        # Disk size for the Node VM
 
-# Network — must match your LAN
+# Network — internal (Tailscale handles external access)
 HOST_INTERFACE=enp34s0  # Your physical NIC (run: ip link show)
-NODE_IP=192.168.2.100   # Static IP for the Node VM
-LAN_GW=192.168.2.1      # Your router's IP
-LAN_CIDR=24             # Subnet mask (24 = 255.255.255.0)
-LAN_DNS="8.8.8.8"       # DNS server
-
-# VM IP pool (must be outside your DHCP range)
-VM_IP_PREFIX=192.168.2
-VM_IP_START=200          # First VM gets .200
-VM_IP_END=250            # Last possible VM gets .250
 ```
 
 Find your physical NIC name:
@@ -214,10 +208,7 @@ This will:
 - Install QEMU and dependencies (`qemu-system-x86`, `qemu-utils`, `genisoimage`)
 - Download the Ubuntu 24.04 cloud image (~600MB)
 - Create a QCOW2 disk for the Node VM (COW on the cloud image)
-- Create a network bridge (`br0`) with your physical NIC
-- Create a TAP device for the Node VM
-
-**Warning:** The bridge setup temporarily disrupts network connectivity on the host (a few seconds) as it moves the host's IP from the physical NIC to the bridge. If you're SSH'd into the host, your session will briefly freeze but should recover.
+- Create a TAP device with NAT for the Node VM
 
 ### Step 3: Launch the Node VM
 
@@ -230,24 +221,35 @@ make launch-daemon   # Background (logs to .images/node-console.log)
 The first boot takes 3-5 minutes. Cloud-init will:
 1. Update packages
 2. Mount the boxcutter repo into the VM via 9p
-3. Run `install.sh` which installs Firecracker, Caddy, networking, and all management scripts
+3. Run `install.sh` which installs Firecracker, Tailscale, Caddy, networking, and all management scripts
 
 Wait for the console to show the login prompt (foreground) or check the log:
 ```bash
 tail -f .images/node-console.log    # If running as daemon
 ```
 
-You can verify the Node VM is ready:
+### Step 4: Configure Tailscale
+
+SSH into the Node VM and set up Tailscale:
+
 ```bash
-ssh ubuntu@192.168.2.100    # Should work once cloud-init finishes
+ssh ubuntu@10.0.0.2
+
+# Join the Node VM to Tailscale (interactive login — this is a persistent node)
+sudo tailscale up --hostname=boxcutter --ssh
+
+# Place the ephemeral VM auth key (used to provision disposable VMs)
+echo 'tskey-auth-XXXXXXX' | sudo tee /etc/boxcutter/tailscale-authkey
 ```
 
-### Step 4: Build the golden image
+The Node VM joins Tailscale interactively (it's a persistent node, not ephemeral). The ephemeral auth key at `/etc/boxcutter/tailscale-authkey` is only used for VMs — they auto-remove from the tailnet when destroyed. The key never touches VM disk images; the Node VM SSHes into each VM over the internal network to run `tailscale up`.
 
-SSH into the Node VM and build the rootfs that all microVMs will use:
+Once the Node VM is on Tailscale, you can SSH to it via its Tailscale IP or MagicDNS name (`boxcutter`) from any device on your tailnet.
+
+### Step 5: Build the golden image
 
 ```bash
-ssh ubuntu@192.168.2.100
+ssh ubuntu@10.0.0.2   # or ssh boxcutter (via Tailscale)
 
 # Phase 1: Create minimal Ubuntu rootfs with debootstrap (~3 minutes)
 sudo boxcutter-ctl golden build
@@ -256,79 +258,79 @@ sudo boxcutter-ctl golden build
 sudo boxcutter-ctl golden provision
 ```
 
-Phase 1 creates a minimal Ubuntu Noble system with SSH, systemd, Avahi, and networking.
+Phase 1 creates a minimal Ubuntu Noble system with SSH, systemd, Tailscale (client only — no auth key), and networking.
 
 Phase 2 boots that image as a temporary Firecracker VM and runs the provision script inside it. This installs build-essential, mise (with Node 22 and Ruby 3.2), GitHub CLI, Claude Code, and other dev tools. The changes are then merged back into the golden image.
 
-### Step 5: Add users
+### Step 6: Add users
 
-From the machine that ran setup (which already has SSH access):
+From any device on your tailnet:
 
 ```bash
-ssh 192.168.2.100 adduser <github-username>
+ssh boxcutter adduser <github-username>
 ```
 
 This fetches their public SSH keys from `github.com/<username>.keys` and adds them to:
 - The Node VM's control interface (so they can create/list/destroy VMs)
 - The golden image's authorized_keys (so they can SSH into VMs)
 
-The user can then, from any machine with their SSH key:
+The user can then, from any device on the tailnet:
 ```bash
-ssh 192.168.2.100 new      # Create a VM
-ssh 192.168.2.100 list     # See their VMs
+ssh boxcutter new      # Create a VM
+ssh boxcutter list     # See their VMs
 ```
 
-### Step 6: Verify
+### Step 7: Verify
 
 ```bash
 # Create a test VM
-ssh 192.168.2.100 new
+ssh boxcutter new
 
 # You should see something like:
 #   VM ready: bold-fox
-#   Connect: ssh 192.168.2.200
+#   Connect: ssh 100.64.1.42
 
-# SSH into it
-ssh 192.168.2.200
+# SSH into it (via Tailscale IP)
+ssh 100.64.1.42
 
-# Or by mDNS name (if your network supports multicast)
-ssh bold-fox.local
+# Or by MagicDNS name (if MagicDNS is enabled)
+ssh bold-fox
 ```
 
 ### After a host reboot
 
-The bridge and Node VM do not persist across host reboots. To restart:
+The TAP device and Node VM do not persist across host reboots. To restart:
 
 ```bash
 cd ~/boxcutter
-make setup         # Re-create the bridge (idempotent — skips what exists)
+make setup         # Re-create the TAP + NAT (idempotent — skips what exists)
 make launch-daemon # Re-launch the Node VM
 ```
 
 VMs that were running before the reboot will be in a stopped state. Start them with:
 ```bash
-ssh 192.168.2.100 start <vm-name>
+ssh boxcutter start <vm-name>
 ```
 
 ## Usage
 
-All commands go through SSH to the Node VM:
+All commands go through SSH to the Node VM (via Tailscale or internal IP):
 
 ```bash
-ssh 192.168.2.100 new              # Create and start a new VM
-ssh 192.168.2.100 list             # List all VMs
-ssh 192.168.2.100 start <name>     # Start a stopped VM
-ssh 192.168.2.100 stop <name>      # Stop a running VM
-ssh 192.168.2.100 destroy <name>   # Destroy a VM
-ssh 192.168.2.100 status           # Host capacity summary
-ssh 192.168.2.100 help             # Show all commands
+ssh boxcutter new              # Create and start a new VM
+ssh boxcutter list             # List all VMs (with Tailscale IPs)
+ssh boxcutter start <name>     # Start a stopped VM
+ssh boxcutter stop <name>      # Stop a running VM
+ssh boxcutter destroy <name>   # Destroy a VM (auto-removed from Tailscale)
+ssh boxcutter status           # Host capacity summary
+ssh boxcutter help             # Show all commands
 ```
 
-Once a VM is running, SSH directly to it:
+Once a VM is running, SSH directly to it via Tailscale:
 
 ```bash
-ssh 192.168.2.200          # By IP
-ssh bold-fox.local         # By mDNS hostname (if your network supports it)
+ssh 100.64.1.42          # By Tailscale IP
+ssh bold-fox             # By MagicDNS name
 ```
 
 ## File structure
@@ -337,14 +339,14 @@ ssh bold-fox.local         # By mDNS hostname (if your network supports it)
 boxcutter/
 ├── host/                    # Physical host scripts
 │   ├── boxcutter.env        # Network and resource configuration
-│   ├── setup.sh             # Install QEMU, create bridge + TAP
+│   ├── setup.sh             # Install QEMU, create TAP + NAT
 │   ├── launch.sh            # Start the Node VM
 │   ├── stop.sh              # Stop the Node VM
 │   └── ssh.sh               # Quick SSH into Node VM
 ├── scripts/                 # Installed into the Node VM
 │   ├── boxcutter-ctl        # VM lifecycle manager (create/start/stop/destroy)
 │   ├── boxcutter-ssh        # SSH ForceCommand dispatch (control interface)
-│   ├── boxcutter-net        # Bridge network setup inside Node VM
+│   ├── boxcutter-net        # Internal bridge network setup + VM isolation
 │   ├── boxcutter-proxy-sync # Service discovery (future)
 │   ├── boxcutter-gateway    # Multi-host gateway dispatch (future)
 │   └── boxcutter-names      # Random adjective-animal name generator
@@ -369,7 +371,7 @@ boxcutter/
 
 The golden image is a single ext4 file built in two phases:
 
-**Phase 1 (`golden build`):** Runs `debootstrap` to create a minimal Ubuntu Noble rootfs. Configures serial console, SSH, static DNS, entropy seeding, hostname-from-kernel-cmdline service, Avahi for mDNS, and the NSS catchall module. No network manager — the kernel `ip=` parameter handles everything.
+**Phase 1 (`golden build`):** Runs `debootstrap` to create a minimal Ubuntu Noble rootfs. Configures serial console, SSH, static DNS, entropy seeding, hostname-from-kernel-cmdline service, Tailscale, and the NSS catchall module. No network manager — the kernel `ip=` parameter handles everything.
 
 **Phase 2 (`golden provision`):** Boots the golden image as a temporary Firecracker VM, SSHes in, and runs `provision.sh` to install dev tools: build-essential, mise (with Node 22 and Ruby 3.2), GitHub CLI, Claude Code, tmux, htop, etc. The COW snapshot is then merged back into the golden image.
 
@@ -380,11 +382,15 @@ The golden image is a single ext4 file built in two phases:
 - VM users share the `dev` account (uid 1000) — isolation is at the VM level, not the user level
 - SSH keys are the only authentication method (password auth is disabled for SSH)
 - Each VM is a full Firecracker microVM with its own kernel — stronger isolation than containers
+- VMs are isolated on the internal bridge — they cannot communicate with each other directly
+- External access is via Tailscale only, subject to your tailnet's ACL policies
+- The Tailscale auth key lives only on the Node VM (`/etc/boxcutter/tailscale-authkey`) — it is never stored on VM disk images
+- The auth key should be **ephemeral** — destroyed VMs auto-remove from the tailnet when they disconnect
 
 ## Limitations
 
 - x86_64 only (Firecracker + nested KVM)
-- mDNS depends on your network passing multicast traffic
 - No persistent storage across VM destruction (by design — VMs are ephemeral)
-- VM-to-VM networking goes through the LAN bridge (no isolated network)
+- Tailscale auth key must be rotated every 90 days
+- VM creation takes ~5-10 seconds longer than before due to Tailscale join time
 - Host bridge setup is not persistent across physical host reboots (re-run `make setup`)

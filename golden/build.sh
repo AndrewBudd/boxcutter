@@ -39,7 +39,7 @@ mount -o loop "${WORK}/rootfs.ext4" "${WORK}/mnt"
 # Debootstrap Ubuntu Noble (minimal + essentials for SSH/network)
 echo "Running debootstrap (Ubuntu Noble)... this takes a few minutes."
 debootstrap \
-  --include=systemd,systemd-sysv,dbus,openssh-server,sudo,curl,wget,jq,git,iproute2,iputils-ping,ca-certificates,locales,gpgv,gnupg,avahi-daemon,libnss-mdns \
+  --include=systemd,systemd-sysv,dbus,openssh-server,sudo,curl,wget,jq,git,iproute2,iputils-ping,ca-certificates,locales,gpgv,gnupg \
   noble "${WORK}/mnt" http://archive.ubuntu.com/ubuntu
 
 echo "Debootstrap complete. Configuring base system..."
@@ -70,7 +70,6 @@ cat > "${WORK}/mnt/etc/systemd/system/set-hostname.service" << 'SVCEOF'
 [Unit]
 Description=Set hostname from kernel ip= parameter
 DefaultDependencies=no
-Before=avahi-daemon.service
 After=local-fs.target
 
 [Service]
@@ -166,11 +165,32 @@ AuthorizedKeysCommand /usr/local/bin/auth-keys-any %u
 AuthorizedKeysCommandUser root
 SSHEOF
 
+# --- Install Tailscale ---
+echo "Installing Tailscale..."
+chroot "${WORK}/mnt" bash -c 'curl -fsSL https://tailscale.com/install.sh | sh' 2>&1 | tail -1
+
+# Configure tailscaled for Firecracker (userspace networking — no /dev/net/tun or iptables)
+cat > "${WORK}/mnt/etc/default/tailscaled" << 'EOF'
+PORT=0
+FLAGS=--tun=userspace-networking
+EOF
+
+# Skip iptables cleanup on stop (not available in Firecracker)
+mkdir -p "${WORK}/mnt/etc/systemd/system/tailscaled.service.d"
+cat > "${WORK}/mnt/etc/systemd/system/tailscaled.service.d/firecracker.conf" << 'EOF'
+[Service]
+ExecStopPost=
+EOF
+
+# Enable tailscaled (Tailscale join is handled by the Node VM via SSH after boot —
+# the auth key is never stored on the VM's disk)
+chroot "${WORK}/mnt" systemctl enable tailscaled 2>/dev/null || true
+
 # --- Services declaration file ---
 cat > "${WORK}/mnt/home/dev/.services" << 'EOF'
 # Declare services as name=port, one per line
 # Auto-discovered by boxcutter-proxy-sync
-# Accessible at http://<vm-ip>:<port>
+# Accessible at http://<tailscale-ip>:<port>
 # example=3000
 EOF
 chown 1000:1000 "${WORK}/mnt/home/dev/.services"
@@ -187,9 +207,10 @@ echo "=== Golden base image built ==="
 echo "Path: ${OUTPUT}"
 echo "Size: ${ACTUAL_SIZE} used / ${SIZE} max"
 echo ""
-echo "The base image has Ubuntu + SSH + networking."
+echo "The base image has Ubuntu + SSH + Tailscale."
 echo "To install dev tools, boot as a VM and provision:"
 echo "  boxcutter-ctl golden provision"
 echo ""
 echo "Or create a VM directly (tools can be added later):"
 echo "  boxcutter-ctl create agent-1"
+echo ""

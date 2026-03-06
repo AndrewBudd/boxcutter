@@ -11,6 +11,7 @@ auth/
 *.token
 *.pem
 *.key
+tailscale-authkey
 
 # Caddy generated certs
 .local/

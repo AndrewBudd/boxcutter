@@ -1,9 +1,12 @@
 #!/bin/bash
-# Set up the bridge network for Firecracker VMs.
-# Bridges eth0 (LAN uplink) with VM TAP devices.
+# Set up the internal bridge network for Firecracker VMs.
+# VMs get internal-only IPs (10.0.1.0/24) with NAT to internet.
+# VM isolation: VMs cannot communicate with each other on the bridge.
 set -e
 
 BRIDGE="brvm0"
+BRIDGE_IP="10.0.1.1"
+BRIDGE_CIDR="24"
 
 case "${1:-up}" in
   up)
@@ -19,39 +22,62 @@ case "${1:-up}" in
     chmod 660 /dev/kvm
     chgrp kvm /dev/kvm 2>/dev/null || true
 
-    # Find the primary network interface (the one with the default route)
-    UPLINK=$(ip route | awk '/^default/{print $5; exit}')
-    [ -z "$UPLINK" ] && { echo "Error: no default route found"; exit 1; }
-
     if ! ip link show "$BRIDGE" &>/dev/null; then
-      echo "Creating bridge ${BRIDGE} with uplink ${UPLINK}..."
+      echo "Creating internal bridge ${BRIDGE} (${BRIDGE_IP}/${BRIDGE_CIDR})..."
 
-      # Capture current IP config before bridging
-      CURRENT_IP=$(ip -4 addr show "$UPLINK" | awk '/inet /{print $2; exit}')
-      CURRENT_GW=$(ip route | awk '/^default/{print $3; exit}')
-
-      # Create bridge
+      # Create bridge — this is internal only, not connected to any uplink
       ip link add name "$BRIDGE" type bridge
       ip link set "$BRIDGE" up
+      ip addr add "${BRIDGE_IP}/${BRIDGE_CIDR}" dev "$BRIDGE"
 
-      # Move uplink into bridge
-      ip addr flush dev "$UPLINK"
-      ip link set "$UPLINK" master "$BRIDGE"
-
-      # Move IP to bridge
-      ip addr add "$CURRENT_IP" dev "$BRIDGE"
-      ip route add default via "$CURRENT_GW" dev "$BRIDGE" 2>/dev/null || true
-
-      echo "Bridge ${BRIDGE} created (${CURRENT_IP})"
+      echo "Bridge ${BRIDGE} created."
     else
       echo "Bridge ${BRIDGE} already exists."
     fi
 
+    # Enable IP forwarding and NAT for VM internet access
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    # Find the uplink interface (the one with the default route)
+    UPLINK=$(ip route | awk '/^default/{print $5; exit}')
+    [ -z "$UPLINK" ] && { echo "Warning: no default route found, VMs won't have internet"; }
+
+    if [ -n "$UPLINK" ]; then
+      # NAT VM traffic to internet via the Node VM's uplink
+      iptables -t nat -C POSTROUTING -s "${BRIDGE_IP%.*}.0/${BRIDGE_CIDR}" -o "$UPLINK" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s "${BRIDGE_IP%.*}.0/${BRIDGE_CIDR}" -o "$UPLINK" -j MASQUERADE
+
+      # Allow forwarding from bridge to uplink and back
+      iptables -C FORWARD -i "$BRIDGE" -o "$UPLINK" -j ACCEPT 2>/dev/null || \
+      iptables -I FORWARD -i "$BRIDGE" -o "$UPLINK" -j ACCEPT
+      iptables -C FORWARD -i "$UPLINK" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+      iptables -I FORWARD -i "$UPLINK" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    fi
+
+    # --- VM isolation: prevent VMs from talking to each other ---
+    # ebtables FORWARD chain handles frames forwarded between bridge ports.
+    # Traffic from the bridge IP (Node VM) to VMs goes through INPUT/OUTPUT, not FORWARD.
+    # So FORWARD DROP blocks VM-to-VM while Node VM can still reach all VMs.
+    if command -v ebtables &>/dev/null; then
+      ebtables -F FORWARD 2>/dev/null || true
+      ebtables -P FORWARD DROP
+      echo "VM isolation enabled (ebtables FORWARD DROP)."
+    else
+      # Fallback: use iptables to block VM-to-VM at Layer 3
+      iptables -C FORWARD -i "$BRIDGE" -o "$BRIDGE" -j DROP 2>/dev/null || \
+      iptables -A FORWARD -i "$BRIDGE" -o "$BRIDGE" -j DROP
+      echo "VM isolation enabled (iptables bridge-to-bridge DROP)."
+    fi
+
     echo "Network ready."
     ;;
 
   down)
+    # Clean up ebtables
+    if command -v ebtables &>/dev/null; then
+      ebtables -F FORWARD 2>/dev/null || true
+      ebtables -P FORWARD ACCEPT 2>/dev/null || true
+    fi
     ip link del "$BRIDGE" 2>/dev/null || true
     echo "Bridge ${BRIDGE} removed."
     ;;

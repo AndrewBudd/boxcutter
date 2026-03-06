@@ -9,6 +9,7 @@ GOLDEN="${BOXCUTTER_HOME}/golden/rootfs.ext4"
 BRIDGE="brvm0"
 SSH_KEY="${BOXCUTTER_HOME}/ssh/id_ed25519"
 CONF="${BOXCUTTER_HOME}/network.conf"
+TS_AUTHKEY_FILE="/etc/boxcutter/tailscale-authkey"
 
 DEFAULT_VCPU=4
 DEFAULT_RAM_MIB=8192
@@ -19,12 +20,12 @@ if [ -f "$CONF" ]; then
   source "$CONF"
 fi
 # Defaults if not configured
-: "${VM_IP_PREFIX:=192.168.2}"
+: "${VM_IP_PREFIX:=10.0.1}"
 : "${VM_IP_START:=200}"
 : "${VM_IP_END:=250}"
-: "${LAN_GW:=192.168.2.1}"
-: "${LAN_CIDR:=24}"
-: "${LAN_DNS:=8.8.8.8}"
+: "${VM_GW:=10.0.1.1}"
+: "${VM_CIDR:=24}"
+: "${VM_DNS:=8.8.8.8}"
 
 usage() {
   cat <<EOF
@@ -47,12 +48,12 @@ EOF
 # --- IP/MAC allocation ---
 
 allocate_ip() {
-  # Find next free IP in the configured LAN pool
+  # Find next free IP in the internal pool
   local used=()
   for d in "${VM_DIR}"/*/; do
     [ -f "${d}/vm.json" ] || continue
     local ip
-    ip=$(jq -r '.ip' "${d}/vm.json" 2>/dev/null) || continue
+    ip=$(jq -r '.internal_ip // .ip' "${d}/vm.json" 2>/dev/null) || continue
     used+=("${ip##*.}")
   done
 
@@ -104,6 +105,27 @@ cidr_to_netmask() {
   echo "$mask"
 }
 
+# --- Tailscale helpers ---
+
+get_tailscale_ip() {
+  # Get the Tailscale IP for a VM by SSHing into it
+  local internal_ip=$1
+  local max_attempts=${2:-30}
+  for i in $(seq 1 "$max_attempts"); do
+    local ts_ip
+    ts_ip=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=2 -o BatchMode=yes "dev@${internal_ip}" \
+      "tailscale ip -4 2>/dev/null" 2>/dev/null) || true
+    if [ -n "$ts_ip" ]; then
+      echo "$ts_ip"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+
 # --- Commands ---
 
 cmd_create() {
@@ -131,7 +153,7 @@ cmd_create() {
   ip=$(allocate_ip)
   mac=$(ip_to_mac "$ip")
   tap=$(tap_name "$name")
-  netmask=$(cidr_to_netmask "$LAN_CIDR")
+  netmask=$(cidr_to_netmask "$VM_CIDR")
 
   # Create COW snapshot of golden image
   echo "  Creating copy-on-write snapshot..."
@@ -149,7 +171,8 @@ cmd_create() {
   dm_name="bc-${name}"
   base_loop=$(losetup --find --show --read-only "$GOLDEN")
   cow_loop=$(losetup --find --show "${VM_DIR}/${name}/cow.img")
-  local sectors=$(( disk_bytes / 512 ))
+  # Sector count must match the base device size
+  local sectors=$(( golden_size / 512 ))
 
   echo "0 ${sectors} snapshot ${base_loop} ${cow_loop} P 8" | dmsetup create "$dm_name"
 
@@ -162,8 +185,8 @@ cmd_create() {
     resize2fs "/dev/mapper/${dm_name}" >/dev/null 2>&1 || true
   fi
 
-  # Kernel ip= parameter for instant static networking (no DHCP needed)
-  local boot_ip="ip=${ip}::${LAN_GW}:${netmask}:${name}:eth0:off:${LAN_DNS}"
+  # Kernel ip= parameter for instant static networking (internal network)
+  local boot_ip="ip=${ip}::${VM_GW}:${netmask}:${name}:eth0:off:${VM_DNS}"
 
   # VM metadata
   cat > "${VM_DIR}/${name}/vm.json" <<EOF
@@ -171,7 +194,7 @@ cmd_create() {
   "name": "${name}",
   "vcpu": ${vcpu},
   "ram_mib": ${ram},
-  "ip": "${ip}",
+  "internal_ip": "${ip}",
   "mac": "${mac}",
   "disk": "${disk}",
   "tap": "${tap}",
@@ -237,7 +260,7 @@ EOF
     rmdir "$MOUNT_DIR"
   fi
 
-  echo "  VM created: ${name} (IP: ${ip})"
+  echo "  VM created: ${name} (internal: ${ip})"
   echo "  Start with: boxcutter-ctl start ${name}"
 }
 
@@ -253,29 +276,29 @@ cmd_start() {
   fi
 
   local ip mac tap
-  ip=$(jq -r '.ip' "${VM_DIR}/${name}/vm.json")
+  ip=$(jq -r '.internal_ip // .ip' "${VM_DIR}/${name}/vm.json")
   mac=$(jq -r '.mac' "${VM_DIR}/${name}/vm.json")
   tap=$(jq -r '.tap // empty' "${VM_DIR}/${name}/vm.json")
   [ -z "$tap" ] && tap=$(tap_name "$name")
 
-  echo "Starting VM: ${name} (${ip})"
+  echo "Starting VM: ${name} (internal: ${ip})"
 
   # Ensure dm-snapshot is active
   local dm_name="bc-${name}"
   if [ ! -e "/dev/mapper/${dm_name}" ]; then
     if [ -f "${VM_DIR}/${name}/cow.img" ]; then
-      local cow_size base_loop cow_loop sectors
-      cow_size=$(stat -c%s "${VM_DIR}/${name}/cow.img")
+      local base_size base_loop cow_loop sectors
+      base_size=$(stat -c%s "$GOLDEN")
       base_loop=$(losetup --find --show --read-only "$GOLDEN")
       cow_loop=$(losetup --find --show "${VM_DIR}/${name}/cow.img")
-      sectors=$(( cow_size / 512 ))
+      sectors=$(( base_size / 512 ))
       echo "0 ${sectors} snapshot ${base_loop} ${cow_loop} P 8" | dmsetup create "$dm_name"
       jq -n --arg base "$base_loop" --arg cow "$cow_loop" --arg dm "$dm_name" \
         '{"base_loop": $base, "cow_loop": $cow, "dm_name": $dm}' > "${VM_DIR}/${name}/snapshot.json"
     fi
   fi
 
-  # Create TAP device on the LAN bridge
+  # Create TAP device on the internal bridge
   if ! ip link show "$tap" &>/dev/null; then
     ip tuntap add dev "$tap" mode tap
     ip link set "$tap" master "${BRIDGE}"
@@ -294,7 +317,52 @@ cmd_start() {
   echo $! > "${VM_DIR}/${name}/firecracker.pid"
 
   echo "  VM started (PID $(cat "${VM_DIR}/${name}/firecracker.pid"))"
-  echo "  SSH: ssh ${ip}"
+
+  # Join Tailscale (skip for internal provision VMs starting with _)
+  if [[ "$name" != _* ]]; then
+    # Wait for SSH to be ready on internal network
+    echo "  Waiting for VM to boot..."
+    for i in $(seq 1 30); do
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=2 -o BatchMode=yes "dev@${ip}" echo ready 2>/dev/null && break
+      sleep 1
+    done
+
+    # Provision Tailscale from Node VM — key never stored on VM disk
+    local ts_authkey=""
+    if [ -f "$TS_AUTHKEY_FILE" ]; then
+      ts_authkey=$(cat "$TS_AUTHKEY_FILE")
+    fi
+    if [ -n "$ts_authkey" ]; then
+      echo "  Joining Tailscale..."
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+        "sudo tailscale up --authkey='${ts_authkey}' --hostname='${name}'" 2>/dev/null || true
+
+      # Expose SSH via Tailscale TCP proxy (so regular SSH keys work over Tailscale IP)
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+        "sudo tailscale serve --bg --tcp 22 tcp://localhost:22" 2>/dev/null || true
+
+      local ts_ip
+      ts_ip=$(get_tailscale_ip "$ip" 15) || true
+      if [ -n "$ts_ip" ]; then
+        local tmp_json
+        tmp_json=$(jq --arg tsip "$ts_ip" '. + {"tailscale_ip": $tsip}' "${VM_DIR}/${name}/vm.json")
+        echo "$tmp_json" > "${VM_DIR}/${name}/vm.json"
+        echo "  Tailscale IP: ${ts_ip}"
+        echo "  SSH: ssh ${ts_ip}"
+      else
+        echo "  Warning: Tailscale did not come up. VM is accessible internally at ${ip}"
+      fi
+    else
+      echo "  Warning: No Tailscale auth key at ${TS_AUTHKEY_FILE}"
+      echo "  VM is accessible internally at ${ip}"
+    fi
+  else
+    echo "  Internal VM — skipping Tailscale"
+    echo "  SSH (internal): ssh ${ip}"
+  fi
 }
 
 cmd_stop() {
@@ -354,7 +422,7 @@ cmd_destroy() {
   [ -z "$name" ] && { echo "Usage: boxcutter-ctl destroy <name>"; exit 1; }
   [ -d "${VM_DIR}/${name}" ] || { echo "VM '${name}' does not exist."; exit 1; }
 
-  # Stop if running
+  # Stop if running (ephemeral Tailscale key auto-removes disconnected nodes)
   if [ -f "${VM_DIR}/${name}/firecracker.pid" ]; then
     local pid
     pid=$(cat "${VM_DIR}/${name}/firecracker.pid")
@@ -366,12 +434,13 @@ cmd_destroy() {
 }
 
 cmd_list() {
-  printf "%-20s %-18s %-8s %-10s %-8s\n" "NAME" "IP" "VCPU" "RAM" "STATUS"
+  printf "%-20s %-18s %-18s %-8s %-10s %-8s\n" "NAME" "TAILSCALE IP" "INTERNAL IP" "VCPU" "RAM" "STATUS"
   for d in "${VM_DIR}"/*/; do
     [ -f "${d}/vm.json" ] || continue
-    local name ip vcpu ram status
+    local name ip ts_ip vcpu ram status
     name=$(basename "$d")
-    ip=$(jq -r '.ip' "${d}/vm.json")
+    ip=$(jq -r '.internal_ip // .ip' "${d}/vm.json")
+    ts_ip=$(jq -r '.tailscale_ip // "-"' "${d}/vm.json")
     vcpu=$(jq -r '.vcpu' "${d}/vm.json")
     ram=$(jq -r '.ram_mib' "${d}/vm.json")
     status="stopped"
@@ -380,7 +449,7 @@ cmd_list() {
       pid=$(cat "${d}/firecracker.pid")
       kill -0 "$pid" 2>/dev/null && status="running"
     fi
-    printf "%-20s %-18s %-8s %-10s %-8s\n" "$name" "$ip" "$vcpu" "$((ram/1024))GB" "$status"
+    printf "%-20s %-18s %-18s %-8s %-10s %-8s\n" "$name" "$ts_ip" "$ip" "$vcpu" "$((ram/1024))GB" "$status"
   done
 }
 
@@ -390,7 +459,7 @@ cmd_shell() {
   [ -d "${VM_DIR}/${name}" ] || { echo "VM '${name}' does not exist."; exit 1; }
 
   local ip
-  ip=$(jq -r '.ip' "${VM_DIR}/${name}/vm.json")
+  ip=$(jq -r '.internal_ip // .ip' "${VM_DIR}/${name}/vm.json")
   exec ssh -t -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "dev@${ip}"
 }
 
@@ -413,7 +482,14 @@ cmd_status() {
     fi
   done
 
+  # Show Tailscale status
+  local ts_ip=""
+  if command -v tailscale &>/dev/null; then
+    ts_ip=$(tailscale ip -4 2>/dev/null) || true
+  fi
+
   echo "Host: $(hostname)"
+  [ -n "$ts_ip" ] && echo "Tailscale: ${ts_ip}"
   echo "VMs: ${running} running / ${vm_count} total"
   echo "RAM: ${used_ram}GB allocated / ${total_ram}GB total"
   echo "Headroom: $((total_ram - used_ram))GB"
@@ -440,7 +516,7 @@ case "${1:-help}" in
         cmd_create _gprov --vcpu 8 --ram 16384
         cmd_start _gprov
 
-        PROV_IP=$(jq -r '.ip' "${VM_DIR}/_gprov/vm.json")
+        PROV_IP=$(jq -r '.internal_ip // .ip' "${VM_DIR}/_gprov/vm.json")
         echo "Waiting for VM to boot..."
         for i in $(seq 1 60); do
           ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -455,7 +531,7 @@ case "${1:-help}" in
           "dev@${PROV_IP}" "sudo bash -s" < "$PROV_SCRIPT"
 
         echo "Shutting down provision VM..."
-        local dm_name="bc-_gprov"
+        dm_name="bc-_gprov"
         if [ -e "/dev/mapper/${dm_name}" ]; then
           echo "Merging snapshot into golden image..."
           dd if="/dev/mapper/${dm_name}" of="${GOLDEN}.new" bs=4M status=progress

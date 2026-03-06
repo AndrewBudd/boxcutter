@@ -2,7 +2,7 @@
 
 # --- Physical host targets ---
 
-setup:                ## Install QEMU, download cloud image, create TAP + NAT
+setup:                ## Install QEMU, download cloud image, create TAP device + NAT
 	@bash host/setup.sh
 
 launch:               ## Start the Boxcutter Node VM (foreground)

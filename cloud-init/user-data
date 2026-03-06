@@ -1,6 +1,6 @@
 #cloud-config
 
-hostname: boxcutter-node
+hostname: boxcutter
 manage_etc_hosts: true
 
 users:
@@ -20,6 +20,7 @@ packages:
   - e2fsprogs
   - iptables-persistent
   - bridge-utils
+  - ebtables
   - net-tools
   - openssh-server
   - ca-certificates

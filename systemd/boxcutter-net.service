@@ -1,5 +1,5 @@
 [Unit]
-Description=Boxcutter VM bridge network (brvm0)
+Description=Boxcutter internal VM bridge network (brvm0)
 Before=caddy.service
 
 [Service]

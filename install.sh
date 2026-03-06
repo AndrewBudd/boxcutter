@@ -1,6 +1,6 @@
 #!/bin/bash
 # Boxcutter Node VM setup — runs inside the Node VM
-# Installs Firecracker, networking, Caddy, and all management scripts.
+# Installs Firecracker, Tailscale, networking, Caddy, and all management scripts.
 set -e
 
 if [ "$EUID" -ne 0 ]; then
@@ -77,36 +77,55 @@ cp "${SRC}/config/Caddyfile" /etc/caddy/Caddyfile
 systemctl enable caddy
 
 # -------------------------------------------------------------------
-# 4. Network config for VM IP pool
+# 4. Install Tailscale on the Node VM
 # -------------------------------------------------------------------
 echo ""
-echo "--- Detecting network config ---"
-# Auto-detect LAN settings from the current network
-DEFAULT_IF=$(ip route | awk '/^default/{print $5; exit}')
-CURRENT_IP=$(ip -4 addr show "$DEFAULT_IF" | awk '/inet /{print $2; exit}')
-CURRENT_GW=$(ip route | awk '/^default/{print $3; exit}')
-IP_PREFIX=$(echo "$CURRENT_IP" | cut -d. -f1-3)
-IP_CIDR=$(echo "$CURRENT_IP" | cut -d/ -f2)
+echo "--- Installing Tailscale ---"
+if ! command -v tailscale &>/dev/null; then
+  curl -fsSL https://tailscale.com/install.sh | sh
+  echo "Tailscale installed."
+else
+  echo "Tailscale already installed."
+fi
+systemctl enable tailscaled
+systemctl start tailscaled
 
+# The Node VM should be joined to Tailscale manually (not with the ephemeral VM key).
+# The ephemeral key at /etc/boxcutter/tailscale-authkey is for VMs only.
+mkdir -p /etc/boxcutter
+if ! tailscale status &>/dev/null; then
+  echo "Tailscale is installed but not connected."
+  echo "Join manually: sudo tailscale up --hostname=boxcutter --ssh"
+  echo "Then place the ephemeral VM auth key at /etc/boxcutter/tailscale-authkey"
+fi
+
+# Install ebtables for VM isolation
+apt-get install -y ebtables >/dev/null 2>&1 || true
+
+# -------------------------------------------------------------------
+# 5. Network config for VM IP pool (internal network)
+# -------------------------------------------------------------------
+echo ""
+echo "--- Configuring internal network ---"
 mkdir -p /etc/boxcutter
 cat > "${BOXCUTTER_HOME}/network.conf" <<NETEOF
-# Auto-detected LAN config (edit if needed)
-VM_IP_PREFIX=${IP_PREFIX}
+# Internal network config (VMs get unroutable IPs + Tailscale)
+VM_IP_PREFIX=10.0.1
 VM_IP_START=200
 VM_IP_END=250
-LAN_GW=${CURRENT_GW}
-LAN_CIDR=${IP_CIDR}
-LAN_DNS=8.8.8.8
+VM_GW=10.0.1.1
+VM_CIDR=24
+VM_DNS=8.8.8.8
 NETEOF
 echo "Network config written to ${BOXCUTTER_HOME}/network.conf"
-echo "  VM IP pool: ${IP_PREFIX}.200-250"
-echo "  Gateway: ${CURRENT_GW}"
+echo "  VM internal pool: 10.0.1.200-250 (not routable outside Node VM)"
+echo "  External access via Tailscale"
 
 # -------------------------------------------------------------------
-# 5. Set up networking
+# 6. Set up networking
 # -------------------------------------------------------------------
 echo ""
-echo "--- Setting up bridge network ---"
+echo "--- Setting up internal bridge network ---"
 install -m 755 "${SRC}/scripts/boxcutter-net" /usr/local/bin/
 cp "${SRC}/systemd/boxcutter-net.service" /etc/systemd/system/
 systemctl daemon-reload
@@ -116,7 +135,7 @@ systemctl enable boxcutter-net
 /usr/local/bin/boxcutter-net up
 
 # -------------------------------------------------------------------
-# 6. Install management scripts
+# 7. Install management scripts
 # -------------------------------------------------------------------
 echo ""
 echo "--- Installing boxcutter scripts ---"
@@ -127,7 +146,7 @@ install -m 755 "${SRC}/scripts/boxcutter-gateway" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-names" /usr/local/bin/
 
 # -------------------------------------------------------------------
-# 7. Systemd services
+# 8. Systemd services
 # -------------------------------------------------------------------
 echo ""
 echo "--- Installing systemd services ---"
@@ -136,7 +155,7 @@ systemctl daemon-reload
 systemctl enable boxcutter-proxy-sync
 
 # -------------------------------------------------------------------
-# 8. SSH control interface
+# 9. SSH control interface
 # -------------------------------------------------------------------
 echo ""
 echo "--- Setting up SSH control interface ---"
@@ -178,7 +197,7 @@ sed -i "s/result->pw_uid = 1000/result->pw_uid = ${BOXCUTTER_UID}/" /tmp/nss_cat
 sed -i "s/result->pw_gid = 1000/result->pw_gid = ${BOXCUTTER_GID}/" /tmp/nss_catchall_node.c
 sed -i 's|/home/dev|/home/boxcutter|g' /tmp/nss_catchall_node.c
 # Add Node VM system users to the skip list
-sed -i 's/"avahi",/"avahi", "ubuntu", "caddy", "dnsmasq",/' /tmp/nss_catchall_node.c
+sed -i 's/"avahi",/"avahi", "ubuntu", "caddy",/' /tmp/nss_catchall_node.c
 
 LIBDIR=$(gcc -print-multi-os-directory 2>/dev/null && echo /usr/lib/x86_64-linux-gnu || echo /usr/lib/x86_64-linux-gnu)
 apt-get install -y gcc libc6-dev > /dev/null 2>&1
@@ -209,7 +228,7 @@ EOF
 systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 
 # -------------------------------------------------------------------
-# 9. Generate SSH keypair for VM access
+# 10. Generate SSH keypair for VM access
 # -------------------------------------------------------------------
 echo ""
 echo "--- Generating VM access SSH key ---"
@@ -220,7 +239,7 @@ if [ ! -f "${BOXCUTTER_HOME}/ssh/id_ed25519" ]; then
 fi
 
 # -------------------------------------------------------------------
-# 10. Ensure loop devices work (needed for golden image build)
+# 11. Ensure loop devices work (needed for golden image build)
 # -------------------------------------------------------------------
 if [ ! -e /dev/loop-control ]; then
   mknod /dev/loop-control c 10 237
@@ -240,7 +259,7 @@ chmod 660 /dev/kvm
 chgrp kvm /dev/kvm 2>/dev/null || true
 
 # -------------------------------------------------------------------
-# 11. Create state directories
+# 12. Create state directories
 # -------------------------------------------------------------------
 mkdir -p "${BOXCUTTER_HOME}/vms"
 mkdir -p "${BOXCUTTER_HOME}/golden"
@@ -248,6 +267,7 @@ mkdir -p "${BOXCUTTER_HOME}/golden"
 # Copy golden image build scripts
 cp "${SRC}/golden/build.sh" "${BOXCUTTER_HOME}/golden/build.sh"
 cp "${SRC}/golden/provision.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
+cp "${SRC}/golden/nss_catchall.c" "${BOXCUTTER_HOME}/golden/nss_catchall.c"
 chmod +x "${BOXCUTTER_HOME}/golden/build.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
 
 # -------------------------------------------------------------------
@@ -259,10 +279,11 @@ echo "  Boxcutter Node VM setup complete!"
 echo "============================================"
 echo ""
 echo "Next steps:"
-echo "  1. Build golden image:  sudo boxcutter-ctl golden build"
-echo "  2. Create a VM:         sudo boxcutter-ctl create agent-1"
-echo "  3. Start the VM:        sudo boxcutter-ctl start agent-1"
-echo "  4. Shell into it:       sudo boxcutter-ctl shell agent-1"
+echo "  1. Join Tailscale (Node VM): sudo tailscale up --hostname=boxcutter --ssh"
+echo "  2. Place ephemeral VM auth key: echo 'tskey-auth-...' | sudo tee /etc/boxcutter/tailscale-authkey"
+echo "  3. Build golden image:  sudo boxcutter-ctl golden build"
+echo "  4. Create a VM:         sudo boxcutter-ctl create agent-1"
+echo "  5. Start the VM:        sudo boxcutter-ctl start agent-1"
 echo ""
 echo "Start all services:"
 echo "  sudo systemctl start caddy boxcutter-net boxcutter-proxy-sync"

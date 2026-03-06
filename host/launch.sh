@@ -26,11 +26,7 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-# Ensure bridge and TAP are up
-if ! ip link show "$BRIDGE" &>/dev/null; then
-  echo "Bridge ${BRIDGE} not found. Run host/setup.sh first."
-  exit 1
-fi
+# Ensure TAP device is up
 if ! ip link show "$TAP_DEVICE" &>/dev/null; then
   echo "TAP device not found. Run host/setup.sh first."
   exit 1
@@ -41,7 +37,7 @@ DAEMON=false
 
 echo "Starting Boxcutter Node VM..."
 echo "  vCPU: ${NODE_VCPU}, RAM: ${NODE_RAM}"
-echo "  Network: ${BRIDGE} → ${NODE_IP}"
+echo "  Network: ${TAP_DEVICE} (${HOST_TAP_IP} → ${NODE_IP})"
 echo ""
 
 QEMU_ARGS=(

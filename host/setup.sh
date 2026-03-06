@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install QEMU and dependencies on the physical host.
-# Download Ubuntu cloud image. Create bridge, TAP device.
+# Download Ubuntu cloud image. Create TAP device with NAT.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -65,8 +65,8 @@ cp "${SCRIPT_DIR}/../cloud-init/meta-data" "${CIDATA_DIR}/meta-data"
 
 # Substitute network config
 sed -e "s|NODE_IP_PLACEHOLDER|${NODE_IP}|" \
-    -e "s|NODE_CIDR_PLACEHOLDER|${LAN_CIDR}|" \
-    -e "s|HOST_TAP_IP_PLACEHOLDER|${LAN_GW}|" \
+    -e "s|NODE_CIDR_PLACEHOLDER|${HOST_TAP_CIDR}|" \
+    -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_TAP_IP}|" \
     -e "s|NODE_MAC_PLACEHOLDER|${NODE_MAC}|" \
     "${SCRIPT_DIR}/../cloud-init/network-config" > "${CIDATA_DIR}/network-config"
 
@@ -75,49 +75,44 @@ genisoimage -output "${IMAGES_DIR}/cloud-init.iso" \
   "${CIDATA_DIR}/user-data" "${CIDATA_DIR}/meta-data" "${CIDATA_DIR}/network-config" \
   2>/dev/null
 
-# --- Set up LAN bridge ---
-echo "Setting up LAN bridge (${BRIDGE})..."
+# --- Set up TAP device with NAT ---
+echo "Setting up TAP device (${TAP_DEVICE}) with NAT..."
 sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-if ! ip link show "$BRIDGE" &>/dev/null; then
-  # Create bridge and move host IP to it
-  sudo ip link add name "$BRIDGE" type bridge
-  sudo ip link set "$BRIDGE" up
-
-  # Move host interface into bridge
-  CURRENT_IP=$(ip -4 addr show "$HOST_INTERFACE" | awk '/inet /{print $2; exit}')
-  CURRENT_GW=$(ip route | awk '/^default.*'"$HOST_INTERFACE"'/{print $3; exit}')
-
-  sudo ip addr flush dev "$HOST_INTERFACE"
-  sudo ip link set "$HOST_INTERFACE" master "$BRIDGE"
-  sudo ip addr add "$CURRENT_IP" dev "$BRIDGE"
-  sudo ip route add default via "$CURRENT_GW" dev "$BRIDGE" 2>/dev/null || true
-
-  echo "Bridge ${BRIDGE} created with ${HOST_INTERFACE}"
-else
-  echo "Bridge ${BRIDGE} already exists."
-fi
-
-# --- Create TAP device on the bridge ---
-echo "Setting up TAP device (${TAP_DEVICE})..."
 if ! ip link show "$TAP_DEVICE" &>/dev/null; then
   sudo ip tuntap add dev "$TAP_DEVICE" mode tap user "$(whoami)"
-  sudo ip link set "$TAP_DEVICE" master "$BRIDGE"
   sudo ip link set "$TAP_DEVICE" up
+  sudo ip addr add "${HOST_TAP_IP}/${HOST_TAP_CIDR}" dev "$TAP_DEVICE" 2>/dev/null || true
+  echo "TAP device ${TAP_DEVICE} created (${HOST_TAP_IP}/${HOST_TAP_CIDR})"
 else
   echo "TAP device already exists."
+  # Ensure IP is assigned
+  sudo ip addr add "${HOST_TAP_IP}/${HOST_TAP_CIDR}" dev "$TAP_DEVICE" 2>/dev/null || true
 fi
 
-# --- Forwarding rules (Docker sets FORWARD policy to DROP) ---
-echo "Setting up forwarding rules..."
-sudo iptables -C FORWARD -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null || \
-sudo iptables -I FORWARD -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT
+# --- NAT: masquerade Node VM traffic to internet ---
+echo "Setting up NAT masquerade..."
+sudo iptables -t nat -C POSTROUTING -s "${HOST_TAP_IP}/${HOST_TAP_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || \
+sudo iptables -t nat -A POSTROUTING -s "${HOST_TAP_IP}/${HOST_TAP_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE
+
+# Also NAT the VM internal network (10.0.1.0/24) which gets routed through the Node VM
+sudo iptables -t nat -C POSTROUTING -s "${VM_IP_PREFIX}.0/${VM_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || \
+sudo iptables -t nat -A POSTROUTING -s "${VM_IP_PREFIX}.0/${VM_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE
+
+# Forward traffic from TAP
+sudo iptables -C FORWARD -i "$TAP_DEVICE" -j ACCEPT 2>/dev/null || \
+sudo iptables -I FORWARD -i "$TAP_DEVICE" -j ACCEPT
+sudo iptables -C FORWARD -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+sudo iptables -I FORWARD -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+# Route the VM internal network through the Node VM
+sudo ip route replace "${VM_IP_PREFIX}.0/${VM_CIDR}" via "$NODE_IP" dev "$TAP_DEVICE" 2>/dev/null || true
 
 echo ""
 echo "=== Host setup complete ==="
 echo "Node VM disk: ${IMAGES_DIR}/node.qcow2"
 echo "Cloud-init:   ${IMAGES_DIR}/cloud-init.iso"
-echo "Bridge:       ${BRIDGE} (${HOST_INTERFACE} + ${TAP_DEVICE})"
-echo "Node VM IP:   ${NODE_IP}"
+echo "TAP device:   ${TAP_DEVICE} (${HOST_TAP_IP}/${HOST_TAP_CIDR})"
+echo "Node VM IP:   ${NODE_IP} (internal — access via Tailscale)"
 echo ""
 echo "Next: ./host/launch.sh"

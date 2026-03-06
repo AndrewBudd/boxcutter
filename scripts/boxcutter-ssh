@@ -19,10 +19,14 @@ case "$ACTION" in
     [ -z "$NAME" ] && { echo "Error: could not generate unique name"; exit 1; }
     $CTL create "$NAME" "${ARGS[@]:1}"
     $CTL start "$NAME"
-    IP=$(jq -r '.ip' "/var/lib/boxcutter/vms/${NAME}/vm.json")
+    TS_IP=$(jq -r '.tailscale_ip // empty' "/var/lib/boxcutter/vms/${NAME}/vm.json" 2>/dev/null)
     echo ""
     echo "VM ready: ${NAME}"
-    echo "Connect: ssh ${IP}"
+    if [ -n "$TS_IP" ]; then
+      echo "Connect: ssh ${TS_IP}"
+    else
+      echo "Connect: Tailscale IP pending (check with: ssh <host> list)"
+    fi
     ;;
   list)    exec $CTL list ;;
   shell)
@@ -48,7 +52,7 @@ case "$ACTION" in
     VM_DIR="/var/lib/boxcutter/vms"
     VM_NAME="${TARGET%.box}"
     [ -d "${VM_DIR}/${VM_NAME}" ] || { echo "VM '${VM_NAME}' does not exist." >&2; exit 1; }
-    IP=$(jq -r '.ip' "${VM_DIR}/${VM_NAME}/vm.json")
+    IP=$(jq -r '.internal_ip // .ip' "${VM_DIR}/${VM_NAME}/vm.json")
     exec nc "$IP" 22
     ;;
   adduser)
@@ -76,11 +80,11 @@ Boxcutter SSH control interface
 
 Commands:
   new                       Provision and start a new VM
-  list                      List all VMs
+  list                      List all VMs (with Tailscale IPs)
   shell <name>              SSH into VM (use -t for interactive)
   start <name>              Start a stopped VM
   stop <name>               Stop a running VM
-  destroy <name>            Tear down a VM
+  destroy <name>            Tear down a VM (auto-removed from Tailscale)
   status                    Host capacity summary
   adduser <github-user>     Add SSH keys from GitHub
   proxy <name>              TCP tunnel to VM (for ProxyCommand)
@@ -88,6 +92,7 @@ Commands:
 Usage: ssh <host> <command> [args]
 
 Any SSH username works — no need to specify a user.
+VMs are accessible via their Tailscale IP addresses.
 EOF
     ;;
 esac
