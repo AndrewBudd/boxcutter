@@ -60,10 +60,16 @@ Output looks like:
 ```
 Creating VM: bold-fox (4 vCPU, 8GB RAM, 50G disk)
   Creating copy-on-write snapshot...
+  Injecting user SSH keys...
   VM created: bold-fox (internal: 10.0.1.200)
+  Start with: boxcutter-ctl start bold-fox
 Starting VM: bold-fox (internal: 10.0.1.200)
-  Waiting for Tailscale...
+  VM started (PID 12847)
+  Waiting for VM to boot...
+ready
+  Joining Tailscale...
   Tailscale IP: 100.64.1.42
+  SSH: ssh 100.64.1.42
 
 VM ready: bold-fox
 Connect: ssh 100.64.1.42
@@ -90,13 +96,11 @@ ssh <TAILSCALE_IP> "command here"
 
 ### Waiting for SSH
 
-After `ssh HOST new`, the VM needs a few seconds before SSH is ready (Tailscale handshake adds ~3-5s). Test with:
+The `ssh HOST new` command waits for the VM to be fully booted and Tailscale-connected before returning. By the time you see the "VM ready" line, SSH should work immediately. If it doesn't connect on the first try (rare), retry once or twice:
 
 ```bash
-ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no <TAILSCALE_IP> echo ready
+ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null <TAILSCALE_IP> echo ready
 ```
-
-Retry a few times if it doesn't connect on the first attempt.
 
 ## Pre-installed tools
 
@@ -129,15 +133,17 @@ ssh <TAILSCALE_IP> "sudo apt-get update && sudo apt-get install -y postgresql re
 
 ## Copying files to/from a VM
 
+Always use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` with scp too, since VM host keys are ephemeral.
+
 ```bash
 # Copy a file to the VM
-scp file.txt <TAILSCALE_IP>:/home/dev/
+scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null file.txt <TAILSCALE_IP>:/home/dev/
 
 # Copy a directory
-scp -r myproject/ <TAILSCALE_IP>:/home/dev/
+scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null myproject/ <TAILSCALE_IP>:/home/dev/
 
 # Copy from the VM
-scp <TAILSCALE_IP>:/home/dev/output.txt ./
+scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null <TAILSCALE_IP>:/home/dev/output.txt ./
 ```
 
 ## Accessing services running in a VM
@@ -182,10 +188,10 @@ VMs are isolated Firecracker microVMs with their own kernel. They're a good plac
 
 ## Important things to know
 
-- **VMs are ephemeral.** Destroying a VM permanently deletes all its data. There is no undo.
+- **VMs are ephemeral.** Destroying a VM permanently deletes all its data. There is no undo. Stopping a VM preserves its disk state — you can start it again later.
 - **Each VM defaults to 4 vCPU, 8GB RAM, 50GB disk.** This is enough for most dev workloads.
-- **Boot time is ~1 second** (internal network), plus ~3-5 seconds for Tailscale to connect.
-- **All SSH is key-based.** Your SSH keys must be registered with the Boxcutter host (via `adduser` or during initial setup).
+- **Boot time is ~5 seconds** total (VM boot + Tailscale join). The `new` command waits for everything to be ready before returning.
+- **All SSH is key-based.** The keys of whoever ran the initial setup are automatically trusted. Additional users can be added via `adduser <github-user>`.
 - **VMs are accessible via Tailscale.** They're reachable from any device on your tailnet, not just the local network.
 - **Any SSH username works.** Both on the control host and on VMs — no need to specify a user.
 - **Check capacity before creating many VMs.** Run `ssh HOST status` to see available RAM. Each VM uses 8GB by default.
