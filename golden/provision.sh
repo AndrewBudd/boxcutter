@@ -44,8 +44,8 @@ su - dev -c 'sed -i "2i export PATH=\"\$HOME/.local/bin:\$HOME/.local/share/mise
 su - dev -c '~/.local/bin/mise use -g node@22' || true
 su - dev -c '~/.local/bin/mise use -g ruby@3.2' || true
 
-# Claude Code (requires node from mise)
-su - dev -c 'export PATH="$HOME/.local/share/mise/shims:$PATH" && npm install -g @anthropic-ai/claude-code' || true
+# Claude Code (native installer, no node dependency)
+su - dev -c 'curl -fsSL https://claude.ai/install.sh | bash' || true
 
 # Services declaration file
 cat > /home/dev/.services << 'EOF'
@@ -55,6 +55,54 @@ cat > /home/dev/.services << 'EOF'
 # example=3000
 EOF
 chown dev:dev /home/dev/.services
+
+# gh-token-refresh: auto-refresh GitHub token from vmid metadata service
+cat > /usr/local/bin/gh-token-refresh << 'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+METADATA="http://169.254.169.254"
+resp=$(curl -sf "$METADATA/token/github" 2>/dev/null) || {
+    echo "vmid: GitHub token not available (service may not be configured)" >&2
+    exit 0
+}
+token=$(echo "$resp" | jq -r '.token // empty')
+[ -z "$token" ] && { echo "vmid: no token in response" >&2; exit 1; }
+mkdir -p "$HOME/.config/gh"
+cat > "$HOME/.config/gh/hosts.yml" <<EOF
+github.com:
+    oauth_token: $token
+    user: x-access-token
+    git_protocol: https
+EOF
+# Also configure git credential for HTTPS clones/pushes
+git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password='$token'"; }; f'
+echo "vmid: GitHub token refreshed (expires: $(echo "$resp" | jq -r '.expires_at // "unknown"'))"
+SCRIPT
+chmod +x /usr/local/bin/gh-token-refresh
+
+# Systemd timer to refresh GitHub token every 30 minutes
+cat > /etc/systemd/system/gh-token-refresh.service << 'EOF'
+[Unit]
+Description=Refresh GitHub token from vmid
+[Service]
+Type=oneshot
+User=dev
+ExecStart=/usr/local/bin/gh-token-refresh
+Environment=HOME=/home/dev
+EOF
+
+cat > /etc/systemd/system/gh-token-refresh.timer << 'EOF'
+[Unit]
+Description=Refresh GitHub token every 30 minutes
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30min
+AccuracySec=1min
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl enable gh-token-refresh.timer 2>/dev/null || true
 
 # Enable SSH
 systemctl enable ssh 2>/dev/null || true

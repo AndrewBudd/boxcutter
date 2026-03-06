@@ -161,6 +161,11 @@ parse_repo_url() {
     echo "${BASH_REMATCH[1]}" | sed 's/\.git$//'
     return
   fi
+  # Bare hostname: github.com/owner/repo
+  if [[ "$url" =~ ^[^/]+\.[^/]+/(.+)$ ]]; then
+    echo "${BASH_REMATCH[1]}" | sed 's/\.git$//'
+    return
+  fi
   # Already owner/repo format
   echo "$url"
 }
@@ -419,13 +424,67 @@ cmd_start() {
     clone_url=$(jq -r '.clone_url // ""' "${VM_DIR}/${name}/vm.json")
     if [ -n "$clone_url" ]; then
       echo "  Cloning ${clone_url}..."
-      # Wait for gh-token-refresh to run (triggered on boot)
-      sleep 2
-      # Trigger a token refresh so gh auth is ready for the clone
-      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+
+      # Mint a GitHub token from vmid (Node-side, via admin socket)
+      local gh_token="" token_error=""
+      if [ -S "$VMID_SOCKET" ] && [ -n "$github_repo" ]; then
+        local token_resp
+        token_resp=$(curl -s --unix-socket "$VMID_SOCKET" \
+          -X POST "http://localhost/internal/vms/${name}/github-token" 2>/dev/null)
+        gh_token=$(echo "$token_resp" | jq -r '.token // empty' 2>/dev/null) || true
+        if [ -z "$gh_token" ]; then
+          token_error=$(echo "$token_resp" | head -1)
+        fi
+      elif [ ! -S "$VMID_SOCKET" ]; then
+        token_error="vmid not running (no socket at $VMID_SOCKET)"
+      elif [ -z "$github_repo" ]; then
+        token_error="no github_repo parsed from clone URL"
+      fi
+
+      if [ -n "$token_error" ]; then
+        echo "  Token error: ${token_error}"
+        echo "  Attempting clone without auth (will only work for public repos)..."
+      fi
+
+      # Build the clone URL with token auth for HTTPS
+      local auth_clone_url="$clone_url"
+      if [ -n "$gh_token" ]; then
+        local repo_path="$github_repo"
+        auth_clone_url="https://x-access-token:${gh_token}@github.com/${repo_path}.git"
+      fi
+
+      local clone_output
+      clone_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
-        "/usr/local/bin/gh-token-refresh 2>/dev/null; git clone '${clone_url}' ~/project" 2>/dev/null || \
-        echo "  Warning: clone failed (repo may require auth — it will work after token refresh)"
+        "git clone '${auth_clone_url}' ~/project 2>&1")
+      local clone_rc=$?
+
+      if [ $clone_rc -eq 0 ]; then
+        echo "  Cloned successfully."
+        if [ -n "$gh_token" ]; then
+          # Strip token from remote URL + set up gh CLI auth + git credential helper
+          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+            "cd ~/project && git remote set-url origin 'https://github.com/${github_repo}.git'
+             mkdir -p ~/.config/gh
+             cat > ~/.config/gh/hosts.yml <<GHEOF
+github.com:
+    oauth_token: ${gh_token}
+    user: x-access-token
+    git_protocol: https
+GHEOF
+             git config --global credential.helper '!f() { echo username=x-access-token; echo password=${gh_token}; }; f'" 2>/dev/null || true
+        fi
+      else
+        echo "  Clone failed."
+        # Sanitize output — strip any token from error messages
+        echo "$clone_output" | sed "s|x-access-token:[^@]*@|x-access-token:***@|g" | sed 's/^/    /'
+        if [ -n "$gh_token" ]; then
+          echo "  The GitHub App token was minted but the repo may not be accessible."
+          echo "  Check: https://github.com/organizations/${github_repo%%/*}/settings/installations"
+          echo "  Ensure the boxcutter-gh app has access to the '${github_repo##*/}' repository."
+        fi
+      fi
     fi
   else
     echo "  Internal VM — skipping Tailscale"

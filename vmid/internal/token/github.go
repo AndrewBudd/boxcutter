@@ -20,14 +20,15 @@ import (
 
 type GitHubTokenMinter struct {
 	appID          int64
-	installationID int64
+	installationID int64 // default installation
 	privateKey     interface{} // *rsa.PrivateKey
 	policies       []config.Policy
 
-	mu             sync.RWMutex
-	repoCache      []string
-	repoCacheTime  time.Time
-	repoCacheTTL   time.Duration
+	mu                  sync.RWMutex
+	repoCache           []string
+	repoCacheTime       time.Time
+	repoCacheTTL        time.Duration
+	installationCache   map[string]int64 // owner -> installation_id
 }
 
 type GitHubTokenResponse struct {
@@ -58,11 +59,12 @@ func NewGitHubTokenMinter(cfg *config.GitHubConfig, policies []config.Policy) (*
 	}
 
 	return &GitHubTokenMinter{
-		appID:          cfg.AppID,
-		installationID: cfg.InstallationID,
-		privateKey:     key,
-		policies:       policies,
-		repoCacheTTL:   cfg.RepoCacheTTL,
+		appID:             cfg.AppID,
+		installationID:    cfg.InstallationID,
+		privateKey:        key,
+		policies:          policies,
+		repoCacheTTL:      cfg.RepoCacheTTL,
+		installationCache: make(map[string]int64),
 	}, nil
 }
 
@@ -143,8 +145,66 @@ type installationTokenResponse struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+// findInstallationForRepo looks up which installation has access to a given repo.
+// Uses GET /repos/{owner}/{repo}/installation with App JWT auth.
+// Caches by owner since all repos under one owner use the same installation.
+func (g *GitHubTokenMinter) findInstallationForRepo(appJWT, repoFullName string) (int64, error) {
+	parts := strings.SplitN(repoFullName, "/", 2)
+	if len(parts) != 2 {
+		return g.installationID, nil
+	}
+	owner := parts[0]
+
+	g.mu.RLock()
+	if id, ok := g.installationCache[owner]; ok {
+		g.mu.RUnlock()
+		return id, nil
+	}
+	g.mu.RUnlock()
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/installation", repoFullName)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+appJWT)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "vmid")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("looking up installation for %s: %w", repoFullName, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("looking up installation for %s: %d %s", repoFullName, resp.StatusCode, body)
+	}
+
+	var result struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("decoding installation for %s: %w", repoFullName, err)
+	}
+
+	g.mu.Lock()
+	g.installationCache[owner] = result.ID
+	g.mu.Unlock()
+
+	return result.ID, nil
+}
+
 func (g *GitHubTokenMinter) createInstallationToken(appJWT string, repos []string, perms map[string]string) (*installationTokenResponse, error) {
-	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", g.installationID)
+	// Determine which installation to use
+	installID := g.installationID
+	if len(repos) > 0 {
+		// Look up the correct installation for the first repo's owner
+		id, err := g.findInstallationForRepo(appJWT, repos[0])
+		if err == nil && id != 0 {
+			installID = id
+		}
+	}
+
+	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installID)
 
 	body := &installationTokenRequest{}
 	if len(repos) > 0 {
@@ -192,9 +252,14 @@ func (g *GitHubTokenMinter) createInstallationToken(appJWT string, repos []strin
 // ResolvePolicy finds the first matching policy for a VM record.
 // If the VM was registered with a github_repo, that takes precedence.
 func (g *GitHubTokenMinter) ResolvePolicy(rec *registry.VMRecord) (repos []string, perms map[string]string, err error) {
-	// On-the-fly policy from provisioner
+	// On-the-fly policy from provisioner — dev VMs need full repo access
 	if rec.GitHubRepo != "" {
-		return []string{rec.GitHubRepo}, map[string]string{"contents": "read"}, nil
+		return []string{rec.GitHubRepo}, map[string]string{
+			"contents":      "write",
+			"pull_requests": "write",
+			"issues":        "write",
+			"metadata":      "read",
+		}, nil
 	}
 
 	// Policy-based resolution
