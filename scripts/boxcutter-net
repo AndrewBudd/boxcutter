@@ -1,12 +1,8 @@
 #!/bin/bash
-# Set up the internal bridge network for Firecracker VMs.
-# VMs get internal-only IPs (10.0.1.0/24) with NAT to internet.
-# VM isolation: VMs cannot communicate with each other on the bridge.
+# Set up one-time network infrastructure for Firecracker VMs.
+# Each VM gets its own TAP with point-to-point 10.0.0.1/30 ↔ 10.0.0.2/30.
+# fwmark-based policy routing handles return traffic to the correct TAP.
 set -e
-
-BRIDGE="brvm0"
-BRIDGE_IP="10.0.1.1"
-BRIDGE_CIDR="24"
 
 case "${1:-up}" in
   up)
@@ -22,63 +18,44 @@ case "${1:-up}" in
     chmod 660 /dev/kvm
     chgrp kvm /dev/kvm 2>/dev/null || true
 
-    if ! ip link show "$BRIDGE" &>/dev/null; then
-      echo "Creating internal bridge ${BRIDGE} (${BRIDGE_IP}/${BRIDGE_CIDR})..."
-
-      # Create bridge — this is internal only, not connected to any uplink
-      ip link add name "$BRIDGE" type bridge
-      ip link set "$BRIDGE" up
-      ip addr add "${BRIDGE_IP}/${BRIDGE_CIDR}" dev "$BRIDGE"
-
-      echo "Bridge ${BRIDGE} created."
-    else
-      echo "Bridge ${BRIDGE} already exists."
-    fi
-
-    # Enable IP forwarding and NAT for VM internet access
+    # Enable IP forwarding
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    # Allow accepted TCP sockets to inherit the packet's fwmark (needed by vmid)
+    sysctl -w net.ipv4.tcp_fwmark_accept=1 >/dev/null
 
-    # Find the uplink interface (the one with the default route)
+    # Find uplink interface
     UPLINK=$(ip route | awk '/^default/{print $5; exit}')
     [ -z "$UPLINK" ] && { echo "Warning: no default route found, VMs won't have internet"; }
 
     if [ -n "$UPLINK" ]; then
-      # NAT VM traffic to internet via the Node VM's uplink
-      iptables -t nat -C POSTROUTING -s "${BRIDGE_IP%.*}.0/${BRIDGE_CIDR}" -o "$UPLINK" -j MASQUERADE 2>/dev/null || \
-      iptables -t nat -A POSTROUTING -s "${BRIDGE_IP%.*}.0/${BRIDGE_CIDR}" -o "$UPLINK" -j MASQUERADE
+      # Restore conntrack marks on return traffic (before per-TAP rules)
+      iptables -t mangle -C PREROUTING -j CONNMARK --restore-mark 2>/dev/null || \
+      iptables -t mangle -A PREROUTING -j CONNMARK --restore-mark
 
-      # Allow forwarding from bridge to uplink and back
-      iptables -C FORWARD -i "$BRIDGE" -o "$UPLINK" -j ACCEPT 2>/dev/null || \
-      iptables -I FORWARD -i "$BRIDGE" -o "$UPLINK" -j ACCEPT
-      iptables -C FORWARD -i "$UPLINK" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-      iptables -I FORWARD -i "$UPLINK" -o "$BRIDGE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+      # Save marks to conntrack after per-TAP marking
+      iptables -t mangle -C POSTROUTING -m mark ! --mark 0 -j CONNMARK --save-mark 2>/dev/null || \
+      iptables -t mangle -A POSTROUTING -m mark ! --mark 0 -j CONNMARK --save-mark
+
+      # NAT all VM traffic (all VMs are 10.0.0.2)
+      iptables -t nat -C POSTROUTING -s 10.0.0.2/32 -o "$UPLINK" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s 10.0.0.2/32 -o "$UPLINK" -j MASQUERADE
+
+      # Allow established return traffic
+      iptables -C FORWARD -i "$UPLINK" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -i "$UPLINK" -m state --state RELATED,ESTABLISHED -j ACCEPT
     fi
 
-    # --- VM isolation: prevent VMs from talking to each other ---
-    # ebtables FORWARD chain handles frames forwarded between bridge ports.
-    # Traffic from the bridge IP (Node VM) to VMs goes through INPUT/OUTPUT, not FORWARD.
-    # So FORWARD DROP blocks VM-to-VM while Node VM can still reach all VMs.
-    if command -v ebtables &>/dev/null; then
-      ebtables -F FORWARD 2>/dev/null || true
-      ebtables -P FORWARD DROP
-      echo "VM isolation enabled (ebtables FORWARD DROP)."
-    else
-      # Fallback: use iptables to block VM-to-VM at Layer 3
-      iptables -C FORWARD -i "$BRIDGE" -o "$BRIDGE" -j DROP 2>/dev/null || \
-      iptables -A FORWARD -i "$BRIDGE" -o "$BRIDGE" -j DROP
-      echo "VM isolation enabled (iptables bridge-to-bridge DROP)."
-    fi
-
-    echo "Network ready."
+    echo "Network ready (per-TAP fwmark routing)."
     ;;
 
   down)
-    # Clean up ebtables
-    if command -v ebtables &>/dev/null; then
-      ebtables -F FORWARD 2>/dev/null || true
-      ebtables -P FORWARD ACCEPT 2>/dev/null || true
+    UPLINK=$(ip route | awk '/^default/{print $5; exit}')
+    if [ -n "$UPLINK" ]; then
+      iptables -t mangle -D PREROUTING -j CONNMARK --restore-mark 2>/dev/null || true
+      iptables -t mangle -D POSTROUTING -m mark ! --mark 0 -j CONNMARK --save-mark 2>/dev/null || true
+      iptables -t nat -D POSTROUTING -s 10.0.0.2/32 -o "$UPLINK" -j MASQUERADE 2>/dev/null || true
+      iptables -D FORWARD -i "$UPLINK" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     fi
-    ip link del "$BRIDGE" 2>/dev/null || true
-    echo "Bridge ${BRIDGE} removed."
+    echo "Network rules removed."
     ;;
 esac

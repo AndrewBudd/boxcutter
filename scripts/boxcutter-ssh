@@ -52,8 +52,8 @@ case "$ACTION" in
     VM_DIR="/var/lib/boxcutter/vms"
     VM_NAME="${TARGET%.box}"
     [ -d "${VM_DIR}/${VM_NAME}" ] || { echo "VM '${VM_NAME}' does not exist." >&2; exit 1; }
-    IP=$(jq -r '.internal_ip // .ip' "${VM_DIR}/${VM_NAME}/vm.json")
-    exec nc "$IP" 22
+    TAP=$(jq -r '.tap // empty' "${VM_DIR}/${VM_NAME}/vm.json")
+    exec socat - "TCP:10.0.0.2:22,so-bindtodevice=${TAP}"
     ;;
   adduser)
     [ -z "$TARGET" ] && { echo "Usage: ssh <host> adduser <github-username>"; exit 1; }

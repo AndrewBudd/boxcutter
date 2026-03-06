@@ -4,11 +4,13 @@ description: >
   Manages ephemeral dev environment VMs via SSH. Creates, lists, starts, stops, and
   destroys Firecracker microVMs that boot in ~5 seconds with Tailscale networking,
   pre-installed dev tools (Node.js, Ruby, git, Claude Code), and passwordless sudo.
-  Triggers on: spinning up a VM, creating a dev environment, testing in a clean machine,
-  running something in isolation, setting up a dev box, ephemeral compute, throwaway
-  environments, sandboxed execution, "try this somewhere safe", "fresh environment",
-  "clean VM", or any mention of Boxcutter. Also triggers when the user needs to SSH
-  into a remote dev machine, check VM status, or manage VM lifecycle.
+  VMs use per-TAP fwmark routing (every VM is 10.0.0.2 on isolated TAP links).
+  Supports normal and paranoid modes. Triggers on: spinning up a VM, creating a dev
+  environment, testing in a clean machine, running something in isolation, setting up
+  a dev box, ephemeral compute, throwaway environments, sandboxed execution, "try this
+  somewhere safe", "fresh environment", "clean VM", or any mention of Boxcutter. Also
+  triggers when the user needs to SSH into a remote dev machine, check VM status, or
+  manage VM lifecycle.
 ---
 
 # Boxcutter
@@ -43,7 +45,8 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null HOST <command>
 | Command | Description |
 |---------|-------------|
 | `ssh HOST new` | Create and start a new VM (returns name + Tailscale IP) |
-| `ssh HOST list` | List all VMs with Tailscale IPs and status |
+| `ssh HOST create <name> --mode paranoid` | Create a paranoid-mode VM |
+| `ssh HOST list` | List all VMs with marks, modes, Tailscale IPs, and status |
 | `ssh HOST start <name>` | Start a stopped VM |
 | `ssh HOST stop <name>` | Gracefully stop a VM |
 | `ssh HOST destroy <name>` | Permanently delete a VM (auto-removed from Tailscale) |
@@ -59,12 +62,11 @@ ssh HOST new
 
 Output looks like:
 ```
-Creating VM: bold-fox (4 vCPU, 8GB RAM, 50G disk)
+Creating VM: bold-fox (4 vCPU, 8GB RAM, 50G disk, mode: normal)
   Creating copy-on-write snapshot...
-  Injecting user SSH keys...
-  VM created: bold-fox (internal: 10.0.1.200)
-  Start with: boxcutter-ctl start bold-fox
-Starting VM: bold-fox (internal: 10.0.1.200)
+  Injecting CA cert...
+  VM created: bold-fox (mark: 41022, mode: normal)
+Starting VM: bold-fox (mark: 41022, mode: normal)
   VM started (PID 12847)
   Waiting for VM to boot...
 ready
@@ -182,7 +184,7 @@ When the user needs an environment that persists across sessions:
 
 ### Running untrusted or experimental code
 
-VMs are isolated Firecracker microVMs with their own kernel. They're a good place to run code you don't fully trust, test destructive operations, or experiment with system-level changes. VMs are also isolated from each other on the internal network.
+VMs are isolated Firecracker microVMs with their own kernel. They're a good place to run code you don't fully trust, test destructive operations, or experiment with system-level changes. VMs are also isolated from each other on separate TAP devices (no shared network).
 
 ## TLS certificates for VM services
 
@@ -220,3 +222,4 @@ Caddy handles cert provisioning and renewal automatically. It needs access to th
 - **Any SSH username works.** Both on the control host and on VMs — no need to specify a user.
 - **Check capacity before creating many VMs.** Run `ssh HOST status` to see available RAM. Each VM uses 8GB by default.
 - **Destroying a VM auto-removes it from Tailscale.** The ephemeral auth key means disconnected nodes are automatically cleaned up.
+- **Normal vs paranoid mode.** Normal VMs have full internet. Paranoid VMs route through a MITM proxy with sentinel token swapping — real credentials never touch the VM.

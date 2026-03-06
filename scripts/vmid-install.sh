@@ -22,7 +22,7 @@ mkdir -p /etc/vmid /run/vmid
 if [ ! -f /etc/vmid/config.yaml ]; then
   cat > /etc/vmid/config.yaml <<'EOF'
 listen:
-  vm_port: 8775
+  vm_port: 80
   admin_socket: /run/vmid/admin.sock
 
 jwt:
@@ -41,21 +41,6 @@ cp "${BOXCUTTER_HOME}/systemd/vmid.service" /etc/systemd/system/ 2>/dev/null || 
 systemctl daemon-reload
 systemctl enable vmid
 
-echo "=== Setting up iptables redirect ==="
-BRIDGE_IF="brvm0"
-VMID_PORT=8775
-
-# Add metadata IP to bridge
-if ! ip addr show dev "$BRIDGE_IF" 2>/dev/null | grep -q 169.254.169.254; then
-  ip addr add 169.254.169.254/32 dev "$BRIDGE_IF" 2>/dev/null || true
-fi
-
-# iptables redirect
-iptables -t nat -C PREROUTING -d 169.254.169.254/32 -p tcp --dport 80 \
-  -j REDIRECT --to-port "$VMID_PORT" 2>/dev/null || \
-iptables -t nat -A PREROUTING -d 169.254.169.254/32 -p tcp --dport 80 \
-  -j REDIRECT --to-port "$VMID_PORT"
-
 echo "=== Starting vmid ==="
 systemctl start vmid
 
@@ -64,3 +49,4 @@ echo "vmid installed and running."
 echo "  Config: /etc/vmid/config.yaml"
 echo "  Socket: /run/vmid/admin.sock"
 echo "  Health: curl --unix-socket /run/vmid/admin.sock http://localhost/healthz"
+echo "  VMs reach vmid at http://10.0.0.1:80 via their TAP link"

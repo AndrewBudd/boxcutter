@@ -7,10 +7,11 @@ Boxcutter runs [Firecracker](https://firecracker-microvm.github.io/) microVMs in
 ```
 $ ssh boxcutter new
 
-Creating VM: bold-fox (4 vCPU, 8GB RAM, 50G disk)
+Creating VM: bold-fox (4 vCPU, 8GB RAM, 50G disk, mode: normal)
   Creating copy-on-write snapshot...
-  VM created: bold-fox (internal: 10.0.1.200)
-Starting VM: bold-fox (internal: 10.0.1.200)
+  Injecting CA cert...
+  VM created: bold-fox (mark: 41022, mode: normal)
+Starting VM: bold-fox (mark: 41022, mode: normal)
   VM started (PID 12847)
   Waiting for Tailscale...
   Tailscale IP: 100.64.1.42
@@ -25,36 +26,33 @@ dev@bold-fox:~$
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Physical Host (Ubuntu 24.04)                       │
-│                                                     │
-│  enp34s0 (physical NIC) ──→ internet (NAT)          │
-│  tap-node0 (10.0.0.1/30) ──→ Node VM               │
-│                                                     │
-│  ┌───────────────────────────────────────────────┐  │
-│  │  Node VM (QEMU/KVM) — 10.0.0.2               │  │
-│  │  Tailscale: 100.x.x.x (boxcutter)       │  │
-│  │                                               │  │
-│  │  ┌─────────────────────────────────────────┐  │  │
-│  │  │  brvm0 bridge (10.0.1.1/24)             │  │  │
-│  │  │  ├── tap-bold-fox   ──→  10.0.1.200     │  │  │
-│  │  │  ├── tap-calm-otter ──→  10.0.1.201     │  │  │
-│  │  │  └── tap-wild-heron ──→  10.0.1.202     │  │  │
-│  │  │  (VM isolation: VMs cannot talk to       │  │  │
-│  │  │   each other on this bridge)             │  │  │
-│  │  └─────────────────────────────────────────┘  │  │
-│  │                                               │  │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐      │  │
-│  │  │bold-fox  │ │calm-otter│ │wild-heron│      │  │
-│  │  │Firecrackr│ │Firecrackr│ │Firecrackr│      │  │
-│  │  │4cpu/8GB  │ │4cpu/8GB  │ │4cpu/8GB  │      │  │
-│  │  │TS:100.x  │ │TS:100.x  │ │TS:100.x  │      │  │
-│  │  └──────────┘ └──────────┘ └──────────┘      │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
-          │
-     Internet (via host NAT)
-     Tailscale overlay network
+┌──────────────────────────────────────────────────────────────┐
+│  Physical Host (Ubuntu 24.04)                                │
+│                                                              │
+│  enp34s0 (physical NIC) ──→ internet (NAT)                   │
+│  tap-node0 (192.168.50.1/30) ──→ Node VM                    │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  Node VM (QEMU/KVM) — 192.168.50.2                    │  │
+│  │  Tailscale: 100.x.x.x (boxcutter)                     │  │
+│  │                                                        │  │
+│  │  Per-VM isolated TAP links (no shared bridge):         │  │
+│  │    tap-bold-fox   10.0.0.1 ↔ 10.0.0.2  mark: 41022   │  │
+│  │    tap-calm-otter 10.0.0.1 ↔ 10.0.0.2  mark: 8193    │  │
+│  │    tap-wild-heron 10.0.0.1 ↔ 10.0.0.2  mark: 55471   │  │
+│  │                                                        │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐             │  │
+│  │  │bold-fox  │  │calm-otter│  │wild-heron│             │  │
+│  │  │Firecrackr│  │Firecrackr│  │Firecrackr│             │  │
+│  │  │4cpu/8GB  │  │4cpu/8GB  │  │4cpu/8GB  │             │  │
+│  │  │10.0.0.2  │  │10.0.0.2  │  │10.0.0.2  │             │  │
+│  │  │TS:100.x  │  │TS:100.x  │  │TS:100.x  │             │  │
+│  │  └──────────┘  └──────────┘  └──────────┘             │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+         │
+    Internet (via host NAT)
+    Tailscale overlay network
 ```
 
 There are three layers:
@@ -67,21 +65,34 @@ The Node VM exists because Firecracker requires KVM and a Linux host with specif
 
 ## How it works
 
-### Networking: Tailscale overlay
+### Networking: per-TAP fwmark routing
 
-VMs have internal-only IPs (10.0.1.0/24) that are not routable from outside the Node VM. Instead, each VM joins Tailscale at boot, getting a stable Tailscale IP that's reachable from any device on your tailnet.
+Every VM gets the same IP address (10.0.0.2) on an isolated point-to-point TAP link. There is no shared bridge — each VM has its own TAP device with 10.0.0.1 on the Node side and 10.0.0.2 on the VM side. Linux fwmark-based policy routing directs return traffic to the correct TAP.
 
-The physical host creates a TAP device with a point-to-point link (10.0.0.0/30) to the Node VM. Inside the Node VM, an internal bridge (`brvm0`) connects TAP devices for each Firecracker microVM. NAT provides internet access for the VMs.
+Each VM is assigned a unique integer "mark" derived from CRC32 of its name. When packets arrive on a TAP, iptables marks them. CONNMARK saves the mark to conntrack so return traffic can be routed back to the correct TAP.
 
-**VM isolation:** VMs cannot communicate with each other on the internal bridge. Only the Node VM can reach VMs directly. VM-to-VM communication goes through Tailscale (if needed), which means it's subject to Tailscale ACLs.
+VMs are completely isolated from each other — there is no shared Layer 2 domain and no route between TAPs. VM-to-VM communication goes through Tailscale (if needed), subject to your tailnet's ACL policies.
 
-Firecracker VMs get their internal IP configuration via the kernel `ip=` boot parameter:
+For full networking details, see [docs/network-architecture.md](network-architecture.md).
+
+Firecracker VMs get their network configuration via the kernel `ip=` boot parameter:
 
 ```
-ip=10.0.1.200::10.0.1.1:255.255.255.0:bold-fox:eth0:off:8.8.8.8
+ip=10.0.0.2::10.0.0.1:255.255.255.252:bold-fox:eth0:off:8.8.8.8
 ```
 
 This provides networking before init even starts — zero DHCP wait, instant connectivity.
+
+### VM provisioning modes
+
+VMs can be created in **normal** or **paranoid** mode:
+
+- **Normal** — full direct internet access, real credentials from the token broker
+- **Paranoid** — no direct internet; all traffic must go through the MITM forward proxy; credentials are wrapped in one-time sentinel tokens that the proxy swaps for real credentials on the fly
+
+```bash
+ssh boxcutter create my-vm --mode paranoid
+```
 
 ### Storage: device-mapper COW snapshots
 
@@ -221,7 +232,7 @@ make launch-daemon   # Background (logs to .images/node-console.log)
 The first boot takes 3-5 minutes. Cloud-init will:
 1. Update packages
 2. Mount the boxcutter repo into the VM via 9p
-3. Run `install.sh` which installs Firecracker, Tailscale, Caddy, networking, and all management scripts
+3. Run `install.sh` which installs Firecracker, Tailscale, Caddy, networking, TLS certificates, vmid, the forward proxy, and all management scripts
 
 Wait for the console to show the login prompt (foreground) or check the log:
 ```bash
@@ -233,7 +244,7 @@ tail -f .images/node-console.log    # If running as daemon
 SSH into the Node VM and set up Tailscale:
 
 ```bash
-ssh ubuntu@10.0.0.2
+ssh ubuntu@192.168.50.2
 
 # Join the Node VM to Tailscale (this is a persistent node, not ephemeral)
 sudo tailscale up --hostname=boxcutter
@@ -249,7 +260,7 @@ Once the Node VM is on Tailscale, you can SSH to it via its Tailscale IP or Magi
 ### Step 5: Build the golden image
 
 ```bash
-ssh ubuntu@10.0.0.2   # or ssh boxcutter (via Tailscale)
+ssh ubuntu@192.168.50.2   # or ssh boxcutter (via Tailscale)
 
 # Phase 1: Create minimal Ubuntu rootfs with debootstrap (~3 minutes)
 sudo boxcutter-ctl golden build
@@ -317,13 +328,14 @@ ssh boxcutter start <vm-name>
 All commands go through SSH to the Node VM (via Tailscale or internal IP):
 
 ```bash
-ssh boxcutter new              # Create and start a new VM
-ssh boxcutter list             # List all VMs (with Tailscale IPs)
-ssh boxcutter start <name>     # Start a stopped VM
-ssh boxcutter stop <name>      # Stop a running VM
-ssh boxcutter destroy <name>   # Destroy a VM (auto-removed from Tailscale)
-ssh boxcutter status           # Host capacity summary
-ssh boxcutter help             # Show all commands
+ssh boxcutter new                        # Create and start a new VM (normal mode)
+ssh boxcutter create <name> --mode paranoid  # Create a paranoid-mode VM
+ssh boxcutter list                       # List all VMs (with marks, modes, Tailscale IPs)
+ssh boxcutter start <name>               # Start a stopped VM
+ssh boxcutter stop <name>                # Stop a running VM
+ssh boxcutter destroy <name>             # Destroy a VM (auto-removed from Tailscale)
+ssh boxcutter status                     # Host capacity summary
+ssh boxcutter help                       # Show all commands
 ```
 
 Once a VM is running, SSH directly to it via Tailscale:
@@ -332,6 +344,15 @@ Once a VM is running, SSH directly to it via Tailscale:
 ssh 100.64.1.42          # By Tailscale IP
 ssh bold-fox             # By MagicDNS name
 ```
+
+## Node VM services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| vmid | :80 | VM identity & token broker (fwmark-based identification) |
+| boxcutter-proxy | :8080 | MITM forward proxy (sentinel token swapping) |
+| derper | :443 | Local Tailscale DERP relay |
+| Caddy | :8880/:8443 | Reverse proxy |
 
 ## File structure
 
@@ -346,10 +367,14 @@ boxcutter/
 ├── scripts/                 # Installed into the Node VM
 │   ├── boxcutter-ctl        # VM lifecycle manager (create/start/stop/destroy)
 │   ├── boxcutter-ssh        # SSH ForceCommand dispatch (control interface)
-│   ├── boxcutter-net        # Internal bridge network setup + VM isolation
-│   ├── boxcutter-proxy-sync # Service discovery (future)
-│   ├── boxcutter-gateway    # Multi-host gateway dispatch (future)
+│   ├── boxcutter-net        # Per-TAP fwmark routing infrastructure
+│   ├── boxcutter-tls        # Internal CA + leaf cert generation
 │   └── boxcutter-names      # Random adjective-animal name generator
+├── vmid/                    # VM identity & token broker (Go)
+│   ├── cmd/vmid/main.go     # Mark-aware listener (SO_MARK)
+│   └── internal/            # Registry, sentinel store, middleware, API
+├── proxy/                   # Forward proxy (Go)
+│   └── cmd/proxy/main.go    # MITM proxy with sentinel swapping
 ├── golden/                  # Golden image build
 │   ├── build.sh             # Phase 1: debootstrap minimal Ubuntu rootfs
 │   ├── provision.sh         # Phase 2: install dev tools (node, ruby, gh, etc.)
@@ -359,10 +384,15 @@ boxcutter/
 │   ├── meta-data
 │   └── network-config
 ├── config/
-│   └── Caddyfile            # Caddy base config (imports per-VM site configs)
+│   └── Caddyfile            # Caddy base config (ports 8880/8443)
 ├── systemd/                 # Systemd unit files for Node VM services
 │   ├── boxcutter-net.service
-│   └── boxcutter-proxy-sync.service
+│   ├── vmid.service
+│   ├── boxcutter-proxy.service
+│   └── boxcutter-derper.service
+├── docs/
+│   ├── README.md            # This file
+│   └── network-architecture.md  # Detailed networking documentation
 ├── install.sh               # Node VM setup (runs inside the Node VM)
 └── Makefile                 # Host-side convenience targets
 ```
@@ -382,10 +412,13 @@ The golden image is a single ext4 file built in two phases:
 - VM users share the `dev` account (uid 1000) — isolation is at the VM level, not the user level
 - SSH keys are the only authentication method (password auth is disabled for SSH)
 - Each VM is a full Firecracker microVM with its own kernel — stronger isolation than containers
-- VMs are isolated on the internal bridge — they cannot communicate with each other directly
+- VMs are isolated on separate TAP devices — no shared L2 domain, no VM-to-VM communication
 - External access is via Tailscale only, subject to your tailnet's ACL policies
 - The Tailscale auth key lives only on the Node VM (`/etc/boxcutter/tailscale-authkey`) — it is never stored on VM disk images
 - The auth key should be **ephemeral** — destroyed VMs auto-remove from the tailnet when they disconnect
+- Internal CA provides TLS for proxy MITM; CA cert is per-VM injected, not baked into the golden image
+- Paranoid mode VMs have no direct internet access — all traffic goes through the inspectable forward proxy
+- Sentinel tokens ensure real credentials never touch VM disk or memory in paranoid mode
 
 ## Limitations
 
@@ -393,4 +426,4 @@ The golden image is a single ext4 file built in two phases:
 - No persistent storage across VM destruction (by design — VMs are ephemeral)
 - Tailscale auth key must be rotated every 90 days
 - VM creation takes ~5-10 seconds longer than before due to Tailscale join time
-- Host bridge setup is not persistent across physical host reboots (re-run `make setup`)
+- Host TAP setup is not persistent across physical host reboots (re-run `make setup`)

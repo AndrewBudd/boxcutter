@@ -1,5 +1,7 @@
 {
   local_certs
+  http_port 8880
+  https_port 8443
 }
 
 import /etc/caddy/sites/*.caddy

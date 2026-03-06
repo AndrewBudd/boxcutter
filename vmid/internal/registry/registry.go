@@ -8,20 +8,24 @@ import (
 type VMRecord struct {
 	VMID       string            `json:"vm_id"`
 	IP         string            `json:"ip"`
+	Mark       int               `json:"mark"`
+	Mode       string            `json:"mode"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	GitHubRepo string            `json:"github_repo,omitempty"`
 }
 
 type Registry struct {
-	mu    sync.RWMutex
-	byIP  map[string]*VMRecord
-	byID  map[string]*VMRecord
+	mu     sync.RWMutex
+	byIP   map[string]*VMRecord
+	byID   map[string]*VMRecord
+	byMark map[int]*VMRecord
 }
 
 func New() *Registry {
 	return &Registry{
-		byIP: make(map[string]*VMRecord),
-		byID: make(map[string]*VMRecord),
+		byIP:   make(map[string]*VMRecord),
+		byID:   make(map[string]*VMRecord),
+		byMark: make(map[int]*VMRecord),
 	}
 }
 
@@ -30,6 +34,9 @@ func (r *Registry) Register(rec *VMRecord) {
 	defer r.mu.Unlock()
 	r.byIP[rec.IP] = rec
 	r.byID[rec.VMID] = rec
+	if rec.Mark != 0 {
+		r.byMark[rec.Mark] = rec
+	}
 }
 
 func (r *Registry) Deregister(vmID string) bool {
@@ -41,6 +48,9 @@ func (r *Registry) Deregister(vmID string) bool {
 	}
 	delete(r.byIP, rec.IP)
 	delete(r.byID, vmID)
+	if rec.Mark != 0 {
+		delete(r.byMark, rec.Mark)
+	}
 	return true
 }
 
@@ -55,6 +65,13 @@ func (r *Registry) LookupID(vmID string) (*VMRecord, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rec, ok := r.byID[vmID]
+	return rec, ok
+}
+
+func (r *Registry) LookupMark(mark int) (*VMRecord, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byMark[mark]
 	return rec, ok
 }
 

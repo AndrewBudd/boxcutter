@@ -60,7 +60,7 @@ chown dev:dev /home/dev/.services
 cat > /usr/local/bin/gh-token-refresh << 'SCRIPT'
 #!/bin/bash
 set -euo pipefail
-METADATA="http://169.254.169.254"
+METADATA="http://10.0.0.1"
 resp=$(curl -sf "$METADATA/token/github" 2>/dev/null) || {
     echo "vmid: GitHub token not available (service may not be configured)" >&2
     exit 0

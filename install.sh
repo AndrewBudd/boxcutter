@@ -99,33 +99,23 @@ if ! tailscale status &>/dev/null; then
   echo "Then place the ephemeral VM auth key at /etc/boxcutter/tailscale-authkey"
 fi
 
-# Install ebtables for VM isolation
-apt-get install -y ebtables >/dev/null 2>&1 || true
+# Install socat (needed for vm_ssh TAP binding)
+apt-get install -y socat >/dev/null 2>&1 || true
 
 # -------------------------------------------------------------------
-# 5. Network config for VM IP pool (internal network)
+# 5. Network config (per-TAP point-to-point, fwmark routing)
 # -------------------------------------------------------------------
 echo ""
 echo "--- Configuring internal network ---"
 mkdir -p /etc/boxcutter
-cat > "${BOXCUTTER_HOME}/network.conf" <<NETEOF
-# Internal network config (VMs get unroutable IPs + Tailscale)
-VM_IP_PREFIX=10.0.1
-VM_IP_START=200
-VM_IP_END=250
-VM_GW=10.0.1.1
-VM_CIDR=24
-VM_DNS=8.8.8.8
-NETEOF
-echo "Network config written to ${BOXCUTTER_HOME}/network.conf"
-echo "  VM internal pool: 10.0.1.200-250 (not routable outside Node VM)"
+echo "  VMs use per-TAP 10.0.0.1/30 ↔ 10.0.0.2/30 with fwmark policy routing"
 echo "  External access via Tailscale"
 
 # -------------------------------------------------------------------
 # 6. Set up networking
 # -------------------------------------------------------------------
 echo ""
-echo "--- Setting up internal bridge network ---"
+echo "--- Setting up VM network ---"
 install -m 755 "${SRC}/scripts/boxcutter-net" /usr/local/bin/
 cp "${SRC}/systemd/boxcutter-net.service" /etc/systemd/system/
 systemctl daemon-reload
@@ -144,6 +134,69 @@ install -m 755 "${SRC}/scripts/boxcutter-proxy-sync" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-ssh" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-gateway" /usr/local/bin/
 install -m 755 "${SRC}/scripts/boxcutter-names" /usr/local/bin/
+install -m 755 "${SRC}/scripts/boxcutter-tls" /usr/local/bin/
+
+# Ensure socat is installed (needed for vm_ssh TAP binding)
+apt-get install -y socat >/dev/null 2>&1 || true
+
+# -------------------------------------------------------------------
+# 7a. TLS infrastructure
+# -------------------------------------------------------------------
+echo ""
+echo "--- Setting up TLS infrastructure ---"
+/usr/local/bin/boxcutter-tls
+
+# -------------------------------------------------------------------
+# 7b. Build forward proxy
+# -------------------------------------------------------------------
+echo ""
+echo "--- Building forward proxy ---"
+PROXY_SRC="${BOXCUTTER_HOME}/proxy"
+if [ ! -d "$PROXY_SRC" ] && [ -d /mnt/boxcutter/proxy ]; then
+  PROXY_SRC="/mnt/boxcutter/proxy"
+fi
+if [ -d "$PROXY_SRC" ]; then
+  cd "$PROXY_SRC"
+  go build -o /usr/local/bin/boxcutter-proxy ./cmd/proxy/
+  echo "Forward proxy built."
+fi
+
+# Create default allowlist if it doesn't exist
+if [ ! -f /etc/boxcutter/proxy-allowlist.conf ]; then
+  cat > /etc/boxcutter/proxy-allowlist.conf <<'ALEOF'
+# Egress allowlist for paranoid mode VMs
+# Lines starting with # are comments
+# Supports exact match and wildcard (*.example.com)
+*.github.com
+github.com
+*.githubusercontent.com
+api.github.com
+*.npmjs.org
+registry.npmjs.org
+*.rubygems.org
+ALEOF
+fi
+
+# -------------------------------------------------------------------
+# 7c. Install DERP relay
+# -------------------------------------------------------------------
+echo ""
+echo "--- Installing DERP relay ---"
+if ! command -v derper &>/dev/null; then
+  go install tailscale.com/cmd/derper@latest 2>/dev/null || true
+  # Move from GOPATH to /usr/local/bin
+  GOPATH_BIN=$(go env GOPATH)/bin
+  [ -f "${GOPATH_BIN}/derper" ] && mv "${GOPATH_BIN}/derper" /usr/local/bin/derper
+fi
+if command -v derper &>/dev/null; then
+  # Set up cert symlinks for derper (expects <hostname>.crt/.key)
+  mkdir -p /etc/boxcutter/derp-certs
+  ln -sf /etc/boxcutter/leaf.crt /etc/boxcutter/derp-certs/10.0.0.1.crt
+  ln -sf /etc/boxcutter/leaf.key /etc/boxcutter/derp-certs/10.0.0.1.key
+  echo "DERP relay ready."
+else
+  echo "Warning: derper not installed (Go may not be available yet)"
+fi
 
 # -------------------------------------------------------------------
 # 8. Systemd services
@@ -151,8 +204,12 @@ install -m 755 "${SRC}/scripts/boxcutter-names" /usr/local/bin/
 echo ""
 echo "--- Installing systemd services ---"
 cp "${SRC}/systemd/boxcutter-proxy-sync.service" /etc/systemd/system/
+cp "${SRC}/systemd/boxcutter-proxy.service" /etc/systemd/system/
+cp "${SRC}/systemd/boxcutter-derper.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable boxcutter-proxy-sync
+systemctl enable boxcutter-proxy 2>/dev/null || true
+systemctl enable boxcutter-derper 2>/dev/null || true
 
 # -------------------------------------------------------------------
 # 9. SSH control interface
@@ -270,6 +327,10 @@ cp "${SRC}/golden/provision.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
 cp "${SRC}/golden/nss_catchall.c" "${BOXCUTTER_HOME}/golden/nss_catchall.c"
 chmod +x "${BOXCUTTER_HOME}/golden/build.sh" "${BOXCUTTER_HOME}/golden/provision.sh"
 
+# Copy vmid and proxy source for building
+cp -r "${SRC}/vmid" "${BOXCUTTER_HOME}/vmid" 2>/dev/null || true
+cp -r "${SRC}/proxy" "${BOXCUTTER_HOME}/proxy" 2>/dev/null || true
+
 # -------------------------------------------------------------------
 # Done
 # -------------------------------------------------------------------
@@ -279,12 +340,12 @@ echo "  Boxcutter Node VM setup complete!"
 echo "============================================"
 echo ""
 echo "Next steps:"
-echo "  1. Join Tailscale (Node VM): sudo tailscale up --hostname=boxcutter --ssh"
+echo "  1. Join Tailscale (Node VM): sudo tailscale up --hostname=boxcutter"
 echo "  2. Place ephemeral VM auth key: echo 'tskey-auth-...' | sudo tee /etc/boxcutter/tailscale-authkey"
 echo "  3. Build golden image:  sudo boxcutter-ctl golden build"
 echo "  4. Create a VM:         sudo boxcutter-ctl create agent-1"
 echo "  5. Start the VM:        sudo boxcutter-ctl start agent-1"
 echo ""
 echo "Start all services:"
-echo "  sudo systemctl start caddy boxcutter-net boxcutter-proxy-sync"
+echo "  sudo systemctl start caddy boxcutter-net boxcutter-proxy-sync vmid boxcutter-proxy boxcutter-derper"
 echo ""

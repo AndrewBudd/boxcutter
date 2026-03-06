@@ -5,16 +5,18 @@ import (
 	"net/http"
 
 	"github.com/AndrewBudd/boxcutter/vmid/internal/middleware"
+	"github.com/AndrewBudd/boxcutter/vmid/internal/sentinel"
 	"github.com/AndrewBudd/boxcutter/vmid/internal/token"
 )
 
 type MetadataHandler struct {
-	jwt    *token.JWTIssuer
-	github *token.GitHubTokenMinter
+	jwt      *token.JWTIssuer
+	github   *token.GitHubTokenMinter
+	sentinel *sentinel.Store
 }
 
-func NewMetadataHandler(jwt *token.JWTIssuer, github *token.GitHubTokenMinter) *MetadataHandler {
-	return &MetadataHandler{jwt: jwt, github: github}
+func NewMetadataHandler(jwt *token.JWTIssuer, github *token.GitHubTokenMinter, sentinel *sentinel.Store) *MetadataHandler {
+	return &MetadataHandler{jwt: jwt, github: github, sentinel: sentinel}
 }
 
 func (h *MetadataHandler) Register(mux *http.ServeMux) {
@@ -95,6 +97,16 @@ func (h *MetadataHandler) handleGitHubToken(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Paranoid mode: wrap real token in a sentinel
+	if rec.Mode == "paranoid" && tok.Token != "" {
+		sv, err := h.sentinel.Put(rec.VMID, tok.Token, "github")
+		if err != nil {
+			http.Error(w, "sentinel error: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		tok.Token = sv
 	}
 
 	writeJSON(w, tok)

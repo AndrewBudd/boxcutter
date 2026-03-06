@@ -13,7 +13,7 @@ Connect: ssh 100.64.1.42
 
 That's it. A new VM is running, on my Tailscale network, reachable from any of my devices, in about a second (plus a few more for Tailscale to connect). I can `ssh bold-fox` and I'm in. No username required — it figures out who I am from my SSH key.
 
-The whole thing is about 800 lines of bash, 60 lines of C, and zero external services beyond Tailscale. I call it Boxcutter.
+The whole thing is about 800 lines of bash, 60 lines of C, a couple of small Go services, and zero external services beyond Tailscale. I call it Boxcutter.
 
 ## The stack
 
@@ -48,7 +48,7 @@ The COW file starts at effectively zero bytes and only grows as the VM writes to
 Most VMs wait for DHCP. Firecracker VMs don't need to. The kernel `ip=` parameter sets up networking before init even starts:
 
 ```
-ip=10.0.1.200::10.0.1.1:255.255.255.0:bold-fox:eth0:off:8.8.8.8
+ip=10.0.0.2::10.0.0.1:255.255.255.252:bold-fox:eth0:off:8.8.8.8
 ```
 
 That one kernel argument gives the VM its IP address, gateway, netmask, hostname, interface, and DNS server. The network is up by the time systemd starts. No DHCP server, no waiting, no network manager.
@@ -59,23 +59,77 @@ Firecracker boots a Linux kernel in about 125ms. It's not a container runtime �
 
 The combination of device-mapper snapshots + kernel `ip=` + Firecracker's fast boot means a VM goes from "nothing" to "accepting SSH connections" in about one second.
 
-## Networking: Tailscale overlay
+## Networking: same IP, different TAPs
 
-Early on I tried bridging VMs directly onto the LAN — giving them real IPs on the local network. It worked, but it created problems: it required a wired Ethernet connection (Linux can't bridge WiFi), you needed to reserve a block of IPs on your router, and the VMs were only reachable from the local network.
-
-The solution was Tailscale. Each VM gets an internal-only IP (10.0.1.x) that's not routable from outside the host. But at boot, a systemd service runs `tailscale up` with a pre-configured auth key, and the VM joins the tailnet. Now it's reachable from anywhere — my laptop, my phone, another machine across the internet.
+Every VM gets the same IP address: `10.0.0.2`. This sounds insane, but it works because each VM gets its own isolated TAP device with a point-to-point link. There is no shared bridge.
 
 ```
-Physical Host
-  └── tap-node0 (10.0.0.1/30) → Node VM (10.0.0.2)
-                                    └── brvm0 (10.0.1.1/24)
-                                        ├── tap-bold-fox   → 10.0.1.200 + Tailscale 100.x.x.x
-                                        └── tap-calm-otter → 10.0.1.201 + Tailscale 100.x.x.x
+Node VM
+  ├── tap-bold-fox   10.0.0.1 ↔ 10.0.0.2  (mark: 41022)
+  ├── tap-calm-otter 10.0.0.1 ↔ 10.0.0.2  (mark: 8193)
+  └── tap-wild-heron 10.0.0.1 ↔ 10.0.0.2  (mark: 55471)
 ```
+
+The trick is **fwmark-based policy routing**. Each VM gets a unique integer "mark" derived from CRC32 of its name. When packets arrive from a VM's TAP, iptables marks them. The mark is saved to Linux's connection tracking (conntrack), so when return traffic comes back from the internet, the kernel restores the mark and routes the packet back to the correct TAP.
+
+```bash
+# Mark packets from this VM's TAP
+iptables -t mangle -I PREROUTING 2 -i tap-bold-fox -j MARK --set-mark 41022
+
+# Route marked return traffic back to the correct TAP
+ip rule add fwmark 41022 lookup 41022
+ip route add 10.0.0.2 dev tap-bold-fox table 41022
+```
+
+This eliminates all IP pool management — no bridge, no DHCP, no IP allocation, no MAC conflicts. Each VM is completely isolated at Layer 2.
+
+### Tailscale overlay
+
+VMs have internal-only IPs that are not routable from outside the Node VM. Instead, each VM joins Tailscale at boot, getting a stable Tailscale IP that's reachable from any device on your tailnet.
+
+The physical host creates a TAP device with a point-to-point link (192.168.50.0/30) to the Node VM. Inside the Node VM, each Firecracker microVM gets its own TAP. NAT provides internet access for the VMs.
 
 ### VM isolation
 
-VMs share an internal bridge, but they can't talk to each other on it. ebtables drops all forwarded frames between bridge ports, so VM-to-VM traffic at Layer 2 is blocked. Only the Node VM (the bridge owner) can reach VMs directly. If two VMs need to communicate, they do it through Tailscale — which means it's subject to your tailnet's ACL policies.
+VMs cannot communicate with each other — period. There is no shared Layer 2 domain. Each VM only sees a point-to-point link to 10.0.0.1 (the Node VM). There are no routes between TAPs. If two VMs need to communicate, they do it through Tailscale, which means it's subject to your tailnet's ACL policies.
+
+### SSH to same-IP VMs
+
+Since all VMs are 10.0.0.2, the Node VM can't simply `ssh 10.0.0.2`. Instead, SSH is bound to a specific TAP device using socat's `SO_BINDTODEVICE`:
+
+```bash
+ssh -o "ProxyCommand=socat - TCP:10.0.0.2:22,so-bindtodevice=tap-bold-fox" dev@10.0.0.2
+```
+
+This forces the connection onto the correct TAP, reaching the intended VM.
+
+## VM identity via fwmark
+
+With every VM at 10.0.0.2, the identity service (vmid) can't use source IP to identify callers. Instead, it reads the **fwmark** from each accepted TCP connection using `getsockopt(SO_MARK)`.
+
+When a VM connects to vmid at 10.0.0.1:80, the packet arrives on its TAP and gets marked by iptables. The Linux sysctl `net.ipv4.tcp_fwmark_accept=1` causes accepted TCP sockets to inherit the packet's fwmark. vmid reads this mark and looks up the VM record.
+
+This is a neat trick — the kernel's packet marking system becomes a VM identification mechanism, without any changes to the VM itself. The VM just connects to its gateway IP and gets identified automatically.
+
+## Normal vs paranoid mode
+
+VMs come in two flavors:
+
+**Normal mode** — full internet access, real credentials. The simple case.
+
+**Paranoid mode** — no direct internet. All outbound traffic must go through a MITM forward proxy. Credentials are wrapped in one-time sentinel tokens that never reach the VM in their real form.
+
+The proxy intercepts HTTPS (using an internal CA cert injected into each VM's trust store), scans Authorization headers for sentinel tokens, swaps them for real credentials on the fly, and forwards the request. The real credential exists only in the proxy's memory for the duration of the request.
+
+```
+Paranoid VM                    Proxy                       GitHub
+    │ Authorization: Bearer     │                              │
+    │   <sentinel>              │                              │
+    │──────────────────────────→│  swap sentinel → real token  │
+    │                           │  Authorization: Bearer       │
+    │                           │    ghp_real...               │
+    │                           │─────────────────────────────→│
+```
 
 ## The "accept any SSH username" trick
 
@@ -123,7 +177,7 @@ The Node VM has a `boxcutter` SSH user with `ForceCommand` — it can't get a sh
 
 ```bash
 ssh boxcutter new          # Create and start a VM
-ssh boxcutter list         # List all VMs (with Tailscale IPs)
+ssh boxcutter list         # List all VMs (with marks, modes, Tailscale IPs)
 ssh boxcutter stop fox     # Stop a VM
 ssh boxcutter destroy fox  # Destroy a VM (removes from Tailscale)
 ssh boxcutter adduser gh   # Import SSH keys from GitHub
@@ -137,9 +191,13 @@ Since VMs have Tailscale IPs, any service running in a VM is directly reachable 
 
 ## What I learned
 
+**Every VM can have the same IP.** By giving each VM its own TAP with point-to-point addressing and using fwmark policy routing, you eliminate IP pool management entirely. It sounds wrong, but it works — and it's simpler than managing a bridge with unique IPs.
+
 **Kernel parameters are underrated.** The `ip=` boot parameter eliminates an entire class of boot-time complexity. No DHCP server, no network manager, no waiting. The kernel just sets up the interface before init runs.
 
 **Device-mapper is incredibly useful.** COW snapshots turn a 30-second file copy into a 0.25-second metadata operation. Docker uses the same mechanism under the hood, but you can use it directly with `dmsetup` for any block device.
+
+**`tcp_fwmark_accept` is obscure but essential.** Accepted TCP sockets don't inherit the incoming packet's fwmark by default. You need `sysctl net.ipv4.tcp_fwmark_accept=1` for `getsockopt(SO_MARK)` to return anything useful. I spent hours debugging why vmid couldn't identify VMs before discovering this sysctl.
 
 **NSS is the right layer for "fake users."** I tried several approaches before landing on a custom NSS module — PAM modules, nss-extrausers, on-the-fly user creation. The problem is always ordering: sshd checks user existence before anything else. NSS is the layer that answers "does this user exist?" and it's the only place where you can intercept that question early enough.
 
@@ -155,10 +213,10 @@ Since VMs have Tailscale IPs, any service running in a VM is directly reachable 
 - **Golden image build:** ~5 minutes (debootstrap + provision)
 - **Per-VM overhead:** ~30MB RSS for the Firecracker process
 - **Disk per VM:** Starts at ~0 bytes, grows with writes
-- **Total codebase:** ~800 lines of bash, ~60 lines of C, no dependencies beyond standard Linux tools + Tailscale
+- **Total codebase:** ~800 lines of bash, ~60 lines of C, ~500 lines of Go, no dependencies beyond standard Linux tools + Tailscale
 
 The whole thing runs on a single machine under my desk. No cloud, no Kubernetes, no container registry, no orchestrator. Just Linux doing what Linux does well, with Tailscale making it accessible from everywhere.
 
 ---
 
-*Boxcutter is open source and runs on standard Linux tools: QEMU, KVM, Firecracker, device-mapper, bridge-utils, Tailscale, and bash.*
+*Boxcutter is open source and runs on standard Linux tools: QEMU, KVM, Firecracker, device-mapper, socat, Tailscale, and bash.*

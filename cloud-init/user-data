@@ -19,8 +19,7 @@ packages:
   - debootstrap
   - e2fsprogs
   - iptables-persistent
-  - bridge-utils
-  - ebtables
+  - socat
   - net-tools
   - openssh-server
   - ca-certificates

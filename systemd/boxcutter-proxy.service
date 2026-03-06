@@ -1,0 +1,12 @@
+[Unit]
+Description=Boxcutter forward proxy (sentinel token swapping)
+After=network.target vmid.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boxcutter-proxy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

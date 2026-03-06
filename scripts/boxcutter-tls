@@ -1,0 +1,58 @@
+#!/bin/bash
+# Generate internal TLS infrastructure for boxcutter services.
+# Creates a CA + leaf cert with IP SAN 10.0.0.1.
+# Idempotent — skips if certs already exist.
+set -e
+
+CERT_DIR="/etc/boxcutter"
+CA_CERT="${CERT_DIR}/ca.crt"
+CA_KEY="${CERT_DIR}/ca.key"
+LEAF_CERT="${CERT_DIR}/leaf.crt"
+LEAF_KEY="${CERT_DIR}/leaf.key"
+
+mkdir -p "$CERT_DIR"
+
+# --- CA ---
+if [ ! -f "$CA_CERT" ] || [ ! -f "$CA_KEY" ]; then
+  echo "Generating boxcutter CA (EC P-256, 10yr)..."
+  openssl ecparam -genkey -name prime256v1 -noout -out "$CA_KEY"
+  openssl req -new -x509 -key "$CA_KEY" \
+    -out "$CA_CERT" \
+    -days 3650 \
+    -subj "/CN=Boxcutter Internal CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign"
+  chmod 600 "$CA_KEY"
+  echo "  CA cert: ${CA_CERT}"
+  echo "  CA key:  ${CA_KEY}"
+else
+  echo "CA already exists, skipping."
+fi
+
+# --- Leaf cert ---
+if [ ! -f "$LEAF_CERT" ] || [ ! -f "$LEAF_KEY" ]; then
+  echo "Generating leaf cert (IP SAN 10.0.0.1, 10yr)..."
+  openssl ecparam -genkey -name prime256v1 -noout -out "$LEAF_KEY"
+
+  # CSR with SAN
+  openssl req -new -key "$LEAF_KEY" \
+    -out "${CERT_DIR}/leaf.csr" \
+    -subj "/CN=boxcutter-node" \
+    -addext "subjectAltName=IP:10.0.0.1"
+
+  # Sign with CA
+  openssl x509 -req -in "${CERT_DIR}/leaf.csr" \
+    -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
+    -out "$LEAF_CERT" \
+    -days 3650 \
+    -extfile <(printf "subjectAltName=IP:10.0.0.1\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth")
+
+  rm -f "${CERT_DIR}/leaf.csr" "${CERT_DIR}/ca.srl"
+  chmod 600 "$LEAF_KEY"
+  echo "  Leaf cert: ${LEAF_CERT}"
+  echo "  Leaf key:  ${LEAF_KEY}"
+else
+  echo "Leaf cert already exists, skipping."
+fi
+
+echo "TLS infrastructure ready."

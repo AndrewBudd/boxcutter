@@ -104,7 +104,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		Listen: ListenConfig{
-			VMPort:      8775,
+			VMPort:      80,
 			AdminSocket: "/run/vmid/admin.sock",
 		},
 		JWT: JWTConfig{

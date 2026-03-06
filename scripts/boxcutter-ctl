@@ -6,9 +6,7 @@ BOXCUTTER_HOME="/var/lib/boxcutter"
 VM_DIR="${BOXCUTTER_HOME}/vms"
 KERNEL="${BOXCUTTER_HOME}/kernel/vmlinux"
 GOLDEN="${BOXCUTTER_HOME}/golden/rootfs.ext4"
-BRIDGE="brvm0"
 SSH_KEY="${BOXCUTTER_HOME}/ssh/id_ed25519"
-CONF="${BOXCUTTER_HOME}/network.conf"
 TS_AUTHKEY_FILE="/etc/boxcutter/tailscale-authkey"
 VMID_SOCKET="/run/vmid/admin.sock"
 
@@ -16,24 +14,12 @@ DEFAULT_VCPU=4
 DEFAULT_RAM_MIB=8192
 DEFAULT_DISK="50G"
 
-# Load network config (written by install.sh or boxcutter-net)
-if [ -f "$CONF" ]; then
-  source "$CONF"
-fi
-# Defaults if not configured
-: "${VM_IP_PREFIX:=10.0.1}"
-: "${VM_IP_START:=200}"
-: "${VM_IP_END:=250}"
-: "${VM_GW:=10.0.1.1}"
-: "${VM_CIDR:=24}"
-: "${VM_DNS:=8.8.8.8}"
-
 usage() {
   cat <<EOF
 boxcutter-ctl — Firecracker microVM manager
 
 Commands:
-  create <name> [--vcpu N] [--ram MiB] [--disk SIZE] [--clone REPO]
+  create <name> [--vcpu N] [--ram MiB] [--disk SIZE] [--clone REPO] [--mode normal|paranoid]
   start <name>
   stop <name>
   destroy <name>
@@ -41,37 +27,38 @@ Commands:
   shell <name>
   status
   golden build [SIZE]    Build golden rootfs image
+  golden provision       Boot + provision golden image
 
 Usage: boxcutter-ctl <command> [args]
 EOF
 }
 
-# --- IP/MAC allocation ---
+# --- Mark allocation ---
 
-allocate_ip() {
-  # Find next free IP in the internal pool
-  local used=()
-  for d in "${VM_DIR}"/*/; do
-    [ -f "${d}/vm.json" ] || continue
-    local ip
-    ip=$(jq -r '.internal_ip // .ip' "${d}/vm.json" 2>/dev/null) || continue
-    used+=("${ip##*.}")
-  done
+allocate_mark() {
+  local name=$1
+  local mark
+  mark=$(printf '%s' "$name" | cksum | awk '{print $1 % 65535 + 1}')
 
-  for idx in $(seq "$VM_IP_START" "$VM_IP_END"); do
-    local taken=false
-    for u in "${used[@]}"; do
-      [ "$u" = "$idx" ] && { taken=true; break; }
+  # Check for collision against existing VMs
+  local suffix=0
+  while true; do
+    local collision=false
+    for d in "${VM_DIR}"/*/; do
+      [ -f "${d}/vm.json" ] || continue
+      local existing
+      existing=$(jq -r '.mark // 0' "${d}/vm.json" 2>/dev/null) || continue
+      if [ "$existing" = "$mark" ]; then
+        collision=true
+        break
+      fi
     done
-    $taken || { echo "${VM_IP_PREFIX}.${idx}"; return 0; }
+    $collision || break
+    suffix=$((suffix + 1))
+    mark=$(printf '%s_%d' "$name" "$suffix" | cksum | awk '{print $1 % 65535 + 1}')
   done
 
-  echo "Error: no free IPs in pool (${VM_IP_PREFIX}.${VM_IP_START}-${VM_IP_END})" >&2
-  exit 1
-}
-
-ip_to_mac() {
-  printf "AA:FC:00:00:00:%02X" "${1##*.}"
+  echo "$mark"
 }
 
 # --- TAP device naming (max 15 chars) ---
@@ -87,36 +74,22 @@ tap_name() {
   fi
 }
 
-# --- Netmask helper ---
-cidr_to_netmask() {
-  local cidr=$1
-  local mask=""
-  local full=$((cidr / 8))
-  local partial=$((cidr % 8))
-  for i in $(seq 1 4); do
-    if [ "$i" -le "$full" ]; then
-      mask="${mask}255"
-    elif [ "$i" -eq $((full + 1)) ] && [ "$partial" -gt 0 ]; then
-      mask="${mask}$(( 256 - (1 << (8 - partial)) ))"
-    else
-      mask="${mask}0"
-    fi
-    [ "$i" -lt 4 ] && mask="${mask}."
-  done
-  echo "$mask"
+# --- SSH via TAP binding (all VMs are 10.0.0.2) ---
+vm_ssh() {
+  local tap=$1; shift
+  ssh -o "ProxyCommand=socat - TCP:10.0.0.2:22,so-bindtodevice=${tap}" \
+      -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=5 -o BatchMode=yes "dev@10.0.0.2" "$@"
 }
 
 # --- Tailscale helpers ---
 
 get_tailscale_ip() {
-  # Get the Tailscale IP for a VM by SSHing into it
-  local internal_ip=$1
+  local tap=$1
   local max_attempts=${2:-30}
   for i in $(seq 1 "$max_attempts"); do
     local ts_ip
-    ts_ip=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -o ConnectTimeout=2 -o BatchMode=yes "dev@${internal_ip}" \
-      "tailscale ip -4 2>/dev/null" 2>/dev/null) || true
+    ts_ip=$(vm_ssh "$tap" "tailscale ip -4 2>/dev/null" 2>/dev/null) || true
     if [ -n "$ts_ip" ]; then
       echo "$ts_ip"
       return 0
@@ -126,15 +99,15 @@ get_tailscale_ip() {
   return 1
 }
 
-
 # --- vmid helpers ---
 
 vmid_register() {
-  local vm_id=$1 ip=$2 github_repo=${3:-}
+  local vm_id=$1 mark=$2 mode=$3 github_repo=${4:-}
   [ -S "$VMID_SOCKET" ] || return 0
   local payload
-  payload=$(jq -n --arg id "$vm_id" --arg ip "$ip" --arg repo "$github_repo" \
-    '{vm_id: $id, ip: $ip} + (if $repo != "" then {github_repo: $repo} else {} end)')
+  payload=$(jq -n --arg id "$vm_id" --argjson mark "$mark" --arg mode "$mode" \
+    --arg ip "10.0.0.2" --arg repo "$github_repo" \
+    '{vm_id: $id, ip: $ip, mark: $mark, mode: $mode} + (if $repo != "" then {github_repo: $repo} else {} end)')
   curl -sf --unix-socket "$VMID_SOCKET" \
     -X POST http://localhost/internal/vms \
     -H 'Content-Type: application/json' \
@@ -170,11 +143,55 @@ parse_repo_url() {
   echo "$url"
 }
 
+# --- Per-TAP network setup/teardown ---
+
+setup_vm_tap() {
+  local tap=$1 mark=$2
+
+  local uplink uplink_gw
+  uplink=$(ip route | awk '/^default/{print $5; exit}')
+  uplink_gw=$(ip route | awk '/^default/{print $3; exit}')
+
+  # Create TAP with point-to-point addressing
+  ip tuntap add dev "$tap" mode tap
+  ip addr add 10.0.0.1 peer 10.0.0.2 dev "$tap"
+  ip link set "$tap" up
+
+  # Mark packets from this TAP
+  iptables -t mangle -I PREROUTING 2 -i "$tap" -j MARK --set-mark "$mark"
+
+  # Policy routing: return traffic goes back to correct TAP
+  # Priority must be below 32766 (main table lookup) to take precedence
+  local prio=$((10000 + (mark % 20000)))
+  ip rule add fwmark "$mark" lookup "$mark" priority "$prio"
+  ip route add 10.0.0.2 dev "$tap" table "$mark"
+  if [ -n "$uplink_gw" ] && [ -n "$uplink" ]; then
+    ip route add default via "$uplink_gw" dev "$uplink" table "$mark"
+  fi
+
+  # Allow forwarding from this TAP
+  iptables -I FORWARD -i "$tap" -j ACCEPT
+}
+
+teardown_vm_tap() {
+  local tap=$1 mark=$2
+
+  iptables -t mangle -D PREROUTING -i "$tap" -j MARK --set-mark "$mark" 2>/dev/null || true
+  iptables -D FORWARD -i "$tap" -j ACCEPT 2>/dev/null || true
+  # Paranoid mode rules
+  iptables -D FORWARD -i "$tap" ! -d 10.0.0.0/24 -j DROP 2>/dev/null || true
+  iptables -D FORWARD -i "$tap" -d 10.0.0.1/32 -p tcp --dport 8080 -j ACCEPT 2>/dev/null || true
+
+  ip rule del fwmark "$mark" lookup "$mark" 2>/dev/null || true
+  ip route flush table "$mark" 2>/dev/null || true
+  ip link del "$tap" 2>/dev/null || true
+}
+
 # --- Commands ---
 
 cmd_create() {
   local name=$1; shift
-  local vcpu=$DEFAULT_VCPU ram=$DEFAULT_RAM_MIB disk=$DEFAULT_DISK clone_url=""
+  local vcpu=$DEFAULT_VCPU ram=$DEFAULT_RAM_MIB disk=$DEFAULT_DISK clone_url="" mode="normal"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -182,6 +199,7 @@ cmd_create() {
       --ram)   ram=$2; shift 2 ;;
       --disk)  disk=$2; shift 2 ;;
       --clone) clone_url=$2; shift 2 ;;
+      --mode)  mode=$2; shift 2 ;;
       *) echo "Unknown option: $1"; exit 1 ;;
     esac
   done
@@ -190,15 +208,16 @@ cmd_create() {
   [ -d "${VM_DIR}/${name}" ] && { echo "VM '${name}' already exists."; exit 1; }
   [ -f "$GOLDEN" ] || { echo "Golden image not found. Run: boxcutter-ctl golden build"; exit 1; }
 
-  echo "Creating VM: ${name} (${vcpu} vCPU, $((ram / 1024))GB RAM, ${disk} disk)"
+  echo "Creating VM: ${name} (${vcpu} vCPU, $((ram / 1024))GB RAM, ${disk} disk, mode: ${mode})"
 
   mkdir -p "${VM_DIR}/${name}"
 
-  local ip mac tap netmask
-  ip=$(allocate_ip)
-  mac=$(ip_to_mac "$ip")
+  local mark tap
+  mark=$(allocate_mark "$name")
   tap=$(tap_name "$name")
-  netmask=$(cidr_to_netmask "$VM_CIDR")
+
+  # Fixed MAC — no shared L2, so no conflict
+  local mac="AA:FC:00:00:00:01"
 
   # Create COW snapshot of golden image
   echo "  Creating copy-on-write snapshot..."
@@ -216,7 +235,6 @@ cmd_create() {
   dm_name="bc-${name}"
   base_loop=$(losetup --find --show --read-only "$GOLDEN")
   cow_loop=$(losetup --find --show "${VM_DIR}/${name}/cow.img")
-  # Sector count must match the base device size
   local sectors=$(( golden_size / 512 ))
 
   echo "0 ${sectors} snapshot ${base_loop} ${cow_loop} P 8" | dmsetup create "$dm_name"
@@ -230,8 +248,8 @@ cmd_create() {
     resize2fs "/dev/mapper/${dm_name}" >/dev/null 2>&1 || true
   fi
 
-  # Kernel ip= parameter for instant static networking (internal network)
-  local boot_ip="ip=${ip}::${VM_GW}:${netmask}:${name}:eth0:off:${VM_DNS}"
+  # Kernel ip= parameter: all VMs are 10.0.0.2 with gateway 10.0.0.1
+  local boot_ip="ip=10.0.0.2::10.0.0.1:255.255.255.252:${name}:eth0:off:8.8.8.8"
 
   # Parse clone URL to owner/repo if provided
   local github_repo=""
@@ -245,14 +263,15 @@ cmd_create() {
     --arg name "$name" \
     --argjson vcpu "$vcpu" \
     --argjson ram "$ram" \
-    --arg ip "$ip" \
+    --argjson mark "$mark" \
+    --arg mode "$mode" \
     --arg mac "$mac" \
     --arg disk "$disk" \
     --arg tap "$tap" \
     --arg created "$(date -Iseconds)" \
     --arg clone_url "$clone_url" \
     --arg github_repo "$github_repo" \
-    '{name: $name, vcpu: $vcpu, ram_mib: $ram, internal_ip: $ip, mac: $mac, disk: $disk, tap: $tap, created: $created} +
+    '{name: $name, vcpu: $vcpu, ram_mib: $ram, mark: $mark, mode: $mode, mac: $mac, disk: $disk, tap: $tap, created: $created} +
      (if $clone_url != "" then {clone_url: $clone_url, github_repo: $github_repo} else {} end)')
   echo "$vm_json" > "${VM_DIR}/${name}/vm.json"
 
@@ -293,6 +312,18 @@ cmd_create() {
 }
 EOF
 
+  # Inject CA cert into rootfs for internal TLS
+  if [ -f /etc/boxcutter/ca.crt ]; then
+    echo "  Injecting CA cert..."
+    MOUNT_DIR=$(mktemp -d)
+    mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
+    mkdir -p "${MOUNT_DIR}/usr/local/share/ca-certificates"
+    cp /etc/boxcutter/ca.crt "${MOUNT_DIR}/usr/local/share/ca-certificates/boxcutter-ca.crt"
+    chroot "$MOUNT_DIR" update-ca-certificates 2>/dev/null || true
+    umount "$MOUNT_DIR"
+    rmdir "$MOUNT_DIR"
+  fi
+
   # Inject any additional SSH keys added after golden image build
   if [ -f /etc/boxcutter/authorized_keys ]; then
     echo "  Injecting user SSH keys..."
@@ -314,7 +345,7 @@ EOF
     rmdir "$MOUNT_DIR"
   fi
 
-  echo "  VM created: ${name} (internal: ${ip})"
+  echo "  VM created: ${name} (mark: ${mark}, mode: ${mode})"
   echo "  Start with: boxcutter-ctl start ${name}"
 }
 
@@ -329,13 +360,14 @@ cmd_start() {
     kill -0 "$pid" 2>/dev/null && { echo "VM '${name}' is already running (PID ${pid})."; exit 1; }
   fi
 
-  local ip mac tap
-  ip=$(jq -r '.internal_ip // .ip' "${VM_DIR}/${name}/vm.json")
+  local mark mac tap mode
+  mark=$(jq -r '.mark' "${VM_DIR}/${name}/vm.json")
   mac=$(jq -r '.mac' "${VM_DIR}/${name}/vm.json")
   tap=$(jq -r '.tap // empty' "${VM_DIR}/${name}/vm.json")
+  mode=$(jq -r '.mode // "normal"' "${VM_DIR}/${name}/vm.json")
   [ -z "$tap" ] && tap=$(tap_name "$name")
 
-  echo "Starting VM: ${name} (internal: ${ip})"
+  echo "Starting VM: ${name} (mark: ${mark}, mode: ${mode})"
 
   # Ensure dm-snapshot is active
   local dm_name="bc-${name}"
@@ -352,11 +384,15 @@ cmd_start() {
     fi
   fi
 
-  # Create TAP device on the internal bridge
+  # Set up per-TAP networking with fwmark
   if ! ip link show "$tap" &>/dev/null; then
-    ip tuntap add dev "$tap" mode tap
-    ip link set "$tap" master "${BRIDGE}"
-    ip link set "$tap" up
+    setup_vm_tap "$tap" "$mark"
+  fi
+
+  # Paranoid mode: block direct internet, allow only proxy
+  if [ "$mode" = "paranoid" ]; then
+    iptables -I FORWARD -i "$tap" -d 10.0.0.1/32 -p tcp --dport 8080 -j ACCEPT
+    iptables -I FORWARD -i "$tap" ! -d 10.0.0.0/24 -j DROP
   fi
 
   # Clean stale socket
@@ -374,11 +410,10 @@ cmd_start() {
 
   # Join Tailscale (skip for internal provision VMs starting with _)
   if [[ "$name" != _* ]]; then
-    # Wait for SSH to be ready on internal network
+    # Wait for SSH to be ready
     echo "  Waiting for VM to boot..."
     for i in $(seq 1 30); do
-      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=2 -o BatchMode=yes "dev@${ip}" echo ready 2>/dev/null && break
+      vm_ssh "$tap" echo ready 2>/dev/null && break
       sleep 1
     done
 
@@ -389,17 +424,15 @@ cmd_start() {
     fi
     if [ -n "$ts_authkey" ]; then
       echo "  Joining Tailscale..."
-      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+      vm_ssh "$tap" \
         "sudo tailscale up --authkey='${ts_authkey}' --hostname='${name}'" 2>/dev/null || true
 
-      # Expose SSH via Tailscale TCP proxy (so regular SSH keys work over Tailscale IP)
-      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+      # Expose SSH via Tailscale TCP proxy
+      vm_ssh "$tap" \
         "sudo tailscale serve --bg --tcp 22 tcp://localhost:22" 2>/dev/null || true
 
       local ts_ip
-      ts_ip=$(get_tailscale_ip "$ip" 15) || true
+      ts_ip=$(get_tailscale_ip "$tap" 15) || true
       if [ -n "$ts_ip" ]; then
         local tmp_json
         tmp_json=$(jq --arg tsip "$ts_ip" '. + {"tailscale_ip": $tsip}' "${VM_DIR}/${name}/vm.json")
@@ -407,17 +440,29 @@ cmd_start() {
         echo "  Tailscale IP: ${ts_ip}"
         echo "  SSH: ssh ${ts_ip}"
       else
-        echo "  Warning: Tailscale did not come up. VM is accessible internally at ${ip}"
+        echo "  Warning: Tailscale did not come up."
       fi
     else
       echo "  Warning: No Tailscale auth key at ${TS_AUTHKEY_FILE}"
-      echo "  VM is accessible internally at ${ip}"
     fi
 
     # Register with vmid
     local github_repo
     github_repo=$(jq -r '.github_repo // ""' "${VM_DIR}/${name}/vm.json")
-    vmid_register "$name" "$ip" "$github_repo"
+    vmid_register "$name" "$mark" "$mode" "$github_repo"
+
+    # Paranoid mode: set proxy env vars inside VM
+    if [ "$mode" = "paranoid" ]; then
+      echo "  Configuring proxy environment..."
+      vm_ssh "$tap" "sudo bash -c 'cat > /etc/profile.d/boxcutter-proxy.sh << \"PROXYEOF\"
+export HTTP_PROXY=http://10.0.0.1:8080
+export HTTPS_PROXY=http://10.0.0.1:8080
+export http_proxy=http://10.0.0.1:8080
+export https_proxy=http://10.0.0.1:8080
+export NO_PROXY=10.0.0.1,localhost,127.0.0.1
+export no_proxy=10.0.0.1,localhost,127.0.0.1
+PROXYEOF'" 2>/dev/null || true
+    fi
 
     # Clone repo if --clone was specified
     local clone_url
@@ -454,8 +499,7 @@ cmd_start() {
       fi
 
       local clone_output
-      clone_output=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+      clone_output=$(vm_ssh "$tap" \
         "git clone '${auth_clone_url}' ~/project 2>&1")
       local clone_rc=$?
 
@@ -463,8 +507,7 @@ cmd_start() {
         echo "  Cloned successfully."
         if [ -n "$gh_token" ]; then
           # Strip token from remote URL + set up gh CLI auth + git credential helper
-          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=5 -o BatchMode=yes "dev@${ip}" \
+          vm_ssh "$tap" \
             "cd ~/project && git remote set-url origin 'https://github.com/${github_repo}.git'
              mkdir -p ~/.config/gh
              cat > ~/.config/gh/hosts.yml <<GHEOF
@@ -477,7 +520,6 @@ GHEOF
         fi
       else
         echo "  Clone failed."
-        # Sanitize output — strip any token from error messages
         echo "$clone_output" | sed "s|x-access-token:[^@]*@|x-access-token:***@|g" | sed 's/^/    /'
         if [ -n "$gh_token" ]; then
           echo "  The GitHub App token was minted but the repo may not be accessible."
@@ -488,7 +530,6 @@ GHEOF
     fi
   else
     echo "  Internal VM — skipping Tailscale"
-    echo "  SSH (internal): ssh ${ip}"
   fi
 }
 
@@ -520,17 +561,23 @@ cmd_stop() {
     kill -9 "$pid" 2>/dev/null || true
   fi
 
-  # Cleanup
-  local tap
+  # Cleanup TAP + fwmark routing
+  local tap mark
   tap=$(jq -r '.tap // empty' "${VM_DIR}/${name}/vm.json" 2>/dev/null)
+  mark=$(jq -r '.mark // 0' "${VM_DIR}/${name}/vm.json" 2>/dev/null)
   [ -z "$tap" ] && tap=$(tap_name "$name")
+
   rm -f "${VM_DIR}/${name}/firecracker.pid" "${VM_DIR}/${name}/api.sock"
-  ip link del "$tap" 2>/dev/null || true
+
+  if [ "$mark" != "0" ] && [ -n "$mark" ]; then
+    teardown_vm_tap "$tap" "$mark"
+  else
+    ip link del "$tap" 2>/dev/null || true
+  fi
 
   # Tear down dm-snapshot
   local dm_name="bc-${name}"
   if [ -e "/dev/mapper/${dm_name}" ]; then
-    # Wait for kernel to release the device after firecracker exits
     for _ in $(seq 1 5); do
       dmsetup remove "$dm_name" 2>/dev/null && break
       sleep 1
@@ -553,7 +600,7 @@ cmd_destroy() {
   [ -z "$name" ] && { echo "Usage: boxcutter-ctl destroy <name>"; exit 1; }
   [ -d "${VM_DIR}/${name}" ] || { echo "VM '${name}' does not exist."; exit 1; }
 
-  # Deregister from vmid
+  # Deregister from vmid (purges sentinels)
   vmid_deregister "$name"
 
   # Stop if running (ephemeral Tailscale key auto-removes disconnected nodes)
@@ -581,13 +628,14 @@ cmd_destroy() {
 }
 
 cmd_list() {
-  printf "%-20s %-18s %-18s %-8s %-10s %-8s\n" "NAME" "TAILSCALE IP" "INTERNAL IP" "VCPU" "RAM" "STATUS"
+  printf "%-20s %-18s %-8s %-8s %-10s %-10s %-8s\n" "NAME" "TAILSCALE IP" "MARK" "MODE" "VCPU" "RAM" "STATUS"
   for d in "${VM_DIR}"/*/; do
     [ -f "${d}/vm.json" ] || continue
-    local name ip ts_ip vcpu ram status
+    local name ts_ip mark mode vcpu ram status
     name=$(basename "$d")
-    ip=$(jq -r '.internal_ip // .ip' "${d}/vm.json")
     ts_ip=$(jq -r '.tailscale_ip // "-"' "${d}/vm.json")
+    mark=$(jq -r '.mark // "-"' "${d}/vm.json")
+    mode=$(jq -r '.mode // "normal"' "${d}/vm.json")
     vcpu=$(jq -r '.vcpu' "${d}/vm.json")
     ram=$(jq -r '.ram_mib' "${d}/vm.json")
     status="stopped"
@@ -596,7 +644,7 @@ cmd_list() {
       pid=$(cat "${d}/firecracker.pid")
       kill -0 "$pid" 2>/dev/null && status="running"
     fi
-    printf "%-20s %-18s %-18s %-8s %-10s %-8s\n" "$name" "$ts_ip" "$ip" "$vcpu" "$((ram/1024))GB" "$status"
+    printf "%-20s %-18s %-8s %-8s %-10s %-10s %-8s\n" "$name" "$ts_ip" "$mark" "$mode" "$vcpu" "$((ram/1024))GB" "$status"
   done
 }
 
@@ -605,9 +653,11 @@ cmd_shell() {
   [ -z "$name" ] && { echo "Usage: boxcutter-ctl shell <name>"; exit 1; }
   [ -d "${VM_DIR}/${name}" ] || { echo "VM '${name}' does not exist."; exit 1; }
 
-  local ip
-  ip=$(jq -r '.internal_ip // .ip' "${VM_DIR}/${name}/vm.json")
-  exec ssh -t -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "dev@${ip}"
+  local tap
+  tap=$(jq -r '.tap // empty' "${VM_DIR}/${name}/vm.json")
+  [ -z "$tap" ] && tap=$(tap_name "$name")
+  exec ssh -t -o "ProxyCommand=socat - TCP:10.0.0.2:22,so-bindtodevice=${tap}" \
+    -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "dev@10.0.0.2"
 }
 
 cmd_status() {
@@ -663,19 +713,18 @@ case "${1:-help}" in
         cmd_create _gprov --vcpu 8 --ram 16384
         cmd_start _gprov
 
-        PROV_IP=$(jq -r '.internal_ip // .ip' "${VM_DIR}/_gprov/vm.json")
+        PROV_TAP=$(jq -r '.tap // empty' "${VM_DIR}/_gprov/vm.json")
+        [ -z "$PROV_TAP" ] && PROV_TAP=$(tap_name "_gprov")
         echo "Waiting for VM to boot..."
         for i in $(seq 1 60); do
-          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=2 -o BatchMode=yes "dev@${PROV_IP}" echo ready 2>/dev/null && break
+          vm_ssh "$PROV_TAP" echo ready 2>/dev/null && break
           sleep 2
         done
 
         echo "Running provision script inside VM..."
         PROV_SCRIPT="${BOXCUTTER_HOME}/golden/provision.sh"
         [ -f "$PROV_SCRIPT" ] || PROV_SCRIPT="/mnt/boxcutter/golden/provision.sh"
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-          "dev@${PROV_IP}" "sudo bash -s" < "$PROV_SCRIPT"
+        vm_ssh "$PROV_TAP" "sudo bash -s" < "$PROV_SCRIPT"
 
         echo "Shutting down provision VM..."
         dm_name="bc-_gprov"

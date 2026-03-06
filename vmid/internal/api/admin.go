@@ -6,16 +6,18 @@ import (
 	"strings"
 
 	"github.com/AndrewBudd/boxcutter/vmid/internal/registry"
+	"github.com/AndrewBudd/boxcutter/vmid/internal/sentinel"
 	"github.com/AndrewBudd/boxcutter/vmid/internal/token"
 )
 
 type AdminHandler struct {
-	reg    *registry.Registry
-	github *token.GitHubTokenMinter
+	reg      *registry.Registry
+	github   *token.GitHubTokenMinter
+	sentinel *sentinel.Store
 }
 
-func NewAdminHandler(reg *registry.Registry, github *token.GitHubTokenMinter) *AdminHandler {
-	return &AdminHandler{reg: reg, github: github}
+func NewAdminHandler(reg *registry.Registry, github *token.GitHubTokenMinter, sentinel *sentinel.Store) *AdminHandler {
+	return &AdminHandler{reg: reg, github: github, sentinel: sentinel}
 }
 
 func (h *AdminHandler) Register(mux *http.ServeMux) {
@@ -24,11 +26,14 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/vms", h.handleList)
 	mux.HandleFunc("GET /internal/vms/{id}", h.handleGet)
 	mux.HandleFunc("POST /internal/vms/{id}/github-token", h.handleMintGitHubToken)
+	mux.HandleFunc("GET /internal/sentinel/{sentinel}", h.handleSentinelSwap)
 }
 
 type registerRequest struct {
 	VMID       string            `json:"vm_id"`
 	IP         string            `json:"ip"`
+	Mark       int               `json:"mark"`
+	Mode       string            `json:"mode"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	GitHubRepo string            `json:"github_repo,omitempty"`
 }
@@ -39,14 +44,19 @@ func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.VMID == "" || req.IP == "" {
-		http.Error(w, "vm_id and ip are required", http.StatusBadRequest)
+	if req.VMID == "" {
+		http.Error(w, "vm_id is required", http.StatusBadRequest)
 		return
+	}
+	if req.Mode == "" {
+		req.Mode = "normal"
 	}
 
 	rec := &registry.VMRecord{
 		VMID:       req.VMID,
 		IP:         req.IP,
+		Mark:       req.Mark,
+		Mode:       req.Mode,
 		Labels:     req.Labels,
 		GitHubRepo: req.GitHubRepo,
 	}
@@ -65,6 +75,7 @@ func (h *AdminHandler) handleDeregister(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
+	h.sentinel.PurgeVM(id)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -113,6 +124,19 @@ func (h *AdminHandler) handleMintGitHubToken(w http.ResponseWriter, r *http.Requ
 	}
 
 	writeJSON(w, tok)
+}
+
+func (h *AdminHandler) handleSentinelSwap(w http.ResponseWriter, r *http.Request) {
+	sv := r.PathValue("sentinel")
+	if sv == "" {
+		sv = extractPathID(r.URL.Path, "/internal/sentinel/")
+	}
+	real, ok := h.sentinel.Swap(sv)
+	if !ok {
+		http.Error(w, "sentinel not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"token": real})
 }
 
 func extractPathID(path, prefix string) string {

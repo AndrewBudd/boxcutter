@@ -1,0 +1,18 @@
+[Unit]
+Description=Boxcutter DERP relay (local Tailscale relay)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/derper \
+    --hostname=10.0.0.1 \
+    --certmode=manual \
+    --certdir=/etc/boxcutter/derp-certs \
+    --stun-port=3478 \
+    --verify-clients \
+    -a :443
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"context"
-	"net"
 	"net/http"
 
 	"github.com/AndrewBudd/boxcutter/vmid/internal/registry"
@@ -10,25 +9,39 @@ import (
 
 type ctxKey int
 
-const vmRecordKey ctxKey = 0
+const (
+	vmRecordKey ctxKey = 0
+	connMarkKey ctxKey = 1
+)
 
 func VMFromContext(ctx context.Context) (*registry.VMRecord, bool) {
 	rec, ok := ctx.Value(vmRecordKey).(*registry.VMRecord)
 	return rec, ok
 }
 
-// Identity looks up the requesting VM by source IP and attaches
-// its record to the request context. Returns 403 if the IP isn't registered.
+// MarkFromContext returns the fwmark injected by ConnContext.
+func MarkFromContext(ctx context.Context) (int, bool) {
+	m, ok := ctx.Value(connMarkKey).(int)
+	return m, ok
+}
+
+// WithMark returns a context with the fwmark value set.
+func WithMark(ctx context.Context, mark int) context.Context {
+	return context.WithValue(ctx, connMarkKey, mark)
+}
+
+// Identity looks up the requesting VM by fwmark (set via ConnContext)
+// and attaches its record to the request context. Returns 403 if not found.
 func Identity(reg *registry.Registry) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				http.Error(w, "bad remote address", http.StatusBadRequest)
+			mark, ok := MarkFromContext(r.Context())
+			if !ok || mark == 0 {
+				http.Error(w, "unknown VM", http.StatusForbidden)
 				return
 			}
 
-			rec, ok := reg.LookupIP(host)
+			rec, ok := reg.LookupMark(mark)
 			if !ok {
 				http.Error(w, "unknown VM", http.StatusForbidden)
 				return

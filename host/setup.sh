@@ -95,18 +95,14 @@ echo "Setting up NAT masquerade..."
 sudo iptables -t nat -C POSTROUTING -s "${HOST_TAP_IP}/${HOST_TAP_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || \
 sudo iptables -t nat -A POSTROUTING -s "${HOST_TAP_IP}/${HOST_TAP_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE
 
-# Also NAT the VM internal network (10.0.1.0/24) which gets routed through the Node VM
-sudo iptables -t nat -C POSTROUTING -s "${VM_IP_PREFIX}.0/${VM_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || \
-sudo iptables -t nat -A POSTROUTING -s "${VM_IP_PREFIX}.0/${VM_CIDR}" -o "$HOST_INTERFACE" -j MASQUERADE
-
 # Forward traffic from TAP
 sudo iptables -C FORWARD -i "$TAP_DEVICE" -j ACCEPT 2>/dev/null || \
 sudo iptables -I FORWARD -i "$TAP_DEVICE" -j ACCEPT
 sudo iptables -C FORWARD -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
 sudo iptables -I FORWARD -o "$TAP_DEVICE" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
-# Route the VM internal network through the Node VM
-sudo ip route replace "${VM_IP_PREFIX}.0/${VM_CIDR}" via "$NODE_IP" dev "$TAP_DEVICE" 2>/dev/null || true
+# Route VM traffic through the Node VM
+sudo ip route replace 10.0.0.2/32 via "$NODE_IP" dev "$TAP_DEVICE" 2>/dev/null || true
 
 echo ""
 echo "=== Host setup complete ==="

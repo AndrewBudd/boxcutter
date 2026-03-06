@@ -9,6 +9,9 @@ ExecStart=/usr/local/bin/vmid -config /etc/vmid/config.yaml
 Restart=always
 RestartSec=5
 
+# Needs port 80 binding and SO_MARK reading
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+
 # Socket should be readable by boxcutter group
 RuntimeDirectory=vmid
 RuntimeDirectoryMode=0755
