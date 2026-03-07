@@ -44,9 +44,10 @@ type HostConfig struct {
 	SocketPath    string
 
 	// Auto-scaling
-	ScalePollInterval time.Duration
-	HealthPollInterval time.Duration
-	ScaleUpThresholdPct int // Scale up when capacity < this %
+	ScalePollInterval   time.Duration
+	HealthPollInterval  time.Duration
+	ScaleUpThresholdPct int // Scale up when VM capacity used > this %
+	MinFreeMemoryMB     int // Hard floor: never scale up if host has less than this free
 }
 
 func defaultConfig() HostConfig {
@@ -90,9 +91,10 @@ func defaultConfig() HostConfig {
 		NodeIPOffset:       2,
 		StatePath:          "/var/lib/boxcutter/cluster.json",
 		SocketPath:         "/run/boxcutter-host.sock",
-		ScalePollInterval:  30 * time.Second,
-		HealthPollInterval: 10 * time.Second,
+		ScalePollInterval:   30 * time.Second,
+		HealthPollInterval:  10 * time.Second,
 		ScaleUpThresholdPct: 80,
+		MinFreeMemoryMB:     8192, // 8GB — never launch a node if host has less than this free
 	}
 }
 
@@ -320,11 +322,12 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 
 		if usedPct >= cfg.ScaleUpThresholdPct {
 			log.Printf("Capacity above %d%%, checking if scale-up is possible...", cfg.ScaleUpThresholdPct)
-			if canScaleUp(cfg) {
+			ok, reason := canScaleUp(cfg)
+			if ok {
 				log.Printf("Scaling up: adding new node...")
 				addNode(cfg, state)
 			} else {
-				log.Printf("Cannot scale up: insufficient host resources")
+				log.Printf("Cannot scale up: %s", reason)
 			}
 		}
 	}
@@ -343,11 +346,10 @@ func queryNodeHealth(bridgeIP string) map[string]interface{} {
 	return result
 }
 
-func canScaleUp(cfg HostConfig) bool {
-	// Check available host memory — need at least NodeRAM + 2GB headroom
+func canScaleUp(cfg HostConfig) (bool, string) {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return false
+		return false, "cannot read /proc/meminfo"
 	}
 	var availKB int
 	for _, line := range splitLines(string(data)) {
@@ -356,9 +358,29 @@ func canScaleUp(cfg HostConfig) bool {
 			break
 		}
 	}
-	// Node needs 12GB, keep 4GB headroom
-	requiredKB := 12*1024*1024 + 4*1024*1024
-	return availKB >= requiredKB
+	availMB := availKB / 1024
+
+	// Hard floor: never scale if below minimum free memory
+	if availMB < cfg.MinFreeMemoryMB {
+		return false, fmt.Sprintf("host has %dMB free, minimum is %dMB", availMB, cfg.MinFreeMemoryMB)
+	}
+
+	// Also need enough for the node VM itself (parse NodeRAM like "12G")
+	var nodeRAMMB int
+	fmt.Sscanf(cfg.NodeRAM, "%dG", &nodeRAMMB)
+	nodeRAMMB *= 1024
+	if nodeRAMMB == 0 {
+		nodeRAMMB = 12 * 1024 // fallback
+	}
+
+	// After launching, we must still have MinFreeMemoryMB left
+	afterLaunchMB := availMB - nodeRAMMB
+	if afterLaunchMB < cfg.MinFreeMemoryMB {
+		return false, fmt.Sprintf("after launch would have %dMB free (%dMB available - %dMB node), minimum is %dMB",
+			afterLaunchMB, availMB, nodeRAMMB, cfg.MinFreeMemoryMB)
+	}
+
+	return true, ""
 }
 
 func splitLines(s string) []string {

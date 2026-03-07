@@ -6,11 +6,9 @@ Wants=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/boxcutter-host run
+Environment=BOXCUTTER_REPO=/home/budda/boxcutter
 Restart=on-failure
 RestartSec=5
-
-# Allow bridge/TAP management
-AmbientCapabilities=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
