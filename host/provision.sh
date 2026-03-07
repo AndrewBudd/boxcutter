@@ -681,9 +681,22 @@ done)
       sed -i "s|bridge_ip:.*BRIDGE_IP_PLACEHOLDER|bridge_ip: ${ORCH_IP}|" /etc/boxcutter/boxcutter.yaml
       sed -i "s|url:.*ORCHESTRATOR_URL_PLACEHOLDER|url: http://${ORCH_IP}:8801|" /etc/boxcutter/boxcutter.yaml
 
-      # Run boxcutter-setup if available
-      if [ -x /usr/local/bin/boxcutter-setup ]; then
-        /usr/local/bin/boxcutter-setup
+      # Sync authorized keys to boxcutter SSH user
+      if id boxcutter &>/dev/null && [ -f /etc/boxcutter/secrets/authorized-keys ]; then
+        mkdir -p /home/boxcutter/.ssh
+        cp /etc/boxcutter/secrets/authorized-keys /home/boxcutter/.ssh/authorized_keys
+        chown -R boxcutter:boxcutter /home/boxcutter/.ssh
+        chmod 700 /home/boxcutter/.ssh
+        chmod 600 /home/boxcutter/.ssh/authorized_keys
+      fi
+
+      # Cluster SSH key for migration
+      if [ -f /etc/boxcutter/secrets/cluster-ssh.key ]; then
+        mkdir -p /root/.ssh
+        cp /etc/boxcutter/secrets/cluster-ssh.key /root/.ssh/cluster-ssh.key
+        chmod 600 /root/.ssh/cluster-ssh.key
+        printf '%s\n' 'Host 192.168.50.*' '  IdentityFile /root/.ssh/cluster-ssh.key' '  User ubuntu' '  StrictHostKeyChecking no' '  UserKnownHostsFile /dev/null' > /root/.ssh/config
+        chmod 600 /root/.ssh/config
       fi
 
       systemctl restart boxcutter-orchestrator 2>/dev/null || true
