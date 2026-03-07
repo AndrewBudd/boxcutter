@@ -216,27 +216,35 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 	// Launch orchestrator
 	if state.Orchestrator != nil {
 		orch := state.Orchestrator
-		if err := bridge.EnsureTAP(orch.TAP, cfg.BridgeDevice, username); err != nil {
-			log.Printf("WARNING: orchestrator TAP: %v", err)
-		}
-		pid, err := qemu.Launch(qemu.VMConfig{
-			Name: orch.ID,
-			VCPU: orch.VCPU,
-			RAM:  orch.RAM,
-			Disk: orch.Disk,
-			ISO:  orch.ISO,
-			TAP:  orch.TAP,
-			MAC:  orch.MAC,
-		}, cfg.ImagesDir)
-		if err != nil {
-			log.Printf("WARNING: orchestrator launch failed: %v", err)
+		if qemu.IsRunning(orch.PID) {
+			log.Printf("  orchestrator already running (PID %d)", orch.PID)
 		} else {
-			state.SetPID(orch.ID, pid)
+			if err := bridge.EnsureTAP(orch.TAP, cfg.BridgeDevice, username); err != nil {
+				log.Printf("WARNING: orchestrator TAP: %v", err)
+			}
+			pid, err := qemu.Launch(qemu.VMConfig{
+				Name: orch.ID,
+				VCPU: orch.VCPU,
+				RAM:  orch.RAM,
+				Disk: orch.Disk,
+				ISO:  orch.ISO,
+				TAP:  orch.TAP,
+				MAC:  orch.MAC,
+			}, cfg.ImagesDir)
+			if err != nil {
+				log.Printf("WARNING: orchestrator launch failed: %v", err)
+			} else {
+				state.SetPID(orch.ID, pid)
+			}
 		}
 	}
 
 	// Launch nodes
 	for _, node := range state.Nodes {
+		if qemu.IsRunning(node.PID) {
+			log.Printf("  %s already running (PID %d)", node.ID, node.PID)
+			continue
+		}
 		if err := bridge.EnsureTAP(node.TAP, cfg.BridgeDevice, username); err != nil {
 			log.Printf("WARNING: node %s TAP: %v", node.ID, err)
 		}
