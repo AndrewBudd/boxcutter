@@ -17,60 +17,64 @@ rebuilding everything manually.
 
 ## Design Principles
 
-1. **Host daemon owns infrastructure** — it is the sole authority over VM lifecycle
-   (create, destroy, health-check, upgrade, capacity). It runs on bare metal,
-   outside the environment it manages. Its control plane is never exposed to
-   anything inside the VMs or nodes.
-2. **Orchestrator owns workloads** — it schedules dev VMs onto nodes, manages SSH
-   keys, distributes golden images, and coordinates migrations. It lives *inside*
-   the environment as a VM and has no knowledge of or control over the host daemon.
-3. **Strict isolation between planes** — the host daemon's API (unix socket or
-   localhost-only) is unreachable from the bridge network. The orchestrator and
-   nodes cannot call up to it. The human operator is the only actor that interacts
-   with the host daemon directly.
-4. **Nodes are immutable cattle** — upgrade by building a new node VM and draining
-   the old one, never by patching in place
-5. **Orchestrator state is reconstructible** — everything in the orchestrator DB
-   can be rebuilt by querying live nodes
+1. **Control plane owns everything outside the VMs** — it is the sole authority
+   over all infrastructure: creating/destroying VMs (both QEMU nodes and
+   Firecracker dev VMs), version rollouts, capacity management, health
+   monitoring, bridge/NAT/TAP networking. It runs on bare metal as a Go binary.
+2. **Nothing inside the VMs can reach the control plane** — the control plane's
+   API (unix socket) is strictly localhost-only. The orchestrator, nodes, and
+   Firecracker VMs have no mechanism to communicate with it. This is a hard
+   security boundary.
+3. **Control plane calls into VMs, never the reverse** — the control plane
+   reaches into nodes to check capacity, enumerate running Firecrackers, move
+   workloads during drains, and verify health. Communication is always initiated
+   by the control plane.
+4. **Orchestrator is the user-facing entry point** — it runs inside a VM and
+   handles SSH sessions, user authentication (SSH keys), and exposes the
+   user-facing API. It has no infrastructure authority and no awareness of the
+   control plane.
+5. **Nodes are immutable cattle** — upgrade by building a new node VM and
+   draining the old one, never by patching in place.
 6. **Build from source every time** — no binary distribution; git tags provide
-   versioning
-7. **Data flows downward at provisioning time** — the host daemon templates node
-   config (IPs, secrets, identity) into cloud-init at build time. At runtime,
-   nodes and orchestrator operate independently.
+   versioning.
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Physical Host (bare metal)                             │
-│                                                         │
-│  boxcutter-host (Go binary)                             │
-│    - manages bridge, TAP devices, NAT                   │
-│    - creates/destroys/monitors QEMU VMs                 │
-│    - builds VM images from source (go build + ISO)      │
-│    - upgrades nodes (build new, drain old, retire)      │
-│    - manages capacity (vCPU/RAM allocation)             │
-│    - control plane: unix socket only (localhost)        │
-│    - NOT accessible from bridge network or VMs          │
-│                                                         │
-│  ┌─────────────────────┐  ┌──────────────────────────┐  │
-│  │ Orchestrator VM     │  │ Node VM (immutable)      │  │
-│  │ - SQLite DB         │  │ - Firecracker microVMs   │  │
-│  │ - schedules dev VMs │  │ - vmid, proxy, agent     │  │
-│  │ - distributes golden│  │ - reports to orchestrator │  │
-│  │ - manages SSH keys  │  │                          │  │
-│  │ - no host access    │  │ Node VM 2... N           │  │
-│  └─────────────────────┘  └──────────────────────────┘  │
-│                                                         │
-│  The host daemon and VMs are in separate trust domains. │
-│  VMs cannot reach the host daemon. The operator manages │
-│  the host daemon via CLI on the physical machine.       │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Physical Host (bare metal)                                  │
+│                                                              │
+│  boxcutter-host (Go binary) — THE CONTROL PLANE              │
+│    - creates ALL VMs: orchestrator, nodes, Firecracker VMs   │
+│    - manages all resources outside VMs:                      │
+│        bridge, TAP devices, NAT, disk images                 │
+│    - orchestrates version rollouts / deployments             │
+│    - adds / frees capacity                                   │
+│    - ensures orchestrator + allocated VMs are up             │
+│    - calls INTO VMs to check capacity, move Firecrackers     │
+│    - control plane: unix socket only (localhost)             │
+│    - NOTHING inside the VMs can communicate with it          │
+│                                                              │
+│  ┌─────────────────────┐  ┌──────────────────────────────┐   │
+│  │ Orchestrator VM     │  │ Node VM (immutable)          │   │
+│  │ - SSH entry point   │  │ - runs Firecracker microVMs  │   │
+│  │ - user auth (keys)  │  │ - vmid, proxy, agent         │   │
+│  │ - user-facing API   │  │ - responds to control plane  │   │
+│  │ - no infra authority│  │   queries (capacity, VM list) │   │
+│  │ - no host access    │  │                              │   │
+│  └─────────────────────┘  │ Node VM 2... N               │   │
+│                           └──────────────────────────────┘   │
+│                                                              │
+│  Communication is ONE-WAY: control plane → VMs.              │
+│  VMs cannot initiate communication with the control plane.   │
+│  The operator interacts with the control plane via CLI on    │
+│  the physical machine.                                       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Installation Flow
 
-### Phase 0: Install the host daemon
+### Phase 0: Install the control plane
 
 The operator installs `boxcutter-host` on the physical machine. This is a Go
 binary that runs as a systemd service on bare metal.
@@ -84,21 +88,23 @@ make install-host
 ```
 
 `boxcutter-host` is responsible for:
-- Creating/managing the bridge device and NAT rules
-- Building VM images from source (`go build` + cloud-init ISO packaging)
-- Creating/destroying/monitoring QEMU VMs
-- Health-checking VMs and restarting them if they crash
-- Upgrading nodes (build new, drain old, retire)
-- Managing host capacity (vCPU/RAM budgets across VMs)
+- Creating/managing the bridge device, TAP devices, and NAT rules
+- Building all VM images from source (`go build` + cloud-init ISO packaging)
+- Creating/destroying/monitoring all VMs (QEMU nodes + Firecracker dev VMs)
+- Health-checking the orchestrator and all allocated VMs, restarting on crash
+- Orchestrating version rollouts and deployments
+- Managing host capacity (vCPU/RAM budgets across all VMs)
+- Calling into node VMs to check capacity, enumerate Firecrackers, move workloads
 
 The control plane is a **unix socket** (`/run/boxcutter-host.sock`) and a CLI
 that talks to it. It is NOT exposed on any network interface. Nothing inside the
-bridge network (orchestrator, nodes, VMs) can reach it.
+bridge network can reach it.
 
 ```bash
 # Operator interacts via CLI on the physical machine only
 boxcutter-host status
-boxcutter-host node list
+boxcutter-host vm list
+boxcutter-host vm create --repo github.com/org/repo
 boxcutter-host upgrade --to v0.4.0
 ```
 
@@ -113,7 +119,7 @@ secrets_dir: /etc/boxcutter/secrets/
 
 ### Phase 1: Bootstrap the cluster
 
-The operator runs a single bootstrap command that creates both the orchestrator
+The operator runs a single bootstrap command that creates the orchestrator
 and the first node:
 
 ```bash
@@ -128,54 +134,72 @@ This command:
 4. Creates a QCOW2 disk, launches the orchestrator VM
 5. Builds the node agent binary from the same git checkout
 6. Packages it, creates disk, launches the first node VM
-7. Waits for both to come up (health checks)
+7. Waits for both to come up (health checks via calls into each VM)
 8. Records the cluster state in `/var/lib/boxcutter/cluster.json`
 
-The host daemon assigns all identities at build time:
+The control plane assigns all identities at build time:
 - **Orchestrator**: bridge IP `192.168.50.2`, hostname `boxcutter-orchestrator`
 - **Node 1**: bridge IP `192.168.50.3`, hostname `boxcutter-node-1`
 - **Secrets**: Tailscale keys, SSH keypairs, CA certs — all baked into cloud-init
 
-### Phase 2: Add more nodes
+### Phase 2: Add capacity
 
-The operator adds nodes via the host daemon CLI:
+The operator adds nodes via the control plane CLI:
 
 ```bash
 boxcutter-host node add --vcpu 12 --ram 48G
-# Host daemon:
+# Control plane:
 #   1. Assigns next bridge IP (192.168.50.4)
 #   2. Builds node image from current git ref
 #   3. Launches node VM
-#   4. Node boots, registers with orchestrator
+#   4. Calls into node to verify it's ready
 ```
 
-The host daemon decides IPs and resource allocation. The orchestrator discovers
-new nodes when they register — it doesn't create them.
+The control plane decides IPs, resource allocation, and when nodes are healthy.
+The orchestrator discovers new nodes only when users SSH in and the control
+plane has already made them available.
 
 ### Phase 3: Golden image build
 
-Once at least one node is up, the orchestrator triggers the golden image build
-on a node (same two-phase process as today):
+The control plane triggers the golden image build by calling into a node:
 
 ```
-Orchestrator → Node Agent: POST /api/golden/build
-Orchestrator → Node Agent: POST /api/golden/provision
+Control plane → Node: build golden image (debootstrap + provision)
+Control plane → Nodes: distribute golden image to all nodes (rsync)
 ```
 
-The golden image version is tracked in the orchestrator DB. The orchestrator
-distributes the golden image to all nodes (rsync over Tailscale).
+The golden image version is tracked by the control plane in `cluster.json`.
 
-### Phase 4: System is operational
+### Phase 4: Creating dev VMs
 
-On host reboot, the host daemon brings everything back up automatically:
+When a dev VM is needed, the control plane creates it:
+
+```bash
+boxcutter-host vm create \
+  --name bold-fox \
+  --repo github.com/org/repo \
+  --vcpu 4 --ram 8G
+```
+
+The control plane:
+1. Checks capacity across nodes (calls into each node's agent)
+2. Picks the node with the most available resources
+3. Calls into the selected node agent to create the Firecracker VM
+4. Records the VM in `cluster.json`
+5. Returns the VM's Tailscale IP / connection info
+
+### Phase 5: System is operational
+
+On host reboot, the control plane brings everything back up automatically:
 
 1. systemd starts `boxcutter-host.service`
-2. Host daemon reads cluster state from `/var/lib/boxcutter/cluster.json`
+2. Control plane reads cluster state from `/var/lib/boxcutter/cluster.json`
 3. Recreates bridge + NAT (idempotent)
 4. Launches orchestrator VM, then all node VMs
-5. Health-checks each VM until it's responsive
-6. Nodes boot, register with orchestrator
-7. Orchestrator tells nodes to restart any dev VMs that were previously running
+5. Calls into each VM to verify health
+6. Calls into each node to restart any Firecracker VMs that were previously
+   allocated
+7. System operational
 
 ## Versioning: Git Tags
 
@@ -186,111 +210,84 @@ git tag -a v0.3.0 -m "Add paranoid mode sentinel tokens"
 git push origin v0.3.0
 ```
 
-The host daemon knows:
+The control plane knows:
 - **Its own version** — baked in at build time via `-ldflags "-X main.Version=v0.3.0"`
 - **What version each VM was built from** — recorded in `cluster.json`
 - **What git ref to use for the next build** — configurable, defaults to latest tag
 
-The orchestrator knows:
-- **Its own version** — baked in at build time
-- **What version each node is running** — reported during registration
-
 ```go
 // Injected at build time (in all binaries)
 var Version = "dev"
-
-// Node registration includes version
-type RegisterRequest struct {
-    ID      string `json:"id"`
-    Version string `json:"version"` // e.g. "v0.3.0"
-    // ...
-}
 ```
 
-The host daemon exposes version info via CLI:
+The control plane exposes version info via CLI:
 
 ```bash
 $ boxcutter-host status
-Host daemon:    v0.4.0
+Control plane:  v0.4.0
 Orchestrator:   v0.3.0 (bridge: 192.168.50.2, healthy)
 Nodes:
   node-1:       v0.3.0 (bridge: 192.168.50.3, healthy, 8/12 vCPU used)
   node-2:       v0.3.0 (bridge: 192.168.50.4, healthy, 4/12 vCPU used)
+Firecracker VMs: 6 running across 2 nodes
 Latest tag:     v0.4.0
 ```
 
 ## Upgrade Process
 
-All upgrades are initiated by the operator via the host daemon CLI. The
-orchestrator and nodes never trigger their own upgrades — they don't know the
-host daemon exists.
+All upgrades are initiated by the operator via the control plane CLI. Nothing
+inside the VMs can trigger an upgrade or knows the control plane exists.
 
-### Upgrading a Node (zero-downtime)
+### Upgrading Nodes (zero-downtime)
 
-Nodes are immutable. Upgrading means building a new one, waiting for VM
-migration, then retiring the old one.
+Nodes are immutable. Upgrading means building a new one, moving Firecrackers
+off the old one, then retiring it.
 
 ```bash
 boxcutter-host upgrade --to v0.4.0
-# Or: upgrade all nodes to latest tag
+# Or: upgrade all components to latest tag
 boxcutter-host upgrade --latest
 ```
 
-The host daemon performs the following steps:
+The control plane performs the following steps:
 
 ```
 1. git fetch && git checkout v0.4.0 (in the configured repo)
 2. Build new node image from that ref (go build + cloud-init ISO)
 3. Launch new node VM with next available bridge IP
-4. Wait for new node to pass health checks
-5. New node registers with orchestrator automatically
-6. Host daemon tells orchestrator to drain old node:
-   - POST to orchestrator API: set old node status to "draining"
-   - Orchestrator migrates each VM to available nodes
-   - Migration uses existing export/import + rsync flow
-7. Host daemon monitors drain progress (polls orchestrator health endpoint)
-8. Once drained, host daemon stops old node VM
-9. Old node's disk is archived or deleted
-10. Updates cluster.json with new node state
+4. Call into new node to verify it's healthy and ready
+5. Drain old node:
+   a. Call into old node: list all running Firecrackers
+   b. For each Firecracker: stop it, rsync COW to new node, start on new node
+   c. Control plane orchestrates each migration directly
+6. Once drained, stop old node VM
+7. Old node's disk is archived or deleted
+8. Update cluster.json
 
 Timeline:
   [0s]   Build new node image (~30s for go build + ISO)
   [30s]  Launch new node VM
-  [90s]  New node is ready (cloud-init + registration)
+  [90s]  New node is ready (cloud-init + health check)
   [90s+] Drain old node (depends on VM count, COW sizes)
          Each VM migration: stop + rsync COW + start on new node
   [done] Old node retired
 ```
 
-Note: the host daemon communicates with the orchestrator during drain only to
-request it to migrate workloads — this is an outbound call from host to
-orchestrator via the bridge network. The orchestrator has no API to call back to
-the host daemon. The host daemon initiates, the orchestrator executes within its
-own domain (workload scheduling).
+The control plane coordinates the entire drain directly — it calls into nodes
+to stop/start Firecrackers and rsyncs data between them. No orchestrator
+involvement.
 
 Active VMs experience a brief interruption during migration (stop → transfer →
 start), but the system as a whole stays available — other nodes continue serving.
 
 ### Upgrading the Orchestrator (brief downtime)
 
-The host daemon also upgrades the orchestrator. Existing VMs keep running during
-the upgrade — they don't depend on the orchestrator at runtime.
+The control plane also upgrades the orchestrator. Running Firecracker VMs are
+unaffected — they don't depend on the orchestrator at runtime.
 
-**Strategy: rebuild state from nodes**
-
-Everything in the orchestrator DB can be reconstructed by querying the nodes:
-
-| Orchestrator DB table | Reconstructible? | How? |
-|---|---|---|
-| `nodes` | Yes | Nodes re-register on boot via `POST /api/nodes/register` |
-| `vms` | Yes | Each node's `GET /api/vms` returns all VM state (name, mark, mode, vcpu, ram, disk, tailscale_ip, status) |
-| `golden_images` | Partially | Active golden image hash can be read from nodes; historical versions are lost (acceptable) |
-| `ssh_keys` | **No** | SSH keys are only stored in the orchestrator DB |
-
-SSH keys are the one piece of state that can't be reconstructed from nodes.
-Solution: the orchestrator's QCOW2 disk persists across upgrades — the host
-daemon replaces the cloud-init ISO (new binary + config) but reuses the same
-disk. The SQLite DB on disk survives the upgrade.
+The orchestrator's QCOW2 disk persists across upgrades — the control plane
+replaces the cloud-init ISO (new binary + config) but reuses the same disk.
+The SQLite DB on disk survives the upgrade.
 
 ```bash
 boxcutter-host upgrade-orchestrator --to v0.4.0
@@ -299,14 +296,13 @@ boxcutter-host upgrade-orchestrator --to v0.4.0
 **Upgrade flow:**
 
 ```
-1. Host daemon builds new orchestrator binary from target git ref
-2. Host daemon packages new cloud-init ISO (new binary, same secrets)
-3. Host daemon stops old orchestrator VM
-4. Host daemon launches orchestrator VM with same QCOW2 disk + new ISO
+1. Control plane builds new orchestrator binary from target git ref
+2. Control plane packages new cloud-init ISO (new binary, same secrets)
+3. Control plane stops old orchestrator VM
+4. Control plane launches orchestrator VM with same QCOW2 disk + new ISO
 5. New orchestrator boots:
    - SQLite DB is intact on disk (SSH keys preserved)
-   - Waits for nodes to re-register (they heartbeat every 30s)
-   - Reconciles VM state by querying each node's /api/vms
+   - Ready to serve SSH connections
 6. System fully operational again
 
 Downtime: ~60-90 seconds (VM stop + VM boot + cloud-init)
@@ -317,78 +313,77 @@ binary handles it on startup (standard SQLite migration pattern).
 
 ### Upgrading the Golden Image
 
-Golden image upgrades are orchestrator-managed (the host daemon is not
-involved — this is a workload concern, not infrastructure):
-
 ```
-1. Orchestrator triggers golden image rebuild on a node
-2. New golden image is built (debootstrap + provision)
-3. Orchestrator records new version in DB, distributes to all nodes
-4. New VMs use the new golden image
+1. Control plane triggers golden image rebuild on a node
+   (calls into node agent to run debootstrap + provision)
+2. Control plane distributes new image to all nodes (rsync)
+3. Control plane records new version in cluster.json
+4. New Firecracker VMs use the new golden image
 5. Existing VMs are unaffected (they have their own COW snapshots
    backed by whatever golden version they were created from)
 ```
 
-No migration needed. Old VMs continue working with their old golden base. When
-they're destroyed and new ones created, the new golden image is used.
+No migration needed. Old VMs continue working with their old golden base.
 
-## Data Directionality Analysis
+## Data Directionality
 
-There are three distinct trust/control domains:
+Communication is strictly one-way: control plane → VMs. Nothing inside the
+VMs can initiate a connection to the control plane.
 
 ```
-Host daemon (bare metal)     ← operator controls via CLI
+Control plane (bare metal)     ← operator controls via CLI
   │
-  │ builds + launches (provisioning time only)
+  │ calls into VMs (bridge network)
+  │ creates/destroys VMs (QEMU + Firecracker)
+  │ manages all resources outside VMs
   ▼
-Orchestrator VM              ← manages workloads
-  │
-  │ schedules + coordinates (runtime)
-  ▼
-Node VMs → Firecracker VMs   ← execute workloads
+┌──────────────────────────────────────────┐
+│  Environment (inside VMs)                │
+│                                          │
+│  Orchestrator VM  ←→  Node VMs           │
+│  (user-facing)        (run Firecrackers) │
+│                                          │
+│  Cannot reach control plane.             │
+│  Can communicate with each other via     │
+│  bridge network and Tailscale.           │
+└──────────────────────────────────────────┘
 ```
 
-### Host daemon → VMs (provisioning-time, downward)
+### Control plane → VMs (all communication)
 
-- **Identity assignment**: host daemon assigns bridge IPs, MACs, hostnames
-- **Build artifacts**: host daemon compiles Go, packages cloud-init ISOs
-- **Secrets injection**: host daemon bakes Tailscale keys, SSH keys, CA certs
-  into cloud-init at build time
-- **Capacity decisions**: host daemon allocates vCPU/RAM per VM
+The control plane calls into VMs for everything:
 
-### Orchestrator → Nodes (runtime, downward)
+- **Node capacity checks**: `GET /api/capacity` on node agents
+- **Firecracker creation**: `POST /api/vms` on node agents
+- **Firecracker listing**: `GET /api/vms` on node agents
+- **Firecracker stop/start**: `POST /api/vms/{name}/stop` on node agents
+- **Drain coordination**: stop Firecracker on old node, rsync COW, start on new
+- **Health checks**: periodic probes to orchestrator and all nodes
+- **Golden image build**: trigger build + distribute via rsync
 
-- **VM creation**: orchestrator picks node, sends create request with name/config
-- **SSH keys**: orchestrator stores keys, passes them to nodes during VM creation
-- **Golden image**: orchestrator triggers build, distributes to nodes
-- **Migration**: orchestrator coordinates, tells source to export, target to import
-- **Draining**: orchestrator moves VMs away when told a node is going away
+### Inside the environment (VM ↔ VM)
 
-### Upward flow (reporting only)
+Within the environment, the orchestrator and nodes can communicate with each
+other over the bridge network and Tailscale. This is internal to the
+environment and invisible to the control plane:
 
-1. **Node registration**: Node reads its config (assigned by host daemon at
-   build time) and reports to the orchestrator. The node doesn't decide its
-   identity — it reads what the host daemon assigned.
+- **Node registration with orchestrator**: nodes report their identity so the
+  orchestrator knows what's available for user-facing queries
+- **SSH key distribution**: orchestrator pushes authorized keys to nodes
+- **User-facing VM info**: orchestrator queries nodes for VM status to display
+  to users via SSH
 
-2. **Mark allocation**: Marks are node-local (each node has its own fwmark
-   space). The node allocates them deterministically (CRC32 of VM name) and
-   reports to the orchestrator. This is reporting, not decision-making.
+### Upward flow (none)
 
-3. **Tailscale IP**: Assigned by Tailscale, reported upward. Inherently external.
-
-### Host daemon ← Orchestrator (drain requests only)
-
-During node upgrades, the host daemon makes a single API call to the
-orchestrator to initiate a drain. This is the only cross-domain communication at
-runtime, and it flows from the host daemon into the environment, never the
-reverse.
+There is no upward flow. The orchestrator and nodes cannot reach the control
+plane. They don't know it exists.
 
 ### Bootstrap data for a new node
 
-Minimal data a node needs to boot and function (all assigned by host daemon):
+Minimal data a node needs to boot (all assigned by control plane at build time):
 
 ```yaml
-# Assigned by host daemon, baked into cloud-init ISO
+# Assigned by control plane, baked into cloud-init ISO
 node:
   id: "node-1"
   hostname: "boxcutter-node-1"
@@ -401,13 +396,10 @@ secrets:
   ssh_private_key: "..."                       # for SSHing into VMs
   authorized_keys: ["ssh-rsa ...", ...]        # who can access
 
-# Points at the orchestrator
+# Points at the orchestrator (for internal VM-to-VM communication only)
 orchestrator:
   url: "http://192.168.50.2:8801"
 ```
-
-Everything else (golden image, VM definitions) comes from the orchestrator after
-the node registers.
 
 ## Boot Sequence (After Install)
 
@@ -418,52 +410,19 @@ Host reboot
   │
   ├─ boxcutter-host reads /var/lib/boxcutter/cluster.json:
   │    - recreates bridge + NAT (idempotent)
-  │    - launches orchestrator VM (knows its disk + ISO path)
+  │    - launches orchestrator VM
   │    - launches all node VMs (in parallel)
-  │    - health-checks each VM
+  │    - calls into each VM to verify health
   │
-  ├─ Orchestrator VM boots
-  │    - systemd starts boxcutter-orchestrator
-  │    - orchestrator reads its SQLite DB
-  │    - waits for nodes to register
-  │
-  ├─ Node VMs boot
-  │    - each node's systemd starts: boxcutter-net → vmid → boxcutter-node
-  │    - node agent registers with orchestrator
-  │    - orchestrator tells node to start any dev VMs that were previously running
+  ├─ Calls into each node to restart allocated Firecracker VMs
   │
   └─ System operational
 
-Note: the host daemon launches ALL VMs (orchestrator + nodes). The orchestrator
-does not participate in launching nodes — it discovers them when they register.
+The control plane owns the entire boot sequence. It knows what VMs should
+exist (from cluster.json), creates them, and verifies they're healthy by
+calling into them. The orchestrator and nodes are passive — they boot and
+wait to be used.
 ```
-
-## Orchestrator State Reconstruction
-
-When the host daemon upgrades the orchestrator (or the DB is lost), it can
-rebuild state:
-
-```
-1. Orchestrator starts with empty DB
-2. Import SSH keys from export file (or operator re-adds them)
-3. Wait for nodes to register (they heartbeat every 30s, or on boot)
-4. For each registered node:
-   a. GET /api/vms → list of all VMs on that node
-   b. For each VM: record in orchestrator DB
-      (name, node_id, mark, mode, vcpu, ram_mib, disk, tailscale_ip, status)
-5. State fully reconstructed
-
-Everything the orchestrator needs is already available via existing node APIs.
-```
-
-This means the orchestrator DB is effectively a **cache** of the cluster state,
-not the source of truth for VM data. The source of truth for "what VMs exist" is
-the nodes themselves. The orchestrator is the source of truth for:
-- **SSH keys** (must be persisted/exported)
-- **Node assignments** (which IPs/names map to which nodes — but this is in the
-  provisioning config, not just the DB)
-- **Scheduling decisions** (but these are stateless — just pick the node with
-  most free RAM)
 
 ## Version / Release Workflow
 
@@ -481,45 +440,41 @@ boxcutter-host upgrade --to v0.4.0
 boxcutter-host upgrade --latest
 ```
 
-The host daemon detects what changed between versions and only upgrades what's
-necessary:
+The control plane detects what changed between versions and upgrades
+accordingly:
 
 ```bash
 git diff v0.3.0..v0.4.0 --name-only
 # If orchestrator/ changed → orchestrator upgrade (stop, rebuild ISO, relaunch)
 # If node/ changed → rolling node upgrade (build new, drain old, retire)
-# If host/ changed → host daemon self-update (rebuild binary, systemctl restart)
-# If golden/ changed → tell operator to trigger golden rebuild via orchestrator
+# If host/ changed → control plane self-update (rebuild binary, systemctl restart)
+# If golden/ changed → golden image rebuild (trigger on a node, distribute)
 ```
-
-The host daemon handles infrastructure upgrades (orchestrator, nodes, itself).
-Golden image rebuilds remain the orchestrator's responsibility since they're a
-workload concern — the host daemon logs a notice if `golden/` changed and the
-operator triggers the rebuild via SSH to the orchestrator.
 
 ## Responsibility Matrix
 
 | Concern | Owner | Why |
 |---|---|---|
-| Bridge, NAT, TAP devices | Host daemon | Infrastructure — bare metal networking |
-| Building VM images (go build + ISO) | Host daemon | Requires git checkout + Go toolchain on host |
-| Launching/stopping QEMU VMs | Host daemon | Infrastructure — process management on host |
-| Health-checking VMs, restart on crash | Host daemon | Infrastructure — availability |
-| Rolling node upgrades | Host daemon | Infrastructure — build new, drain, retire |
-| Orchestrator upgrades | Host daemon | Infrastructure — rebuild ISO, relaunch |
-| Host capacity (vCPU/RAM budgets) | Host daemon | Infrastructure — physical resource limits |
-| Scheduling dev VMs onto nodes | Orchestrator | Workload — pick node with most free capacity |
-| SSH key management | Orchestrator | Workload — user access control |
-| Golden image builds | Orchestrator | Workload — dev environment tooling |
-| VM migration during drain | Orchestrator | Workload — rsync COW + restart on new node |
-| Firecracker VM lifecycle | Node agent | Workload — create/destroy/snapshot |
+| Bridge, NAT, TAP devices | Control plane | Bare metal resource |
+| Building VM images (go build + ISO) | Control plane | Requires git checkout + Go toolchain on host |
+| Creating/destroying QEMU node VMs | Control plane | Bare metal process management |
+| Creating/destroying Firecracker VMs | Control plane | Calls into node agents |
+| Health-checking all VMs | Control plane | Availability — restart on crash |
+| Rolling node upgrades | Control plane | Build new, drain (move Firecrackers), retire |
+| Orchestrator upgrades | Control plane | Rebuild ISO, relaunch |
+| Golden image builds + distribution | Control plane | Triggers on node, distributes via rsync |
+| Capacity management (vCPU/RAM) | Control plane | Physical resource limits + scheduling |
+| Drain coordination (moving Firecrackers) | Control plane | Calls into nodes to stop/rsync/start |
+| SSH entry point for users | Orchestrator | User-facing service inside environment |
+| SSH key management | Orchestrator | User authentication |
+| User-facing VM status queries | Orchestrator | Queries nodes for display to users |
 
 ## Summary
 
 | Component | Install | Upgrade | State |
 |---|---|---|---|
-| **Host daemon** | `make install-host` (Go binary + systemd) | Self-update via `boxcutter-host upgrade` | `/etc/boxcutter/host.yaml` + `/var/lib/boxcutter/cluster.json` |
-| **Orchestrator** | Built by host daemon during bootstrap | Host daemon rebuilds ISO, relaunches (same disk) | SQLite DB on QCOW2 disk (survives upgrades) |
-| **Node VMs** | Built by host daemon (`node add` or bootstrap) | Host daemon: build new → drain old → retire | VM state on disk (owned by VMs, not node) |
-| **Golden image** | Built by orchestrator on a node | Rebuild + distribute (existing VMs unaffected) | ext4 file on each node |
-| **Firecracker VMs** | Created by orchestrator via node agent | N/A (ephemeral, destroy and recreate) | COW snapshot (per-VM, immutable base) |
+| **Control plane** | `make install-host` (Go binary + systemd) | Self-update via `boxcutter-host upgrade` | `/etc/boxcutter/host.yaml` + `/var/lib/boxcutter/cluster.json` |
+| **Orchestrator** | Built by control plane during bootstrap | Control plane rebuilds ISO, relaunches (same disk) | SQLite DB on QCOW2 disk (SSH keys, survives upgrades) |
+| **Node VMs** | Built by control plane (`node add` or bootstrap) | Control plane: build new → drain → retire | Stateless (Firecrackers have their own COW state) |
+| **Golden image** | Built by control plane on a node | Rebuild + distribute (existing VMs unaffected) | ext4 file on each node |
+| **Firecracker VMs** | Created by control plane via node agent | N/A (ephemeral, destroy and recreate) | COW snapshot (per-VM, backed by golden image) |
