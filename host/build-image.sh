@@ -578,7 +578,9 @@ sudo bash -c '
   rm -rf /etc/boxcutter/secrets/*
   rm -f /etc/boxcutter/boxcutter.yaml
 
-  # Remove Tailscale state
+  # Remove Tailscale state (logout first to deregister device from tailnet)
+  tailscale logout 2>/dev/null || true
+  systemctl stop tailscaled 2>/dev/null || true
   rm -rf /var/lib/tailscale/*
 
   # Remove build artifacts

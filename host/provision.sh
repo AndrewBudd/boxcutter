@@ -699,6 +699,12 @@ done)
         chmod 600 /root/.ssh/config
       fi
 
+      # Join Tailscale
+      if command -v tailscale &>/dev/null && [ -f /etc/boxcutter/secrets/tailscale-node-authkey ]; then
+        NODE_KEY=$(cat /etc/boxcutter/secrets/tailscale-node-authkey | tr -d '[:space:]')
+        tailscale up --authkey="$NODE_KEY" --hostname=boxcutter
+      fi
+
       systemctl restart boxcutter-orchestrator 2>/dev/null || true
 
 runcmd:
