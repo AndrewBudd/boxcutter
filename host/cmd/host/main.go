@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/AndrewBudd/boxcutter/host/internal/bridge"
 	"github.com/AndrewBudd/boxcutter/host/internal/cluster"
+	"github.com/AndrewBudd/boxcutter/host/internal/oci"
 	"github.com/AndrewBudd/boxcutter/host/internal/qemu"
 )
 
@@ -48,6 +50,10 @@ type HostConfig struct {
 	HealthPollInterval  time.Duration
 	ScaleUpThresholdPct int // Scale up when VM capacity used > this %
 	MinFreeMemoryMB     int // Hard floor: never scale up if host has less than this free
+
+	// OCI image distribution
+	OCIRegistry   string // OCI registry (default: ghcr.io)
+	OCIRepository string // Repository path (default: AndrewBudd/boxcutter)
 }
 
 func defaultConfig() HostConfig {
@@ -95,6 +101,8 @@ func defaultConfig() HostConfig {
 		HealthPollInterval:  10 * time.Second,
 		ScaleUpThresholdPct: 80,
 		MinFreeMemoryMB:     8192, // 8GB — never launch a node if host has less than this free
+		OCIRegistry:         oci.DefaultRegistry,
+		OCIRepository:       oci.DefaultRepository,
 	}
 }
 
@@ -111,8 +119,16 @@ func main() {
 		cliStatus()
 	case "bootstrap":
 		runBootstrap()
+	case "pull":
+		cliPull()
+	case "upgrade":
+		cliUpgrade()
+	case "version":
+		cliVersion()
+	case "build-image":
+		cliBuildImage()
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap>\n")
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|version|build-image>\n")
 		os.Exit(1)
 	}
 }
@@ -666,6 +682,485 @@ func printOfflineStatus(state *cluster.State) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// cliPull downloads a pre-built VM image from an OCI registry.
+//
+//	boxcutter-host pull <node|orchestrator|golden> [--tag TAG]
+func cliPull() {
+	cfg := defaultConfig()
+	vmType, tag := parsePullArgs()
+
+	fmt.Printf("Pulling %s image (tag: %s)...\n", vmType, tag)
+	fmt.Printf("  Registry: %s/%s/%s\n", cfg.OCIRegistry, cfg.OCIRepository, vmType)
+
+	ctx := context.Background()
+
+	meta, outputFile, err := oci.Pull(ctx, oci.PullOptions{
+		Registry:   cfg.OCIRegistry,
+		Repository: cfg.OCIRepository,
+		VMType:     vmType,
+		Tag:        tag,
+		OutputDir:  cfg.ImagesDir,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Pull failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Decompress the zstd file
+	var ext string
+	if vmType == "golden" {
+		ext = ".ext4"
+	} else {
+		ext = ".qcow2"
+	}
+	baseName := fmt.Sprintf("%s-base%s", vmType, ext)
+	basePath := filepath.Join(cfg.ImagesDir, baseName)
+
+	if outputFile != "" && filepath.Ext(outputFile) == ".zst" {
+		fmt.Printf("  Decompressing %s...\n", filepath.Base(outputFile))
+		if err := decompressZstd(outputFile, basePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Decompression failed: %v\n", err)
+			os.Exit(1)
+		}
+		os.Remove(outputFile)
+	} else if outputFile != "" {
+		os.Rename(outputFile, basePath)
+	}
+
+	fmt.Printf("\nPull complete!\n")
+	fmt.Printf("  Base image: %s\n", basePath)
+	if meta.Version != "" {
+		fmt.Printf("  Version: %s\n", meta.Version)
+	}
+	if meta.Commit != "" {
+		fmt.Printf("  Commit: %s\n", meta.Commit)
+	}
+	fmt.Printf("  Digest: %s\n", meta.Digest)
+
+	if vmType == "golden" {
+		fmt.Printf("\nTo deploy this golden image to nodes, copy it to /var/lib/boxcutter/golden/ on each node.\n")
+	} else {
+		fmt.Printf("\nTo provision a VM from this image:\n")
+		fmt.Printf("  bash host/provision.sh %s --from-image\n", vmType)
+	}
+}
+
+// cliUpgrade pulls a new image and performs a rolling upgrade.
+//
+//	boxcutter-host upgrade <node|orchestrator|all> [--tag TAG]
+func cliUpgrade() {
+	cfg := defaultConfig()
+	vmType, tag := parsePullArgs()
+
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+
+	// For "all", pull both
+	types := []string{vmType}
+	if vmType == "all" {
+		types = []string{"node", "orchestrator"}
+	}
+
+	for _, t := range types {
+		fmt.Printf("Pulling %s image (tag: %s)...\n", t, tag)
+		meta, outputFile, err := oci.Pull(ctx, oci.PullOptions{
+			Registry:   cfg.OCIRegistry,
+			Repository: cfg.OCIRepository,
+			VMType:     t,
+			Tag:        tag,
+			OutputDir:  cfg.ImagesDir,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Pull failed for %s: %v\n", t, err)
+			os.Exit(1)
+		}
+
+		baseName := fmt.Sprintf("%s-base.qcow2", t)
+		basePath := filepath.Join(cfg.ImagesDir, baseName)
+		if outputFile != "" && filepath.Ext(outputFile) == ".zst" {
+			fmt.Printf("  Decompressing...\n")
+			if err := decompressZstd(outputFile, basePath); err != nil {
+				fmt.Fprintf(os.Stderr, "Decompression failed: %v\n", err)
+				os.Exit(1)
+			}
+			os.Remove(outputFile)
+		} else if outputFile != "" {
+			os.Rename(outputFile, basePath)
+		}
+
+		switch t {
+		case "node":
+			upgradeNodes(cfg, state, basePath, meta)
+		case "orchestrator":
+			upgradeOrchestrator(cfg, state, basePath, meta)
+		}
+	}
+}
+
+func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *oci.ImageMetadata) {
+	fmt.Printf("\n--- Upgrading nodes ---\n")
+
+	for _, oldNode := range state.Nodes {
+		fmt.Printf("Upgrading %s...\n", oldNode.ID)
+
+		newNum := state.NextNodeNum()
+		newID := fmt.Sprintf("boxcutter-node-%d", newNum)
+		newOctet := cfg.NodeIPOffset + newNum
+		newBridgeIP := fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
+		newTAP := fmt.Sprintf("tap-node%d", newNum)
+		newMAC := fmt.Sprintf("52:54:00:00:00:%02x", newOctet)
+		newDisk := fmt.Sprintf("%s/%s.qcow2", cfg.ImagesDir, newID)
+		newISO := fmt.Sprintf("%s/%s-cloud-init.iso", cfg.ImagesDir, newID)
+
+		fmt.Printf("  Creating disk from base image for %s...\n", newID)
+		if err := createCOWDisk(basePath, newDisk, cfg.NodeDisk); err != nil {
+			log.Printf("Failed to create disk for %s: %v", newID, err)
+			continue
+		}
+
+		if !fileExists(newISO) {
+			fmt.Printf("  Cloud-init ISO not found: %s\n", newISO)
+			fmt.Printf("  Generate with: bash host/provision.sh node %s --from-image\n", newID)
+			fmt.Printf("  Skipping %s upgrade.\n", oldNode.ID)
+			os.Remove(newDisk)
+			continue
+		}
+
+		currentUser, _ := user.Current()
+		username := "root"
+		if currentUser != nil {
+			username = currentUser.Username
+		}
+
+		if err := bridge.EnsureTAP(newTAP, cfg.BridgeDevice, username); err != nil {
+			log.Printf("Failed to create TAP for %s: %v", newID, err)
+			continue
+		}
+
+		pid, err := qemu.Launch(qemu.VMConfig{
+			Name: newID,
+			VCPU: cfg.NodeVCPU,
+			RAM:  cfg.NodeRAM,
+			Disk: newDisk,
+			ISO:  newISO,
+			TAP:  newTAP,
+			MAC:  newMAC,
+		}, cfg.ImagesDir)
+		if err != nil {
+			log.Printf("Failed to launch %s: %v", newID, err)
+			continue
+		}
+
+		state.AddNode(cluster.VMEntry{
+			ID:           newID,
+			BridgeIP:     newBridgeIP,
+			Disk:         newDisk,
+			ISO:          newISO,
+			PID:          pid,
+			VCPU:         cfg.NodeVCPU,
+			RAM:          cfg.NodeRAM,
+			TAP:          newTAP,
+			MAC:          newMAC,
+			ImageVersion: meta.Version,
+			ImageCommit:  meta.Commit,
+			ImageDigest:  meta.Digest,
+		})
+		state.Save()
+
+		fmt.Printf("  New node %s launched (PID %d). Waiting for health...\n", newID, pid)
+
+		if !waitForNodeHealth(newBridgeIP, 120*time.Second) {
+			log.Printf("New node %s did not become healthy, skipping drain of %s", newID, oldNode.ID)
+			continue
+		}
+
+		fmt.Printf("  Draining old node %s...\n", oldNode.ID)
+		drainNode(cfg, state, oldNode.ID)
+		fmt.Printf("  Node %s upgraded to %s\n", oldNode.ID, newID)
+	}
+}
+
+func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, meta *oci.ImageMetadata) {
+	fmt.Printf("\n--- Upgrading orchestrator ---\n")
+
+	if state.Orchestrator == nil {
+		fmt.Println("No orchestrator to upgrade.")
+		return
+	}
+
+	orchDisk := fmt.Sprintf("%s/orchestrator.qcow2", cfg.ImagesDir)
+	orchISO := fmt.Sprintf("%s/orchestrator-cloud-init.iso", cfg.ImagesDir)
+
+	if !fileExists(orchISO) {
+		fmt.Printf("Cloud-init ISO not found: %s\n", orchISO)
+		fmt.Printf("Generate with: bash host/provision.sh orchestrator --from-image\n")
+		return
+	}
+
+	fmt.Println("  Stopping old orchestrator...")
+	qemu.Stop("orchestrator", state.Orchestrator.PID)
+
+	orchDiskNew := orchDisk + ".new"
+	if err := createCOWDisk(basePath, orchDiskNew, cfg.OrchestratorDisk); err != nil {
+		log.Printf("Failed to create orchestrator disk: %v", err)
+		return
+	}
+
+	os.Rename(orchDisk, orchDisk+".bak")
+	os.Rename(orchDiskNew, orchDisk)
+
+	currentUser, _ := user.Current()
+	username := "root"
+	if currentUser != nil {
+		username = currentUser.Username
+	}
+
+	bridge.EnsureTAP(cfg.OrchestratorTAP, cfg.BridgeDevice, username)
+	pid, err := qemu.Launch(qemu.VMConfig{
+		Name: "orchestrator",
+		VCPU: cfg.OrchestratorVCPU,
+		RAM:  cfg.OrchestratorRAM,
+		Disk: orchDisk,
+		ISO:  orchISO,
+		TAP:  cfg.OrchestratorTAP,
+		MAC:  cfg.OrchestratorMAC,
+	}, cfg.ImagesDir)
+	if err != nil {
+		log.Printf("Orchestrator launch failed: %v", err)
+		os.Rename(orchDisk+".bak", orchDisk)
+		return
+	}
+
+	state.SetOrchestrator(cluster.VMEntry{
+		ID:           "orchestrator",
+		BridgeIP:     cfg.OrchestratorIP,
+		Disk:         orchDisk,
+		ISO:          orchISO,
+		PID:          pid,
+		VCPU:         cfg.OrchestratorVCPU,
+		RAM:          cfg.OrchestratorRAM,
+		TAP:          cfg.OrchestratorTAP,
+		MAC:          cfg.OrchestratorMAC,
+		ImageVersion: meta.Version,
+		ImageCommit:  meta.Commit,
+		ImageDigest:  meta.Digest,
+	})
+	state.Save()
+
+	os.Remove(orchDisk + ".bak")
+	fmt.Printf("  Orchestrator upgraded (PID %d)\n", pid)
+}
+
+// cliVersion shows the current and latest available image versions.
+func cliVersion() {
+	cfg := defaultConfig()
+
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Running versions:")
+	if state.Orchestrator != nil {
+		v := state.Orchestrator.ImageVersion
+		if v == "" {
+			v = "(built from source)"
+		}
+		fmt.Printf("  orchestrator: %s\n", v)
+	}
+	for _, n := range state.Nodes {
+		v := n.ImageVersion
+		if v == "" {
+			v = "(built from source)"
+		}
+		fmt.Printf("  %s: %s\n", n.ID, v)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	fmt.Println("\nLatest available:")
+	for _, vmType := range []string{"node", "orchestrator", "golden"} {
+		meta, err := oci.Resolve(ctx, oci.PullOptions{
+			Registry:   cfg.OCIRegistry,
+			Repository: cfg.OCIRepository,
+			VMType:     vmType,
+			Tag:        "latest",
+		})
+		if err != nil {
+			fmt.Printf("  %s: (not available)\n", vmType)
+		} else {
+			v := meta.Version
+			if v == "" {
+				v = meta.Digest[:12]
+			}
+			fmt.Printf("  %s: %s\n", vmType, v)
+		}
+	}
+}
+
+// cliBuildImage builds a VM image and optionally pushes to OCI registry.
+//
+//	boxcutter-host build-image <node|orchestrator|golden> [--push] [--tag TAG]
+func cliBuildImage() {
+	cfg := defaultConfig()
+
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host build-image <node|orchestrator|golden> [--push] [--tag TAG]\n")
+		os.Exit(1)
+	}
+
+	vmType := os.Args[2]
+	if vmType != "node" && vmType != "orchestrator" && vmType != "golden" {
+		fmt.Fprintf(os.Stderr, "VM type must be 'node', 'orchestrator', or 'golden'\n")
+		os.Exit(1)
+	}
+
+	push := false
+	tag := ""
+	for i, arg := range os.Args {
+		if arg == "--push" {
+			push = true
+		}
+		if arg == "--tag" && i+1 < len(os.Args) {
+			tag = os.Args[i+1]
+		}
+	}
+
+	// Get version from git
+	version := ""
+	commit := ""
+	if out, err := exec.Command("git", "-C", cfg.RepoDir, "describe", "--tags", "--always").Output(); err == nil {
+		version = string(out[:len(out)-1]) // trim newline
+	}
+	if out, err := exec.Command("git", "-C", cfg.RepoDir, "rev-parse", "--short", "HEAD").Output(); err == nil {
+		commit = string(out[:len(out)-1])
+	}
+	if tag == "" {
+		tag = version
+	}
+	if tag == "" {
+		tag = "latest"
+	}
+
+	// Run the build script
+	buildScript := filepath.Join(cfg.RepoDir, "host", "build-image.sh")
+	if !fileExists(buildScript) {
+		fmt.Fprintf(os.Stderr, "Build script not found: %s\n", buildScript)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Building %s image...\n", vmType)
+	cmd := exec.Command("bash", buildScript, vmType)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Dir = cfg.RepoDir
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !push {
+		fmt.Printf("\nBuild complete. To push: boxcutter-host build-image %s --push --tag %s\n", vmType, tag)
+		return
+	}
+
+	// Find the built image
+	var ext string
+	if vmType == "golden" {
+		ext = "ext4"
+	} else {
+		ext = "qcow2"
+	}
+	imagePath := filepath.Join(cfg.ImagesDir, fmt.Sprintf("%s-image.%s.zst", vmType, ext))
+	if !fileExists(imagePath) {
+		fmt.Fprintf(os.Stderr, "Built image not found at %s\n", imagePath)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pushing %s image (tag: %s)...\n", vmType, tag)
+	ctx := context.Background()
+	tags := []string{tag}
+	if tag != "latest" {
+		tags = append(tags, "latest")
+	}
+
+	if err := oci.Push(ctx, oci.PushOptions{
+		Registry:   cfg.OCIRegistry,
+		Repository: cfg.OCIRepository,
+		VMType:     vmType,
+		Tags:       tags,
+		FilePath:   imagePath,
+		Version:    version,
+		Commit:     commit,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Push failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pushed %s image with tags: %v\n", vmType, tags)
+}
+
+func parsePullArgs() (string, string) {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host %s <node|orchestrator|golden|all> [--tag TAG]\n", os.Args[1])
+		os.Exit(1)
+	}
+
+	vmType := os.Args[2]
+	valid := map[string]bool{"node": true, "orchestrator": true, "golden": true, "all": true}
+	if !valid[vmType] {
+		fmt.Fprintf(os.Stderr, "VM type must be 'node', 'orchestrator', 'golden', or 'all'\n")
+		os.Exit(1)
+	}
+	if vmType == "all" && os.Args[1] == "pull" {
+		fmt.Fprintf(os.Stderr, "Cannot pull 'all' — specify 'node', 'orchestrator', or 'golden'\n")
+		os.Exit(1)
+	}
+
+	tag := "latest"
+	for i, arg := range os.Args {
+		if arg == "--tag" && i+1 < len(os.Args) {
+			tag = os.Args[i+1]
+		}
+	}
+
+	return vmType, tag
+}
+
+func createCOWDisk(basePath, diskPath, size string) error {
+	return runShell(fmt.Sprintf("qemu-img create -f qcow2 -b %s -F qcow2 %s %s",
+		basePath, diskPath, size))
+}
+
+func decompressZstd(src, dst string) error {
+	return runShell(fmt.Sprintf("zstd -d -f %s -o %s", src, dst))
+}
+
+func runShell(cmd string) error {
+	c := exec.Command("sh", "-c", cmd)
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	return c.Run()
+}
+
+func waitForNodeHealth(bridgeIP string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if health := queryNodeHealth(bridgeIP); health != nil {
+			return true
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return false
 }
 
 func runBootstrap() {

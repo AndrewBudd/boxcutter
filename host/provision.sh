@@ -2,8 +2,10 @@
 # Build and package cloud-init ISO for a Boxcutter VM.
 #
 # Usage:
-#   bash host/provision.sh node [NAME] [--rebuild]     Build a Node VM ISO
-#   bash host/provision.sh orchestrator [--rebuild]     Build the Orchestrator VM ISO
+#   bash host/provision.sh node [NAME] [--rebuild]         Build a Node VM ISO (from source)
+#   bash host/provision.sh orchestrator [--rebuild]         Build the Orchestrator VM ISO (from source)
+#   bash host/provision.sh node [NAME] --from-image        Generate slim config-only ISO for a pulled image
+#   bash host/provision.sh orchestrator --from-image       Generate slim config-only ISO for a pulled image
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,10 +30,12 @@ mkdir -p "$IMAGES_DIR"
 
 # --- Parse args ---
 REBUILD=false
+FROM_IMAGE=false
 VM_NAME=""
 for arg in "$@"; do
   case "$arg" in
     --rebuild) REBUILD=true ;;
+    --from-image) FROM_IMAGE=true ;;
     *) [ -z "$VM_NAME" ] && VM_NAME="$arg" ;;
   esac
 done
@@ -512,9 +516,186 @@ META
 }
 
 # ======================================================================
+# FROM-IMAGE: slim config-only cloud-init ISO (no binary build needed)
+# ======================================================================
+build_from_image_node() {
+  local NAME="${VM_NAME:-boxcutter-node-1}"
+  local NODE_NUM="${NAME##*-}"
+  if ! [[ "$NODE_NUM" =~ ^[0-9]+$ ]]; then
+    echo "Error: node name must end with a number (e.g. boxcutter-node-1)"
+    exit 1
+  fi
+  local NODE_OCTET=$((NODE_IP_OFFSET + NODE_NUM))
+  local THIS_NODE_IP="${NODE_SUBNET}.${NODE_OCTET}"
+  local THIS_NODE_MAC="$(printf '52:54:00:00:00:%02x' "$NODE_OCTET")"
+
+  echo "=== Provisioning Node VM (from image): ${NAME} ==="
+  echo "  Bridge IP: ${THIS_NODE_IP}, MAC: ${THIS_NODE_MAC}"
+
+  local CIDATA=$(mktemp -d)
+
+  # Slim user-data: just configure networking, hostname, secrets
+  cat > "${CIDATA}/user-data" <<USERDATA
+#cloud-config
+hostname: ${NAME}
+manage_etc_hosts: true
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBKEY}
+
+write_files:
+  - path: /etc/boxcutter/boxcutter.yaml
+    content: |
+$(sed 's/^/      /' "${BUNDLE_DIR}/boxcutter.yaml")
+    permissions: '0600'
+$(for secret in "${BUNDLE_DIR}/secrets/"*; do
+  [ -f "$secret" ] || continue
+  local sname=$(basename "$secret")
+  printf "  - path: /etc/boxcutter/secrets/%s\n" "$sname"
+  printf "    content: |\n"
+  sed 's/^/      /' "$secret"
+  printf "    permissions: '0600'\n"
+done)
+  - path: /opt/boxcutter-config.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      # Set hostname
+      hostnamectl set-hostname ${NAME}
+
+      # Configure node bridge IP in boxcutter.yaml
+      sed -i "s|bridge_ip:.*|bridge_ip: ${THIS_NODE_IP}|" /etc/boxcutter/boxcutter.yaml
+
+      # Restart services to pick up new config
+      systemctl restart boxcutter-node 2>/dev/null || true
+
+runcmd:
+  - bash /opt/boxcutter-config.sh
+USERDATA
+
+  cat > "${CIDATA}/meta-data" <<META
+instance-id: ${NAME}-$(date +%s)
+local-hostname: ${NAME}
+META
+
+  sed -e "s|NODE_IP_PLACEHOLDER|${THIS_NODE_IP}|" \
+      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_BRIDGE_CIDR}|" \
+      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_BRIDGE_IP}|" \
+      -e "s|NODE_MAC_PLACEHOLDER|${THIS_NODE_MAC}|" \
+      "${REPO_DIR}/cloud-init/network-config" > "${CIDATA}/network-config"
+
+  local ISO="${IMAGES_DIR}/${NAME}-cloud-init.iso"
+  genisoimage -output "$ISO" -volid cidata -joliet -rock \
+    "${CIDATA}/user-data" "${CIDATA}/meta-data" "${CIDATA}/network-config" 2>/dev/null
+  echo "  Cloud-init ISO: ${ISO}"
+
+  # Create COW disk from base image
+  local BASE="${IMAGES_DIR}/node-base.qcow2"
+  local DISK="${IMAGES_DIR}/${NAME}.qcow2"
+  if [ ! -f "$BASE" ]; then
+    echo "Error: base image not found at ${BASE}"
+    echo "Pull with: boxcutter-host pull node"
+    exit 1
+  fi
+  if [ "$REBUILD" = true ] || [ ! -f "$DISK" ]; then
+    qemu-img create -f qcow2 -b "$BASE" -F qcow2 "$DISK" "$NODE_DISK"
+    echo "  VM disk: ${DISK} (COW on ${BASE})"
+  fi
+
+  echo ""
+  echo "=== Node provisioning (from image) complete ==="
+  rm -rf "$CIDATA"
+}
+
+build_from_image_orchestrator() {
+  echo "=== Provisioning Orchestrator VM (from image) ==="
+
+  local CIDATA=$(mktemp -d)
+
+  cat > "${CIDATA}/user-data" <<USERDATA
+#cloud-config
+hostname: boxcutter
+manage_etc_hosts: true
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBKEY}
+
+write_files:
+  - path: /etc/boxcutter/boxcutter.yaml
+    content: |
+$(sed 's/^/      /' "${BUNDLE_DIR}/boxcutter.yaml")
+    permissions: '0600'
+$(for secret in "${BUNDLE_DIR}/secrets/"*; do
+  [ -f "$secret" ] || continue
+  local sname=$(basename "$secret")
+  printf "  - path: /etc/boxcutter/secrets/%s\n" "$sname"
+  printf "    content: |\n"
+  sed 's/^/      /' "$secret"
+  printf "    permissions: '0600'\n"
+done)
+  - path: /opt/boxcutter-config.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      hostnamectl set-hostname boxcutter
+      systemctl restart boxcutter-orchestrator 2>/dev/null || true
+
+runcmd:
+  - bash /opt/boxcutter-config.sh
+USERDATA
+
+  cat > "${CIDATA}/meta-data" <<META
+instance-id: boxcutter-orch-$(date +%s)
+local-hostname: boxcutter
+META
+
+  sed -e "s|NODE_IP_PLACEHOLDER|${ORCH_IP}|" \
+      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_BRIDGE_CIDR}|" \
+      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_BRIDGE_IP}|" \
+      -e "s|NODE_MAC_PLACEHOLDER|${ORCH_MAC}|" \
+      "${REPO_DIR}/cloud-init/network-config" > "${CIDATA}/network-config"
+
+  local ISO="${IMAGES_DIR}/orchestrator-cloud-init.iso"
+  genisoimage -output "$ISO" -volid cidata -joliet -rock \
+    "${CIDATA}/user-data" "${CIDATA}/meta-data" "${CIDATA}/network-config" 2>/dev/null
+  echo "  Cloud-init ISO: ${ISO}"
+
+  local BASE="${IMAGES_DIR}/orchestrator-base.qcow2"
+  local DISK="${IMAGES_DIR}/orchestrator.qcow2"
+  if [ ! -f "$BASE" ]; then
+    echo "Error: base image not found at ${BASE}"
+    echo "Pull with: boxcutter-host pull orchestrator"
+    exit 1
+  fi
+  if [ "$REBUILD" = true ] || [ ! -f "$DISK" ]; then
+    qemu-img create -f qcow2 -b "$BASE" -F qcow2 "$DISK" "$ORCH_DISK"
+    echo "  VM disk: ${DISK} (COW on ${BASE})"
+  fi
+
+  echo ""
+  echo "=== Orchestrator provisioning (from image) complete ==="
+  rm -rf "$CIDATA"
+}
+
+# ======================================================================
 # Dispatch
 # ======================================================================
-case "$VM_TYPE" in
-  node)         build_node ;;
-  orchestrator) build_orchestrator ;;
-esac
+if [ "$FROM_IMAGE" = true ]; then
+  case "$VM_TYPE" in
+    node)         build_from_image_node ;;
+    orchestrator) build_from_image_orchestrator ;;
+  esac
+else
+  case "$VM_TYPE" in
+    node)         build_node ;;
+    orchestrator) build_orchestrator ;;
+  esac
+fi

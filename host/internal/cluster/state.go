@@ -22,6 +22,11 @@ type VMEntry struct {
 	RAM      string `json:"ram"`
 	TAP      string `json:"tap"`
 	MAC      string `json:"mac"`
+
+	// OCI image tracking (set when VM was created from a pulled image)
+	ImageVersion string `json:"image_version,omitempty"` // e.g., "v0.1.0"
+	ImageCommit  string `json:"image_commit,omitempty"`  // e.g., "049616f"
+	ImageDigest  string `json:"image_digest,omitempty"`  // OCI manifest digest
 }
 
 type State struct {
