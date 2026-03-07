@@ -33,6 +33,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/export", h.handleExport)
 	mux.HandleFunc("POST /api/vms/{name}/import", h.handleImport)
 	mux.HandleFunc("POST /api/vms/{name}/import-snapshot", h.handleImportSnapshot)
+	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleCopy)
 	mux.HandleFunc("POST /api/vms/{name}/migrate", h.handleMigrate)
 	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
 	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
@@ -311,6 +312,63 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, resp)
+}
+
+func (h *Handler) handleCopy(w http.ResponseWriter, r *http.Request) {
+	srcName := r.PathValue("name")
+	if srcName == "" {
+		srcName = extractStopStartName(r.URL.Path)
+	}
+
+	var req struct {
+		DstName string `json:"dst_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.DstName == "" {
+		http.Error(w, "dst_name is required", http.StatusBadRequest)
+		return
+	}
+
+	flusher, canFlush := w.(http.Flusher)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusCreated)
+
+	progress := func(phase, message string) {
+		line, _ := json.Marshal(progressEvent{Phase: phase, Message: message})
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	resp, err := h.mgr.CopyVM(srcName, req.DstName, progress)
+	if err != nil {
+		log.Printf("Copy %s -> %s failed: %v", srcName, req.DstName, err)
+		line, _ := json.Marshal(progressEvent{Phase: "error", Error: err.Error()})
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
+		}
+		return
+	}
+
+	line, _ := json.Marshal(progressEvent{
+		Phase:       "ready",
+		Message:     "VM copied",
+		Name:        resp.Name,
+		TailscaleIP: resp.TailscaleIP,
+		Mark:        resp.Mark,
+		Mode:        resp.Mode,
+		Status:      resp.Status,
+	})
+	fmt.Fprintf(w, "%s\n", line)
+	if canFlush {
+		flusher.Flush()
+	}
 }
 
 func (h *Handler) handleGoldenVersions(w http.ResponseWriter, r *http.Request) {

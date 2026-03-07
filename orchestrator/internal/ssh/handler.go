@@ -55,6 +55,18 @@ func (h *Handler) Run(args []string) int {
 			return 1
 		}
 		return h.cmdStart(target)
+	case "cp", "copy":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> cp <source-vm> [new-name]")
+			return 1
+		}
+		dstName := ""
+		if len(args) > 2 {
+			dstName = args[2]
+		}
+		return h.cmdCopy(target, dstName)
+	case "images":
+		return h.cmdImages()
 	case "status":
 		return h.cmdStatus()
 	case "nodes":
@@ -313,6 +325,74 @@ func (h *Handler) cmdNodes() int {
 	return 0
 }
 
+func (h *Handler) cmdCopy(srcName, dstName string) int {
+	body := map[string]interface{}{}
+	if dstName != "" {
+		body["dst_name"] = dstName
+	}
+
+	resp, err := h.postStream("/api/vms/"+srcName+"/copy", body, func(evt map[string]interface{}) {
+		phase, _ := evt["phase"].(string)
+		message, _ := evt["message"].(string)
+		if phase != "ready" && phase != "error" && message != "" {
+			fmt.Printf("  -> %s\n", message)
+		}
+	})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+
+	name, _ := resp["name"].(string)
+	tsIP, _ := resp["tailscale_ip"].(string)
+	nodeName, _ := resp["node"].(string)
+	mode, _ := resp["mode"].(string)
+	status, _ := resp["status"].(string)
+
+	fmt.Println()
+	fmt.Printf("  Copied:  %s -> %s\n", srcName, name)
+	fmt.Printf("  Node:    %s\n", nodeName)
+	if tsIP != "" {
+		fmt.Printf("  IP:      %s\n", tsIP)
+	}
+	fmt.Printf("  Mode:    %s\n", mode)
+	fmt.Printf("  Status:  %s\n", status)
+	fmt.Println()
+	if tsIP != "" {
+		fmt.Printf("  Connect: ssh %s\n", name)
+	}
+	return 0
+}
+
+func (h *Handler) cmdImages() int {
+	resp, err := h.get("/api/golden")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var images []map[string]interface{}
+	json.Unmarshal(resp, &images)
+
+	if len(images) == 0 {
+		fmt.Println("No golden images found. Images are discovered from nodes every 30 seconds.")
+		return 0
+	}
+
+	fmt.Printf("%-40s %s\n", "VERSION", "NODES")
+	for _, img := range images {
+		version, _ := img["version"].(string)
+		nodesRaw, _ := img["nodes"].([]interface{})
+		var nodeNames []string
+		for _, n := range nodesRaw {
+			if s, ok := n.(string); ok {
+				nodeNames = append(nodeNames, s)
+			}
+		}
+		fmt.Printf("%-40s %s\n", version, strings.Join(nodeNames, ", "))
+	}
+	return 0
+}
+
 func (h *Handler) cmdAddUser(githubUser string) int {
 	// Fetch SSH keys from GitHub
 	resp, err := http.Get(fmt.Sprintf("https://github.com/%s.keys", githubUser))
@@ -397,6 +477,8 @@ Commands:
   destroy <name>          Destroy a VM
   stop <name>             Stop a running VM
   start <name>            Start a stopped VM
+  cp <name> [new-name]    Copy a VM (clone its disk)
+  images                  List golden images across all nodes
   status                  Cluster capacity summary
   nodes                   List all nodes
   adduser <github-user>   Add SSH keys from GitHub (for new VMs)

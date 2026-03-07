@@ -58,6 +58,13 @@ func (db *DB) migrate() error {
 		status TEXT DEFAULT 'running'
 	);
 
+	CREATE TABLE IF NOT EXISTS golden_images (
+		version TEXT NOT NULL,
+		node_id TEXT NOT NULL REFERENCES nodes(id),
+		discovered_at TEXT NOT NULL,
+		PRIMARY KEY (version, node_id)
+	);
+
 	CREATE TABLE IF NOT EXISTS ssh_keys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		github_user TEXT NOT NULL,
@@ -253,6 +260,87 @@ func (db *DB) ListVMsByNode(nodeID string) ([]*VM, error) {
 func (db *DB) DeleteVM(name string) error {
 	_, err := db.conn.Exec(`DELETE FROM vms WHERE name=?`, name)
 	return err
+}
+
+// --- Golden image operations ---
+
+type GoldenImage struct {
+	Version      string `json:"version"`
+	NodeID       string `json:"node_id"`
+	DiscoveredAt string `json:"discovered_at"`
+}
+
+func (db *DB) UpsertGoldenImage(version, nodeID, discoveredAt string) error {
+	_, err := db.conn.Exec(`
+		INSERT INTO golden_images (version, node_id, discovered_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(version, node_id) DO UPDATE SET discovered_at=excluded.discovered_at`,
+		version, nodeID, discoveredAt)
+	return err
+}
+
+func (db *DB) ListGoldenImages() ([]*GoldenImage, error) {
+	rows, err := db.conn.Query(`SELECT version, node_id, discovered_at FROM golden_images ORDER BY version, node_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var images []*GoldenImage
+	for rows.Next() {
+		var g GoldenImage
+		if rows.Scan(&g.Version, &g.NodeID, &g.DiscoveredAt) == nil {
+			images = append(images, &g)
+		}
+	}
+	return images, nil
+}
+
+func (db *DB) DeleteGoldenImagesForNode(nodeID string) error {
+	_, err := db.conn.Exec(`DELETE FROM golden_images WHERE node_id=?`, nodeID)
+	return err
+}
+
+// SyncNodeVMs replaces the VM records for a node with the given list.
+// This reconciles the orchestrator's view with reality on the node.
+func (db *DB) SyncNodeVMs(nodeID string, vms []VM) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Delete VMs for this node that aren't in the new list
+	names := make(map[string]bool)
+	for _, v := range vms {
+		names[v.Name] = true
+	}
+
+	rows, err := tx.Query(`SELECT name FROM vms WHERE node_id=?`, nodeID)
+	if err != nil {
+		return err
+	}
+	var existing []string
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		existing = append(existing, name)
+	}
+	rows.Close()
+
+	for _, name := range existing {
+		if !names[name] {
+			tx.Exec(`DELETE FROM vms WHERE name=? AND node_id=?`, name, nodeID)
+		}
+	}
+
+	// Upsert current VMs
+	for _, v := range vms {
+		tx.Exec(`INSERT INTO vms (name, node_id, status) VALUES (?, ?, ?)
+			ON CONFLICT(name) DO UPDATE SET node_id=excluded.node_id, status=excluded.status`,
+			v.Name, nodeID, v.Status)
+	}
+
+	return tx.Commit()
 }
 
 // --- SSH key operations ---
