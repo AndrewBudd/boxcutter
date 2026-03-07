@@ -1052,16 +1052,21 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		}
 	}
 
-	// Stop source VM if running (need consistent COW)
+	// Pause source VM if running (freezes vCPUs for consistent COW copy)
 	wasRunning := IsRunning(srcDir)
 	if wasRunning {
-		progress("copy", "Stopping source VM for consistent copy...")
-		m.stopVM(srcName)
+		progress("copy", "Pausing source VM...")
+		if err := fcPause(srcDir); err != nil {
+			return nil, fmt.Errorf("pausing source VM: %w", err)
+		}
 	}
 
 	// Ensure source DM snapshot is set up so we can read the COW
 	srcCowPath := filepath.Join(srcDir, "cow.img")
 	if _, err := os.Stat(srcCowPath); err != nil {
+		if wasRunning {
+			fcResume(srcDir)
+		}
 		return nil, fmt.Errorf("source COW image not found")
 	}
 
@@ -1070,21 +1075,19 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 	os.MkdirAll(dstDir, 0755)
 	dstCowPath := filepath.Join(dstDir, "cow.img")
 	if err := copyFile(srcCowPath, dstCowPath); err != nil {
+		if wasRunning {
+			fcResume(srcDir)
+		}
 		os.RemoveAll(dstDir)
 		return nil, fmt.Errorf("copying COW: %w", err)
 	}
 
-	// Restart source VM if it was running
+	// Resume source VM immediately after copy
 	if wasRunning {
-		progress("copy", "Restarting source VM...")
-		go func() {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			srcSt2, _ := LoadVMState(srcDir)
-			if srcSt2 != nil {
-				m.startVM(srcSt2, nil)
-			}
-		}()
+		progress("copy", "Resuming source VM...")
+		if err := fcResume(srcDir); err != nil {
+			log.Printf("Warning: failed to resume source VM %s: %v", srcName, err)
+		}
 	}
 
 	// Set up destination VM state with same golden version but new identity
