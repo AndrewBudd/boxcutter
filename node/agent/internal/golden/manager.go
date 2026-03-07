@@ -164,7 +164,8 @@ func (m *Manager) pullFromOCI(version string) error {
 	defer os.RemoveAll(tmpDir)
 
 	// Pull using oras CLI (installed on nodes)
-	ref := fmt.Sprintf("%s/%s/golden:%s", m.registry, m.repo, version)
+	// OCI registries require lowercase repository names
+	ref := fmt.Sprintf("%s/%s/golden:%s", m.registry, strings.ToLower(m.repo), version)
 	log.Printf("golden: pulling %s", ref)
 
 	cmd := exec.Command("oras", "pull", "--output", tmpDir, ref)
