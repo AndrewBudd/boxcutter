@@ -169,6 +169,7 @@ func (m *Manager) pullFromOCI(version string) error {
 	log.Printf("golden: pulling %s", ref)
 
 	cmd := exec.Command("oras", "pull", "--output", tmpDir, ref)
+	cmd.Env = append(os.Environ(), "HOME=/tmp")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
