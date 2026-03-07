@@ -28,6 +28,11 @@ source "${SCRIPT_DIR}/boxcutter.env"
 IMAGES_DIR="${REPO_DIR}/.images"
 BUILD_DIR=""
 
+# Ensure Go is in PATH (may not be in root's PATH under sudo)
+if ! command -v go &>/dev/null && [ -x /usr/local/go/bin/go ]; then
+  export PATH="/usr/local/go/bin:$PATH"
+fi
+
 VM_TYPE="${1:-}"
 if [ "$VM_TYPE" != "node" ] && [ "$VM_TYPE" != "orchestrator" ] && [ "$VM_TYPE" != "golden" ]; then
   echo "Usage: bash host/build-image.sh <node|orchestrator|golden>"
