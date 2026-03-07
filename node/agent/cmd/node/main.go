@@ -87,13 +87,19 @@ func main() {
 
 	// Golden image manager — handles OCI pulls and version switching
 	goldenMgr := golden.NewManager(golden.Config{
-		GoldenDir: filepath.Dir(cfg.Storage.GoldenLocalPath),
+		GoldenDir:     filepath.Dir(cfg.Storage.GoldenLocalPath),
+		OCIRegistry:   cfg.OCI.Registry,
+		OCIRepository: cfg.OCI.Repository,
 	})
 
 	// MQTT client — connect to broker on host bridge
+	brokerAddr := cfg.MQTT.BrokerAddr
+	if brokerAddr == "" {
+		brokerAddr = nodemqtt.BrokerAddrFromEnv()
+	}
 	var mqttClient *nodemqtt.Client
 	mqttClient, err = nodemqtt.Connect(nodemqtt.Config{
-		BrokerAddr: nodemqtt.BrokerAddrFromEnv(),
+		BrokerAddr: brokerAddr,
 		NodeID:     hostname,
 		OnGolden: func(version string) {
 			if err := goldenMgr.SetHead(version); err != nil {

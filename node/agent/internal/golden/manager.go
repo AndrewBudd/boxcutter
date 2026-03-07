@@ -153,16 +153,9 @@ func (m *Manager) GCUnused(inUse map[string]bool) []string {
 	return removed
 }
 
-// pullFromOCI downloads a golden image from the OCI registry.
+// pullFromOCI downloads a golden image from the OCI registry using the oras CLI.
 func (m *Manager) pullFromOCI(version string) error {
 	os.MkdirAll(m.goldenDir, 0755)
-
-	// Use oras CLI if available, otherwise fall back to a simple HTTP pull
-	// For now, use the boxcutter-host binary which has the OCI client built in.
-	// On the node, we shell out to a helper script that does:
-	//   1. Pull the zstd-compressed ext4 from the OCI registry
-	//   2. Decompress it
-	//   3. Place it in the golden directory
 
 	tmpDir, err := os.MkdirTemp("", "golden-pull-*")
 	if err != nil {

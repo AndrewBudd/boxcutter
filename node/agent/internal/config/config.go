@@ -17,6 +17,17 @@ type Config struct {
 	Storage      StorageConfig      `yaml:"storage"`
 	VMDefaults   VMDefaults         `yaml:"vm_defaults"`
 	Orchestrator OrchestratorConfig `yaml:"orchestrator"`
+	MQTT         MQTTConfig         `yaml:"mqtt"`
+	OCI          OCIConfig          `yaml:"oci"`
+}
+
+type MQTTConfig struct {
+	BrokerAddr string `yaml:"broker_addr"` // tcp://host:port (default: tcp://192.168.50.1:1883)
+}
+
+type OCIConfig struct {
+	Registry   string `yaml:"registry"`   // default: ghcr.io
+	Repository string `yaml:"repository"` // default: AndrewBudd/boxcutter
 }
 
 type OrchestratorConfig struct {
