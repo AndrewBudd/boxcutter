@@ -1,6 +1,8 @@
 .PHONY: help provision-node provision-orchestrator launch-node launch-orchestrator \
        stop-node stop-orchestrator ssh-node ssh-orchestrator status clean \
-       build-host install-host
+       build-host install-host \
+       pull-node pull-orchestrator provision-node-image provision-orchestrator-image \
+       build-image-node build-image-orchestrator
 
 # --- Orchestrator ---
 
@@ -52,6 +54,26 @@ install-host: build-host  ## Install boxcutter-host binary + systemd service
 	@sudo cp host/boxcutter-host.service /etc/systemd/system/
 	@sudo systemctl daemon-reload
 	@echo "Installed. Run: sudo systemctl enable --now boxcutter-host"
+
+# --- OCI Image Distribution ---
+
+pull-node:                ## Pull pre-built node image from OCI registry
+	@cd host && go run ./cmd/host/ pull node
+
+pull-orchestrator:        ## Pull pre-built orchestrator image from OCI registry
+	@cd host && go run ./cmd/host/ pull orchestrator
+
+provision-node-image:     ## Generate slim cloud-init ISO for pulled node image
+	@bash host/provision.sh node --from-image
+
+provision-orchestrator-image: ## Generate slim cloud-init ISO for pulled orchestrator image
+	@bash host/provision.sh orchestrator --from-image
+
+build-image-node:         ## Build publishable node QCOW2 (for CI/local)
+	@bash host/build-image.sh node
+
+build-image-orchestrator: ## Build publishable orchestrator QCOW2 (for CI/local)
+	@bash host/build-image.sh orchestrator
 
 # --- Cluster ---
 

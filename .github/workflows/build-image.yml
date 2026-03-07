@@ -1,0 +1,107 @@
+name: Build and Push VM Images
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description: 'Override image tag (defaults to git tag or SHA)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.vm_type }} image
+    runs-on: [self-hosted, kvm]
+    strategy:
+      matrix:
+        vm_type: [node, orchestrator]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            qemu-system-x86 qemu-utils genisoimage zstd \
+            debootstrap e2fsprogs
+
+      - name: Build image
+        run: bash host/build-image.sh ${{ matrix.vm_type }}
+        timeout-minutes: 30
+
+      - name: Determine version tag
+        id: version
+        run: |
+          if [ -n "${{ inputs.tag_override }}" ]; then
+            echo "tag=${{ inputs.tag_override }}" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Install ORAS CLI
+        run: |
+          ORAS_VERSION="1.2.0"
+          curl -sLO "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          tar xzf "oras_${ORAS_VERSION}_linux_amd64.tar.gz" -C /usr/local/bin/ oras
+          rm -f "oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push to registry
+        run: |
+          VERSION="${{ steps.version.outputs.tag }}"
+          COMMIT="${{ steps.version.outputs.commit }}"
+          IMAGE="ghcr.io/${{ github.repository }}/${{ matrix.vm_type }}"
+          FILE=".images/${{ matrix.vm_type }}-image.qcow2.zst"
+
+          # Push with version tag
+          TAGS="${VERSION}"
+
+          # Also tag as latest if this is a release tag
+          if [[ "$VERSION" == v* ]]; then
+            TAGS="${VERSION},latest"
+          fi
+
+          oras push "${IMAGE}:${TAGS}" \
+            --artifact-type "application/vnd.boxcutter.vm.v1" \
+            "${FILE}:application/vnd.boxcutter.vm.qcow2.v1+zstd" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}"
+
+          # Also push commit SHA tag for traceability
+          oras push "${IMAGE}:sha-${COMMIT}" \
+            --artifact-type "application/vnd.boxcutter.vm.v1" \
+            "${FILE}:application/vnd.boxcutter.vm.qcow2.v1+zstd" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Summary
+        run: |
+          VERSION="${{ steps.version.outputs.tag }}"
+          echo "### ${{ matrix.vm_type }} image published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Registry:** \`ghcr.io/${{ github.repository }}/${{ matrix.vm_type }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Size:** $(du -h .images/${{ matrix.vm_type }}-image.qcow2.zst | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pull with:" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "boxcutter-host pull ${{ matrix.vm_type }} --tag ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"

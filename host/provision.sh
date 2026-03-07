@@ -2,8 +2,10 @@
 # Build and package cloud-init ISO for a Boxcutter VM.
 #
 # Usage:
-#   bash host/provision.sh node [NAME] [--rebuild]     Build a Node VM ISO
-#   bash host/provision.sh orchestrator [--rebuild]     Build the Orchestrator VM ISO
+#   bash host/provision.sh node [NAME] [--rebuild]         Build a Node VM ISO (from source)
+#   bash host/provision.sh orchestrator [--rebuild]         Build the Orchestrator VM ISO (from source)
+#   bash host/provision.sh node [NAME] --from-image         Generate slim config-only ISO for a pulled image
+#   bash host/provision.sh orchestrator --from-image        Generate slim config-only ISO for a pulled image
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,10 +30,12 @@ mkdir -p "$IMAGES_DIR"
 
 # --- Parse args ---
 REBUILD=false
+FROM_IMAGE=false
 VM_NAME=""
 for arg in "$@"; do
   case "$arg" in
     --rebuild) REBUILD=true ;;
+    --from-image) FROM_IMAGE=true ;;
     *) [ -z "$VM_NAME" ] && VM_NAME="$arg" ;;
   esac
 done
@@ -512,9 +516,209 @@ META
 }
 
 # ======================================================================
+# SLIM CLOUD-INIT (for pre-built / pulled images)
+# ======================================================================
+# When using --from-image, we skip Go compilation and package installation.
+# The cloud-init ISO contains only secrets/config + a small runcmd that calls
+# the inject-config script baked into the pre-built image.
+
+build_slim_node() {
+  local NAME="${VM_NAME:-boxcutter-node-1}"
+  local NODE_NUM="${NAME##*-}"
+  if ! [[ "$NODE_NUM" =~ ^[0-9]+$ ]]; then
+    echo "Error: node name must end with a number (e.g. boxcutter-node-1)"
+    exit 1
+  fi
+  local NODE_OCTET=$((NODE_IP_OFFSET + NODE_NUM))
+  local THIS_NODE_IP="${NODE_SUBNET}.${NODE_OCTET}"
+  local THIS_NODE_MAC="$(printf '52:54:00:00:00:%02x' "$NODE_OCTET")"
+
+  echo "=== Provisioning Node VM (from image): ${NAME} ==="
+  echo "  Bridge IP: ${THIS_NODE_IP}, MAC: ${THIS_NODE_MAC}"
+  echo ""
+
+  BUILD_DIR=$(mktemp -d)
+  trap "rm -rf ${BUILD_DIR}" EXIT
+
+  # --- Package config-only bundle ---
+  echo "--- Packaging config bundle ---"
+  local BD="${BUILD_DIR}/bundle"
+  mkdir -p "${BD}/secrets"
+
+  sed -e "s|BRIDGE_IP_PLACEHOLDER|${THIS_NODE_IP}|g" \
+      -e "s|ORCHESTRATOR_URL_PLACEHOLDER|http://${ORCH_IP}:8801|g" \
+      -e "s|HOSTNAME_PLACEHOLDER|${NAME}|g" \
+      "${BUNDLE_DIR}/boxcutter.yaml" > "${BD}/boxcutter.yaml"
+  cp "${BUNDLE_DIR}"/secrets/* "${BD}/secrets/" 2>/dev/null || true
+
+  local CONFIG_TAR="${BUILD_DIR}/config.tar.gz"
+  tar czf "$CONFIG_TAR" -C "${BD}" .
+  local CONFIG_B64=$(base64 -w0 "$CONFIG_TAR")
+
+  # --- Cloud-init (slim) ---
+  echo "--- Generating slim cloud-init ISO ---"
+  local CIDATA="${BUILD_DIR}/cidata"
+  mkdir -p "${CIDATA}"
+
+  cat > "${CIDATA}/user-data" <<USERDATA
+#cloud-config
+
+hostname: ${NAME}
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBKEY}
+
+write_files:
+  - path: /opt/boxcutter-config.tar.gz
+    encoding: b64
+    content: ${CONFIG_B64}
+    permissions: '0644'
+
+runcmd:
+  - bash /opt/boxcutter-inject-config.sh
+USERDATA
+
+  cat > "${CIDATA}/meta-data" <<META
+instance-id: ${NAME}-$(date +%s)
+local-hostname: ${NAME}
+META
+
+  sed -e "s|NODE_IP_PLACEHOLDER|${THIS_NODE_IP}|" \
+      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_BRIDGE_CIDR}|" \
+      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_BRIDGE_IP}|" \
+      -e "s|NODE_MAC_PLACEHOLDER|${THIS_NODE_MAC}|" \
+      "${REPO_DIR}/cloud-init/network-config" > "${CIDATA}/network-config"
+
+  local ISO="${IMAGES_DIR}/${NAME}-cloud-init.iso"
+  genisoimage -output "$ISO" -volid cidata -joliet -rock \
+    "${CIDATA}/user-data" "${CIDATA}/meta-data" "${CIDATA}/network-config" 2>/dev/null
+  echo "  Cloud-init ISO: ${ISO}"
+
+  # --- VM disk (COW from pulled base image) ---
+  local BASE_IMG="${IMAGES_DIR}/node-base.qcow2"
+  local DISK="${IMAGES_DIR}/${NAME}.qcow2"
+  if [ ! -f "$BASE_IMG" ]; then
+    echo ""
+    echo "Error: base image not found at ${BASE_IMG}"
+    echo "Pull it first with: boxcutter-host pull node"
+    exit 1
+  fi
+  if [ "$REBUILD" = true ] || [ ! -f "$DISK" ]; then
+    echo ""
+    echo "--- Creating COW disk from base image ---"
+    rm -f "$DISK"
+    qemu-img create -f qcow2 -b "$BASE_IMG" -F qcow2 "$DISK" "$NODE_DISK"
+    echo "  VM disk: ${DISK} (COW on ${BASE_IMG})"
+  fi
+
+  echo ""
+  echo "=== Node provisioning complete (from image) ==="
+  echo "Launch with: make launch-node NAME=${NAME}"
+}
+
+build_slim_orchestrator() {
+  echo "=== Provisioning Orchestrator VM (from image) ==="
+  echo ""
+
+  BUILD_DIR=$(mktemp -d)
+  trap "rm -rf ${BUILD_DIR}" EXIT
+
+  # --- Package config-only bundle ---
+  echo "--- Packaging config bundle ---"
+  local BD="${BUILD_DIR}/bundle"
+  mkdir -p "${BD}/secrets"
+
+  cp "${BUNDLE_DIR}/boxcutter.yaml" "${BD}/"
+  for secret in tailscale-node-authkey authorized-keys; do
+    [ -f "${BUNDLE_DIR}/secrets/${secret}" ] && cp "${BUNDLE_DIR}/secrets/${secret}" "${BD}/secrets/"
+  done
+
+  local CONFIG_TAR="${BUILD_DIR}/config.tar.gz"
+  tar czf "$CONFIG_TAR" -C "${BD}" .
+  local CONFIG_B64=$(base64 -w0 "$CONFIG_TAR")
+
+  # --- Cloud-init (slim) ---
+  echo "--- Generating slim cloud-init ISO ---"
+  local CIDATA="${BUILD_DIR}/cidata"
+  mkdir -p "${CIDATA}"
+
+  cat > "${CIDATA}/user-data" <<USERDATA
+#cloud-config
+
+hostname: boxcutter
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBKEY}
+
+write_files:
+  - path: /opt/boxcutter-config.tar.gz
+    encoding: b64
+    content: ${CONFIG_B64}
+    permissions: '0644'
+
+runcmd:
+  - bash /opt/boxcutter-inject-config.sh
+USERDATA
+
+  cat > "${CIDATA}/meta-data" <<META
+instance-id: boxcutter-orch-$(date +%s)
+local-hostname: boxcutter
+META
+
+  sed -e "s|NODE_IP_PLACEHOLDER|${ORCH_IP}|" \
+      -e "s|NODE_CIDR_PLACEHOLDER|${HOST_BRIDGE_CIDR}|" \
+      -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_BRIDGE_IP}|" \
+      -e "s|NODE_MAC_PLACEHOLDER|${ORCH_MAC}|" \
+      "${REPO_DIR}/cloud-init/network-config" > "${CIDATA}/network-config"
+
+  local ISO="${IMAGES_DIR}/orchestrator-cloud-init.iso"
+  genisoimage -output "$ISO" -volid cidata -joliet -rock \
+    "${CIDATA}/user-data" "${CIDATA}/meta-data" "${CIDATA}/network-config" 2>/dev/null
+  echo "  Cloud-init ISO: ${ISO}"
+
+  # --- VM disk (COW from pulled base image) ---
+  local BASE_IMG="${IMAGES_DIR}/orchestrator-base.qcow2"
+  local DISK="${IMAGES_DIR}/orchestrator.qcow2"
+  if [ ! -f "$BASE_IMG" ]; then
+    echo ""
+    echo "Error: base image not found at ${BASE_IMG}"
+    echo "Pull it first with: boxcutter-host pull orchestrator"
+    exit 1
+  fi
+  if [ "$REBUILD" = true ] || [ ! -f "$DISK" ]; then
+    echo ""
+    echo "--- Creating COW disk from base image ---"
+    rm -f "$DISK"
+    qemu-img create -f qcow2 -b "$BASE_IMG" -F qcow2 "$DISK" "$ORCH_DISK"
+    echo "  VM disk: ${DISK} (COW on ${BASE_IMG})"
+  fi
+
+  echo ""
+  echo "=== Orchestrator provisioning complete (from image) ==="
+  echo "Launch with: make launch-orchestrator"
+}
+
+# ======================================================================
 # Dispatch
 # ======================================================================
-case "$VM_TYPE" in
-  node)         build_node ;;
-  orchestrator) build_orchestrator ;;
-esac
+if [ "$FROM_IMAGE" = true ]; then
+  case "$VM_TYPE" in
+    node)         build_slim_node ;;
+    orchestrator) build_slim_orchestrator ;;
+  esac
+else
+  case "$VM_TYPE" in
+    node)         build_node ;;
+    orchestrator) build_orchestrator ;;
+  esac
+fi
