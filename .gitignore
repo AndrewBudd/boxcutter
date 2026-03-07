@@ -23,10 +23,13 @@ tailscale-authkey
 
 # Go build artifacts
 node/agent/node
+node/agent/boxcutter-node
 node/proxy/proxy
 node/vmid/vmid
 orchestrator/orchestrator
 orchestrator/ssh
+orchestrator/boxcutter-orchestrator
+orchestrator/boxcutter-ssh-orchestrator
 host/boxcutter-host
 host/host
 
