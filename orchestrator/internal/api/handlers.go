@@ -25,7 +25,8 @@ func NewHandler(database *db.DB) *Handler {
 	return h
 }
 
-// healthMonitorLoop checks node health every 30 seconds and marks nodes down/up.
+// healthMonitorLoop checks node health every 30 seconds, marks nodes down/up,
+// and syncs VM inventory and golden image data from each active node.
 func (h *Handler) healthMonitorLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -46,10 +47,32 @@ func (h *Handler) healthMonitorLoop() {
 					log.Printf("Node %s: unreachable, marking down", n.ID)
 					h.db.SetNodeStatus(n.ID, "down")
 				}
-			} else {
-				if n.Status == "down" {
-					log.Printf("Node %s: back up, marking active", n.ID)
-					h.db.SetNodeStatus(n.ID, "active")
+				continue
+			}
+			if n.Status == "down" {
+				log.Printf("Node %s: back up, marking active", n.ID)
+				h.db.SetNodeStatus(n.ID, "active")
+			}
+
+			// Sync VM inventory from node
+			if vmList := fc.ListVMs(); vmList != nil {
+				var dbVMs []db.VM
+				for _, v := range vmList {
+					dbVMs = append(dbVMs, db.VM{
+						Name:   v.Name,
+						NodeID: n.ID,
+						Status: v.Status,
+					})
+				}
+				h.db.SyncNodeVMs(n.ID, dbVMs)
+			}
+
+			// Sync golden image versions from node
+			if versions := fc.GoldenVersions(); versions != nil {
+				now := time.Now().Format(time.RFC3339)
+				h.db.DeleteGoldenImagesForNode(n.ID)
+				for _, ver := range versions {
+					h.db.UpsertGoldenImage(ver, n.ID, now)
 				}
 			}
 		}
@@ -70,6 +93,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/vms/{name}", h.handleVMDestroy)
 	mux.HandleFunc("POST /api/vms/{name}/stop", h.handleVMStop)
 	mux.HandleFunc("POST /api/vms/{name}/start", h.handleVMStart)
+	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleVMCopy)
+
+	// Golden images
+	mux.HandleFunc("GET /api/golden", h.handleGoldenList)
 
 	// SSH keys
 	mux.HandleFunc("POST /api/keys/add", h.handleAddKeys)
@@ -560,6 +587,135 @@ func (h *Handler) handleVMStart(w http.ResponseWriter, r *http.Request) {
 
 	h.db.UpdateVMStatus(name, "running")
 	writeJSON(w, resp)
+}
+
+func (h *Handler) handleVMCopy(w http.ResponseWriter, r *http.Request) {
+	srcName := r.PathValue("name")
+	if srcName == "" {
+		srcName = extractPathSegment(r.URL.Path, "/api/vms/", "/copy")
+	}
+
+	var req struct {
+		DstName string `json:"dst_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Generate name if not provided
+	if req.DstName == "" {
+		out, err := exec.Command("boxcutter-names", "generate").Output()
+		if err != nil {
+			http.Error(w, "failed to generate name", http.StatusInternalServerError)
+			return
+		}
+		req.DstName = strings.TrimSpace(string(out))
+	}
+
+	// Check if destination already exists
+	if _, err := h.db.GetVM(req.DstName); err == nil {
+		http.Error(w, fmt.Sprintf("VM '%s' already exists", req.DstName), http.StatusConflict)
+		return
+	}
+
+	// Find the source VM's node
+	srcVM, err := h.db.GetVM(srcName)
+	if err != nil {
+		http.Error(w, "source VM not found", http.StatusNotFound)
+		return
+	}
+
+	n, _ := h.db.GetNode(srcVM.NodeID)
+	if n == nil {
+		http.Error(w, "source node not found", http.StatusInternalServerError)
+		return
+	}
+
+	// Stream progress
+	flusher, canFlush := w.(http.Flusher)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusCreated)
+
+	client := node.NewClient(n.APIAddr)
+	nodeResp, err := client.CopyStreaming(srcName, req.DstName, func(evt *node.ProgressEvent) {
+		line, _ := json.Marshal(evt)
+		fmt.Fprintf(w, "%s\n", line)
+		if canFlush {
+			flusher.Flush()
+		}
+	})
+	if err != nil {
+		log.Printf("Copy %s -> %s failed: %v", srcName, req.DstName, err)
+		errEvt, _ := json.Marshal(map[string]string{"phase": "error", "error": err.Error()})
+		fmt.Fprintf(w, "%s\n", errEvt)
+		if canFlush {
+			flusher.Flush()
+		}
+		return
+	}
+
+	// Record new VM in DB
+	h.db.CreateVM(&db.VM{
+		Name:   nodeResp.Name,
+		NodeID: srcVM.NodeID,
+		Status: nodeResp.Status,
+	})
+
+	log.Printf("VM copied: %s -> %s on node %s", srcName, nodeResp.Name, srcVM.NodeID)
+
+	ready, _ := json.Marshal(map[string]interface{}{
+		"phase":        "ready",
+		"name":         nodeResp.Name,
+		"node":         n.TailscaleName,
+		"tailscale_ip": nodeResp.TailscaleIP,
+		"mode":         nodeResp.Mode,
+		"status":       nodeResp.Status,
+	})
+	fmt.Fprintf(w, "%s\n", ready)
+	if canFlush {
+		flusher.Flush()
+	}
+}
+
+// --- Golden images ---
+
+type goldenListEntry struct {
+	Version  string   `json:"version"`
+	Nodes    []string `json:"nodes"`
+}
+
+func (h *Handler) handleGoldenList(w http.ResponseWriter, r *http.Request) {
+	images, err := h.db.ListGoldenImages()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Group by version
+	versionNodes := make(map[string][]string)
+	var order []string
+	for _, img := range images {
+		if _, seen := versionNodes[img.Version]; !seen {
+			order = append(order, img.Version)
+		}
+		// Resolve node name
+		nodeName := img.NodeID
+		if n, err := h.db.GetNode(img.NodeID); err == nil {
+			nodeName = n.TailscaleName
+		}
+		versionNodes[img.Version] = append(versionNodes[img.Version], nodeName)
+	}
+
+	var entries []goldenListEntry
+	for _, ver := range order {
+		entries = append(entries, goldenListEntry{
+			Version: ver,
+			Nodes:   versionNodes[ver],
+		})
+	}
+	writeJSON(w, entries)
 }
 
 // --- Health ---

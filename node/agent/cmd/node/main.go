@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -77,6 +78,9 @@ func main() {
 	// Restart VMs that were running before node restarted
 	go mgr.RestartAll()
 
+	// Auto-build golden image if missing
+	go autoGoldenBuild(mgr)
+
 	// Register with orchestrator if configured
 	if cfg.Orchestrator.URL != "" {
 		go registerWithOrchestrator(cfg, mgr)
@@ -89,6 +93,29 @@ func main() {
 
 	log.Println("Shutting down node agent...")
 	server.Close()
+}
+
+func autoGoldenBuild(mgr *vm.Manager) {
+	goldenPath := mgr.GoldenPath()
+	if _, err := os.Stat(goldenPath); err == nil {
+		return // golden image exists
+	}
+
+	buildScript := filepath.Join(filepath.Dir(goldenPath), "build.sh")
+	if _, err := os.Stat(buildScript); err != nil {
+		log.Printf("Golden image missing but no build script at %s", buildScript)
+		return
+	}
+
+	log.Printf("Golden image missing — starting automatic build...")
+	cmd := exec.Command("bash", buildScript)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("Golden image auto-build failed: %v", err)
+		return
+	}
+	log.Printf("Golden image auto-build complete")
 }
 
 func registerWithOrchestrator(cfg *config.Config, mgr *vm.Manager) {

@@ -261,6 +261,43 @@ func (c *Client) Migrate(name string, req *MigrateRequest) (*MigrateResponse, er
 	return &mr, nil
 }
 
+// CopyStreaming copies a VM on the same node, streaming progress.
+func (c *Client) CopyStreaming(srcName, dstName string, onProgress func(*ProgressEvent)) (*CreateResponse, error) {
+	body, _ := json.Marshal(map[string]string{"dst_name": dstName})
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+srcName+"/copy", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("copy request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	decoder := json.NewDecoder(resp.Body)
+	var result *CreateResponse
+	for decoder.More() {
+		var evt ProgressEvent
+		if err := decoder.Decode(&evt); err != nil {
+			break
+		}
+		if evt.Phase == "error" {
+			return nil, fmt.Errorf("%s", evt.Error)
+		}
+		if evt.Phase == "ready" {
+			result = &CreateResponse{
+				Name:        evt.Name,
+				TailscaleIP: evt.TailscaleIP,
+				Mark:        evt.Mark,
+				Mode:        evt.Mode,
+				Status:      evt.Status,
+			}
+		} else if onProgress != nil {
+			onProgress(&evt)
+		}
+	}
+	if result == nil {
+		return nil, fmt.Errorf("no response from node")
+	}
+	return result, nil
+}
+
 // VMDetail is the full VM info returned by the node agent.
 type VMDetail struct {
 	Name        string `json:"name"`
@@ -321,6 +358,22 @@ func (c *FastClient) ListVMs() []VMDetail {
 	var vms []VMDetail
 	json.NewDecoder(resp.Body).Decode(&vms)
 	return vms
+}
+
+// GoldenVersions fetches available golden image versions from the node.
+func (c *FastClient) GoldenVersions() []string {
+	resp, err := c.http.Get(c.baseURL + "/api/golden/versions")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Versions []string `json:"versions"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&result) != nil {
+		return nil
+	}
+	return result.Versions
 }
 
 // Health fetches health from the node. Returns nil on any error.

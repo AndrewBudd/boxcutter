@@ -1029,6 +1029,141 @@ func (m *Manager) ExportVM(name string) (string, *VMState, error) {
 	return cowPath, st, nil
 }
 
+// CopyVM creates a new VM by copying an existing VM's disk.
+// The source VM is stopped during the copy, then restarted.
+func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*CreateResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	srcDir := VMDir(srcName)
+	srcSt, err := LoadVMState(srcDir)
+	if err != nil {
+		return nil, fmt.Errorf("source VM '%s' not found", srcName)
+	}
+
+	dstDir := VMDir(dstName)
+	if _, err := os.Stat(dstDir); err == nil {
+		return nil, fmt.Errorf("VM '%s' already exists", dstName)
+	}
+
+	progress := func(phase, msg string) {
+		if progressFn != nil {
+			progressFn(phase, msg)
+		}
+	}
+
+	// Pause source VM if running (freezes vCPUs for consistent COW copy)
+	wasRunning := IsRunning(srcDir)
+	if wasRunning {
+		progress("copy", "Pausing source VM...")
+		if err := fcPause(srcDir); err != nil {
+			return nil, fmt.Errorf("pausing source VM: %w", err)
+		}
+	}
+
+	// Ensure source DM snapshot is set up so we can read the COW
+	srcCowPath := filepath.Join(srcDir, "cow.img")
+	if _, err := os.Stat(srcCowPath); err != nil {
+		if wasRunning {
+			fcResume(srcDir)
+		}
+		return nil, fmt.Errorf("source COW image not found")
+	}
+
+	// Create destination dir and copy COW
+	progress("copy", "Copying disk image...")
+	os.MkdirAll(dstDir, 0755)
+	dstCowPath := filepath.Join(dstDir, "cow.img")
+	if err := copyFile(srcCowPath, dstCowPath); err != nil {
+		if wasRunning {
+			fcResume(srcDir)
+		}
+		os.RemoveAll(dstDir)
+		return nil, fmt.Errorf("copying COW: %w", err)
+	}
+
+	// Resume source VM immediately after copy
+	if wasRunning {
+		progress("copy", "Resuming source VM...")
+		if err := fcResume(srcDir); err != nil {
+			log.Printf("Warning: failed to resume source VM %s: %v", srcName, err)
+		}
+	}
+
+	// Set up destination VM state with same golden version but new identity
+	goldenPath := GoldenPathForVersion(m.GoldenDir(), srcSt.GoldenVer)
+	if _, err := os.Stat(goldenPath); err != nil {
+		// Try current golden
+		goldenPath = m.cfg.Storage.GoldenLocalPath
+	}
+
+	existingMarks := m.collectExistingMarks()
+	mark := AllocateMark(dstName, existingMarks)
+	tap := TAPName(dstName)
+
+	// Set up DM snapshot for the destination
+	progress("copy", "Setting up disk snapshot...")
+	ss, err := CreateSnapshot(dstDir, goldenPath, srcSt.Disk)
+	if err != nil {
+		os.RemoveAll(dstDir)
+		return nil, fmt.Errorf("creating snapshot: %w", err)
+	}
+	SaveSnapshotState(dstDir, ss)
+
+	dstSt := &VMState{
+		Name:       dstName,
+		VCPU:       srcSt.VCPU,
+		RAMMIB:     srcSt.RAMMIB,
+		Mark:       mark,
+		Mode:       srcSt.Mode,
+		MAC:        fixedMAC,
+		Disk:       srcSt.Disk,
+		TAP:        tap,
+		Created:    time.Now().Format(time.RFC3339),
+		GoldenVer:  srcSt.GoldenVer,
+	}
+	if err := SaveVMState(dstDir, dstSt); err != nil {
+		CleanupSnapshot(dstDir)
+		os.RemoveAll(dstDir)
+		return nil, err
+	}
+
+	if err := writeFirecrackerConfig(dstDir, dstSt); err != nil {
+		CleanupSnapshot(dstDir)
+		os.RemoveAll(dstDir)
+		return nil, err
+	}
+
+	// Mount the copied rootfs and update hostname
+	dmName := "bc-" + dstName
+	mountDir, err := os.MkdirTemp("", "bc-mount-")
+	if err == nil {
+		if run("mount", "/dev/mapper/"+dmName, mountDir) == nil {
+			// Update hostname
+			os.WriteFile(filepath.Join(mountDir, "etc/hostname"), []byte(dstName+"\n"), 0644)
+			// Remove Tailscale state so it gets a fresh identity
+			os.RemoveAll(filepath.Join(mountDir, "var/lib/tailscale"))
+			run("umount", mountDir)
+		}
+		os.RemoveAll(mountDir)
+	}
+
+	// Start the new VM
+	resp, err := m.startVM(dstSt, progress)
+	if err != nil {
+		CleanupSnapshot(dstDir)
+		os.RemoveAll(dstDir)
+		return nil, fmt.Errorf("starting copied VM: %w", err)
+	}
+
+	return resp, nil
+}
+
+// copyFile copies a file using cp --sparse=always.
+func copyFile(src, dst string) error {
+	return run("cp", "--sparse=always", src, dst)
+}
+
 // MigrateVM migrates a VM to another node using Firecracker snapshots.
 // The VM is paused (not stopped), its state is snapshotted, and it resumes
 // on the target node with all processes and memory intact.
