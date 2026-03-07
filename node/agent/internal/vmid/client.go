@@ -78,6 +78,21 @@ func (c *Client) MintGitHubToken(vmID string) (*GitHubTokenResponse, error) {
 	return &tok, nil
 }
 
+// GHCRToken returns a GitHub installation token with packages scope for ghcr.io auth.
+func (c *Client) GHCRToken() (string, error) {
+	resp, err := c.http.Get("http://localhost/internal/ghcr-token")
+	if err != nil {
+		return "", fmt.Errorf("vmid ghcr token: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("vmid ghcr token: status %d", resp.StatusCode)
+	}
+	var tok GitHubTokenResponse
+	json.NewDecoder(resp.Body).Decode(&tok)
+	return tok.Token, nil
+}
+
 func (c *Client) Healthy() bool {
 	resp, err := c.http.Get("http://localhost/healthz")
 	if err != nil {

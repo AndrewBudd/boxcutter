@@ -319,6 +319,27 @@ func matchLabels(vmLabels, matchLabels map[string]string) bool {
 	return true
 }
 
+// MintPackagesToken creates a GitHub installation token with packages:write scope.
+// Used by the node agent to authenticate with ghcr.io for pulling golden images.
+func (g *GitHubTokenMinter) MintPackagesToken() (*GitHubTokenResponse, error) {
+	appJWT, err := g.mintAppJWT()
+	if err != nil {
+		return nil, fmt.Errorf("minting app JWT: %w", err)
+	}
+
+	perms := map[string]string{"packages": "read"}
+	instToken, err := g.createInstallationToken(appJWT, nil, perms)
+	if err != nil {
+		return nil, err
+	}
+
+	return &GitHubTokenResponse{
+		Token:       instToken.Token,
+		ExpiresAt:   instToken.ExpiresAt,
+		Permissions: perms,
+	}, nil
+}
+
 // MintToken creates a scoped GitHub installation token for a VM.
 func (g *GitHubTokenMinter) MintToken(rec *registry.VMRecord) (*GitHubTokenResponse, error) {
 	repos, perms, err := g.ResolvePolicy(rec)

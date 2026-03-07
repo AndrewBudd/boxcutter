@@ -46,6 +46,7 @@ type PullOptions struct {
 	VMType     string // "node", "orchestrator", or "golden"
 	Tag        string // Tag to pull (default: "latest")
 	OutputDir  string // Directory to write the pulled image to
+	Auth       *GitHubAppAuth // Optional: authenticate via GitHub App (used if GITHUB_TOKEN not set)
 }
 
 func (o *PullOptions) defaults() {
@@ -75,10 +76,17 @@ func newRepo(opts *PullOptions) (*remote.Repository, error) {
 		return nil, fmt.Errorf("creating repository reference: %w", err)
 	}
 
-	// Set up authentication from GITHUB_TOKEN or GH_TOKEN
+	// Set up authentication: env var takes precedence, then GitHub App
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
 		token = os.Getenv("GH_TOKEN")
+	}
+	if token == "" && opts.Auth != nil {
+		var err error
+		token, err = opts.Auth.Token()
+		if err != nil {
+			return nil, fmt.Errorf("GitHub App auth: %w", err)
+		}
 	}
 	if token != "" {
 		repo.Client = &auth.Client{
@@ -186,6 +194,7 @@ type PushOptions struct {
 	VMType     string   // "node", "orchestrator", or "golden"
 	Tags       []string // Tags to apply (e.g., ["v0.1.0", "latest"])
 	FilePath   string   // Path to the .qcow2.zst or .ext4.zst file
+	Auth       *GitHubAppAuth // Optional: authenticate via GitHub App
 
 	Version string
 	Commit  string
@@ -212,6 +221,7 @@ func Push(ctx context.Context, opts PushOptions) error {
 		Registry:   opts.Registry,
 		Repository: opts.Repository,
 		VMType:     opts.VMType,
+		Auth:       opts.Auth,
 	}
 	repo, err := newRepo(pullOpts)
 	if err != nil {

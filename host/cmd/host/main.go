@@ -54,6 +54,11 @@ type HostConfig struct {
 	// OCI image distribution
 	OCIRegistry   string // OCI registry (default: ghcr.io)
 	OCIRepository string // Repository path (default: AndrewBudd/boxcutter)
+
+	// GitHub App auth for ghcr.io
+	GitHubAppID          int64
+	GitHubInstallationID int64
+	GitHubPrivateKeyPath string
 }
 
 func defaultConfig() HostConfig {
@@ -103,6 +108,20 @@ func defaultConfig() HostConfig {
 		MinFreeMemoryMB:     8192, // 8GB — never launch a node if host has less than this free
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
+		GitHubAppID:          3020803,
+		GitHubInstallationID: 114361932,
+		GitHubPrivateKeyPath: filepath.Join(repoDir, ".boxcutter", "secrets", "github-app.pem"),
+	}
+}
+
+func (cfg HostConfig) ociAuth() *oci.GitHubAppAuth {
+	if !fileExists(cfg.GitHubPrivateKeyPath) {
+		return nil
+	}
+	return &oci.GitHubAppAuth{
+		AppID:          cfg.GitHubAppID,
+		InstallationID: cfg.GitHubInstallationID,
+		PrivateKeyPath: cfg.GitHubPrivateKeyPath,
 	}
 }
 
@@ -127,8 +146,10 @@ func main() {
 		cliVersion()
 	case "build-image":
 		cliBuildImage()
+	case "push-golden":
+		cliPushGolden()
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|version|build-image>\n")
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|version|build-image|push-golden>\n")
 		os.Exit(1)
 	}
 }
@@ -712,6 +733,7 @@ func cliPull() {
 		VMType:     vmType,
 		Tag:        tag,
 		OutputDir:  cfg.ImagesDir,
+		Auth:       cfg.ociAuth(),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Pull failed: %v\n", err)
@@ -792,6 +814,7 @@ func cliUpgrade() {
 			VMType:     t,
 			Tag:        tag,
 			OutputDir:  cfg.ImagesDir,
+			Auth:       cfg.ociAuth(),
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Pull failed for %s: %v\n", t, err)
@@ -1167,6 +1190,7 @@ func cliVersion() {
 			Repository: cfg.OCIRepository,
 			VMType:     vmType,
 			Tag:        "latest",
+			Auth:       cfg.ociAuth(),
 		})
 		if err != nil {
 			fmt.Printf("  %s: (not available)\n", vmType)
@@ -1274,12 +1298,120 @@ func cliBuildImage() {
 		FilePath:   imagePath,
 		Version:    version,
 		Commit:     commit,
+		Auth:       cfg.ociAuth(),
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Push failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Printf("Pushed %s image with tags: %v\n", vmType, tags)
+}
+
+// cliPushGolden fetches the current golden image from a node, compresses it, and pushes to ghcr.io.
+//
+//	boxcutter-host push-golden [--tag TAG]
+func cliPushGolden() {
+	cfg := defaultConfig()
+
+	tag := "latest"
+	for i, arg := range os.Args {
+		if arg == "--tag" && i+1 < len(os.Args) {
+			tag = os.Args[i+1]
+		}
+	}
+
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Find a running node to get the golden image from
+	var nodeIP string
+	for _, n := range state.Nodes {
+		if qemu.IsRunning(n.PID) {
+			nodeIP = n.BridgeIP
+			break
+		}
+	}
+	if nodeIP == "" {
+		fmt.Fprintln(os.Stderr, "No running nodes to fetch golden image from")
+		os.Exit(1)
+	}
+
+	// Get the current golden version from the node
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/golden/versions", nodeIP))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to query node golden versions: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var versions struct {
+		Head     string   `json:"head"`
+		Versions []string `json:"versions"`
+	}
+	json.NewDecoder(resp.Body).Decode(&versions)
+
+	if versions.Head == "" {
+		fmt.Fprintln(os.Stderr, "Node has no golden head version")
+		os.Exit(1)
+	}
+
+	fmt.Printf("Fetching golden image %s from node %s...\n", versions.Head, nodeIP)
+
+	// Stream the golden image from the node via SSH + zstd compression
+	os.MkdirAll(cfg.ImagesDir, 0755)
+	zstPath := filepath.Join(cfg.ImagesDir, fmt.Sprintf("golden-%s.ext4.zst", versions.Head))
+
+	// Use SSH to stream-compress the golden image from the node
+	sshCmd := fmt.Sprintf("ssh -i %s/host/ssh-key -o StrictHostKeyChecking=no ubuntu@%s "+
+		"'sudo zstd -c --sparse /var/lib/boxcutter/golden/%s.ext4' > %s",
+		cfg.RepoDir, nodeIP, versions.Head, zstPath)
+	fmt.Printf("  Compressing and downloading...\n")
+	cmd := exec.Command("sh", "-c", sshCmd)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		// Fallback: try with ~/.ssh/id_rsa
+		sshCmd2 := fmt.Sprintf("ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ubuntu@%s "+
+			"'sudo zstd -c --sparse /var/lib/boxcutter/golden/%s.ext4' > %s",
+			nodeIP, versions.Head, zstPath)
+		cmd2 := exec.Command("sh", "-c", sshCmd2)
+		cmd2.Stderr = os.Stderr
+		if err := cmd2.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to fetch golden image: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	fi, _ := os.Stat(zstPath)
+	fmt.Printf("  Compressed: %d MB\n", fi.Size()/(1024*1024))
+
+	// Push to ghcr.io
+	if tag == "latest" {
+		tag = versions.Head
+	}
+	fmt.Printf("Pushing golden image (tag: %s)...\n", tag)
+	ctx := context.Background()
+	tags := []string{tag}
+	if tag != "latest" {
+		tags = append(tags, "latest")
+	}
+
+	if err := oci.Push(ctx, oci.PushOptions{
+		Registry:   cfg.OCIRegistry,
+		Repository: cfg.OCIRepository,
+		VMType:     "golden",
+		Tags:       tags,
+		FilePath:   zstPath,
+		Version:    tag,
+		Auth:       cfg.ociAuth(),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Push failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Pushed golden image %s to %s/%s/golden:%s\n", versions.Head, cfg.OCIRegistry, cfg.OCIRepository, tag)
 }
 
 func parsePullArgs() (string, string) {

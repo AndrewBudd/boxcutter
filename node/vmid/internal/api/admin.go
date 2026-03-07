@@ -26,6 +26,8 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/vms", h.handleList)
 	mux.HandleFunc("GET /internal/vms/{id}", h.handleGet)
 	mux.HandleFunc("POST /internal/vms/{id}/github-token", h.handleMintGitHubToken)
+	mux.HandleFunc("POST /internal/ghcr-token", h.handleGHCRToken)
+	mux.HandleFunc("GET /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/sentinel/{sentinel}", h.handleSentinelSwap)
 }
 
@@ -118,6 +120,21 @@ func (h *AdminHandler) handleMintGitHubToken(w http.ResponseWriter, r *http.Requ
 	}
 
 	tok, err := h.github.MintToken(rec)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, tok)
+}
+
+func (h *AdminHandler) handleGHCRToken(w http.ResponseWriter, r *http.Request) {
+	if h.github == nil {
+		http.Error(w, "GitHub integration not configured", http.StatusNotFound)
+		return
+	}
+
+	tok, err := h.github.MintPackagesToken()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

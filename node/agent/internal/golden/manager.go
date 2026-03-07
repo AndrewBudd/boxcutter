@@ -22,11 +22,15 @@ const (
 	defaultOCIRepository = "AndrewBudd/boxcutter"
 )
 
+// TokenFunc returns a ghcr.io authentication token. Called before each OCI pull.
+type TokenFunc func() (string, error)
+
 // Manager handles golden image lifecycle on a single node.
 type Manager struct {
 	goldenDir string
 	registry  string
 	repo      string
+	tokenFn   TokenFunc
 
 	mu          sync.Mutex
 	currentHead string // the version currently set as head
@@ -34,9 +38,10 @@ type Manager struct {
 
 // Config for the golden image manager.
 type Config struct {
-	GoldenDir     string // default: /var/lib/boxcutter/golden
-	OCIRegistry   string // default: ghcr.io
-	OCIRepository string // default: AndrewBudd/boxcutter
+	GoldenDir     string    // default: /var/lib/boxcutter/golden
+	OCIRegistry   string    // default: ghcr.io
+	OCIRepository string    // default: AndrewBudd/boxcutter
+	TokenFunc     TokenFunc // optional: provides ghcr.io auth token
 }
 
 // NewManager creates a golden image manager.
@@ -55,6 +60,7 @@ func NewManager(cfg Config) *Manager {
 		goldenDir: cfg.GoldenDir,
 		registry:  cfg.OCIRegistry,
 		repo:      cfg.OCIRepository,
+		tokenFn:   cfg.TokenFunc,
 	}
 
 	// Read current head from symlink
@@ -163,6 +169,21 @@ func (m *Manager) pullFromOCI(version string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Authenticate oras CLI with ghcr.io if we have a token provider
+	if m.tokenFn != nil {
+		token, err := m.tokenFn()
+		if err != nil {
+			log.Printf("golden: warning: could not get ghcr token: %v", err)
+		} else {
+			loginCmd := exec.Command("oras", "login", m.registry, "-u", "boxcutter", "--password-stdin")
+			loginCmd.Stdin = strings.NewReader(token)
+			loginCmd.Stderr = os.Stderr
+			if err := loginCmd.Run(); err != nil {
+				log.Printf("golden: warning: oras login failed: %v", err)
+			}
+		}
+	}
+
 	// Pull using oras CLI (installed on nodes)
 	// OCI registries require lowercase repository names
 	ref := fmt.Sprintf("%s/%s/golden:%s", m.registry, strings.ToLower(m.repo), version)
@@ -195,13 +216,24 @@ func (m *Manager) pullFromOCI(version string) error {
 	destPath := filepath.Join(m.goldenDir, version+".ext4")
 
 	if strings.HasSuffix(srcFile, ".zst") {
-		// Decompress
+		// Decompress to temp file, then sparsify to save disk space
 		log.Printf("golden: decompressing %s", filepath.Base(srcFile))
-		cmd := exec.Command("zstd", "-d", "-f", srcFile, "-o", destPath)
+		tmpDest := destPath + ".tmp"
+		cmd := exec.Command("zstd", "-d", "-f", srcFile, "-o", tmpDest)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
+			os.Remove(tmpDest)
 			return fmt.Errorf("zstd decompress: %w", err)
+		}
+		// Punch holes in zero regions to make the file sparse
+		sparsify := exec.Command("fallocate", "--dig-holes", tmpDest)
+		if err := sparsify.Run(); err != nil {
+			log.Printf("golden: fallocate --dig-holes failed (non-fatal): %v", err)
+		}
+		if err := os.Rename(tmpDest, destPath); err != nil {
+			os.Remove(tmpDest)
+			return fmt.Errorf("renaming decompressed file: %w", err)
 		}
 	} else {
 		// Just move it

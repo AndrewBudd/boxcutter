@@ -1,0 +1,57 @@
+#!/bin/bash
+# One-time setup: authenticate with ghcr.io and create initial packages.
+#
+# GitHub App tokens cannot create NEW packages on personal accounts.
+# This script uses `gh auth login` to get a proper OAuth token, then
+# pushes minimal placeholder images to create the package namespaces.
+# After this, the GitHub App token can push to these packages.
+#
+# Usage: ./scripts/ghcr-setup
+
+set -euo pipefail
+
+REGISTRY="ghcr.io"
+OWNER="andrewbudd"
+PACKAGES=("boxcutter/golden" "boxcutter/node" "boxcutter/orchestrator")
+
+echo "=== ghcr.io Package Setup ==="
+echo "This is a one-time setup to create package namespaces on ghcr.io."
+echo ""
+
+# Check if gh is authenticated with write:packages scope
+if ! gh auth status 2>&1 | grep -q "Logged in"; then
+    echo "Logging in to GitHub with write:packages scope..."
+    gh auth login --hostname github.com --scopes write:packages
+fi
+
+# Get token from gh
+GH_TOKEN=$(gh auth token)
+
+echo "$GH_TOKEN" | oras login "$REGISTRY" -u "$OWNER" --password-stdin
+
+echo ""
+echo "Creating package namespaces..."
+
+for pkg in "${PACKAGES[@]}"; do
+    echo -n "  $REGISTRY/$OWNER/$pkg ... "
+
+    # Create a minimal file to push
+    tmpdir=$(mktemp -d)
+    echo "placeholder" > "$tmpdir/placeholder.txt"
+
+    if cd "$tmpdir" && oras push "$REGISTRY/$OWNER/$pkg:init" placeholder.txt 2>/dev/null; then
+        echo "created"
+        # Delete the init tag (keep the package)
+        oras manifest delete --force "$REGISTRY/$OWNER/$pkg:init" 2>/dev/null || true
+    else
+        echo "already exists or failed"
+    fi
+
+    rm -rf "$tmpdir"
+done
+
+echo ""
+echo "Done! Package namespaces are ready."
+echo "The GitHub App token can now push to these packages."
+echo ""
+echo "You can verify with: oras repo tags $REGISTRY/$OWNER/boxcutter/golden"
