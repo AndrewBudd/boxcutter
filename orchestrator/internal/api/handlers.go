@@ -36,12 +36,16 @@ func NewHandler(database *db.DB) *Handler {
 func (h *Handler) SetMQTT(mc *orchmqtt.Client) {
 	h.mqtt = mc
 
-	// On connect, publish the current golden head (if any)
+	// On connect, publish the current golden head (if any) — non-blocking
 	if mc != nil {
-		head := h.db.GetGoldenHead()
-		if head != "" {
-			mc.PublishGoldenHead(head)
-		}
+		go func() {
+			head := h.db.GetGoldenHead()
+			if head != "" {
+				if err := mc.PublishGoldenHead(head); err != nil {
+					log.Printf("mqtt: failed to publish initial golden head: %v", err)
+				}
+			}
+		}()
 	}
 }
 

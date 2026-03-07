@@ -68,16 +68,12 @@ func Connect(cfg Config) (*Client, error) {
 
 	c.client = paho.NewClient(opts)
 
-	// Connect in background (non-blocking — will retry automatically)
+	// Single connect call — paho's ConnectRetry + AutoReconnect handle retries
 	go func() {
-		for {
-			token := c.client.Connect()
-			token.Wait()
-			if token.Error() == nil {
-				return
-			}
-			log.Printf("mqtt: connect failed: %v, retrying in 5s", token.Error())
-			time.Sleep(5 * time.Second)
+		token := c.client.Connect()
+		token.Wait()
+		if token.Error() != nil {
+			log.Printf("mqtt: connect failed: %v (auto-retry enabled)", token.Error())
 		}
 	}()
 
