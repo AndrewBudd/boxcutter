@@ -110,8 +110,31 @@ func defaultConfig() HostConfig {
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,
 		GitHubInstallationID: 114361932,
-		GitHubPrivateKeyPath: filepath.Join(repoDir, ".boxcutter", "secrets", "github-app.pem"),
+		GitHubPrivateKeyPath: findGitHubAppKey(repoDir),
 	}
+}
+
+func findGitHubAppKey(repoDir string) string {
+	// Check repo-relative path first, then user home paths
+	candidates := []string{
+		filepath.Join(repoDir, ".boxcutter", "secrets", "github-app.pem"),
+	}
+	// Check SUDO_USER's home if running under sudo
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		if u, err := user.Lookup(sudoUser); err == nil {
+			candidates = append(candidates, filepath.Join(u.HomeDir, ".boxcutter", "secrets", "github-app.pem"))
+		}
+	}
+	// Current user's home
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".boxcutter", "secrets", "github-app.pem"))
+	}
+	for _, p := range candidates {
+		if fileExists(p) {
+			return p
+		}
+	}
+	return candidates[0] // return default even if not found
 }
 
 func (cfg HostConfig) ociAuth() *oci.GitHubAppAuth {

@@ -84,8 +84,12 @@ func newRepo(opts *PullOptions) (*remote.Repository, error) {
 		token = os.Getenv("GH_TOKEN")
 	}
 	if token == "" {
-		// Try gh CLI token (works for both push and pull on personal accounts)
-		if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+		// Try gh CLI token — under sudo, run as the real user for correct auth context
+		ghCmd := exec.Command("gh", "auth", "token")
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			ghCmd = exec.Command("sudo", "-u", sudoUser, "gh", "auth", "token")
+		}
+		if out, err := ghCmd.Output(); err == nil {
 			token = strings.TrimSpace(string(out))
 		}
 	}
