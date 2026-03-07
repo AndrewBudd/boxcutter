@@ -17,25 +17,32 @@ rebuilding everything manually.
 
 ## Design Principles
 
-1. **Control plane owns everything outside the VMs** — it is the sole authority
-   over all infrastructure: creating/destroying VMs (both QEMU nodes and
-   Firecracker dev VMs), version rollouts, capacity management, health
-   monitoring, bridge/NAT/TAP networking. It runs on bare metal as a Go binary.
-2. **Nothing inside the VMs can reach the control plane** — the control plane's
+1. **Control plane makes the service exist and keeps it existing** — it creates
+   the QEMU VMs (orchestrator + nodes), deploys new versions, adds/frees
+   capacity, and ensures the orchestrator and nodes stay up. It manages all
+   resources outside the VMs: bridge, NAT, TAP, disk images. It runs on bare
+   metal as a Go binary.
+2. **Data plane is the service** — the orchestrator and node VMs are the
+   running service. Everything that happens at runtime — creating Firecracker
+   dev VMs, scheduling them onto nodes, distributing SSH keys, building golden
+   images, handling user sessions — is a data plane activity owned by the
+   orchestrator and nodes.
+3. **Nothing inside the VMs can reach the control plane** — the control plane's
    API (unix socket) is strictly localhost-only. The orchestrator, nodes, and
    Firecracker VMs have no mechanism to communicate with it. This is a hard
    security boundary.
-3. **Control plane calls into VMs, never the reverse** — the control plane
-   reaches into nodes to check capacity, enumerate running Firecrackers, move
-   workloads during drains, and verify health. Communication is always initiated
-   by the control plane.
-4. **Orchestrator is the user-facing entry point** — it runs inside a VM and
-   handles SSH sessions, user authentication (SSH keys), and exposes the
-   user-facing API. It has no infrastructure authority and no awareness of the
-   control plane.
-5. **Nodes are immutable cattle** — upgrade by building a new node VM and
+4. **Control plane calls into VMs, never the reverse** — during upgrades and
+   capacity changes, the control plane reaches into nodes to check capacity
+   and move Firecrackers. Communication is always initiated by the control
+   plane.
+5. **If the control plane goes away, everything keeps running** — the data
+   plane operates independently. Users can create Firecracker VMs, SSH in,
+   distribute keys, build golden images — all without the control plane. The
+   only thing that stops working is adding capacity, upgrading, and crash
+   recovery of QEMU VMs.
+6. **Nodes are immutable cattle** — upgrade by building a new node VM and
    draining the old one, never by patching in place.
-6. **Build from source every time** — no binary distribution; git tags provide
+7. **Build from source every time** — no binary distribution; git tags provide
    versioning.
 
 ## Architecture Overview
@@ -44,33 +51,57 @@ rebuilding everything manually.
 ┌──────────────────────────────────────────────────────────────┐
 │  Physical Host (bare metal)                                  │
 │                                                              │
-│  boxcutter-host (Go binary) — THE CONTROL PLANE              │
-│    - creates ALL VMs: orchestrator, nodes, Firecracker VMs   │
+│  boxcutter-host (Go binary) — CONTROL PLANE                  │
+│    - creates QEMU VMs (orchestrator + nodes)                 │
 │    - manages all resources outside VMs:                      │
 │        bridge, TAP devices, NAT, disk images                 │
 │    - orchestrates version rollouts / deployments             │
-│    - adds / frees capacity                                   │
-│    - ensures orchestrator + allocated VMs are up             │
+│    - adds / frees capacity (node VMs)                        │
+│    - ensures orchestrator + node VMs are up                  │
 │    - calls INTO VMs to check capacity, move Firecrackers     │
 │    - control plane: unix socket only (localhost)             │
 │    - NOTHING inside the VMs can communicate with it          │
 │                                                              │
-│  ┌─────────────────────┐  ┌──────────────────────────────┐   │
-│  │ Orchestrator VM     │  │ Node VM (immutable)          │   │
-│  │ - SSH entry point   │  │ - runs Firecracker microVMs  │   │
-│  │ - user auth (keys)  │  │ - vmid, proxy, agent         │   │
-│  │ - user-facing API   │  │ - responds to control plane  │   │
-│  │ - no infra authority│  │   queries (capacity, VM list) │   │
-│  │ - no host access    │  │                              │   │
-│  └─────────────────────┘  │ Node VM 2... N               │   │
-│                           └──────────────────────────────┘   │
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │  DATA PLANE (the running service)                     │   │
+│  │                                                       │   │
+│  │  Orchestrator VM          Node VMs (immutable)        │   │
+│  │  - SSH entry point        - run Firecracker microVMs  │   │
+│  │  - user auth (SSH keys)   - vmid, proxy, agent        │   │
+│  │  - creates Firecracker    - golden image builds       │   │
+│  │    VMs on nodes           - respond to orchestrator   │   │
+│  │  - distributes keys                                   │   │
+│  │  - schedules workloads    Node VM 2... N              │   │
+│  │                                                       │   │
+│  │  Operates independently of control plane.             │   │
+│  │  Cannot reach control plane.                          │   │
+│  └───────────────────────────────────────────────────────┘   │
 │                                                              │
-│  Communication is ONE-WAY: control plane → VMs.              │
-│  VMs cannot initiate communication with the control plane.   │
 │  The operator interacts with the control plane via CLI on    │
 │  the physical machine.                                       │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+## Control Plane vs Data Plane
+
+| Activity | Plane | Why |
+|---|---|---|
+| Create/destroy QEMU VMs (orchestrator, nodes) | Control | Making the service exist |
+| Bridge, NAT, TAP networking | Control | Resources outside VMs |
+| Version rollouts / deployments | Control | Upgrading the service |
+| Add / free node capacity | Control | Scaling the service |
+| Ensure orchestrator + nodes are up | Control | Keeping the service existing |
+| Move Firecrackers during node drain | Control | Part of upgrading the service |
+| Create/destroy Firecracker dev VMs | **Data** | Service behavior (user request) |
+| Schedule Firecrackers onto nodes | **Data** | Service behavior (orchestrator decides) |
+| SSH key management + distribution | **Data** | Service behavior (user auth) |
+| Golden image builds + distribution | **Data** | Service behavior (dev environment tooling) |
+| User SSH sessions | **Data** | Service behavior |
+| GitHub key distribution | **Data** | Service behavior |
+| VM migration (non-upgrade) | **Data** | Service behavior |
+
+**Key test**: if the control plane goes away, does this still work? If yes,
+it's data plane. If no, it's control plane.
 
 ## Installation Flow
 
@@ -89,12 +120,12 @@ make install-host
 
 `boxcutter-host` is responsible for:
 - Creating/managing the bridge device, TAP devices, and NAT rules
-- Building all VM images from source (`go build` + cloud-init ISO packaging)
-- Creating/destroying/monitoring all VMs (QEMU nodes + Firecracker dev VMs)
-- Health-checking the orchestrator and all allocated VMs, restarting on crash
+- Building QEMU VM images from source (`go build` + cloud-init ISO packaging)
+- Creating/destroying/monitoring QEMU VMs (orchestrator + nodes)
+- Health-checking the orchestrator and nodes, restarting them on crash
 - Orchestrating version rollouts and deployments
-- Managing host capacity (vCPU/RAM budgets across all VMs)
-- Calling into node VMs to check capacity, enumerate Firecrackers, move workloads
+- Adding/freeing node capacity
+- Calling into nodes during upgrades to check capacity and move Firecrackers
 
 The control plane is a **unix socket** (`/run/boxcutter-host.sock`) and a CLI
 that talks to it. It is NOT exposed on any network interface. Nothing inside the
@@ -103,8 +134,8 @@ bridge network can reach it.
 ```bash
 # Operator interacts via CLI on the physical machine only
 boxcutter-host status
-boxcutter-host vm list
-boxcutter-host vm create --repo github.com/org/repo
+boxcutter-host node add --vcpu 12 --ram 48G
+boxcutter-host node remove node-2
 boxcutter-host upgrade --to v0.4.0
 ```
 
@@ -134,7 +165,7 @@ This command:
 4. Creates a QCOW2 disk, launches the orchestrator VM
 5. Builds the node agent binary from the same git checkout
 6. Packages it, creates disk, launches the first node VM
-7. Waits for both to come up (health checks via calls into each VM)
+7. Calls into each VM to verify health
 8. Records the cluster state in `/var/lib/boxcutter/cluster.json`
 
 The control plane assigns all identities at build time:
@@ -142,64 +173,23 @@ The control plane assigns all identities at build time:
 - **Node 1**: bridge IP `192.168.50.3`, hostname `boxcutter-node-1`
 - **Secrets**: Tailscale keys, SSH keypairs, CA certs — all baked into cloud-init
 
-### Phase 2: Add capacity
+### Phase 2: System is operational
 
-The operator adds nodes via the control plane CLI:
+Once the orchestrator and at least one node are up, the **data plane takes
+over**. The service is now running and handles everything at runtime:
 
-```bash
-boxcutter-host node add --vcpu 12 --ram 48G
-# Control plane:
-#   1. Assigns next bridge IP (192.168.50.4)
-#   2. Builds node image from current git ref
-#   3. Launches node VM
-#   4. Calls into node to verify it's ready
-```
+- Users SSH into the orchestrator to create Firecracker dev VMs
+- Orchestrator schedules Firecrackers onto available nodes
+- Orchestrator distributes SSH keys, manages golden images
+- Nodes run Firecrackers, vmid, proxy
 
-The control plane decides IPs, resource allocation, and when nodes are healthy.
-The orchestrator discovers new nodes only when users SSH in and the control
-plane has already made them available.
+The control plane's ongoing role is limited to:
+- Health-checking the orchestrator and node VMs (restart on crash)
+- Adding/removing node capacity when the operator requests it
+- Upgrading versions when the operator requests it
 
-### Phase 3: Golden image build
-
-The control plane triggers the golden image build by calling into a node:
-
-```
-Control plane → Node: build golden image (debootstrap + provision)
-Control plane → Nodes: distribute golden image to all nodes (rsync)
-```
-
-The golden image version is tracked by the control plane in `cluster.json`.
-
-### Phase 4: Creating dev VMs
-
-When a dev VM is needed, the control plane creates it:
-
-```bash
-boxcutter-host vm create \
-  --name bold-fox \
-  --repo github.com/org/repo \
-  --vcpu 4 --ram 8G
-```
-
-The control plane:
-1. Checks capacity across nodes (calls into each node's agent)
-2. Picks the node with the most available resources
-3. Calls into the selected node agent to create the Firecracker VM
-4. Records the VM in `cluster.json`
-5. Returns the VM's Tailscale IP / connection info
-
-### Phase 5: System is operational
-
-On host reboot, the control plane brings everything back up automatically:
-
-1. systemd starts `boxcutter-host.service`
-2. Control plane reads cluster state from `/var/lib/boxcutter/cluster.json`
-3. Recreates bridge + NAT (idempotent)
-4. Launches orchestrator VM, then all node VMs
-5. Calls into each VM to verify health
-6. Calls into each node to restart any Firecracker VMs that were previously
-   allocated
-7. System operational
+If the control plane process stops, the data plane continues operating
+normally. Users can create and use Firecracker VMs without interruption.
 
 ## Versioning: Git Tags
 
@@ -212,7 +202,7 @@ git push origin v0.3.0
 
 The control plane knows:
 - **Its own version** — baked in at build time via `-ldflags "-X main.Version=v0.3.0"`
-- **What version each VM was built from** — recorded in `cluster.json`
+- **What version each QEMU VM was built from** — recorded in `cluster.json`
 - **What git ref to use for the next build** — configurable, defaults to latest tag
 
 ```go
@@ -227,9 +217,8 @@ $ boxcutter-host status
 Control plane:  v0.4.0
 Orchestrator:   v0.3.0 (bridge: 192.168.50.2, healthy)
 Nodes:
-  node-1:       v0.3.0 (bridge: 192.168.50.3, healthy, 8/12 vCPU used)
-  node-2:       v0.3.0 (bridge: 192.168.50.4, healthy, 4/12 vCPU used)
-Firecracker VMs: 6 running across 2 nodes
+  node-1:       v0.3.0 (bridge: 192.168.50.3, healthy)
+  node-2:       v0.3.0 (bridge: 192.168.50.4, healthy)
 Latest tag:     v0.4.0
 ```
 
@@ -259,7 +248,7 @@ The control plane performs the following steps:
 5. Drain old node:
    a. Call into old node: list all running Firecrackers
    b. For each Firecracker: stop it, rsync COW to new node, start on new node
-   c. Control plane orchestrates each migration directly
+   c. Control plane coordinates each migration directly
 6. Once drained, stop old node VM
 7. Old node's disk is archived or deleted
 8. Update cluster.json
@@ -273,16 +262,12 @@ Timeline:
   [done] Old node retired
 ```
 
-The control plane coordinates the entire drain directly — it calls into nodes
-to stop/start Firecrackers and rsyncs data between them. No orchestrator
-involvement.
-
 Active VMs experience a brief interruption during migration (stop → transfer →
 start), but the system as a whole stays available — other nodes continue serving.
 
 ### Upgrading the Orchestrator (brief downtime)
 
-The control plane also upgrades the orchestrator. Running Firecracker VMs are
+The control plane upgrades the orchestrator. Running Firecracker VMs are
 unaffected — they don't depend on the orchestrator at runtime.
 
 The orchestrator's QCOW2 disk persists across upgrades — the control plane
@@ -313,70 +298,70 @@ binary handles it on startup (standard SQLite migration pattern).
 
 ### Upgrading the Golden Image
 
+Golden image upgrades are a data plane concern — the orchestrator and nodes
+handle this without control plane involvement. The operator triggers it via
+SSH to the orchestrator:
+
 ```
-1. Control plane triggers golden image rebuild on a node
-   (calls into node agent to run debootstrap + provision)
-2. Control plane distributes new image to all nodes (rsync)
-3. Control plane records new version in cluster.json
+1. Orchestrator triggers golden image rebuild on a node (debootstrap + provision)
+2. Orchestrator distributes new image to all nodes (rsync over Tailscale)
+3. Orchestrator records new version in its DB
 4. New Firecracker VMs use the new golden image
-5. Existing VMs are unaffected (they have their own COW snapshots
-   backed by whatever golden version they were created from)
+5. Existing VMs are unaffected (they have their own COW snapshots)
 ```
 
-No migration needed. Old VMs continue working with their old golden base.
+No control plane involvement. No migration needed.
 
 ## Data Directionality
-
-Communication is strictly one-way: control plane → VMs. Nothing inside the
-VMs can initiate a connection to the control plane.
 
 ```
 Control plane (bare metal)     ← operator controls via CLI
   │
-  │ calls into VMs (bridge network)
-  │ creates/destroys VMs (QEMU + Firecracker)
+  │ creates/destroys QEMU VMs
+  │ calls into VMs during upgrades + health checks
   │ manages all resources outside VMs
+  │ (one-way: control plane → VMs)
   ▼
 ┌──────────────────────────────────────────┐
-│  Environment (inside VMs)                │
+│  Data Plane (the running service)        │
 │                                          │
 │  Orchestrator VM  ←→  Node VMs           │
 │  (user-facing)        (run Firecrackers) │
 │                                          │
+│  Operates independently.                 │
 │  Cannot reach control plane.             │
-│  Can communicate with each other via     │
-│  bridge network and Tailscale.           │
+│  Communicates internally via bridge      │
+│  network and Tailscale.                  │
 └──────────────────────────────────────────┘
 ```
 
-### Control plane → VMs (all communication)
+### Control plane → VMs (during upgrades and health checks only)
 
-The control plane calls into VMs for everything:
+- **Health checks**: periodic probes to orchestrator and node VMs
+- **Capacity checks**: `GET /api/capacity` on node agents (during drain)
+- **Firecracker listing**: `GET /api/vms` on node agents (during drain)
+- **Firecracker stop/start**: during drain, stop on old node, start on new
+- **rsync COW data**: during drain, transfer Firecracker disk between nodes
 
-- **Node capacity checks**: `GET /api/capacity` on node agents
-- **Firecracker creation**: `POST /api/vms` on node agents
-- **Firecracker listing**: `GET /api/vms` on node agents
-- **Firecracker stop/start**: `POST /api/vms/{name}/stop` on node agents
-- **Drain coordination**: stop Firecracker on old node, rsync COW, start on new
-- **Health checks**: periodic probes to orchestrator and all nodes
-- **Golden image build**: trigger build + distribute via rsync
+### Inside the data plane (VM ↔ VM, all runtime activity)
 
-### Inside the environment (VM ↔ VM)
+The orchestrator and nodes communicate freely over bridge network and
+Tailscale. All service behavior lives here:
 
-Within the environment, the orchestrator and nodes can communicate with each
-other over the bridge network and Tailscale. This is internal to the
-environment and invisible to the control plane:
-
-- **Node registration with orchestrator**: nodes report their identity so the
-  orchestrator knows what's available for user-facing queries
+- **Firecracker creation**: user SSHes to orchestrator → orchestrator calls
+  node agent to create Firecracker VM
+- **Scheduling**: orchestrator checks node capacity, picks best node
 - **SSH key distribution**: orchestrator pushes authorized keys to nodes
-- **User-facing VM info**: orchestrator queries nodes for VM status to display
-  to users via SSH
+- **Golden image builds**: orchestrator triggers on a node, distributes
+- **GitHub key / credential management**: orchestrator distributes to nodes
+- **Node registration**: nodes report to orchestrator so it knows what's
+  available
 
 ### Upward flow (none)
 
 There is no upward flow. The orchestrator and nodes cannot reach the control
-plane. They don't know it exists.
+plane. They don't know it exists. The control plane is not part of their
+configuration, not in their DNS, not on any network they can reach.
 
 ### Bootstrap data for a new node
 
@@ -396,7 +381,7 @@ secrets:
   ssh_private_key: "..."                       # for SSHing into VMs
   authorized_keys: ["ssh-rsa ...", ...]        # who can access
 
-# Points at the orchestrator (for internal VM-to-VM communication only)
+# Points at the orchestrator (data plane internal communication)
 orchestrator:
   url: "http://192.168.50.2:8801"
 ```
@@ -414,14 +399,16 @@ Host reboot
   │    - launches all node VMs (in parallel)
   │    - calls into each VM to verify health
   │
-  ├─ Calls into each node to restart allocated Firecracker VMs
+  ├─ Data plane boots:
+  │    - orchestrator starts, reads its DB
+  │    - nodes start, register with orchestrator
+  │    - orchestrator tells nodes to restart previously-running Firecrackers
   │
   └─ System operational
 
-The control plane owns the entire boot sequence. It knows what VMs should
-exist (from cluster.json), creates them, and verifies they're healthy by
-calling into them. The orchestrator and nodes are passive — they boot and
-wait to be used.
+The control plane launches the QEMU VMs and verifies they're healthy.
+The data plane handles everything else: restarting Firecrackers,
+re-establishing node registration, resuming service.
 ```
 
 ## Version / Release Workflow
@@ -448,33 +435,15 @@ git diff v0.3.0..v0.4.0 --name-only
 # If orchestrator/ changed → orchestrator upgrade (stop, rebuild ISO, relaunch)
 # If node/ changed → rolling node upgrade (build new, drain old, retire)
 # If host/ changed → control plane self-update (rebuild binary, systemctl restart)
-# If golden/ changed → golden image rebuild (trigger on a node, distribute)
+# If golden/ changed → no control plane action (data plane concern)
 ```
-
-## Responsibility Matrix
-
-| Concern | Owner | Why |
-|---|---|---|
-| Bridge, NAT, TAP devices | Control plane | Bare metal resource |
-| Building VM images (go build + ISO) | Control plane | Requires git checkout + Go toolchain on host |
-| Creating/destroying QEMU node VMs | Control plane | Bare metal process management |
-| Creating/destroying Firecracker VMs | Control plane | Calls into node agents |
-| Health-checking all VMs | Control plane | Availability — restart on crash |
-| Rolling node upgrades | Control plane | Build new, drain (move Firecrackers), retire |
-| Orchestrator upgrades | Control plane | Rebuild ISO, relaunch |
-| Golden image builds + distribution | Control plane | Triggers on node, distributes via rsync |
-| Capacity management (vCPU/RAM) | Control plane | Physical resource limits + scheduling |
-| Drain coordination (moving Firecrackers) | Control plane | Calls into nodes to stop/rsync/start |
-| SSH entry point for users | Orchestrator | User-facing service inside environment |
-| SSH key management | Orchestrator | User authentication |
-| User-facing VM status queries | Orchestrator | Queries nodes for display to users |
 
 ## Summary
 
-| Component | Install | Upgrade | State |
-|---|---|---|---|
-| **Control plane** | `make install-host` (Go binary + systemd) | Self-update via `boxcutter-host upgrade` | `/etc/boxcutter/host.yaml` + `/var/lib/boxcutter/cluster.json` |
-| **Orchestrator** | Built by control plane during bootstrap | Control plane rebuilds ISO, relaunches (same disk) | SQLite DB on QCOW2 disk (SSH keys, survives upgrades) |
-| **Node VMs** | Built by control plane (`node add` or bootstrap) | Control plane: build new → drain → retire | Stateless (Firecrackers have their own COW state) |
-| **Golden image** | Built by control plane on a node | Rebuild + distribute (existing VMs unaffected) | ext4 file on each node |
-| **Firecracker VMs** | Created by control plane via node agent | N/A (ephemeral, destroy and recreate) | COW snapshot (per-VM, backed by golden image) |
+| Component | Install | Upgrade | State | Plane |
+|---|---|---|---|---|
+| **Control plane** | `make install-host` (Go binary + systemd) | Self-update via `boxcutter-host upgrade` | `/etc/boxcutter/host.yaml` + `/var/lib/boxcutter/cluster.json` | Control |
+| **Orchestrator** | Built by control plane during bootstrap | Control plane rebuilds ISO, relaunches (same disk) | SQLite DB on QCOW2 disk (SSH keys, survives upgrades) | Data |
+| **Node VMs** | Built by control plane (`node add` or bootstrap) | Control plane: build new → drain → retire | Stateless (Firecrackers have their own COW state) | Data |
+| **Golden image** | Built by orchestrator on a node | Rebuild + distribute (data plane, no control plane) | ext4 file on each node | Data |
+| **Firecracker VMs** | Created by orchestrator via node agent | N/A (ephemeral, destroy and recreate) | COW snapshot (per-VM, backed by golden image) | Data |
