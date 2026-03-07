@@ -545,6 +545,18 @@ func (m *Manager) GCGoldenImages() []string {
 	return removed
 }
 
+// GoldenVersionsInUse returns the set of golden versions referenced by running VMs.
+func (m *Manager) GoldenVersionsInUse() map[string]bool {
+	vms, _ := ListVMs()
+	inUse := make(map[string]bool)
+	for _, v := range vms {
+		if v.GoldenVer != "" {
+			inUse[v.GoldenVer] = true
+		}
+	}
+	return inUse
+}
+
 // Health returns node health and capacity info.
 func (m *Manager) Health() map[string]interface{} {
 	vms, _ := ListVMs()

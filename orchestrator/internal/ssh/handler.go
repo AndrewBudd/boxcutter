@@ -67,6 +67,12 @@ func (h *Handler) Run(args []string) int {
 		return h.cmdCopy(target, dstName)
 	case "images":
 		return h.cmdImages()
+	case "golden":
+		if len(args) < 3 || args[1] != "set-head" {
+			fmt.Println("Usage: ssh <host> golden set-head <version>")
+			return 1
+		}
+		return h.cmdGoldenSetHead(args[2])
 	case "status":
 		return h.cmdStatus()
 	case "nodes":
@@ -365,6 +371,12 @@ func (h *Handler) cmdCopy(srcName, dstName string) int {
 }
 
 func (h *Handler) cmdImages() int {
+	// Get golden head version
+	headResp, _ := h.get("/api/golden/head")
+	var headResult map[string]string
+	json.Unmarshal(headResp, &headResult)
+	head := headResult["version"]
+
 	resp, err := h.get("/api/golden")
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -372,6 +384,10 @@ func (h *Handler) cmdImages() int {
 	}
 	var images []map[string]interface{}
 	json.Unmarshal(resp, &images)
+
+	if head != "" {
+		fmt.Printf("HEAD: %s\n\n", head)
+	}
 
 	if len(images) == 0 {
 		fmt.Println("No golden images found. Images are discovered from nodes every 30 seconds.")
@@ -388,8 +404,25 @@ func (h *Handler) cmdImages() int {
 				nodeNames = append(nodeNames, s)
 			}
 		}
-		fmt.Printf("%-40s %s\n", version, strings.Join(nodeNames, ", "))
+		marker := ""
+		if version == head {
+			marker = " ← head"
+		}
+		fmt.Printf("%-40s %s%s\n", version, strings.Join(nodeNames, ", "), marker)
 	}
+	return 0
+}
+
+func (h *Handler) cmdGoldenSetHead(version string) int {
+	result, err := h.post("/api/golden/head", map[string]string{"version": version})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var res map[string]interface{}
+	json.Unmarshal(result, &res)
+	fmt.Printf("Golden head set to %s\n", version)
+	fmt.Println("Nodes will pull the new version automatically via MQTT.")
 	return 0
 }
 
@@ -479,6 +512,7 @@ Commands:
   start <name>            Start a stopped VM
   cp <name> [new-name]    Copy a VM (clone its disk)
   images                  List golden images across all nodes
+  golden set-head <ver>   Set golden image head version (nodes pull via MQTT)
   status                  Cluster capacity summary
   nodes                   List all nodes
   adduser <github-user>   Add SSH keys from GitHub (for new VMs)

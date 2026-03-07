@@ -17,6 +17,8 @@ import (
 
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/api"
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/config"
+	"github.com/AndrewBudd/boxcutter/node/agent/internal/golden"
+	nodemqtt "github.com/AndrewBudd/boxcutter/node/agent/internal/mqtt"
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/network"
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/vm"
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/vmid"
@@ -50,6 +52,8 @@ func main() {
 		log.Println("vmid: not available (will retry on VM operations)")
 	}
 
+	hostname, _ := os.Hostname()
+
 	// VM manager
 	mgr := vm.NewManager(cfg, vmidClient)
 
@@ -80,6 +84,42 @@ func main() {
 
 	// Auto-build golden image if missing
 	go autoGoldenBuild(mgr)
+
+	// Golden image manager — handles OCI pulls and version switching
+	goldenMgr := golden.NewManager(golden.Config{
+		GoldenDir: filepath.Dir(cfg.Storage.GoldenLocalPath),
+	})
+
+	// MQTT client — connect to broker on host bridge
+	var mqttClient *nodemqtt.Client
+	mqttClient, err = nodemqtt.Connect(nodemqtt.Config{
+		BrokerAddr: nodemqtt.BrokerAddrFromEnv(),
+		NodeID:     hostname,
+		OnGolden: func(version string) {
+			if err := goldenMgr.SetHead(version); err != nil {
+				log.Printf("mqtt: failed to set golden head %s: %v", version, err)
+				return
+			}
+			// Publish updated image list
+			if mqttClient != nil {
+				mqttClient.PublishImages(goldenMgr.Versions())
+			}
+		},
+	})
+	if err != nil {
+		log.Printf("mqtt: connection failed (non-fatal): %v", err)
+	} else {
+		defer mqttClient.Close()
+
+		// Periodic status publishing
+		go mqttStatusLoop(mgr, mqttClient, goldenMgr)
+
+		// Publish initial image list
+		mqttClient.PublishImages(goldenMgr.Versions())
+	}
+
+	// Register golden manager with the API handler for golden endpoints
+	handler.SetGoldenManager(goldenMgr)
 
 	// Register with orchestrator if configured
 	if cfg.Orchestrator.URL != "" {
@@ -198,6 +238,30 @@ func registerWithOrchestrator(cfg *config.Config, mgr *vm.Manager) {
 
 	// Start heartbeat loop
 	go heartbeatLoop(orchURL, hostname, mgr)
+}
+
+func mqttStatusLoop(mgr *vm.Manager, mc *nodemqtt.Client, gm *golden.Manager) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		health := mgr.Health()
+		ramTotal, _ := health["ram_total_mib"].(int)
+		ramAlloc, _ := health["ram_allocated_mib"].(int)
+		vmsRunning, _ := health["vms_running"].(int)
+		goldenReady, _ := health["golden_ready"].(bool)
+		hostname, _ := health["hostname"].(string)
+
+		mc.PublishStatus(&nodemqtt.NodeStatus{
+			Hostname:        hostname,
+			RAMTotalMIB:     ramTotal,
+			RAMAllocatedMIB: ramAlloc,
+			VMsRunning:      vmsRunning,
+			GoldenReady:     goldenReady,
+			GoldenHead:      gm.CurrentHead(),
+			Status:          "active",
+		})
+	}
 }
 
 func heartbeatLoop(orchURL, nodeID string, mgr *vm.Manager) {

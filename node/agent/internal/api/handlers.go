@@ -12,15 +12,22 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/AndrewBudd/boxcutter/node/agent/internal/golden"
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/vm"
 )
 
 type Handler struct {
-	mgr *vm.Manager
+	mgr      *vm.Manager
+	goldenMgr *golden.Manager
 }
 
 func NewHandler(mgr *vm.Manager) *Handler {
 	return &Handler{mgr: mgr}
+}
+
+// SetGoldenManager sets the golden image manager for OCI-based golden image management.
+func (h *Handler) SetGoldenManager(gm *golden.Manager) {
+	h.goldenMgr = gm
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -137,6 +144,15 @@ func (h *Handler) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Trigger golden image GC after VM destruction
+	if h.goldenMgr != nil {
+		go func() {
+			inUse := h.mgr.GoldenVersionsInUse()
+			h.goldenMgr.GCUnused(inUse)
+		}()
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -373,9 +389,13 @@ func (h *Handler) handleCopy(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleGoldenVersions(w http.ResponseWriter, r *http.Request) {
 	versions := vm.ListGoldenVersions(h.mgr.GoldenDir())
-	writeJSON(w, map[string]interface{}{
+	result := map[string]interface{}{
 		"versions": versions,
-	})
+	}
+	if h.goldenMgr != nil {
+		result["head"] = h.goldenMgr.CurrentHead()
+	}
+	writeJSON(w, result)
 }
 
 func (h *Handler) handleGoldenCheck(w http.ResponseWriter, r *http.Request) {

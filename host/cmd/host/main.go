@@ -138,6 +138,16 @@ func runDaemon() {
 
 	log.Println("boxcutter-host starting...")
 
+	// 0. Start mosquitto broker
+	mosquittoProc := startMosquitto(cfg)
+	if mosquittoProc != nil {
+		defer func() {
+			log.Println("Stopping mosquitto...")
+			mosquittoProc.Process.Signal(syscall.SIGTERM)
+			mosquittoProc.Wait()
+		}()
+	}
+
 	// 1. Set up bridge + NAT
 	if err := bridge.Setup(bridge.Config{
 		BridgeDevice: cfg.BridgeDevice,
@@ -762,13 +772,19 @@ func cliUpgrade() {
 
 	ctx := context.Background()
 
-	// For "all", pull both
+	// For "all", upgrade both node and orchestrator
 	types := []string{vmType}
 	if vmType == "all" {
 		types = []string{"node", "orchestrator"}
 	}
 
 	for _, t := range types {
+		if t == "golden" {
+			// Golden image upgrade: tell orchestrator to set head, nodes pull via MQTT
+			upgradeGolden(cfg, state, tag)
+			continue
+		}
+
 		fmt.Printf("Pulling %s image (tag: %s)...\n", t, tag)
 		meta, outputFile, err := oci.Pull(ctx, oci.PullOptions{
 			Registry:   cfg.OCIRegistry,
@@ -802,6 +818,74 @@ func cliUpgrade() {
 			upgradeOrchestrator(cfg, state, basePath, meta)
 		}
 	}
+}
+
+// upgradeGolden tells the orchestrator to set a new golden head version.
+// Nodes subscribed to MQTT will pull it automatically.
+func upgradeGolden(cfg HostConfig, state *cluster.State, tag string) {
+	fmt.Printf("\n--- Upgrading golden image to %s ---\n", tag)
+
+	if state.Orchestrator == nil {
+		fmt.Fprintln(os.Stderr, "No orchestrator in cluster state")
+		os.Exit(1)
+	}
+
+	orchAddr := fmt.Sprintf("http://%s:8801", state.Orchestrator.BridgeIP)
+
+	// Set the golden head version on the orchestrator
+	setHeadReq := map[string]string{"version": tag}
+	data, _ := json.Marshal(setHeadReq)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(orchAddr+"/api/golden/head", "application/json", bytes.NewReader(data))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to set golden head: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "Failed to set golden head (HTTP %d): %s\n", resp.StatusCode, string(body))
+		os.Exit(1)
+	}
+
+	fmt.Printf("  Golden head set to %s on orchestrator\n", tag)
+	fmt.Printf("  Nodes will pull the new version via MQTT notification\n")
+
+	// Poll nodes until they all have the new golden version
+	fmt.Printf("  Waiting for nodes to pull golden image...\n")
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		allReady := true
+		for _, n := range state.Nodes {
+			if !qemu.IsRunning(n.PID) {
+				continue
+			}
+			health := queryNodeHealth(n.BridgeIP)
+			if health == nil {
+				allReady = false
+				continue
+			}
+			// Check if node has the golden version via its API
+			nodeClient := &http.Client{Timeout: 3 * time.Second}
+			resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/golden/%s", n.BridgeIP, tag))
+			if err != nil || resp.StatusCode != 200 {
+				allReady = false
+				if resp != nil {
+					resp.Body.Close()
+				}
+				continue
+			}
+			resp.Body.Close()
+		}
+		if allReady {
+			fmt.Printf("  All nodes have golden image %s\n", tag)
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+	fmt.Printf("  Warning: timeout waiting for all nodes to pull golden image\n")
 }
 
 func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *oci.ImageMetadata) {
@@ -881,6 +965,12 @@ func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *o
 			continue
 		}
 
+		// Wait for golden image to be ready on new node
+		fmt.Printf("  Waiting for golden image on %s...\n", newID)
+		if !waitForGoldenReady(newBridgeIP, 300*time.Second) {
+			log.Printf("New node %s golden image not ready, proceeding anyway", newID)
+		}
+
 		fmt.Printf("  Draining old node %s...\n", oldNode.ID)
 		drainNode(cfg, state, oldNode.ID)
 		fmt.Printf("  Node %s upgraded to %s\n", oldNode.ID, newID)
@@ -895,7 +985,15 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		return
 	}
 
-	orchDisk := fmt.Sprintf("%s/orchestrator.qcow2", cfg.ImagesDir)
+	oldOrch := state.Orchestrator
+
+	// 1. Provision new orchestrator with a fresh bridge IP
+	newNum := state.NextNodeNum() + 100 // use high octet to avoid collision with nodes
+	newOctet := cfg.NodeIPOffset + newNum
+	newBridgeIP := fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
+	newTAP := fmt.Sprintf("tap-orch-new")
+	newMAC := fmt.Sprintf("52:54:00:00:01:%02x", newOctet%256)
+	newDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
 	orchISO := fmt.Sprintf("%s/orchestrator-cloud-init.iso", cfg.ImagesDir)
 
 	if !fileExists(orchISO) {
@@ -904,17 +1002,11 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		return
 	}
 
-	fmt.Println("  Stopping old orchestrator...")
-	qemu.Stop("orchestrator", state.Orchestrator.PID)
-
-	orchDiskNew := orchDisk + ".new"
-	if err := createCOWDisk(basePath, orchDiskNew, cfg.OrchestratorDisk); err != nil {
+	fmt.Printf("  Creating new orchestrator disk from base image...\n")
+	if err := createCOWDisk(basePath, newDisk, cfg.OrchestratorDisk); err != nil {
 		log.Printf("Failed to create orchestrator disk: %v", err)
 		return
 	}
-
-	os.Rename(orchDisk, orchDisk+".bak")
-	os.Rename(orchDiskNew, orchDisk)
 
 	currentUser, _ := user.Current()
 	username := "root"
@@ -922,40 +1014,121 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		username = currentUser.Username
 	}
 
-	bridge.EnsureTAP(cfg.OrchestratorTAP, cfg.BridgeDevice, username)
-	pid, err := qemu.Launch(qemu.VMConfig{
-		Name: "orchestrator",
-		VCPU: cfg.OrchestratorVCPU,
-		RAM:  cfg.OrchestratorRAM,
-		Disk: orchDisk,
-		ISO:  orchISO,
-		TAP:  cfg.OrchestratorTAP,
-		MAC:  cfg.OrchestratorMAC,
-	}, cfg.ImagesDir)
-	if err != nil {
-		log.Printf("Orchestrator launch failed: %v", err)
-		os.Rename(orchDisk+".bak", orchDisk)
+	if err := bridge.EnsureTAP(newTAP, cfg.BridgeDevice, username); err != nil {
+		log.Printf("Failed to create TAP for new orchestrator: %v", err)
+		os.Remove(newDisk)
 		return
 	}
 
+	// 2. Launch new orchestrator on temp IP
+	fmt.Printf("  Launching new orchestrator (bridge IP %s)...\n", newBridgeIP)
+	pid, err := qemu.Launch(qemu.VMConfig{
+		Name: "orchestrator-new",
+		VCPU: cfg.OrchestratorVCPU,
+		RAM:  cfg.OrchestratorRAM,
+		Disk: newDisk,
+		ISO:  orchISO,
+		TAP:  newTAP,
+		MAC:  newMAC,
+	}, cfg.ImagesDir)
+	if err != nil {
+		log.Printf("New orchestrator launch failed: %v", err)
+		os.Remove(newDisk)
+		return
+	}
+
+	// 3. Wait for new orchestrator to become healthy
+	fmt.Printf("  Waiting for new orchestrator to become healthy...\n")
+	if !waitForHealth(fmt.Sprintf("http://%s:8801/healthz", newBridgeIP), 120*time.Second) {
+		log.Printf("New orchestrator did not become healthy")
+		qemu.Stop("orchestrator-new", pid)
+		os.Remove(newDisk)
+		return
+	}
+
+	// 4. Tell new orchestrator to migrate from the old one
+	fmt.Printf("  Triggering migration: new (%s) <- old (%s)...\n", newBridgeIP, oldOrch.BridgeIP)
+	migrateReq := map[string]string{
+		"source_addr": fmt.Sprintf("%s:8801", oldOrch.BridgeIP),
+		"source_ip":   oldOrch.BridgeIP,
+	}
+	migrateData, _ := json.Marshal(migrateReq)
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Post(
+		fmt.Sprintf("http://%s:8801/api/migrate", newBridgeIP),
+		"application/json",
+		bytes.NewReader(migrateData),
+	)
+	if err != nil {
+		log.Printf("Migration request failed: %v", err)
+		qemu.Stop("orchestrator-new", pid)
+		os.Remove(newDisk)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("Migration failed (HTTP %d): %s", resp.StatusCode, string(body))
+		qemu.Stop("orchestrator-new", pid)
+		os.Remove(newDisk)
+		return
+	}
+
+	// 5. Migration succeeded — old orchestrator is shut down by the new one.
+	// Wait for old orchestrator to stop.
+	fmt.Printf("  Waiting for old orchestrator to shut down...\n")
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if !qemu.IsRunning(oldOrch.PID) {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if qemu.IsRunning(oldOrch.PID) {
+		log.Printf("Old orchestrator still running, force stopping")
+		qemu.Stop("orchestrator", oldOrch.PID)
+	}
+
+	// 6. Update cluster state
 	state.SetOrchestrator(cluster.VMEntry{
 		ID:           "orchestrator",
-		BridgeIP:     cfg.OrchestratorIP,
-		Disk:         orchDisk,
+		BridgeIP:     newBridgeIP,
+		Disk:         newDisk,
 		ISO:          orchISO,
 		PID:          pid,
 		VCPU:         cfg.OrchestratorVCPU,
 		RAM:          cfg.OrchestratorRAM,
-		TAP:          cfg.OrchestratorTAP,
-		MAC:          cfg.OrchestratorMAC,
+		TAP:          newTAP,
+		MAC:          newMAC,
 		ImageVersion: meta.Version,
 		ImageCommit:  meta.Commit,
 		ImageDigest:  meta.Digest,
 	})
 	state.Save()
 
-	os.Remove(orchDisk + ".bak")
-	fmt.Printf("  Orchestrator upgraded (PID %d)\n", pid)
+	// Clean up old disk
+	os.Remove(oldOrch.Disk)
+
+	fmt.Printf("  Orchestrator upgraded (PID %d, bridge IP %s)\n", pid, newBridgeIP)
+}
+
+// waitForHealth polls a URL until it returns 200 or timeout expires.
+func waitForHealth(url string, timeout time.Duration) bool {
+	client := &http.Client{Timeout: 3 * time.Second}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return true
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return false
 }
 
 // cliVersion shows the current and latest available image versions.
@@ -1152,6 +1325,21 @@ func runShell(cmd string) error {
 	return c.Run()
 }
 
+// waitForGoldenReady polls a node's health endpoint until golden_ready is true.
+func waitForGoldenReady(bridgeIP string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		health := queryNodeHealth(bridgeIP)
+		if health != nil {
+			if ready, ok := health["golden_ready"].(bool); ok && ready {
+				return true
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return false
+}
+
 func waitForNodeHealth(bridgeIP string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1161,6 +1349,28 @@ func waitForNodeHealth(bridgeIP string, timeout time.Duration) bool {
 		time.Sleep(5 * time.Second)
 	}
 	return false
+}
+
+// startMosquitto launches the MQTT broker as a subprocess.
+func startMosquitto(cfg HostConfig) *exec.Cmd {
+	confPath := filepath.Join(cfg.RepoDir, "host", "mosquitto.conf")
+	if !fileExists(confPath) {
+		log.Printf("mosquitto config not found at %s, skipping MQTT broker", confPath)
+		return nil
+	}
+
+	// Ensure persistence directory exists
+	os.MkdirAll("/var/lib/mosquitto", 0755)
+
+	cmd := exec.Command("mosquitto", "-c", confPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		log.Printf("WARNING: mosquitto failed to start: %v (MQTT features disabled)", err)
+		return nil
+	}
+	log.Printf("mosquitto broker started (PID %d)", cmd.Process.Pid)
+	return cmd
 }
 
 func runBootstrap() {

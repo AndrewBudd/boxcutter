@@ -5,24 +5,44 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/db"
+	orchmqtt "github.com/AndrewBudd/boxcutter/orchestrator/internal/mqtt"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/node"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/scheduler"
 )
 
 type Handler struct {
-	db *db.DB
+	db   *db.DB
+	mqtt *orchmqtt.Client
+
+	// migrating is true when this orchestrator is in pre-migrate mode
+	migrating bool
+	migrateMu sync.Mutex
 }
 
 func NewHandler(database *db.DB) *Handler {
 	h := &Handler{db: database}
 	go h.healthMonitorLoop()
 	return h
+}
+
+// SetMQTT sets the MQTT client for publishing golden head updates.
+func (h *Handler) SetMQTT(mc *orchmqtt.Client) {
+	h.mqtt = mc
+
+	// On connect, publish the current golden head (if any)
+	if mc != nil {
+		head := h.db.GetGoldenHead()
+		if head != "" {
+			mc.PublishGoldenHead(head)
+		}
+	}
 }
 
 // healthMonitorLoop checks node health every 30 seconds, marks nodes down/up,
@@ -97,6 +117,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	// Golden images
 	mux.HandleFunc("GET /api/golden", h.handleGoldenList)
+	mux.HandleFunc("GET /api/golden/head", h.handleGoldenGetHead)
+	mux.HandleFunc("POST /api/golden/head", h.handleGoldenSetHead)
+
+	// Migration (self-migration for orchestrator upgrades)
+	mux.HandleFunc("POST /api/migrate", h.handleMigrate)
+	mux.HandleFunc("POST /api/prepare-migrate", h.handlePrepareMigrate)
+	mux.HandleFunc("POST /api/shutdown", h.handleShutdown)
 
 	// SSH keys
 	mux.HandleFunc("POST /api/keys/add", h.handleAddKeys)
@@ -716,6 +743,169 @@ func (h *Handler) handleGoldenList(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, entries)
+}
+
+// --- Golden head ---
+
+func (h *Handler) handleGoldenGetHead(w http.ResponseWriter, r *http.Request) {
+	head := h.db.GetGoldenHead()
+	writeJSON(w, map[string]string{"version": head})
+}
+
+func (h *Handler) handleGoldenSetHead(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Version == "" {
+		http.Error(w, "version is required", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.db.SetGoldenHead(req.Version); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Publish to MQTT so nodes get notified
+	if h.mqtt != nil {
+		if err := h.mqtt.PublishGoldenHead(req.Version); err != nil {
+			log.Printf("mqtt: failed to publish golden head: %v", err)
+		}
+	}
+
+	log.Printf("Golden head set to %s", req.Version)
+	writeJSON(w, map[string]string{"version": req.Version, "status": "ok"})
+}
+
+// --- Migration (orchestrator self-migration) ---
+
+// handleMigrate is called on the NEW orchestrator by the control plane.
+// It drives the entire migration from the old orchestrator.
+func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SourceAddr string `json:"source_addr"` // e.g., "192.168.50.2:8801"
+		SourceIP   string `json:"source_ip"`   // e.g., "192.168.50.2"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.SourceAddr == "" || req.SourceIP == "" {
+		http.Error(w, "source_addr and source_ip are required", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Migration: starting from source %s", req.SourceAddr)
+
+	sourceURL := "http://" + req.SourceAddr
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// 1. Tell old orchestrator to prepare for migration
+	log.Printf("Migration: sending prepare-migrate to %s", req.SourceAddr)
+	resp, err := client.Post(sourceURL+"/api/prepare-migrate", "application/json", nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("prepare-migrate failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		http.Error(w, fmt.Sprintf("prepare-migrate returned %d", resp.StatusCode), http.StatusBadGateway)
+		return
+	}
+
+	// 2. rsync the database from old orchestrator
+	log.Printf("Migration: rsyncing database from %s", req.SourceIP)
+	dbPath := "/var/lib/boxcutter/orchestrator.db"
+
+	rsyncCmd := exec.Command("rsync", "-az", "--timeout=30",
+		fmt.Sprintf("ubuntu@%s:%s", req.SourceIP, dbPath),
+		dbPath+".migrated")
+	rsyncCmd.Stdout = os.Stdout
+	rsyncCmd.Stderr = os.Stderr
+	if err := rsyncCmd.Run(); err != nil {
+		http.Error(w, fmt.Sprintf("rsync db failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Also rsync Tailscale state to preserve identity
+	log.Printf("Migration: rsyncing Tailscale state from %s", req.SourceIP)
+	rsyncTS := exec.Command("rsync", "-az", "--timeout=30",
+		fmt.Sprintf("ubuntu@%s:/var/lib/tailscale/", req.SourceIP),
+		"/var/lib/tailscale/")
+	rsyncTS.Stdout = os.Stdout
+	rsyncTS.Stderr = os.Stderr
+	if err := rsyncTS.Run(); err != nil {
+		log.Printf("Migration: tailscale rsync failed (non-fatal): %v", err)
+	}
+
+	// 3. Tell old orchestrator to shut down
+	log.Printf("Migration: sending shutdown to %s", req.SourceAddr)
+	resp, err = client.Post(sourceURL+"/api/shutdown", "application/json", nil)
+	if err != nil {
+		log.Printf("Migration: shutdown request failed (continuing): %v", err)
+	} else {
+		resp.Body.Close()
+	}
+
+	// 4. Wait for old orchestrator to become unreachable
+	log.Printf("Migration: waiting for old orchestrator to stop...")
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(sourceURL + "/healthz")
+		if err != nil {
+			break // unreachable = good
+		}
+		resp.Body.Close()
+		time.Sleep(2 * time.Second)
+	}
+
+	// 5. Activate the migrated database
+	log.Printf("Migration: activating migrated database")
+	os.Rename(dbPath+".migrated", dbPath)
+
+	// 6. Start Tailscale with the old identity
+	log.Printf("Migration: starting Tailscale")
+	exec.Command("systemctl", "restart", "tailscaled").Run()
+	time.Sleep(3 * time.Second)
+	exec.Command("tailscale", "up").Run()
+
+	// 7. Restart our own orchestrator service to pick up the new DB
+	log.Printf("Migration: restarting orchestrator service")
+	exec.Command("systemctl", "restart", "boxcutter-orchestrator").Run()
+
+	log.Printf("Migration: complete")
+	writeJSON(w, map[string]string{"status": "migrated"})
+}
+
+// handlePrepareMigrate is called on the OLD orchestrator by the new one.
+// It stops accepting new work and prepares for state transfer.
+func (h *Handler) handlePrepareMigrate(w http.ResponseWriter, r *http.Request) {
+	h.migrateMu.Lock()
+	h.migrating = true
+	h.migrateMu.Unlock()
+
+	log.Printf("Prepare-migrate: entering migration mode, new requests will be rejected")
+
+	writeJSON(w, map[string]string{
+		"status":  "ready",
+		"db_path": "/var/lib/boxcutter/orchestrator.db",
+	})
+}
+
+// handleShutdown is called on the OLD orchestrator by the new one.
+// It gracefully shuts down the VM.
+func (h *Handler) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Shutdown: received shutdown request, powering off in 2 seconds")
+	writeJSON(w, map[string]string{"status": "shutting_down"})
+
+	go func() {
+		time.Sleep(2 * time.Second)
+		exec.Command("shutdown", "-h", "now").Run()
+	}()
 }
 
 // --- Health ---

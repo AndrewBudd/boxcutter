@@ -65,6 +65,11 @@ func (db *DB) migrate() error {
 		PRIMARY KEY (version, node_id)
 	);
 
+	CREATE TABLE IF NOT EXISTS golden_config (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
+
 	CREATE TABLE IF NOT EXISTS ssh_keys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		github_user TEXT NOT NULL,
@@ -341,6 +346,22 @@ func (db *DB) SyncNodeVMs(nodeID string, vms []VM) error {
 	}
 
 	return tx.Commit()
+}
+
+// --- Golden config operations ---
+
+// GetGoldenHead returns the current golden head version.
+func (db *DB) GetGoldenHead() string {
+	var val string
+	db.conn.QueryRow(`SELECT value FROM golden_config WHERE key='head_version'`).Scan(&val)
+	return val
+}
+
+// SetGoldenHead sets the golden head version.
+func (db *DB) SetGoldenHead(version string) error {
+	_, err := db.conn.Exec(`INSERT INTO golden_config (key, value) VALUES ('head_version', ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, version)
+	return err
 }
 
 // --- SSH key operations ---

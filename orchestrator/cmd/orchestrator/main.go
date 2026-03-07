@@ -11,6 +11,7 @@ import (
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/api"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/config"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/db"
+	orchmqtt "github.com/AndrewBudd/boxcutter/orchestrator/internal/mqtt"
 )
 
 func main() {
@@ -35,9 +36,20 @@ func main() {
 	}
 	defer database.Close()
 
+	// MQTT client
+	mqttClient, err := orchmqtt.Connect(orchmqtt.Config{
+		BrokerAddr: orchmqtt.BrokerAddrFromEnv(),
+	})
+	if err != nil {
+		log.Printf("mqtt: connection failed (non-fatal): %v", err)
+	} else {
+		defer mqttClient.Close()
+	}
+
 	// HTTP API
 	mux := http.NewServeMux()
 	handler := api.NewHandler(database)
+	handler.SetMQTT(mqttClient)
 	handler.Register(mux)
 
 	server := &http.Server{
