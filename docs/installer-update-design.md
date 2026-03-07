@@ -69,9 +69,9 @@ rebuilding everything manually.
 │  │  - SSH entry point        - run Firecracker microVMs  │   │
 │  │  - user auth (SSH keys)   - vmid, proxy, agent        │   │
 │  │  - schedules Firecrackers - golden image builds       │   │
-│  │    onto nodes             - report state changes to   │   │
-│  │  - distributes keys         orchestrator              │   │
-│  │  - tracks VM locations    Node VM 2... N              │   │
+│  │    onto nodes             - report to orchestrator    │   │
+│  │  - distributes keys         on startup                │   │
+│  │  - queries nodes for state Node VM 2... N             │   │
 │  │                                                       │   │
 │  │  Operates independently of control plane.             │   │
 │  │  Cannot reach control plane.                          │   │
@@ -98,7 +98,6 @@ rebuilding everything manually.
 | Golden image builds + distribution | **Data** | Service behavior (dev environment tooling) |
 | User SSH sessions | **Data** | Service behavior |
 | GitHub key / credential distribution | **Data** | Service behavior |
-| Track where Firecrackers are running | **Data** | Orchestrator learns from node state reports |
 
 **Key test**: if the control plane goes away, does this still work? If yes,
 it's data plane. If no, it's control plane.
@@ -117,23 +116,20 @@ Control plane: "node-2, import this COW and start bold-fox"
 ```
 
 These are **in-the-moment control decisions** — the control plane doesn't need
-to remember what happened afterward. The nodes themselves inform the
-orchestrator of state changes (a Firecracker appeared, a Firecracker went away)
-so the orchestrator's view of the world stays current for user-facing queries.
+to remember what happened afterward.
 
-### How the orchestrator tracks state
+### Nobody persistently tracks Firecrackers
 
-The orchestrator does **not** drive Firecracker moves — it learns about them.
-Nodes report state changes to the orchestrator:
+Neither the control plane nor the orchestrator maintains a database of
+Firecracker VMs. Both query nodes when they need to know:
 
-- Node creates a Firecracker (user request via orchestrator) → node confirms
-  to orchestrator
-- Control plane moves a Firecracker (drain/capacity) → destination node
-  reports the new Firecracker to orchestrator, source node reports removal
-- Node restarts a Firecracker after reboot → node reports to orchestrator
-
-The orchestrator maintains a view of "where is everything" for user-facing
-queries, but it's built from node reports, not from orchestrating moves.
+- **Control plane** queries nodes during drains and capacity decisions. It
+  doesn't remember afterward — each operation is self-contained.
+- **Orchestrator** queries nodes when a user asks to create a VM (to find
+  capacity) or when it needs to answer "where is my VM?" It doesn't maintain
+  a persistent replica of node state.
+- **Nodes** are the source of truth. Each node knows exactly what Firecrackers
+  it's running. Everyone else asks.
 
 ## Installation Flow
 
@@ -337,9 +333,8 @@ SSH to the orchestrator:
 ```
 1. Orchestrator triggers golden image rebuild on a node (debootstrap + provision)
 2. Orchestrator distributes new image to all nodes (rsync over Tailscale)
-3. Orchestrator records new version in its DB
-4. New Firecracker VMs use the new golden image
-5. Existing VMs are unaffected (they have their own COW snapshots)
+3. New Firecracker VMs use the new golden image
+4. Existing VMs are unaffected (they have their own COW snapshots)
 ```
 
 No control plane involvement. No migration needed.
@@ -392,8 +387,9 @@ All service behavior lives here:
 - **SSH key distribution**: orchestrator pushes authorized keys to nodes
 - **Golden image builds**: orchestrator triggers on a node, distributes
 - **GitHub key / credential management**: orchestrator distributes to nodes
-- **State tracking**: nodes report state changes to orchestrator (Firecracker
-  created, removed, moved) so the orchestrator's view stays current
+- **Node registration**: nodes report to orchestrator on startup so it knows
+  what nodes are available. Orchestrator queries nodes for Firecracker state
+  as needed — no persistent tracking.
 
 ### Upward flow (none)
 
@@ -438,9 +434,8 @@ Host reboot
   │    - calls into each VM to verify health
   │
   ├─ Data plane boots:
-  │    - orchestrator starts, reads its DB
-  │    - nodes start, register with orchestrator
-  │    - orchestrator tells nodes to restart previously-running Firecrackers
+  │    - orchestrator starts, reads its DB (SSH keys)
+  │    - nodes start, restart their own Firecrackers, register with orchestrator
   │
   └─ System operational
 
@@ -481,7 +476,7 @@ git diff v0.3.0..v0.4.0 --name-only
 | Component | Install | Upgrade | State | Plane |
 |---|---|---|---|---|
 | **Control plane** | `make install-host` (Go binary + systemd) | Self-update via `boxcutter-host upgrade` | `/etc/boxcutter/host.yaml` + `/var/lib/boxcutter/cluster.json` | Control |
-| **Orchestrator** | Built by control plane during bootstrap | Control plane rebuilds ISO, relaunches (same disk) | SQLite DB on QCOW2 disk (SSH keys, survives upgrades) | Data |
+| **Orchestrator** | Built by control plane during bootstrap | Control plane rebuilds ISO, relaunches (same disk) | SQLite DB on QCOW2 disk (SSH keys only, survives upgrades) | Data |
 | **Node VMs** | Built by control plane (`node add` or bootstrap) | Control plane: build new → drain → retire | Stateless (Firecrackers have their own COW state) | Data |
 | **Golden image** | Built by orchestrator on a node | Rebuild + distribute (data plane, no control plane) | ext4 file on each node | Data |
 | **Firecracker VMs** | Created by orchestrator via node agent | N/A (ephemeral, destroy and recreate) | COW snapshot (per-VM, backed by golden image) | Data |
