@@ -22,15 +22,11 @@ const (
 	defaultOCIRepository = "AndrewBudd/boxcutter"
 )
 
-// TokenFunc returns a ghcr.io authentication token. Called before each OCI pull.
-type TokenFunc func() (string, error)
-
 // Manager handles golden image lifecycle on a single node.
 type Manager struct {
 	goldenDir string
 	registry  string
 	repo      string
-	tokenFn   TokenFunc
 
 	mu          sync.Mutex
 	currentHead string // the version currently set as head
@@ -38,10 +34,9 @@ type Manager struct {
 
 // Config for the golden image manager.
 type Config struct {
-	GoldenDir     string    // default: /var/lib/boxcutter/golden
-	OCIRegistry   string    // default: ghcr.io
-	OCIRepository string    // default: AndrewBudd/boxcutter
-	TokenFunc     TokenFunc // optional: provides ghcr.io auth token
+	GoldenDir     string // default: /var/lib/boxcutter/golden
+	OCIRegistry   string // default: ghcr.io
+	OCIRepository string // default: AndrewBudd/boxcutter
 }
 
 // NewManager creates a golden image manager.
@@ -60,7 +55,6 @@ func NewManager(cfg Config) *Manager {
 		goldenDir: cfg.GoldenDir,
 		registry:  cfg.OCIRegistry,
 		repo:      cfg.OCIRepository,
-		tokenFn:   cfg.TokenFunc,
 	}
 
 	// Read current head from symlink
@@ -168,21 +162,6 @@ func (m *Manager) pullFromOCI(version string) error {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
-
-	// Authenticate oras CLI with ghcr.io if we have a token provider
-	if m.tokenFn != nil {
-		token, err := m.tokenFn()
-		if err != nil {
-			log.Printf("golden: warning: could not get ghcr token: %v", err)
-		} else {
-			loginCmd := exec.Command("oras", "login", m.registry, "-u", "boxcutter", "--password-stdin")
-			loginCmd.Stdin = strings.NewReader(token)
-			loginCmd.Stderr = os.Stderr
-			if err := loginCmd.Run(); err != nil {
-				log.Printf("golden: warning: oras login failed: %v", err)
-			}
-		}
-	}
 
 	// Pull using oras CLI (installed on nodes)
 	// OCI registries require lowercase repository names

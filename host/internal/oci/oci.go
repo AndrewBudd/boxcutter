@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
@@ -62,11 +64,11 @@ func (o *PullOptions) defaults() {
 }
 
 func (o *PullOptions) ref() string {
-	return fmt.Sprintf("%s/%s/%s:%s", o.Registry, o.Repository, o.VMType, o.Tag)
+	return fmt.Sprintf("%s/%s/%s:%s", o.Registry, strings.ToLower(o.Repository), o.VMType, o.Tag)
 }
 
 func (o *PullOptions) repoPath() string {
-	return fmt.Sprintf("%s/%s", o.Repository, o.VMType)
+	return fmt.Sprintf("%s/%s", strings.ToLower(o.Repository), o.VMType)
 }
 
 // newRepo creates an authenticated remote.Repository for the given options.
@@ -76,12 +78,19 @@ func newRepo(opts *PullOptions) (*remote.Repository, error) {
 		return nil, fmt.Errorf("creating repository reference: %w", err)
 	}
 
-	// Set up authentication: env var takes precedence, then GitHub App
+	// Set up authentication: env var > gh CLI > GitHub App
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
 		token = os.Getenv("GH_TOKEN")
 	}
+	if token == "" {
+		// Try gh CLI token (works for both push and pull on personal accounts)
+		if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+			token = strings.TrimSpace(string(out))
+		}
+	}
 	if token == "" && opts.Auth != nil {
+		// Fall back to GitHub App token (works for pull only on personal accounts)
 		var err error
 		token, err = opts.Auth.Token()
 		if err != nil {

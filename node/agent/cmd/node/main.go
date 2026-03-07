@@ -90,7 +90,6 @@ func main() {
 		GoldenDir:     filepath.Dir(cfg.Storage.GoldenLocalPath),
 		OCIRegistry:   cfg.OCI.Registry,
 		OCIRepository: cfg.OCI.Repository,
-		TokenFunc:     vmidClient.GHCRToken,
 	})
 
 	// MQTT client — connect to broker on host bridge
