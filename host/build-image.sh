@@ -315,6 +315,14 @@ write_files:
       if ! command -v tailscale &>/dev/null; then curl -fsSL https://tailscale.com/install.sh | sh; fi
       systemctl enable tailscaled
 
+      # ORAS CLI (for pulling golden images from OCI registry)
+      if ! command -v oras &>/dev/null; then
+        ORAS_VERSION="1.2.2"
+        curl -sLO "https://github.com/oras-project/oras/releases/download/v\${ORAS_VERSION}/oras_\${ORAS_VERSION}_linux_amd64.tar.gz"
+        tar xzf "oras_\${ORAS_VERSION}_linux_amd64.tar.gz" -C /usr/local/bin/ oras
+        rm -f "oras_\${ORAS_VERSION}_linux_amd64.tar.gz"
+      fi
+
       # Go + DERP
       if ! command -v go &>/dev/null; then
         curl -sL "https://go.dev/dl/go1.22.5.linux-amd64.tar.gz" | tar xz -C /usr/local

@@ -589,9 +589,9 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 	if len(vms) == 0 {
 		log.Printf("Drain: %s has no VMs, stopping", nodeID)
-		qemu.Stop(nodeID, node.PID)
 		state.RemoveNode(nodeID)
 		state.Save()
+		qemu.Stop(nodeID, node.PID)
 		return
 	}
 
@@ -642,11 +642,11 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		}
 	}
 
-	// Stop the drained node
+	// Remove from state FIRST so health monitor doesn't auto-restart
 	log.Printf("Drain: stopping %s", nodeID)
-	qemu.Stop(nodeID, node.PID)
 	state.RemoveNode(nodeID)
 	state.Save()
+	qemu.Stop(nodeID, node.PID)
 	log.Printf("Drain: %s complete", nodeID)
 }
 
@@ -933,11 +933,12 @@ func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *o
 		}
 
 		if !fileExists(newISO) {
-			fmt.Printf("  Cloud-init ISO not found: %s\n", newISO)
-			fmt.Printf("  Generate with: bash host/provision.sh node %s --from-image\n", newID)
-			fmt.Printf("  Skipping %s upgrade.\n", oldNode.ID)
-			os.Remove(newDisk)
-			continue
+			fmt.Printf("  Generating cloud-init ISO for %s...\n", newID)
+			if err := generateCloudInitISO(cfg, "node", newID); err != nil {
+				log.Printf("Failed to generate cloud-init ISO for %s: %v", newID, err)
+				os.Remove(newDisk)
+				continue
+			}
 		}
 
 		currentUser, _ := user.Current()
@@ -1017,11 +1018,15 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 	newTAP := fmt.Sprintf("tap-orch-new")
 	newMAC := fmt.Sprintf("52:54:00:00:01:%02x", newOctet%256)
 	newDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
-	orchISO := fmt.Sprintf("%s/orchestrator-cloud-init.iso", cfg.ImagesDir)
+	orchISO := fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir)
 
-	if !fileExists(orchISO) {
-		fmt.Printf("Cloud-init ISO not found: %s\n", orchISO)
-		fmt.Printf("Generate with: bash host/provision.sh orchestrator --from-image\n")
+	// Generate a fresh cloud-init ISO with the temp bridge IP and MAC
+	fmt.Printf("  Generating cloud-init ISO for orchestrator...\n")
+	if err := generateCloudInitISOWithOutput(cfg, "orchestrator", "", orchISO,
+		"CLOUD_INIT_IP="+newBridgeIP,
+		"CLOUD_INIT_MAC="+newMAC,
+	); err != nil {
+		log.Printf("Failed to generate cloud-init ISO for orchestrator: %v", err)
 		return
 	}
 
@@ -1067,6 +1072,45 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		qemu.Stop("orchestrator-new", pid)
 		os.Remove(newDisk)
 		return
+	}
+
+	// 3.5. Deploy latest orchestrator binary (base image may have older version)
+	fmt.Printf("  Deploying latest orchestrator binary...\n")
+	orchBinary := filepath.Join(cfg.RepoDir, "orchestrator", "cmd", "orchestrator")
+	// Build fresh
+	buildCmd := exec.Command("go", "build", "-o", "/tmp/boxcutter-orchestrator-new", "./cmd/orchestrator/")
+	buildCmd.Dir = filepath.Join(cfg.RepoDir, "orchestrator")
+	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
+	if err := buildCmd.Run(); err != nil {
+		log.Printf("Warning: could not build latest orchestrator binary: %v", err)
+	} else {
+		_ = orchBinary // suppress unused
+		sshKey := filepath.Join(cfg.RepoDir, ".boxcutter", "secrets", "cluster-ssh.key")
+		sshOpts := fmt.Sprintf("-i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", sshKey)
+		scpCmd := exec.Command("scp", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+			"-i", sshKey,
+			"/tmp/boxcutter-orchestrator-new", fmt.Sprintf("ubuntu@%s:/tmp/boxcutter-orchestrator", newBridgeIP))
+		scpCmd.Stdout = os.Stdout
+		scpCmd.Stderr = os.Stderr
+		if err := scpCmd.Run(); err != nil {
+			log.Printf("Warning: SCP binary failed: %v (continuing with existing)", err)
+		} else {
+			// Install and restart
+			installCmd := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+				"-i", sshKey, fmt.Sprintf("ubuntu@%s", newBridgeIP),
+				"sudo systemctl stop boxcutter-orchestrator && sudo cp /tmp/boxcutter-orchestrator /usr/local/bin/ && sudo systemctl start boxcutter-orchestrator")
+			installCmd.Stdout = os.Stdout
+			installCmd.Stderr = os.Stderr
+			_ = sshOpts // suppress unused
+			if err := installCmd.Run(); err != nil {
+				log.Printf("Warning: binary install failed: %v", err)
+			}
+			// Wait for new orchestrator to be healthy again after restart
+			if !waitForHealth(fmt.Sprintf("http://%s:8801/healthz", newBridgeIP), 30*time.Second) {
+				log.Printf("Warning: orchestrator not healthy after binary update")
+			}
+		}
+		os.Remove("/tmp/boxcutter-orchestrator-new")
 	}
 
 	// 4. Tell new orchestrator to migrate from the old one
@@ -1154,6 +1198,34 @@ func waitForHealth(url string, timeout time.Duration) bool {
 	return false
 }
 
+// generateCloudInitISO calls provision.sh --from-image to create a cloud-init ISO.
+// For nodes, name should be like "boxcutter-node-2". For orchestrator, name is ignored.
+func generateCloudInitISO(cfg HostConfig, vmType, name string) error {
+	return generateCloudInitISOWithOutput(cfg, vmType, name, "")
+}
+
+// generateCloudInitISOWithOutput is like generateCloudInitISO but allows specifying
+// the output path, IP, and MAC for the cloud-init ISO.
+func generateCloudInitISOWithOutput(cfg HostConfig, vmType, name, outputPath string, envOverrides ...string) error {
+	script := filepath.Join(cfg.RepoDir, "host", "provision.sh")
+	args := []string{script, vmType}
+	if name != "" {
+		args = append(args, name)
+	}
+	args = append(args, "--from-image")
+	cmd := exec.Command("bash", args...)
+	cmd.Dir = cfg.RepoDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	env := os.Environ()
+	if outputPath != "" {
+		env = append(env, "CLOUD_INIT_OUTPUT="+outputPath)
+	}
+	env = append(env, envOverrides...)
+	cmd.Env = env
+	return cmd.Run()
+}
+
 // cliVersion shows the current and latest available image versions.
 func cliVersion() {
 	cfg := defaultConfig()
@@ -1222,10 +1294,15 @@ func cliBuildImage() {
 	}
 
 	push := false
+	pushOnly := false
 	tag := ""
 	for i, arg := range os.Args {
 		if arg == "--push" {
 			push = true
+		}
+		if arg == "--push-only" {
+			push = true
+			pushOnly = true
 		}
 		if arg == "--tag" && i+1 < len(os.Args) {
 			tag = os.Args[i+1]
@@ -1248,26 +1325,28 @@ func cliBuildImage() {
 		tag = "latest"
 	}
 
-	// Run the build script
-	buildScript := filepath.Join(cfg.RepoDir, "host", "build-image.sh")
-	if !fileExists(buildScript) {
-		fmt.Fprintf(os.Stderr, "Build script not found: %s\n", buildScript)
-		os.Exit(1)
-	}
+	if !pushOnly {
+		// Run the build script
+		buildScript := filepath.Join(cfg.RepoDir, "host", "build-image.sh")
+		if !fileExists(buildScript) {
+			fmt.Fprintf(os.Stderr, "Build script not found: %s\n", buildScript)
+			os.Exit(1)
+		}
 
-	fmt.Printf("Building %s image...\n", vmType)
-	cmd := exec.Command("bash", buildScript, vmType)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Dir = cfg.RepoDir
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
-		os.Exit(1)
-	}
+		fmt.Printf("Building %s image...\n", vmType)
+		cmd := exec.Command("bash", buildScript, vmType)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Dir = cfg.RepoDir
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
+			os.Exit(1)
+		}
 
-	if !push {
-		fmt.Printf("\nBuild complete. To push: boxcutter-host build-image %s --push --tag %s\n", vmType, tag)
-		return
+		if !push {
+			fmt.Printf("\nBuild complete. To push: boxcutter-host build-image %s --push --tag %s\n", vmType, tag)
+			return
+		}
 	}
 
 	// Find the built image

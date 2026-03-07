@@ -821,7 +821,8 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Migration: rsyncing database from %s", req.SourceIP)
 	dbPath := "/var/lib/boxcutter/orchestrator.db"
 
-	rsyncCmd := exec.Command("rsync", "-az", "--timeout=30",
+	sshOpts := "ssh -i /etc/boxcutter/secrets/cluster-ssh.key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+	rsyncCmd := exec.Command("rsync", "-az", "--timeout=30", "-e", sshOpts,
 		fmt.Sprintf("ubuntu@%s:%s", req.SourceIP, dbPath),
 		dbPath+".migrated")
 	rsyncCmd.Stdout = os.Stdout
@@ -833,7 +834,7 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 	// Also rsync Tailscale state to preserve identity
 	log.Printf("Migration: rsyncing Tailscale state from %s", req.SourceIP)
-	rsyncTS := exec.Command("rsync", "-az", "--timeout=30",
+	rsyncTS := exec.Command("rsync", "-az", "--timeout=30", "-e", sshOpts,
 		fmt.Sprintf("ubuntu@%s:/var/lib/tailscale/", req.SourceIP),
 		"/var/lib/tailscale/")
 	rsyncTS.Stdout = os.Stdout

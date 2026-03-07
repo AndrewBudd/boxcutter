@@ -13,7 +13,14 @@ REPO_DIR="${SCRIPT_DIR}/.."
 source "${SCRIPT_DIR}/boxcutter.env"
 
 IMAGES_DIR="${REPO_DIR}/.images"
-BUNDLE_DIR="${HOME}/.boxcutter"
+# Find bootstrap bundle: check BOXCUTTER_BUNDLE env, then SUDO_USER's home, then HOME
+if [ -n "${BOXCUTTER_BUNDLE:-}" ]; then
+  BUNDLE_DIR="$BOXCUTTER_BUNDLE"
+elif [ -n "${SUDO_USER:-}" ] && [ -d "$(eval echo ~${SUDO_USER})/.boxcutter" ]; then
+  BUNDLE_DIR="$(eval echo ~${SUDO_USER})/.boxcutter"
+else
+  BUNDLE_DIR="${HOME}/.boxcutter"
+fi
 
 VM_TYPE="${1:-}"
 shift || true
@@ -49,7 +56,11 @@ fi
 
 # --- Find SSH key ---
 SSH_PUBKEY=""
-for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
+REAL_HOME="${HOME}"
+if [ -n "${SUDO_USER:-}" ]; then
+  REAL_HOME="$(eval echo ~${SUDO_USER})"
+fi
+for keyfile in "${REAL_HOME}/.ssh/id_ed25519.pub" "${REAL_HOME}/.ssh/id_rsa.pub" ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
   [ -f "$keyfile" ] && { SSH_PUBKEY=$(cat "$keyfile"); break; }
 done
 [ -z "$SSH_PUBKEY" ] && { echo "Error: no SSH public key found"; exit 1; }
@@ -578,8 +589,15 @@ done)
       # Set hostname
       hostnamectl set-hostname ${NAME}
 
-      # Configure node bridge IP in boxcutter.yaml
+      # Configure boxcutter.yaml with real values
+      sed -i "s|hostname:.*HOSTNAME_PLACEHOLDER|hostname: ${NAME}|" /etc/boxcutter/boxcutter.yaml
       sed -i "s|bridge_ip:.*|bridge_ip: ${THIS_NODE_IP}|" /etc/boxcutter/boxcutter.yaml
+      sed -i "s|url:.*ORCHESTRATOR_URL_PLACEHOLDER|url: http://${ORCH_IP}:8801|" /etc/boxcutter/boxcutter.yaml
+
+      # Run boxcutter-setup if available (generates derived secrets, joins Tailscale)
+      if [ -x /usr/local/bin/boxcutter-setup ]; then
+        /usr/local/bin/boxcutter-setup
+      fi
 
       # Restart services to pick up new config
       systemctl restart boxcutter-node 2>/dev/null || true
@@ -657,6 +675,17 @@ done)
       #!/bin/bash
       set -e
       hostnamectl set-hostname boxcutter
+
+      # Configure boxcutter.yaml with real values
+      sed -i "s|hostname:.*HOSTNAME_PLACEHOLDER|hostname: boxcutter|" /etc/boxcutter/boxcutter.yaml
+      sed -i "s|bridge_ip:.*BRIDGE_IP_PLACEHOLDER|bridge_ip: ${ORCH_IP}|" /etc/boxcutter/boxcutter.yaml
+      sed -i "s|url:.*ORCHESTRATOR_URL_PLACEHOLDER|url: http://${ORCH_IP}:8801|" /etc/boxcutter/boxcutter.yaml
+
+      # Run boxcutter-setup if available
+      if [ -x /usr/local/bin/boxcutter-setup ]; then
+        /usr/local/bin/boxcutter-setup
+      fi
+
       systemctl restart boxcutter-orchestrator 2>/dev/null || true
 
 runcmd:
@@ -668,13 +697,15 @@ instance-id: boxcutter-orch-$(date +%s)
 local-hostname: boxcutter
 META
 
-  sed -e "s|NODE_IP_PLACEHOLDER|${ORCH_IP}|" \
+  local ORCH_NET_IP="${CLOUD_INIT_IP:-${ORCH_IP}}"
+  local ORCH_NET_MAC="${CLOUD_INIT_MAC:-${ORCH_MAC}}"
+  sed -e "s|NODE_IP_PLACEHOLDER|${ORCH_NET_IP}|" \
       -e "s|NODE_CIDR_PLACEHOLDER|${HOST_BRIDGE_CIDR}|" \
       -e "s|HOST_TAP_IP_PLACEHOLDER|${HOST_BRIDGE_IP}|" \
-      -e "s|NODE_MAC_PLACEHOLDER|${ORCH_MAC}|" \
+      -e "s|NODE_MAC_PLACEHOLDER|${ORCH_NET_MAC}|" \
       "${REPO_DIR}/cloud-init/network-config" > "${CIDATA}/network-config"
 
-  local ISO="${IMAGES_DIR}/orchestrator-cloud-init.iso"
+  local ISO="${CLOUD_INIT_OUTPUT:-${IMAGES_DIR}/orchestrator-cloud-init.iso}"
   genisoimage -output "$ISO" -volid cidata -joliet -rock \
     "${CIDATA}/user-data" "${CIDATA}/meta-data" "${CIDATA}/network-config" 2>/dev/null
   echo "  Cloud-init ISO: ${ISO}"
