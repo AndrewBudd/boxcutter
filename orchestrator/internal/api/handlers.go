@@ -62,8 +62,6 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/nodes/{id}/heartbeat", h.handleNodeHeartbeat)
 	mux.HandleFunc("GET /api/nodes", h.handleNodeList)
 	mux.HandleFunc("GET /api/nodes/{id}", h.handleNodeGet)
-	mux.HandleFunc("DELETE /api/nodes/{id}", h.handleNodeDelete)
-	mux.HandleFunc("POST /api/nodes/{id}/drain", h.handleNodeDrain)
 
 	// VM management
 	mux.HandleFunc("POST /api/vms", h.handleVMCreate)
@@ -72,9 +70,6 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/vms/{name}", h.handleVMDestroy)
 	mux.HandleFunc("POST /api/vms/{name}/stop", h.handleVMStop)
 	mux.HandleFunc("POST /api/vms/{name}/start", h.handleVMStart)
-
-	// Migration
-	mux.HandleFunc("POST /api/migrate", h.handleMigrate)
 
 	// SSH keys
 	mux.HandleFunc("POST /api/keys/add", h.handleAddKeys)
@@ -116,26 +111,6 @@ func (h *Handler) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Node registered: %s (%s)", n.ID, n.TailscaleName)
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, &n)
-
-	// Check golden image in background — build if missing
-	if n.APIAddr != "" {
-		go func() {
-			client := node.NewClient(n.APIAddr)
-			health, err := client.Health()
-			if err != nil || health.GoldenReady {
-				return
-			}
-			log.Printf("Node %s: golden image missing, starting build...", n.ID)
-			h.db.SetNodeStatus(n.ID, "provisioning")
-			err = client.BuildGolden(func(phase, msg string) {})
-			if err != nil {
-				log.Printf("Node %s: golden build failed: %v", n.ID, err)
-				return
-			}
-			h.db.SetNodeStatus(n.ID, "active")
-			log.Printf("Node %s: golden image ready", n.ID)
-		}()
-	}
 }
 
 func (h *Handler) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -191,94 +166,6 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, n)
-}
-
-func (h *Handler) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		id = extractName(r.URL.Path, "/api/nodes/")
-	}
-	if err := h.db.DeleteNode(id); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) handleNodeDrain(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		id = extractPathSegment(r.URL.Path, "/api/nodes/", "/drain")
-	}
-
-	// Mark node as draining
-	if err := h.db.SetNodeStatus(id, "draining"); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Get VMs on this node
-	vms, err := h.db.ListVMsByNode(id)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Get target nodes with real-time health
-	allNodes, _ := h.db.ActiveNodes()
-	for _, n := range allNodes {
-		fc := node.NewFastClient(n.APIAddr)
-		if health := fc.Health(); health != nil {
-			// Store in a way scheduler can use
-			// We need RAM info for scheduling — fetch it
-		}
-	}
-
-	// Migrate each VM
-	var migrated, failed int
-	for _, vm := range vms {
-		// For drain, we need to pick a target — query real-time health
-		targetNode, err := h.pickNodeForMigration(allNodes, id)
-		if err != nil {
-			log.Printf("Drain: no target for %s: %v", vm.Name, err)
-			failed++
-			continue
-		}
-
-		if err := h.migrateVM(vm.Name, id, targetNode.ID); err != nil {
-			log.Printf("Drain: failed to migrate %s: %v", vm.Name, err)
-			failed++
-		} else {
-			migrated++
-		}
-	}
-
-	if failed == 0 && len(vms) > 0 {
-		h.db.SetNodeStatus(id, "retired")
-	}
-
-	writeJSON(w, map[string]interface{}{
-		"node":     id,
-		"total":    len(vms),
-		"migrated": migrated,
-		"failed":   failed,
-		"status":   "draining",
-	})
-}
-
-// pickNodeForMigration picks a target node, excluding the given node ID.
-func (h *Handler) pickNodeForMigration(nodes []*db.Node, excludeID string) (*db.Node, error) {
-	var candidates []*db.Node
-	for _, n := range nodes {
-		if n.ID != excludeID {
-			candidates = append(candidates, n)
-		}
-	}
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no target nodes available")
-	}
-	// Simple: pick the first available (scheduler needs health data, but for drain just pick any)
-	return candidates[0], nil
 }
 
 // --- VM handlers ---
@@ -673,90 +560,6 @@ func (h *Handler) handleVMStart(w http.ResponseWriter, r *http.Request) {
 
 	h.db.UpdateVMStatus(name, "running")
 	writeJSON(w, resp)
-}
-
-// --- Migration ---
-
-type migrateRequest struct {
-	VMName   string `json:"vm"`
-	ToNodeID string `json:"to"`
-}
-
-func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
-	var req migrateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	vm, err := h.db.GetVM(req.VMName)
-	if err != nil {
-		http.Error(w, "VM not found", http.StatusNotFound)
-		return
-	}
-
-	toNodeID := req.ToNodeID
-	if toNodeID == "" {
-		// Auto-pick
-		nodes, _ := h.db.ActiveNodes()
-		var candidates []*db.Node
-		for _, n := range nodes {
-			if n.ID != vm.NodeID {
-				candidates = append(candidates, n)
-			}
-		}
-		if len(candidates) == 0 {
-			http.Error(w, "no target nodes available", http.StatusServiceUnavailable)
-			return
-		}
-		toNodeID = candidates[0].ID
-	}
-
-	if err := h.migrateVM(req.VMName, vm.NodeID, toNodeID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	writeJSON(w, map[string]string{
-		"vm":        req.VMName,
-		"from_node": vm.NodeID,
-		"to_node":   toNodeID,
-		"status":    "migrated",
-	})
-}
-
-func (h *Handler) migrateVM(vmName, fromNodeID, toNodeID string) error {
-	fromNode, err := h.db.GetNode(fromNodeID)
-	if err != nil {
-		return fmt.Errorf("source node not found: %w", err)
-	}
-	toNode, err := h.db.GetNode(toNodeID)
-	if err != nil {
-		return fmt.Errorf("target node not found: %w", err)
-	}
-
-	log.Printf("Migrating %s: %s → %s", vmName, fromNode.TailscaleName, toNode.TailscaleName)
-
-	// Mark as migrating
-	h.db.UpdateVMStatus(vmName, "migrating")
-
-	// Tell the source node to migrate the VM directly to the target node.
-	srcClient := node.NewClient(fromNode.APIAddr)
-	_, err = srcClient.Migrate(vmName, &node.MigrateRequest{
-		TargetAddr:     toNode.APIAddr,
-		TargetBridgeIP: toNode.BridgeIP,
-	})
-	if err != nil {
-		h.db.UpdateVMStatus(vmName, "running") // revert on failure
-		return fmt.Errorf("migration failed: %w", err)
-	}
-
-	// Update DB with new node
-	h.db.UpdateVMNode(vmName, toNodeID)
-	h.db.UpdateVMStatus(vmName, "running")
-
-	log.Printf("Migration complete: %s → %s", vmName, toNode.TailscaleName)
-	return nil
 }
 
 // --- Health ---

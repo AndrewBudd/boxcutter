@@ -59,14 +59,6 @@ func (h *Handler) Run(args []string) int {
 		return h.cmdStatus()
 	case "nodes":
 		return h.cmdNodes()
-	case "drain":
-		if target == "" {
-			fmt.Println("Usage: ssh <host> drain <node-id>")
-			return 1
-		}
-		return h.cmdDrain(target)
-	case "migrate":
-		return h.cmdMigrate(args[1:])
 	case "adduser":
 		if target == "" {
 			fmt.Println("Usage: ssh <host> adduser <github-username>")
@@ -321,61 +313,6 @@ func (h *Handler) cmdNodes() int {
 	return 0
 }
 
-func (h *Handler) cmdDrain(nodeID string) int {
-	resp, err := h.post("/api/nodes/"+nodeID+"/drain", nil)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return 1
-	}
-	var result map[string]interface{}
-	json.Unmarshal(resp, &result)
-
-	total, _ := result["total"].(float64)
-	migrated, _ := result["migrated"].(float64)
-	failed, _ := result["failed"].(float64)
-
-	fmt.Printf("Node %s draining: %.0f/%.0f VMs migrated", nodeID, migrated, total)
-	if failed > 0 {
-		fmt.Printf(" (%.0f failed)", failed)
-	}
-	fmt.Println()
-	return 0
-}
-
-func (h *Handler) cmdMigrate(args []string) int {
-	if len(args) == 0 {
-		fmt.Println("Usage: ssh <host> migrate <vm-name> [--to <node-id>]")
-		return 1
-	}
-
-	vmName := args[0]
-	toNode := ""
-	for i := 1; i < len(args); i++ {
-		if args[i] == "--to" && i+1 < len(args) {
-			toNode = args[i+1]
-			i++
-		}
-	}
-
-	body := map[string]interface{}{"vm": vmName}
-	if toNode != "" {
-		body["to"] = toNode
-	}
-
-	resp, err := h.post("/api/migrate", body)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return 1
-	}
-	var result map[string]interface{}
-	json.Unmarshal(resp, &result)
-
-	fromNode, _ := result["from_node"].(string)
-	toNodeResult, _ := result["to_node"].(string)
-	fmt.Printf("Migrated %s: %s → %s\n", vmName, fromNode, toNodeResult)
-	return 0
-}
-
 func (h *Handler) cmdAddUser(githubUser string) int {
 	// Fetch SSH keys from GitHub
 	resp, err := http.Get(fmt.Sprintf("https://github.com/%s.keys", githubUser))
@@ -462,9 +399,6 @@ Commands:
   start <name>            Start a stopped VM
   status                  Cluster capacity summary
   nodes                   List all nodes
-  drain <node-id>         Drain all VMs from a node
-  migrate <name> [--to <node-id>]
-                          Migrate VM to another node
   adduser <github-user>   Add SSH keys from GitHub (for new VMs)
   removeuser <github-user>
                           Remove SSH keys for a user
