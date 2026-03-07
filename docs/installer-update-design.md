@@ -68,10 +68,10 @@ rebuilding everything manually.
 │  │  Orchestrator VM          Node VMs (immutable)        │   │
 │  │  - SSH entry point        - run Firecracker microVMs  │   │
 │  │  - user auth (SSH keys)   - vmid, proxy, agent        │   │
-│  │  - creates Firecracker    - golden image builds       │   │
-│  │    VMs on nodes           - respond to orchestrator   │   │
-│  │  - distributes keys                                   │   │
-│  │  - schedules workloads    Node VM 2... N              │   │
+│  │  - schedules Firecrackers - golden image builds       │   │
+│  │    onto nodes             - report state changes to   │   │
+│  │  - distributes keys         orchestrator              │   │
+│  │  - tracks VM locations    Node VM 2... N              │   │
 │  │                                                       │   │
 │  │  Operates independently of control plane.             │   │
 │  │  Cannot reach control plane.                          │   │
@@ -91,17 +91,49 @@ rebuilding everything manually.
 | Version rollouts / deployments | Control | Upgrading the service |
 | Add / free node capacity | Control | Scaling the service |
 | Ensure orchestrator + nodes are up | Control | Keeping the service existing |
-| Move Firecrackers during node drain | Control | Part of upgrading the service |
+| Drain nodes / move Firecrackers between nodes | Control | Infrastructure + capacity management |
 | Create/destroy Firecracker dev VMs | **Data** | Service behavior (user request) |
 | Schedule Firecrackers onto nodes | **Data** | Service behavior (orchestrator decides) |
 | SSH key management + distribution | **Data** | Service behavior (user auth) |
 | Golden image builds + distribution | **Data** | Service behavior (dev environment tooling) |
 | User SSH sessions | **Data** | Service behavior |
-| GitHub key distribution | **Data** | Service behavior |
-| VM migration (non-upgrade) | **Data** | Service behavior |
+| GitHub key / credential distribution | **Data** | Service behavior |
+| Track where Firecrackers are running | **Data** | Orchestrator learns from node state reports |
 
 **Key test**: if the control plane goes away, does this still work? If yes,
 it's data plane. If no, it's control plane.
+
+### How the control plane interacts with nodes
+
+The control plane does **not** persistently track Firecracker VMs. It doesn't
+maintain a database of which Firecrackers are on which nodes. When it needs to
+act (drain, capacity rebalance, health check), it queries nodes in the moment:
+
+```
+Control plane: "node-1, what Firecrackers are you running?"
+Node-1: [bold-fox, shy-elk, warm-jay]
+Control plane: "node-1, stop bold-fox and export its COW"
+Control plane: "node-2, import this COW and start bold-fox"
+```
+
+These are **in-the-moment control decisions** — the control plane doesn't need
+to remember what happened afterward. The nodes themselves inform the
+orchestrator of state changes (a Firecracker appeared, a Firecracker went away)
+so the orchestrator's view of the world stays current for user-facing queries.
+
+### How the orchestrator tracks state
+
+The orchestrator does **not** drive Firecracker moves — it learns about them.
+Nodes report state changes to the orchestrator:
+
+- Node creates a Firecracker (user request via orchestrator) → node confirms
+  to orchestrator
+- Control plane moves a Firecracker (drain/capacity) → destination node
+  reports the new Firecracker to orchestrator, source node reports removal
+- Node restarts a Firecracker after reboot → node reports to orchestrator
+
+The orchestrator maintains a view of "where is everything" for user-facing
+queries, but it's built from node reports, not from orchestrating moves.
 
 ## Installation Flow
 
@@ -335,18 +367,24 @@ Control plane (bare metal)     ← operator controls via CLI
 └──────────────────────────────────────────┘
 ```
 
-### Control plane → VMs (during upgrades and health checks only)
+### Control plane → Nodes (in-the-moment queries and commands)
+
+The control plane calls into nodes when it needs to act. It does not
+persistently track Firecracker state — it queries and acts in the moment:
 
 - **Health checks**: periodic probes to orchestrator and node VMs
-- **Capacity checks**: `GET /api/capacity` on node agents (during drain)
-- **Firecracker listing**: `GET /api/vms` on node agents (during drain)
-- **Firecracker stop/start**: during drain, stop on old node, start on new
-- **rsync COW data**: during drain, transfer Firecracker disk between nodes
+- **Capacity queries**: ask nodes how much vCPU/RAM is free (during capacity decisions)
+- **Firecracker listing**: ask nodes what's running (during drain)
+- **Firecracker stop/start/export/import**: direct commands to nodes during drain
+- **rsync COW data**: transfer Firecracker disk between nodes during drain
+
+The control plane talks directly to node agents for all of this. It never
+needs to involve the orchestrator in infrastructure operations.
 
 ### Inside the data plane (VM ↔ VM, all runtime activity)
 
-The orchestrator and nodes communicate freely over bridge network and
-Tailscale. All service behavior lives here:
+The orchestrator and nodes communicate over bridge network and Tailscale.
+All service behavior lives here:
 
 - **Firecracker creation**: user SSHes to orchestrator → orchestrator calls
   node agent to create Firecracker VM
@@ -354,8 +392,8 @@ Tailscale. All service behavior lives here:
 - **SSH key distribution**: orchestrator pushes authorized keys to nodes
 - **Golden image builds**: orchestrator triggers on a node, distributes
 - **GitHub key / credential management**: orchestrator distributes to nodes
-- **Node registration**: nodes report to orchestrator so it knows what's
-  available
+- **State tracking**: nodes report state changes to orchestrator (Firecracker
+  created, removed, moved) so the orchestrator's view stays current
 
 ### Upward flow (none)
 
