@@ -1,5 +1,6 @@
 .PHONY: help provision-node provision-orchestrator launch-node launch-orchestrator \
-       stop-node stop-orchestrator ssh-node ssh-orchestrator status clean
+       stop-node stop-orchestrator ssh-node ssh-orchestrator status clean \
+       build-host install-host
 
 # --- Orchestrator ---
 
@@ -40,6 +41,17 @@ stop-node:                ## Stop a Node VM
 
 ssh-node:                 ## SSH into Node VM 1 (use host/ssh.sh for others)
 	@bash host/ssh.sh node 1
+
+# --- Host Control Plane ---
+
+build-host:               ## Build boxcutter-host binary
+	@cd host && go build -o boxcutter-host ./cmd/host/
+
+install-host: build-host  ## Install boxcutter-host binary + systemd service
+	@sudo cp host/boxcutter-host /usr/local/bin/boxcutter-host
+	@sudo cp host/boxcutter-host.service /etc/systemd/system/
+	@sudo systemctl daemon-reload
+	@echo "Installed. Run: sudo systemctl enable --now boxcutter-host"
 
 # --- Cluster ---
 

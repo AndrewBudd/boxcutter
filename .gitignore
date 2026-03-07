@@ -27,6 +27,8 @@ node/proxy/proxy
 node/vmid/vmid
 orchestrator/orchestrator
 orchestrator/ssh
+host/boxcutter-host
+host/host
 
 # Bootstrap bundle (secrets)
 .boxcutter/

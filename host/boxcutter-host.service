@@ -1,0 +1,16 @@
+[Unit]
+Description=Boxcutter Host Control Plane
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boxcutter-host run
+Restart=on-failure
+RestartSec=5
+
+# Allow bridge/TAP management
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
