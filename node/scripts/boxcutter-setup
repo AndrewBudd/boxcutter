@@ -107,8 +107,15 @@ VMID_CONFIG="/etc/vmid/config.yaml"
 # Start with base config
 cat > "$VMID_CONFIG" <<'EOF'
 listen:
+  vm_addr: "169.254.169.254"
   vm_port: 80
   admin_socket: /run/vmid/admin.sock
+
+metadata:
+  ssh_authorized_keys:
+    - /etc/boxcutter/secrets/cluster-ssh.key.pub
+    - /etc/boxcutter/secrets/authorized-keys
+  ca_cert_path: /etc/boxcutter/secrets/ca.crt
 
 jwt:
   ttl: "10m"
