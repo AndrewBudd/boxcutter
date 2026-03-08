@@ -562,7 +562,7 @@ ssh $SSH_OPTS ubuntu@${BUILD_IP} "sudo cp /tmp/boxcutter-inject-config.sh /opt/b
 # --- Clean up instance-specific state ---
 echo ""
 echo "--- Cleaning up instance state ---"
-ssh $SSH_OPTS ubuntu@${BUILD_IP} <<'CLEANUP'
+ssh $SSH_OPTS ubuntu@${BUILD_IP} <<'CLEANUP' || true
 sudo bash -c '
   # Remove cloud-init state so it re-runs on next boot
   cloud-init clean --logs 2>/dev/null || rm -rf /var/lib/cloud/
@@ -599,7 +599,7 @@ sudo bash -c '
 
   # Clear logs
   journalctl --flush --rotate --vacuum-time=1s 2>/dev/null || true
-  find /var/log -type f -exec truncate -s 0 {} \;
+  find /var/log -type f -exec truncate -s 0 {} \; 2>/dev/null || true
 
   # Clear bash history
   truncate -s 0 /root/.bash_history 2>/dev/null || true

@@ -56,20 +56,20 @@ install-host: build-host  ## Install boxcutter-host binary + systemd service
 
 # --- OCI Images ---
 
-build-image:              ## Build a VM image (usage: make build-image TYPE=node)
-	@bash host/build-image.sh $(TYPE)
+publish:                  ## Build + push image to ghcr.io (usage: make publish TYPE=node)
+	@bash host/publish-image.sh $(TYPE)
 
-pull:                     ## Pull a VM image from OCI registry (usage: make pull TYPE=node TAG=v0.1.0)
+publish-all:              ## Build + push both node and orchestrator images
+	@bash host/publish-image.sh all
+
+build-image:              ## Build image locally only (usage: make build-image TYPE=node)
+	@bash host/publish-image.sh $(TYPE) --build-only
+
+pull:                     ## Pull image from OCI registry (usage: make pull TYPE=node)
 	@cd host && go build -o boxcutter-host ./cmd/host/ && ./boxcutter-host pull $(TYPE) $(TAG)
-
-upgrade:                  ## Pull latest image and rolling-upgrade (usage: make upgrade TYPE=node)
-	@cd host && go build -o boxcutter-host ./cmd/host/ && ./boxcutter-host upgrade $(TYPE)
 
 version:                  ## Show running vs latest image versions
 	@cd host && go build -o boxcutter-host ./cmd/host/ && ./boxcutter-host version
-
-provision-from-image:     ## Provision VM from a pulled OCI image (usage: make provision-from-image TYPE=node)
-	@bash host/provision.sh $(TYPE) --from-image
 
 # --- Cluster ---
 
