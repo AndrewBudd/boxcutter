@@ -83,8 +83,8 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		Node: NodeConfig{Hostname: "boxcutter"},
 		SSH: SSHConfig{
-			PrivateKeyPath:     "/etc/boxcutter/secrets/node-ssh.key",
-			PublicKeyPath:      "/etc/boxcutter/secrets/node-ssh.pub",
+			PrivateKeyPath:     "/etc/boxcutter/secrets/cluster-ssh.key",
+			PublicKeyPath:      "/etc/boxcutter/secrets/cluster-ssh.key.pub",
 			AuthorizedKeysPath: "/etc/boxcutter/secrets/authorized-keys",
 		},
 		Tailscale: TailscaleConfig{

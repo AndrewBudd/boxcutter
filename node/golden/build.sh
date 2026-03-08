@@ -121,22 +121,9 @@ chmod 440 "${WORK}/mnt/etc/sudoers.d/dev"
 # --- Set root password for serial console ---
 chroot "${WORK}/mnt" bash -c 'echo "root:root" | chpasswd'
 
-# --- Inject SSH keys ---
-echo "Injecting SSH keys..."
+# --- SSH directory structure (keys injected at VM creation time, never baked in) ---
 mkdir -p "${WORK}/mnt/home/dev/.ssh"
 touch "${WORK}/mnt/home/dev/.ssh/authorized_keys"
-
-# Node's internal key (for boxcutter-ctl shell)
-if [ -f /etc/boxcutter/secrets/node-ssh.pub ]; then
-  cat /etc/boxcutter/secrets/node-ssh.pub >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
-fi
-
-# User-provided trusted keys
-if [ -f /etc/boxcutter/secrets/authorized-keys ]; then
-  echo "  Adding user-trusted keys from /etc/boxcutter/secrets/authorized-keys"
-  cat /etc/boxcutter/secrets/authorized-keys >> "${WORK}/mnt/home/dev/.ssh/authorized_keys"
-fi
-
 chown -R 1000:1000 "${WORK}/mnt/home/dev/.ssh"
 chmod 700 "${WORK}/mnt/home/dev/.ssh"
 chmod 600 "${WORK}/mnt/home/dev/.ssh/authorized_keys"

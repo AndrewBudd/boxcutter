@@ -6,12 +6,12 @@ BOXCUTTER_HOME="/var/lib/boxcutter"
 VM_DIR="${BOXCUTTER_HOME}/vms"
 KERNEL="${BOXCUTTER_HOME}/kernel/vmlinux"
 GOLDEN="${BOXCUTTER_HOME}/golden/rootfs.ext4"
-SSH_KEY="/etc/boxcutter/secrets/node-ssh.key"
+SSH_KEY="/etc/boxcutter/secrets/cluster-ssh.key"
 TS_AUTHKEY_FILE="/etc/boxcutter/secrets/tailscale-vm-authkey"
 VMID_SOCKET="/run/vmid/admin.sock"
 
-DEFAULT_VCPU=4
-DEFAULT_RAM_MIB=8192
+DEFAULT_VCPU=2
+DEFAULT_RAM_MIB=2048
 DEFAULT_DISK="50G"
 
 usage() {
@@ -222,7 +222,7 @@ cmd_create() {
   # Create COW snapshot of golden image
   echo "  Creating copy-on-write snapshot..."
   local golden_size
-  golden_size=$(stat -c%s "$GOLDEN")
+  golden_size=$(stat -L -c%s "$GOLDEN")
   local disk_bytes
   disk_bytes=$(numfmt --from=iec "$disk" 2>/dev/null || echo "$golden_size")
   [ "$disk_bytes" -lt "$golden_size" ] && disk_bytes=$golden_size
@@ -324,26 +324,28 @@ EOF
     rmdir "$MOUNT_DIR"
   fi
 
-  # Inject any additional SSH keys added after golden image build
-  if [ -f /etc/boxcutter/secrets/authorized-keys ]; then
-    echo "  Injecting user SSH keys..."
-    MOUNT_DIR=$(mktemp -d)
-    mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
-    mkdir -p "${MOUNT_DIR}/home/dev/.ssh"
-    if [ -f "${MOUNT_DIR}/home/dev/.ssh/authorized_keys" ]; then
-      while IFS= read -r key; do
-        grep -qF "$key" "${MOUNT_DIR}/home/dev/.ssh/authorized_keys" 2>/dev/null || \
-          echo "$key" >> "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-      done < /etc/boxcutter/secrets/authorized-keys
-    else
-      cp /etc/boxcutter/secrets/authorized-keys "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-    fi
-    chown -R 1000:1000 "${MOUNT_DIR}/home/dev/.ssh"
-    chmod 700 "${MOUNT_DIR}/home/dev/.ssh"
-    chmod 600 "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-    umount "$MOUNT_DIR"
-    rmdir "$MOUNT_DIR"
+  # Inject SSH keys (golden image has no keys baked in — all injected here)
+  echo "  Injecting SSH keys..."
+  MOUNT_DIR=$(mktemp -d)
+  mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
+  mkdir -p "${MOUNT_DIR}/home/dev/.ssh"
+  : > "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
+
+  # Cluster SSH key (for node→VM access via boxcutter-ctl shell)
+  if [ -f /etc/boxcutter/secrets/cluster-ssh.key.pub ]; then
+    cat /etc/boxcutter/secrets/cluster-ssh.key.pub >> "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
   fi
+
+  # User-provided trusted keys
+  if [ -f /etc/boxcutter/secrets/authorized-keys ]; then
+    cat /etc/boxcutter/secrets/authorized-keys >> "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
+  fi
+
+  chown -R 1000:1000 "${MOUNT_DIR}/home/dev/.ssh"
+  chmod 700 "${MOUNT_DIR}/home/dev/.ssh"
+  chmod 600 "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
+  umount "$MOUNT_DIR"
+  rmdir "$MOUNT_DIR"
 
   echo "  VM created: ${name} (mark: ${mark}, mode: ${mode})"
   echo "  Start with: boxcutter-ctl start ${name}"

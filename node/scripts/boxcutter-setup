@@ -60,14 +60,11 @@ echo "All required secrets present."
 
 # --- Auto-generate secrets that can be generated ---
 
-# SSH keypair for Node→VM access
-if [ ! -f "${SECRETS_DIR}/node-ssh.key" ]; then
-  echo "Generating Node→VM SSH keypair..."
-  ssh-keygen -t ed25519 -f "${SECRETS_DIR}/node-ssh.key" -N "" -q
-  mv "${SECRETS_DIR}/node-ssh.key.pub" "${SECRETS_DIR}/node-ssh.pub"
-  echo "  Created: node-ssh.key, node-ssh.pub"
+# Cluster SSH key (shared across all nodes, used for node→VM access)
+if [ -f "${SECRETS_DIR}/cluster-ssh.key" ]; then
+  echo "Cluster SSH key: exists"
 else
-  echo "SSH keypair: exists"
+  echo "Warning: cluster-ssh.key not found — node→VM SSH will not work"
 fi
 
 # CA + leaf certs (delegate to boxcutter-tls)
@@ -158,7 +155,7 @@ echo ""
 echo "=== Setup complete ==="
 echo "  Config:       ${CONFIG}"
 echo "  Secrets:      ${SECRETS_DIR}/"
-echo "  SSH key:      ${SECRETS_DIR}/node-ssh.key"
+echo "  SSH key:      ${SECRETS_DIR}/cluster-ssh.key"
 echo "  CA cert:      ${SECRETS_DIR}/ca.crt"
 echo "  vmid config:  ${VMID_CONFIG}"
 TS_IP=$(tailscale ip -4 2>/dev/null) || true
