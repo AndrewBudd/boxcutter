@@ -928,7 +928,7 @@ func bootstrapGolden(cfg HostConfig, state *cluster.State) {
 
 	// Wait for nodes to have the golden image
 	log.Println("  Waiting for nodes to pull golden image...")
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(15 * time.Minute)
 	for time.Now().Before(deadline) {
 		allReady := true
 		for _, n := range state.Nodes {
