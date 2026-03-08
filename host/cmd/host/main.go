@@ -927,32 +927,20 @@ func bootstrapGolden(cfg HostConfig, state *cluster.State) {
 	log.Println("  Golden head set to 'latest' — nodes will pull via MQTT")
 
 	// Wait for nodes to have the golden image
-	log.Println("  Waiting for nodes to pull golden image...")
-	deadline := time.Now().Add(15 * time.Minute)
-	for time.Now().Before(deadline) {
-		allReady := true
-		for _, n := range state.Nodes {
-			if !qemu.IsRunning(n.PID) {
-				continue
-			}
-			nodeClient := &http.Client{Timeout: 3 * time.Second}
-			resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/golden/latest", n.BridgeIP))
-			if err != nil || resp.StatusCode != 200 {
-				allReady = false
-				if resp != nil {
-					resp.Body.Close()
-				}
-				continue
-			}
-			resp.Body.Close()
+	log.Println("  Waiting for nodes to build/pull golden image...")
+	allReady := true
+	for _, n := range state.Nodes {
+		if !qemu.IsRunning(n.PID) {
+			continue
 		}
-		if allReady {
-			log.Println("  All nodes have golden image")
-			return
+		if !waitForGoldenReady(n.BridgeIP, 15*time.Minute) {
+			log.Printf("  Warning: timeout waiting for golden image on %s", n.ID)
+			allReady = false
 		}
-		time.Sleep(10 * time.Second)
 	}
-	log.Println("  Warning: timeout waiting for nodes to pull golden image")
+	if allReady {
+		log.Println("  All nodes have golden image")
+	}
 }
 
 // findClusterSSHKey returns the path to the cluster SSH key.
