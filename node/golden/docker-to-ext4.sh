@@ -66,6 +66,11 @@ done
 mkdir -p "${WORK}/mnt"/{dev,proc,sys,run,tmp}
 chmod 1777 "${WORK}/mnt/tmp"
 
+# Restore capabilities lost during Docker export (extended attrs stripped by tar)
+if [ -f "${WORK}/mnt/bin/ping" ]; then
+  setcap cap_net_raw+ep "${WORK}/mnt/bin/ping" 2>/dev/null || true
+fi
+
 # Unmount
 umount "${WORK}/mnt"
 
