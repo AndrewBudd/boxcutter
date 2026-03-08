@@ -293,8 +293,6 @@ write_files:
       mkdir -p "\$BOXCUTTER_HOME/kernel" "\$BOXCUTTER_HOME/vms" "\$BOXCUTTER_HOME/golden"
       cp -r "\$PD/golden/"* "\$BOXCUTTER_HOME/golden/" 2>/dev/null || true
       chmod +x "\$BOXCUTTER_HOME/golden/docker-to-ext4.sh" 2>/dev/null || true
-      cp "\$PD/config/Caddyfile" /etc/caddy/Caddyfile 2>/dev/null || true
-
       # Firecracker
       if ! command -v firecracker &>/dev/null; then
         FC_VERSION="v1.12.0"; ARCH=\$(uname -m)
@@ -317,7 +315,13 @@ write_files:
         apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confnew" caddy
       fi
+      cp "\$PD/config/Caddyfile" /etc/caddy/Caddyfile 2>/dev/null || true
       systemctl enable caddy
+
+      # Docker (for building golden images from Dockerfile)
+      if ! command -v docker &>/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+      fi
 
       # Tailscale
       if ! command -v tailscale &>/dev/null; then curl -fsSL https://tailscale.com/install.sh | sh; fi
