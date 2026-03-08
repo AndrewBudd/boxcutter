@@ -26,8 +26,7 @@ Commands:
   list
   shell <name>
   status
-  golden build [SIZE]    Build golden rootfs image
-  golden provision       Boot + provision golden image
+  golden build [SIZE]    Build golden rootfs from Dockerfile (default: 4G)
 
 Usage: boxcutter-ctl <command> [args]
 EOF
@@ -706,46 +705,8 @@ case "${1:-help}" in
   status)  cmd_status ;;
   golden)
     case "$2" in
-      build) exec "${BOXCUTTER_HOME}/golden/build.sh" "${3:-}" ;;
-      provision)
-        echo "=== Provisioning golden image (Phase 2) ==="
-        GOLDEN="${BOXCUTTER_HOME}/golden/rootfs.ext4"
-        [ -f "$GOLDEN" ] || { echo "No golden base image. Run: boxcutter-ctl golden build"; exit 1; }
-
-        cmd_create _gprov --vcpu 8 --ram 16384
-        cmd_start _gprov
-
-        PROV_TAP=$(jq -r '.tap // empty' "${VM_DIR}/_gprov/vm.json")
-        [ -z "$PROV_TAP" ] && PROV_TAP=$(tap_name "_gprov")
-        echo "Waiting for VM to boot..."
-        for i in $(seq 1 60); do
-          vm_ssh "$PROV_TAP" echo ready 2>/dev/null && break
-          sleep 2
-        done
-
-        echo "Running provision script inside VM..."
-        PROV_SCRIPT="${BOXCUTTER_HOME}/golden/provision.sh"
-        [ -f "$PROV_SCRIPT" ] || PROV_SCRIPT="/mnt/boxcutter/golden/provision.sh"
-        vm_ssh "$PROV_TAP" "sudo bash -s" < "$PROV_SCRIPT"
-
-        echo "Shutting down provision VM..."
-        dm_name="bc-_gprov"
-        if [ -e "/dev/mapper/${dm_name}" ]; then
-          echo "Merging snapshot into golden image..."
-          dd if="/dev/mapper/${dm_name}" of="${GOLDEN}.new" bs=4M status=progress
-          cmd_stop _gprov
-          mv "${GOLDEN}.new" "$GOLDEN"
-        else
-          cmd_stop _gprov
-        fi
-        cmd_destroy _gprov
-
-        echo ""
-        echo "=== Golden image provisioned ==="
-        echo "Path: ${GOLDEN}"
-        du -h "$GOLDEN"
-        ;;
-      *) echo "Usage: boxcutter-ctl golden {build|provision}" ;;
+      build) exec "${BOXCUTTER_HOME}/golden/docker-to-ext4.sh" "${3:-}" ;;
+      *) echo "Usage: boxcutter-ctl golden build [SIZE]" ;;
     esac
     ;;
   help|*) usage ;;

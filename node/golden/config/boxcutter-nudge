@@ -1,0 +1,4 @@
+#!/bin/bash
+# Called via vsock after snapshot migration to nudge tailscale.
+# Force STUN re-probing to discover the new network path.
+tailscale netcheck >/dev/null 2>&1 &

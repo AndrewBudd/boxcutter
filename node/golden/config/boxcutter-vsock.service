@@ -1,0 +1,12 @@
+[Unit]
+Description=Boxcutter vsock listener
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boxcutter-vsock-listen
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

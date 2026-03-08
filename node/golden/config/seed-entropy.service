@@ -1,0 +1,13 @@
+[Unit]
+Description=Seed entropy from urandom at boot
+DefaultDependencies=no
+Before=sysinit.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/dd if=/dev/urandom of=/var/lib/systemd/random-seed bs=512 count=1 status=none
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
