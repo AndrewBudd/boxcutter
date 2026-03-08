@@ -34,6 +34,7 @@ dev@bold-fox:~$
 |    - bridge/TAP/NAT management                                |
 |    - boot recovery, health monitoring                         |
 |    - auto-scaling, drain/migration coordination               |
+|    - OCI image pull, VM provisioning                          |
 |                                                               |
 |  br-boxcutter (192.168.50.1/24)                               |
 |    |                                                          |
@@ -68,15 +69,12 @@ Control plane (`boxcutter-host`) runs on bare metal and owns all infrastructure:
 - **CPU:** x86_64 with hardware virtualization (Intel VT-x / AMD-V) and nested virtualization
 - **RAM:** 32GB minimum (orchestrator 4G + node 12G + headroom). 64GB recommended.
 - **Disk:** 50GB minimum. 150GB+ recommended.
-- **Network:** Internet connectivity for Tailscale
+- **Network:** Internet connectivity for Tailscale and OCI image pulls
 
 ### Software
 
 - Ubuntu 24.04 on the physical host
 - sudo access
-- SSH key (`~/.ssh/id_rsa` or `~/.ssh/id_ed25519`)
-- Tailscale account with reusable+ephemeral auth key
-- Go 1.22+ (for building Go services)
 
 ### Verify KVM + nested virtualization
 
@@ -89,68 +87,98 @@ cat /sys/module/kvm_amd/parameters/nested    # Should say 1 or Y
 cat /sys/module/kvm_intel/parameters/nested
 ```
 
-## Installation
+## Quick Start
 
-### Step 1: Clone and configure
+### Step 1: Install host dependencies
+
+```bash
+sudo apt install qemu-system-x86 qemu-utils genisoimage zstd mosquitto mosquitto-clients
+
+# Go 1.22+
+curl -sL https://go.dev/dl/go1.22.5.linux-amd64.tar.gz | sudo tar xz -C /usr/local
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+
+# GitHub CLI (needed for pushing images to ghcr.io, not required for bootstrap)
+# https://cli.github.com/
+```
+
+### Step 2: Clone and configure
 
 ```bash
 git clone <repo-url> ~/boxcutter
 cd ~/boxcutter
 ```
 
-Edit `host/boxcutter.env`:
+Edit `host/boxcutter.env` to match your host:
 
 ```bash
 HOST_INTERFACE=enp34s0    # Your physical NIC (ip route | grep default)
-NODE_VCPU=6               # vCPUs per node VM
+NODE_VCPU=6               # vCPUs per node VM (adjust for your hardware)
 NODE_RAM=12G              # RAM per node VM
 NODE_DISK=150G            # Disk per node VM
 ```
 
-### Step 2: Set up secrets
+### Step 3: Set up secrets
 
 ```bash
 mkdir -p ~/.boxcutter/secrets
-
-# Tailscale auth keys (reusable + ephemeral)
-echo 'tskey-auth-XXXXX' > ~/.boxcutter/secrets/tailscale-node-authkey
-echo 'tskey-auth-YYYYY' > ~/.boxcutter/secrets/tailscale-vm-authkey
-
-# Generate cluster SSH key (shared across all nodes)
-ssh-keygen -t ed25519 -f ~/.boxcutter/secrets/cluster-ssh.key -N ""
 ```
 
-### Step 3: Build and install the control plane
+Create the following files:
+
+| File | What it is | How to get it |
+|------|-----------|---------------|
+| `~/.boxcutter/secrets/tailscale-node-authkey` | Tailscale auth key for orchestrator + node VMs | [Tailscale admin](https://login.tailscale.com/admin/settings/keys) -- reusable key |
+| `~/.boxcutter/secrets/tailscale-vm-authkey` | Tailscale auth key for Firecracker microVMs | Same -- reusable + ephemeral key |
+| `~/.boxcutter/secrets/cluster-ssh.key` | SSH key for inter-node communication | `ssh-keygen -t ed25519 -f ~/.boxcutter/secrets/cluster-ssh.key -N ""` |
+| `~/.boxcutter/secrets/authorized-keys` | SSH public keys for the boxcutter control interface | Your `~/.ssh/id_rsa.pub` or `id_ed25519.pub` |
+| `~/.boxcutter/secrets/github-app.pem` | GitHub App private key (for repo cloning in VMs) | [GitHub App settings](https://github.com/settings/apps) |
+
+You also need a config file at `~/.boxcutter/boxcutter.yaml`:
+
+```yaml
+node:
+  hostname: HOSTNAME_PLACEHOLDER
+  bridge_ip: BRIDGE_IP_PLACEHOLDER
+
+orchestrator:
+  url: ORCHESTRATOR_URL_PLACEHOLDER
+
+github:
+  enabled: true
+  app_id: <your-app-id>
+  installation_ids:
+    - <your-installation-id>
+  private_key_file: /etc/boxcutter/secrets/github-app.pem
+
+tailscale:
+  node_authkey_file: /etc/boxcutter/secrets/tailscale-node-authkey
+  vm_authkey_file: /etc/boxcutter/secrets/tailscale-vm-authkey
+```
+
+The `PLACEHOLDER` values are templated automatically per-VM during provisioning.
+
+### Step 4: Build, install, and bootstrap
 
 ```bash
-make build-host
 make install-host
-# -> Installs /usr/local/bin/boxcutter-host + systemd service
+sudo env BOXCUTTER_REPO=$PWD boxcutter-host bootstrap
 ```
 
-### Step 4: Provision VMs
+That's it. Bootstrap handles everything:
 
-```bash
-# Provision the orchestrator VM (builds binaries, creates disk + cloud-init ISO)
-make provision-orchestrator
+1. Sets up the bridge network (`br-boxcutter`) and NAT rules
+2. Pulls pre-built VM images from `ghcr.io/andrewbudd/boxcutter` (with retry on failure)
+3. Creates COW disks from the base images
+4. Generates cloud-init ISOs (injects your secrets from `~/.boxcutter/`)
+5. Launches the orchestrator and node-1 QEMU VMs
+6. Waits for both to become healthy
+7. Sets up the golden image (Firecracker rootfs) on the node
 
-# Provision a node VM
-make provision-node
-```
+Bootstrap is fully idempotent -- if it fails partway through (e.g. network timeout during image pull), re-run it and it picks up where it left off.
 
-### Step 5: Bootstrap the cluster
-
-```bash
-sudo boxcutter-host bootstrap
-```
-
-This will:
-- Create the bridge device (`br-boxcutter`) and NAT rules
-- Create TAP devices for each VM
-- Launch the orchestrator and node-1 QEMU VMs
-- Save state to `/var/lib/boxcutter/cluster.json`
-
-### Step 6: Start the control plane service
+### Step 5: Start the control plane service
 
 ```bash
 sudo systemctl enable --now boxcutter-host
@@ -161,33 +189,23 @@ The service will:
 - Launch all VMs from `cluster.json`
 - Monitor VM health (restart crashed VMs)
 - Auto-scale nodes when capacity exceeds 80%
-- Never scale if host has less than 8GB free memory
 
-### Step 7: Wait for VMs to boot and verify
+### Step 6: Verify and start using
 
 ```bash
-# Check control plane status
-sudo boxcutter-host status
-
-# Or via the unix socket API
-sudo curl -s --unix-socket /run/boxcutter-host.sock http://localhost/status | python3 -m json.tool
-
-# Wait for node to register with orchestrator, then test SSH interface
+# Check cluster status
 ssh -i ~/.ssh/id_rsa boxcutter@192.168.50.2 status
 ssh -i ~/.ssh/id_rsa boxcutter@192.168.50.2 nodes
-```
 
-### Step 8: Add users and create VMs
-
-```bash
-# Add SSH keys from GitHub
+# Add your SSH keys
 ssh -i ~/.ssh/id_rsa boxcutter@192.168.50.2 adduser <github-username>
 
 # Create a VM
 ssh -i ~/.ssh/id_rsa boxcutter@192.168.50.2 new
 
-# Or via Tailscale once the orchestrator has joined
+# Or via Tailscale (once orchestrator has joined your tailnet)
 ssh boxcutter new
+ssh boxcutter list
 ```
 
 ## Usage
@@ -206,14 +224,16 @@ ssh boxcutter list                 # List all VMs
 ssh boxcutter destroy <name>       # Destroy a VM
 ssh boxcutter stop <name>          # Stop a running VM
 ssh boxcutter start <name>         # Start a stopped VM
+ssh boxcutter cp <name> [new-name] # Clone a VM's disk
 ssh boxcutter status               # Cluster capacity summary
 ssh boxcutter nodes                # List all nodes with health
+ssh boxcutter images               # List golden images on nodes
 ssh boxcutter adduser <github>     # Add SSH keys from GitHub
 ssh boxcutter removeuser <github>  # Remove SSH keys
 ssh boxcutter keys                 # List configured SSH keys
 ```
 
-## After a host reboot
+## After a Host Reboot
 
 The `boxcutter-host` systemd service handles reboots automatically:
 
@@ -223,6 +243,48 @@ The `boxcutter-host` systemd service handles reboots automatically:
 
 No manual intervention needed.
 
+## Image Build and Publish
+
+VM base images are distributed as OCI artifacts via `ghcr.io`. The images are public -- anyone can pull without authentication.
+
+### Building and publishing images
+
+```bash
+# Build + push both node and orchestrator images
+make publish-all
+
+# Build + push a single image type
+make publish TYPE=node
+make publish TYPE=orchestrator
+
+# Build only (no push)
+make build-image TYPE=node
+
+# Push a previously built image
+./host/publish-image.sh node --push-only
+
+# Custom tag (default: git short hash)
+./host/publish-image.sh node --tag v1.0
+```
+
+Pushing requires `gh auth login` (GitHub CLI authentication).
+
+### Upgrading a running cluster
+
+```bash
+# Pull latest images from OCI and rolling-upgrade all VMs
+sudo boxcutter-host upgrade all
+
+# Upgrade just nodes (rolls out new node, drains old, zero VM downtime)
+sudo boxcutter-host upgrade node
+
+# Upgrade just the orchestrator (migrates state to new instance)
+sudo boxcutter-host upgrade orchestrator
+
+# Update the golden image (nodes pull via MQTT)
+sudo boxcutter-host upgrade golden
+```
+
 ## Migration
 
 Firecracker VMs can be live-migrated between nodes using snapshot/restore. The VM pauses (not stops), its memory and state are snapshotted, transferred to the target node, and resumed. Processes, memory, and Tailscale connections survive. Downtime is ~10s for a 2GB VM.
@@ -231,27 +293,28 @@ Migration is coordinated by the control plane during drain operations. Users can
 
 After migration, a vsock-based nudge triggers `tailscale netcheck` inside the VM to re-establish network paths through the new node.
 
-## File structure
+## File Structure
 
 ```
 boxcutter/
-+-- host/                        # Physical host
++-- host/                        # Physical host control plane
 |   +-- boxcutter.env            # Network and resource configuration
-|   +-- boxcutter-host.service   # systemd unit for control plane
+|   +-- boxcutter-host.service   # systemd unit
 |   +-- cmd/host/main.go         # Control plane binary
-|   +-- internal/                # bridge, cluster state, qemu management
-|   +-- setup.sh                 # Manual bridge/TAP setup (superseded by boxcutter-host)
-|   +-- launch.sh                # Manual VM launch (superseded by boxcutter-host)
-|   +-- provision.sh             # Provision orchestrator/node VMs
+|   +-- internal/                # bridge, cluster state, qemu, OCI
+|   +-- provision.sh             # Cloud-init ISO generation
+|   +-- build-image.sh           # Build VM base images (QCOW2)
+|   +-- publish-image.sh         # Build + push images to ghcr.io
+|   +-- mosquitto.conf           # MQTT broker config (golden image distribution)
 +-- orchestrator/                # Orchestrator VM (Go)
-|   +-- cmd/orchestrator/        # HTTP API server
+|   +-- cmd/orchestrator/        # HTTP API server (:8801)
 |   +-- cmd/ssh/                 # SSH ForceCommand binary
-|   +-- internal/                # api, db, scheduler, node client
+|   +-- internal/                # api, db, mqtt, scheduler
 +-- node/                        # Node VM
 |   +-- agent/                   # Node agent (Go) - VM lifecycle, migration
 |   |   +-- cmd/node/            # HTTP API server (:8800)
-|   |   +-- internal/            # vm manager, fcapi, networking
-|   +-- golden/                  # Golden image build
+|   |   +-- internal/            # vm manager, fcapi, networking, mqtt, golden
+|   +-- golden/                  # Golden image (Firecracker rootfs)
 |   |   +-- build.sh             # Phase 1: debootstrap rootfs
 |   |   +-- provision.sh         # Phase 2: install dev tools
 |   |   +-- nss_catchall.c       # NSS module for any-username SSH
