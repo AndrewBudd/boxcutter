@@ -77,7 +77,11 @@ func (m *Manager) SetHead(version string) error {
 	log.Printf("golden: head changing from %s to %s", m.currentHead, version)
 
 	if version == "build" || version == "latest" {
-		// Build locally from Dockerfile
+		// Build locally from Dockerfile, but only if no golden image exists yet
+		if m.currentHead != "" {
+			log.Printf("golden: already have version %s, skipping build", m.currentHead)
+			return nil
+		}
 		if err := m.buildLocal(); err != nil {
 			return fmt.Errorf("building golden image locally: %w", err)
 		}
