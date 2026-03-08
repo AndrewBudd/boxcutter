@@ -19,7 +19,7 @@ Boxcutter provides ephemeral dev environment VMs powered by Firecracker microVMs
 
 ## Finding your Boxcutter host
 
-The Boxcutter control interface runs on a Node VM that joins Tailscale as `boxcutter`. Check these locations for the host address:
+The Boxcutter control interface runs on an Orchestrator VM that joins Tailscale as `boxcutter`. Check these locations for the host address:
 
 1. **CLAUDE.md** in the current project — look for a Boxcutter host IP or hostname
 2. **Memory files** — check for previously saved Boxcutter configuration
@@ -50,8 +50,13 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null HOST <command>
 | `ssh HOST start <name>` | Start a stopped VM |
 | `ssh HOST stop <name>` | Gracefully stop a VM |
 | `ssh HOST destroy <name>` | Permanently delete a VM (auto-removed from Tailscale) |
-| `ssh HOST status` | Show host capacity (RAM headroom, VM count) |
+| `ssh HOST status` | Cluster capacity summary |
+| `ssh HOST nodes` | List all nodes with health |
+| `ssh HOST images` | List golden images on nodes |
+| `ssh HOST cp <name> [new-name]` | Clone a VM's disk |
 | `ssh HOST adduser <github-user>` | Import SSH keys from GitHub for a new user |
+| `ssh HOST removeuser <github-user>` | Remove a user's SSH keys |
+| `ssh HOST keys` | List configured SSH keys |
 | `ssh HOST help` | Show available commands |
 
 ### Creating a VM
@@ -62,23 +67,21 @@ ssh HOST new
 
 Output looks like:
 ```
-Creating VM: bold-fox (4 vCPU, 8GB RAM, 50G disk, mode: normal)
-  Creating copy-on-write snapshot...
-  Injecting CA cert...
-  VM created: bold-fox (mark: 41022, mode: normal)
-Starting VM: bold-fox (mark: 41022, mode: normal)
-  VM started (PID 12847)
-  Waiting for VM to boot...
-ready
-  Joining Tailscale...
-  Tailscale IP: 100.64.1.42
-  SSH: ssh 100.64.1.42
+  -> Trying boxcutter-node-1...
+  Creating VM: bold-fox (2 vCPU, 2GB RAM, 50G disk, mode: normal)
 
-VM ready: bold-fox
-Connect: ssh 100.64.1.42
+  Name:    bold-fox
+  Node:    boxcutter-node-1
+  vCPU:    2
+  RAM:     2G
+  IP:      100.64.1.42
+  Mode:    normal
+  Status:  running
+
+  Connect: ssh bold-fox
 ```
 
-Parse the **name** and **Tailscale IP** from the output. The name appears after "VM ready:" and the IP appears after "Connect: ssh". You need the name for lifecycle commands (`stop`, `destroy`) and for SSH access — the VM name works as a hostname via MagicDNS (e.g., `ssh bold-fox`). The Tailscale IP also works (`ssh 100.64.1.42`).
+Parse the **name** and **Tailscale IP** from the output. The name appears after "Name:" and the IP appears after "IP:". You need the name for lifecycle commands (`stop`, `destroy`) and for SSH access — the VM name works as a hostname via MagicDNS (e.g., `ssh bold-fox`). The Tailscale IP also works (`ssh 100.64.1.42`).
 
 Prefer using the VM name as the hostname — it's shorter and more readable. Give the user both the name and the Tailscale IP.
 
@@ -215,11 +218,11 @@ Caddy handles cert provisioning and renewal automatically. It needs access to th
 ## Important things to know
 
 - **VMs are ephemeral.** Destroying a VM permanently deletes all its data. There is no undo. Stopping a VM preserves its disk state — you can start it again later.
-- **Each VM defaults to 4 vCPU, 8GB RAM, 50GB disk.** This is enough for most dev workloads.
+- **Each VM defaults to 2 vCPU, 2GB RAM, 50GB disk.** This is enough for most dev workloads.
 - **Boot time is ~5 seconds** total (VM boot + Tailscale join). The `new` command waits for everything to be ready before returning.
 - **All SSH is key-based.** The keys of whoever ran the initial setup are automatically trusted. Additional users can be added via `adduser <github-user>`.
 - **VMs are accessible via Tailscale.** They're reachable from any device on your tailnet, not just the local network.
 - **Any SSH username works.** Both on the control host and on VMs — no need to specify a user.
-- **Check capacity before creating many VMs.** Run `ssh HOST status` to see available RAM. Each VM uses 8GB by default.
+- **Check capacity before creating many VMs.** Run `ssh HOST status` to see available RAM. Each VM uses 2GB by default.
 - **Destroying a VM auto-removes it from Tailscale.** The ephemeral auth key means disconnected nodes are automatically cleaned up.
 - **Normal vs paranoid mode.** Normal VMs have full internet. Paranoid VMs route through a MITM proxy with sentinel token swapping — real credentials never touch the VM.
