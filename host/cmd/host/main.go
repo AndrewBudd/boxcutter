@@ -874,6 +874,106 @@ func cliUpgrade() {
 	}
 }
 
+// bootstrapGolden attempts to pull the golden image during bootstrap.
+// Non-fatal: if no golden image exists in OCI, it triggers a build on the node instead.
+func bootstrapGolden(cfg HostConfig, state *cluster.State) {
+	if state.Orchestrator == nil || len(state.Nodes) == 0 {
+		log.Println("  Skipping golden image (no orchestrator or nodes)")
+		return
+	}
+
+	// First check if golden image exists in OCI
+	orchAddr := fmt.Sprintf("http://%s:8801", state.Orchestrator.BridgeIP)
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	setHeadReq := map[string]string{"version": "latest"}
+	data, _ := json.Marshal(setHeadReq)
+	resp, err := client.Post(orchAddr+"/api/golden/head", "application/json", bytes.NewReader(data))
+	if err != nil {
+		log.Printf("  Could not set golden head on orchestrator: %v", err)
+		log.Println("  Golden image will need to be set up manually:")
+		log.Println("    make publish TYPE=golden   # or: ssh ubuntu@<node> sudo /var/lib/boxcutter/golden/build.sh")
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		log.Printf("  Orchestrator returned %d for golden head — golden image may not be published yet", resp.StatusCode)
+		log.Println("  Triggering golden image build on node-1...")
+
+		// Fall back to building golden on the node directly
+		nodeIP := state.Nodes[0].BridgeIP
+		sshKey := findClusterSSHKey(cfg)
+		if sshKey == "" {
+			log.Println("  No cluster SSH key found, cannot trigger remote build")
+			return
+		}
+		buildCmd := exec.Command("ssh",
+			"-i", sshKey,
+			"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+			fmt.Sprintf("ubuntu@%s", nodeIP),
+			"sudo /var/lib/boxcutter/golden/build.sh")
+		buildCmd.Stdout = os.Stdout
+		buildCmd.Stderr = os.Stderr
+		if err := buildCmd.Run(); err != nil {
+			log.Printf("  Golden image build failed: %v", err)
+			log.Println("  You can build it manually later: ssh ubuntu@<node> sudo /var/lib/boxcutter/golden/build.sh")
+		} else {
+			log.Println("  Golden image built successfully on node-1")
+		}
+		return
+	}
+
+	log.Println("  Golden head set to 'latest' — nodes will pull via MQTT")
+
+	// Wait for nodes to have the golden image
+	log.Println("  Waiting for nodes to pull golden image...")
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		allReady := true
+		for _, n := range state.Nodes {
+			if !qemu.IsRunning(n.PID) {
+				continue
+			}
+			nodeClient := &http.Client{Timeout: 3 * time.Second}
+			resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/golden/latest", n.BridgeIP))
+			if err != nil || resp.StatusCode != 200 {
+				allReady = false
+				if resp != nil {
+					resp.Body.Close()
+				}
+				continue
+			}
+			resp.Body.Close()
+		}
+		if allReady {
+			log.Println("  All nodes have golden image")
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+	log.Println("  Warning: timeout waiting for nodes to pull golden image")
+}
+
+// findClusterSSHKey returns the path to the cluster SSH key.
+func findClusterSSHKey(cfg HostConfig) string {
+	candidates := []string{
+		filepath.Join(cfg.RepoDir, ".boxcutter", "secrets", "cluster-ssh.key"),
+	}
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		if u, err := user.Lookup(sudoUser); err == nil {
+			candidates = append(candidates, filepath.Join(u.HomeDir, ".boxcutter", "secrets", "cluster-ssh.key"))
+		}
+	}
+	candidates = append(candidates, "/etc/boxcutter/secrets/cluster-ssh.key")
+	for _, p := range candidates {
+		if fileExists(p) {
+			return p
+		}
+	}
+	return ""
+}
+
 // upgradeGolden tells the orchestrator to set a new golden head version.
 // Nodes subscribed to MQTT will pull it automatically.
 func upgradeGolden(cfg HostConfig, state *cluster.State, tag string) {
@@ -1615,11 +1715,69 @@ func startMosquitto(cfg HostConfig) *exec.Cmd {
 	return cmd
 }
 
+// ensureBaseImage pulls and decompresses a base image from OCI if it doesn't already exist.
+// Retries up to 3 times on network failure.
+func ensureBaseImage(cfg HostConfig, vmType string) (string, *oci.ImageMetadata, error) {
+	basePath := filepath.Join(cfg.ImagesDir, fmt.Sprintf("%s-base.qcow2", vmType))
+
+	if fileExists(basePath) {
+		log.Printf("  %s base image already exists", vmType)
+		return basePath, nil, nil
+	}
+
+	var meta *oci.ImageMetadata
+	var outputFile string
+	var err error
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			// Clean up any partial download from previous attempt
+			zstPath := filepath.Join(cfg.ImagesDir, fmt.Sprintf("%s-image.qcow2.zst", vmType))
+			os.Remove(zstPath)
+			delay := time.Duration(attempt*5) * time.Second
+			log.Printf("  Retrying in %s (attempt %d/3)...", delay, attempt)
+			time.Sleep(delay)
+		}
+
+		log.Printf("  Pulling %s image from OCI registry...", vmType)
+		ctx := context.Background()
+		meta, outputFile, err = oci.Pull(ctx, oci.PullOptions{
+			Registry:   cfg.OCIRegistry,
+			Repository: cfg.OCIRepository,
+			VMType:     vmType,
+			Tag:        "latest",
+			OutputDir:  cfg.ImagesDir,
+			Auth:       cfg.ociAuth(),
+		})
+		if err == nil {
+			break
+		}
+		log.Printf("  Pull failed: %v", err)
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("pull %s image after 3 attempts: %w", vmType, err)
+	}
+
+	if outputFile != "" && filepath.Ext(outputFile) == ".zst" {
+		log.Printf("  Decompressing %s image...", vmType)
+		if err := decompressZstd(outputFile, basePath); err != nil {
+			return "", nil, fmt.Errorf("decompress %s: %w", vmType, err)
+		}
+		os.Remove(outputFile)
+	} else if outputFile != "" {
+		os.Rename(outputFile, basePath)
+	}
+
+	return basePath, meta, nil
+}
+
 func runBootstrap() {
 	cfg := defaultConfig()
+	os.MkdirAll(cfg.ImagesDir, 0755)
 	log.Println("boxcutter-host bootstrap")
 
-	// Set up bridge
+	// Phase 1: Bridge
+	log.Println("--- Setting up bridge network ---")
 	if err := bridge.Setup(bridge.Config{
 		BridgeDevice: cfg.BridgeDevice,
 		BridgeIP:     cfg.BridgeIP,
@@ -1629,6 +1787,63 @@ func runBootstrap() {
 		log.Fatalf("Bridge setup: %v", err)
 	}
 
+	// Phase 2: Ensure base images exist (pull from OCI if needed)
+	log.Println("--- Ensuring base images ---")
+	orchBasePath, orchMeta, err := ensureBaseImage(cfg, "orchestrator")
+	if err != nil {
+		log.Fatalf("Orchestrator image: %v", err)
+	}
+	nodeBasePath, nodeMeta, err := ensureBaseImage(cfg, "node")
+	if err != nil {
+		log.Fatalf("Node image: %v", err)
+	}
+
+	// Phase 3: Create COW disks
+	log.Println("--- Creating VM disks ---")
+	orchDisk := filepath.Join(cfg.ImagesDir, "orchestrator.qcow2")
+	if !fileExists(orchDisk) {
+		log.Println("  Creating orchestrator COW disk...")
+		if err := createCOWDisk(orchBasePath, orchDisk, cfg.OrchestratorDisk); err != nil {
+			log.Fatalf("Orchestrator disk: %v", err)
+		}
+	} else {
+		log.Println("  Orchestrator disk already exists")
+	}
+
+	node1Disk := filepath.Join(cfg.ImagesDir, "boxcutter-node-1.qcow2")
+	if !fileExists(node1Disk) {
+		log.Println("  Creating node-1 COW disk...")
+		if err := createCOWDisk(nodeBasePath, node1Disk, cfg.NodeDisk); err != nil {
+			log.Fatalf("Node-1 disk: %v", err)
+		}
+	} else {
+		log.Println("  Node-1 disk already exists")
+	}
+
+	// Phase 4: Generate cloud-init ISOs
+	log.Println("--- Generating cloud-init ISOs ---")
+	orchISO := filepath.Join(cfg.ImagesDir, "orchestrator-cloud-init.iso")
+	if !fileExists(orchISO) {
+		log.Println("  Generating orchestrator ISO...")
+		if err := generateCloudInitISO(cfg, "orchestrator", ""); err != nil {
+			log.Fatalf("Orchestrator ISO: %v", err)
+		}
+	} else {
+		log.Println("  Orchestrator ISO already exists")
+	}
+
+	node1ISO := filepath.Join(cfg.ImagesDir, "boxcutter-node-1-cloud-init.iso")
+	if !fileExists(node1ISO) {
+		log.Println("  Generating node-1 ISO...")
+		if err := generateCloudInitISO(cfg, "node", "boxcutter-node-1"); err != nil {
+			log.Fatalf("Node-1 ISO: %v", err)
+		}
+	} else {
+		log.Println("  Node-1 ISO already exists")
+	}
+
+	// Phase 5: Launch VMs
+	log.Println("--- Launching VMs ---")
 	state, _ := cluster.Load(cfg.StatePath)
 
 	currentUser, _ := user.Current()
@@ -1637,48 +1852,75 @@ func runBootstrap() {
 		username = currentUser.Username
 	}
 
-	// Register orchestrator in state
-	orchDisk := fmt.Sprintf("%s/orchestrator.qcow2", cfg.ImagesDir)
-	orchISO := fmt.Sprintf("%s/orchestrator-cloud-init.iso", cfg.ImagesDir)
-
-	if _, err := os.Stat(orchDisk); err != nil {
-		log.Printf("Orchestrator disk not found at %s", orchDisk)
-		log.Printf("Run: make provision-orchestrator")
-		os.Exit(1)
-	}
-
-	bridge.EnsureTAP(cfg.OrchestratorTAP, cfg.BridgeDevice, username)
-
-	orchPID, err := qemu.Launch(qemu.VMConfig{
-		Name: "orchestrator",
-		VCPU: cfg.OrchestratorVCPU,
-		RAM:  cfg.OrchestratorRAM,
-		Disk: orchDisk,
-		ISO:  orchISO,
-		TAP:  cfg.OrchestratorTAP,
-		MAC:  cfg.OrchestratorMAC,
-	}, cfg.ImagesDir)
-	if err != nil {
-		log.Fatalf("Orchestrator launch: %v", err)
-	}
-
-	state.SetOrchestrator(cluster.VMEntry{
+	// Orchestrator
+	orchEntry := cluster.VMEntry{
 		ID:       "orchestrator",
+		Type:     "orchestrator",
 		BridgeIP: cfg.OrchestratorIP,
 		Disk:     orchDisk,
 		ISO:      orchISO,
-		PID:      orchPID,
 		VCPU:     cfg.OrchestratorVCPU,
 		RAM:      cfg.OrchestratorRAM,
 		TAP:      cfg.OrchestratorTAP,
 		MAC:      cfg.OrchestratorMAC,
-	})
+	}
+	if orchMeta != nil {
+		orchEntry.ImageVersion = orchMeta.Version
+		orchEntry.ImageCommit = orchMeta.Commit
+		orchEntry.ImageDigest = orchMeta.Digest
+	}
 
-	// Launch node-1
-	node1Disk := fmt.Sprintf("%s/boxcutter-node-1.qcow2", cfg.ImagesDir)
-	node1ISO := fmt.Sprintf("%s/boxcutter-node-1-cloud-init.iso", cfg.ImagesDir)
+	if state.Orchestrator != nil && qemu.IsRunning(state.Orchestrator.PID) {
+		log.Printf("  Orchestrator already running (PID %d)", state.Orchestrator.PID)
+	} else {
+		bridge.EnsureTAP(cfg.OrchestratorTAP, cfg.BridgeDevice, username)
+		orchPID, err := qemu.Launch(qemu.VMConfig{
+			Name: "orchestrator",
+			VCPU: cfg.OrchestratorVCPU,
+			RAM:  cfg.OrchestratorRAM,
+			Disk: orchDisk,
+			ISO:  orchISO,
+			TAP:  cfg.OrchestratorTAP,
+			MAC:  cfg.OrchestratorMAC,
+		}, cfg.ImagesDir)
+		if err != nil {
+			log.Fatalf("Orchestrator launch: %v", err)
+		}
+		orchEntry.PID = orchPID
+		log.Printf("  Orchestrator started (PID %d)", orchPID)
+	}
+	state.SetOrchestrator(orchEntry)
 
-	if _, err := os.Stat(node1Disk); err == nil {
+	// Node-1
+	node1BridgeIP := fmt.Sprintf("%s.3", cfg.NodeSubnet)
+	node1MAC := "52:54:00:00:00:03"
+	node1Entry := cluster.VMEntry{
+		ID:       "boxcutter-node-1",
+		Type:     "node",
+		BridgeIP: node1BridgeIP,
+		Disk:     node1Disk,
+		ISO:      node1ISO,
+		VCPU:     cfg.NodeVCPU,
+		RAM:      cfg.NodeRAM,
+		TAP:      "tap-node1",
+		MAC:      node1MAC,
+	}
+	if nodeMeta != nil {
+		node1Entry.ImageVersion = nodeMeta.Version
+		node1Entry.ImageCommit = nodeMeta.Commit
+		node1Entry.ImageDigest = nodeMeta.Digest
+	}
+
+	alreadyRunning := false
+	for _, n := range state.Nodes {
+		if n.ID == "boxcutter-node-1" && qemu.IsRunning(n.PID) {
+			log.Printf("  Node-1 already running (PID %d)", n.PID)
+			node1Entry.PID = n.PID
+			alreadyRunning = true
+			break
+		}
+	}
+	if !alreadyRunning {
 		bridge.EnsureTAP("tap-node1", cfg.BridgeDevice, username)
 		node1PID, err := qemu.Launch(qemu.VMConfig{
 			Name: "boxcutter-node-1",
@@ -1687,29 +1929,44 @@ func runBootstrap() {
 			Disk: node1Disk,
 			ISO:  node1ISO,
 			TAP:  "tap-node1",
-			MAC:  "52:54:00:00:00:03",
+			MAC:  node1MAC,
 		}, cfg.ImagesDir)
 		if err != nil {
-			log.Printf("WARNING: node-1 launch failed: %v", err)
-		} else {
-			state.AddNode(cluster.VMEntry{
-				ID:       "boxcutter-node-1",
-				BridgeIP: fmt.Sprintf("%s.3", cfg.NodeSubnet),
-				Disk:     node1Disk,
-				ISO:      node1ISO,
-				PID:      node1PID,
-				VCPU:     cfg.NodeVCPU,
-				RAM:      cfg.NodeRAM,
-				TAP:      "tap-node1",
-				MAC:      "52:54:00:00:00:03",
-			})
+			log.Fatalf("Node-1 launch: %v", err)
 		}
+		node1Entry.PID = node1PID
+		log.Printf("  Node-1 started (PID %d)", node1PID)
+	}
+	// Clear old nodes and add fresh
+	state.Nodes = nil
+	state.AddNode(node1Entry)
+	state.Save()
+
+	// Phase 6: Wait for health
+	log.Println("--- Waiting for VMs to become healthy ---")
+	if !waitForHealth(fmt.Sprintf("http://%s:8801/healthz", cfg.OrchestratorIP), 120*time.Second) {
+		log.Println("WARNING: Orchestrator did not become healthy within 120s")
 	} else {
-		log.Printf("No node-1 disk found — run: make provision-node")
+		log.Println("  Orchestrator healthy")
 	}
 
-	if err := state.Save(); err != nil {
-		log.Fatalf("Saving cluster state: %v", err)
+	if !waitForNodeHealth(node1BridgeIP, 120*time.Second) {
+		log.Println("WARNING: Node-1 did not become healthy within 120s")
+	} else {
+		log.Println("  Node-1 healthy")
+	}
+
+	// Phase 7: Golden image — start MQTT broker and trigger golden pull
+	log.Println("--- Setting up golden image ---")
+	mosquittoCmd := startMosquitto(cfg)
+
+	// Give MQTT a moment to start and nodes to connect
+	time.Sleep(5 * time.Second)
+
+	bootstrapGolden(cfg, state)
+
+	if mosquittoCmd != nil {
+		mosquittoCmd.Process.Kill()
 	}
 
 	log.Printf("Bootstrap complete. State saved to %s", cfg.StatePath)
