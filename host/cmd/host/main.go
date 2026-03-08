@@ -892,7 +892,7 @@ func bootstrapGolden(cfg HostConfig, state *cluster.State) {
 	if err != nil {
 		log.Printf("  Could not set golden head on orchestrator: %v", err)
 		log.Println("  Golden image will need to be set up manually:")
-		log.Println("    make publish TYPE=golden   # or: ssh ubuntu@<node> sudo /var/lib/boxcutter/golden/build.sh")
+		log.Println("    make publish TYPE=golden   # or: ssh ubuntu@<node> sudo /var/lib/boxcutter/golden/docker-to-ext4.sh")
 		return
 	}
 	resp.Body.Close()
@@ -912,12 +912,12 @@ func bootstrapGolden(cfg HostConfig, state *cluster.State) {
 			"-i", sshKey,
 			"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
 			fmt.Sprintf("ubuntu@%s", nodeIP),
-			"sudo /var/lib/boxcutter/golden/build.sh")
+			"sudo /var/lib/boxcutter/golden/docker-to-ext4.sh")
 		buildCmd.Stdout = os.Stdout
 		buildCmd.Stderr = os.Stderr
 		if err := buildCmd.Run(); err != nil {
 			log.Printf("  Golden image build failed: %v", err)
-			log.Println("  You can build it manually later: ssh ubuntu@<node> sudo /var/lib/boxcutter/golden/build.sh")
+			log.Println("  You can build it manually later: ssh ubuntu@<node> sudo /var/lib/boxcutter/golden/docker-to-ext4.sh")
 		} else {
 			log.Println("  Golden image built successfully on node-1")
 		}

@@ -119,7 +119,11 @@ build_node() {
 
   cp "${REPO_DIR}"/node/systemd/*.service "${PD}/systemd/"
   cp "${REPO_DIR}/node/config/Caddyfile" "${PD}/config/" 2>/dev/null || true
-  cp "${REPO_DIR}"/node/golden/build.sh "${REPO_DIR}"/node/golden/provision.sh "${REPO_DIR}"/node/golden/nss_catchall.c "${REPO_DIR}"/node/golden/vsock_listen.c "${PD}/golden/"
+  # Golden image: Dockerfile, conversion script, config files, and C sources
+  cp "${REPO_DIR}"/node/golden/Dockerfile "${REPO_DIR}"/node/golden/docker-to-ext4.sh "${PD}/golden/"
+  cp "${REPO_DIR}"/node/golden/nss_catchall.c "${REPO_DIR}"/node/golden/vsock_listen.c "${PD}/golden/"
+  cp "${REPO_DIR}"/node/golden/gh-token-refresh.sh "${REPO_DIR}"/node/golden/gh-token-refresh.service "${REPO_DIR}"/node/golden/gh-token-refresh.timer "${PD}/golden/"
+  cp -r "${REPO_DIR}"/node/golden/config "${PD}/golden/"
 
   # Template node-specific values into boxcutter.yaml
   sed -e "s|BRIDGE_IP_PLACEHOLDER|${THIS_NODE_IP}|g" \
@@ -158,7 +162,7 @@ packages:
   - jq
   - curl
   - wget
-  - debootstrap
+  - docker.io
   - e2fsprogs
   - iptables-persistent
   - socat
@@ -195,8 +199,8 @@ write_files:
 
       BOXCUTTER_HOME="/var/lib/boxcutter"
       mkdir -p "\$BOXCUTTER_HOME/kernel" "\$BOXCUTTER_HOME/vms" "\$BOXCUTTER_HOME/golden"
-      cp "\$PD/golden/"* "\$BOXCUTTER_HOME/golden/"
-      chmod +x "\$BOXCUTTER_HOME/golden/build.sh" "\$BOXCUTTER_HOME/golden/provision.sh"
+      cp -r "\$PD/golden/"* "\$BOXCUTTER_HOME/golden/"
+      chmod +x "\$BOXCUTTER_HOME/golden/docker-to-ext4.sh"
 
       # Firecracker
       if ! command -v firecracker &>/dev/null; then

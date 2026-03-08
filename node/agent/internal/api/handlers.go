@@ -417,7 +417,7 @@ func (h *Handler) handleGoldenBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	buildScript := filepath.Join(filepath.Dir(goldenPath), "build.sh")
+	buildScript := filepath.Join(filepath.Dir(goldenPath), "docker-to-ext4.sh")
 	if _, err := os.Stat(buildScript); err != nil {
 		http.Error(w, "build script not found", http.StatusNotFound)
 		return

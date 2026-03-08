@@ -64,7 +64,8 @@ func NewManager(cfg Config) *Manager {
 }
 
 // SetHead is called when the orchestrator publishes a new golden head version.
-// It pulls the image if not already present and updates the symlink.
+// If the version is "build", it builds locally from the Dockerfile.
+// Otherwise, it pulls the image from OCI if not already present.
 func (m *Manager) SetHead(version string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -75,34 +76,61 @@ func (m *Manager) SetHead(version string) error {
 
 	log.Printf("golden: head changing from %s to %s", m.currentHead, version)
 
-	// Check if we already have this version
-	versionPath := filepath.Join(m.goldenDir, version+".ext4")
-	if _, err := os.Stat(versionPath); err != nil {
-		// Need to pull it
-		log.Printf("golden: pulling version %s from OCI registry", version)
-		if err := m.pullFromOCI(version); err != nil {
-			return fmt.Errorf("pulling golden image %s: %w", version, err)
+	if version == "build" || version == "latest" {
+		// Build locally from Dockerfile
+		if err := m.buildLocal(); err != nil {
+			return fmt.Errorf("building golden image locally: %w", err)
 		}
-	}
+		// Read the version that was just built
+		version = m.readCurrentVersion()
+		if version == "" {
+			return fmt.Errorf("golden image built but no version found")
+		}
+	} else {
+		// Check if we already have this version
+		versionPath := filepath.Join(m.goldenDir, version+".ext4")
+		if _, err := os.Stat(versionPath); err != nil {
+			// Need to pull it
+			log.Printf("golden: pulling version %s from OCI registry", version)
+			if err := m.pullFromOCI(version); err != nil {
+				return fmt.Errorf("pulling golden image %s: %w", version, err)
+			}
+		}
 
-	// Update the symlink
-	symlinkPath := filepath.Join(m.goldenDir, "rootfs.ext4")
-	tmpLink := symlinkPath + ".tmp"
-	os.Remove(tmpLink)
-	if err := os.Symlink(version+".ext4", tmpLink); err != nil {
-		return fmt.Errorf("creating symlink: %w", err)
-	}
-	if err := os.Rename(tmpLink, symlinkPath); err != nil {
-		return fmt.Errorf("activating symlink: %w", err)
-	}
+		// Update the symlink
+		symlinkPath := filepath.Join(m.goldenDir, "rootfs.ext4")
+		tmpLink := symlinkPath + ".tmp"
+		os.Remove(tmpLink)
+		if err := os.Symlink(version+".ext4", tmpLink); err != nil {
+			return fmt.Errorf("creating symlink: %w", err)
+		}
+		if err := os.Rename(tmpLink, symlinkPath); err != nil {
+			return fmt.Errorf("activating symlink: %w", err)
+		}
 
-	// Update current-version file
-	os.WriteFile(filepath.Join(m.goldenDir, "current-version"), []byte(version), 0644)
+		// Update current-version file
+		os.WriteFile(filepath.Join(m.goldenDir, "current-version"), []byte(version), 0644)
+	}
 
 	m.currentHead = version
 	log.Printf("golden: now using version %s", version)
 
 	return nil
+}
+
+// buildLocal runs docker-to-ext4.sh to build the golden image from the Dockerfile.
+func (m *Manager) buildLocal() error {
+	scriptPath := filepath.Join(m.goldenDir, "docker-to-ext4.sh")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return fmt.Errorf("docker-to-ext4.sh not found at %s", scriptPath)
+	}
+
+	log.Printf("golden: building locally from Dockerfile")
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Dir = m.goldenDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // CurrentHead returns the current golden head version.

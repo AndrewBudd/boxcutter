@@ -92,7 +92,7 @@ if [ "$VM_TYPE" = "golden" ]; then
 
   if [ -z "$GOLDEN_SRC" ]; then
     echo "Error: No golden image found. Build one on a node first:"
-    echo "  ssh ubuntu@<node-ip> sudo /var/lib/boxcutter/golden/build.sh"
+    echo "  ssh ubuntu@<node-ip> sudo /var/lib/boxcutter/golden/docker-to-ext4.sh"
     exit 1
   fi
 
@@ -148,9 +148,12 @@ if [ "$VM_TYPE" = "node" ]; then
   cp "${REPO_DIR}/node/config/Caddyfile" "${PD}/config/" 2>/dev/null || true
 
   mkdir -p "${PD}/golden"
-  cp "${REPO_DIR}"/node/golden/build.sh "${REPO_DIR}"/node/golden/provision.sh \
+  cp "${REPO_DIR}"/node/golden/Dockerfile "${REPO_DIR}"/node/golden/docker-to-ext4.sh \
      "${REPO_DIR}"/node/golden/nss_catchall.c "${REPO_DIR}"/node/golden/vsock_listen.c \
+     "${REPO_DIR}"/node/golden/gh-token-refresh.sh "${REPO_DIR}"/node/golden/gh-token-refresh.service \
+     "${REPO_DIR}"/node/golden/gh-token-refresh.timer \
      "${PD}/golden/"
+  cp -r "${REPO_DIR}"/node/golden/config "${PD}/golden/"
 else
   cp "${BUILD_DIR}/boxcutter-orchestrator" "${BUILD_DIR}/boxcutter-ssh-orchestrator" "${PD}/bin/"
   cp "${REPO_DIR}/orchestrator/scripts/boxcutter-names" "${PD}/scripts/"
@@ -254,7 +257,7 @@ packages:
   - jq
   - curl
   - wget
-  - debootstrap
+  - docker.io
   - e2fsprogs
   - iptables-persistent
   - socat
@@ -288,8 +291,8 @@ write_files:
       mkdir -p /etc/caddy/sites /etc/boxcutter/secrets
       BOXCUTTER_HOME="/var/lib/boxcutter"
       mkdir -p "\$BOXCUTTER_HOME/kernel" "\$BOXCUTTER_HOME/vms" "\$BOXCUTTER_HOME/golden"
-      cp "\$PD/golden/"* "\$BOXCUTTER_HOME/golden/" 2>/dev/null || true
-      chmod +x "\$BOXCUTTER_HOME/golden/build.sh" "\$BOXCUTTER_HOME/golden/provision.sh" 2>/dev/null || true
+      cp -r "\$PD/golden/"* "\$BOXCUTTER_HOME/golden/" 2>/dev/null || true
+      chmod +x "\$BOXCUTTER_HOME/golden/docker-to-ext4.sh" 2>/dev/null || true
       cp "\$PD/config/Caddyfile" /etc/caddy/Caddyfile 2>/dev/null || true
 
       # Firecracker
