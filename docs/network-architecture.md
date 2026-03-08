@@ -187,7 +187,14 @@ ssh -o "ProxyCommand=socat - TCP:10.0.0.2:22,so-bindtodevice=tap-bold-fox" \
 
 ## vmid: VM Identity via fwmark
 
-vmid is the VM identity and token broker. It listens on port 80 on the Node VM. VMs reach it at `http://10.0.0.1/` (their TAP gateway address).
+vmid is the VM identity, metadata, and token broker. It listens on `169.254.169.254:80` (the standard cloud metadata address, added to loopback). VMs reach it at `http://169.254.169.254/` via their default gateway (10.0.0.1), which routes to the node's loopback.
+
+vmid serves both public endpoints (no identity required) and identity-protected endpoints:
+
+- **Public:** `/metadata/ssh-keys`, `/metadata/ca-cert`, `/.well-known/jwks.json`
+- **Identity-protected:** `/identity`, `/token/github`, `/token/jwt`, `/sentinel/*`
+
+SSH keys and CA certificates are fetched on first boot by `boxcutter-metadata.service` — no rootfs mounting or file injection needed during VM creation.
 
 ### The identification problem
 
@@ -403,7 +410,7 @@ Return:
 | Port | Service | Listener |
 |---|---|---|
 | 22 | SSH control interface | Orchestrator VM |
-| 80 | vmid (metadata) | Node VM, all interfaces |
+| 80 | vmid (metadata) | 169.254.169.254 (cloud metadata address) |
 | 443 | DERP relay | Node VM (`10.0.0.1`) |
 | 1883 | Mosquitto MQTT broker | Host (`192.168.50.1`) |
 | 3478/udp | DERP STUN | Node VM |

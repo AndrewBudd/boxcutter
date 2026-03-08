@@ -46,8 +46,9 @@ boxcutter/
 │   │   └── go.mod
 │   │
 │   ├── golden/                  # Firecracker rootfs builder
-│   │   ├── build.sh             # Phase 1: debootstrap
-│   │   ├── provision.sh         # Phase 2: dev tools
+│   │   ├── Dockerfile           # Golden image definition
+│   │   ├── docker-to-ext4.sh    # Build Dockerfile -> ext4
+│   │   ├── config/              # systemd units, SSH config, metadata fetch
 │   │   ├── nss_catchall.c       # NSS module (any-username SSH)
 │   │   └── vsock_listen.c       # Migration nudge listener
 │   │
@@ -183,18 +184,17 @@ ssh ubuntu@192.168.50.3 "sudo mv /tmp/boxcutter-ctl /usr/local/bin/ && sudo chmo
 
 ### Golden image
 
-The golden image is the Firecracker microVM rootfs. Rebuilding it is slower (boots a VM, installs packages):
+The golden image is the Firecracker microVM rootfs, built from a Dockerfile. Rebuilding takes ~2 minutes with Docker cache, ~8 minutes without:
 
 ```bash
 # SSH into a node
 ssh ubuntu@192.168.50.3
 
-# Phase 1: build base rootfs (debootstrap, ~5 min)
+# Build golden image from Dockerfile
 sudo boxcutter-ctl golden build
-
-# Phase 2: provision dev tools (boots rootfs, installs packages, ~10 min)
-sudo boxcutter-ctl golden provision
 ```
+
+This runs `docker build` on the node's `golden/Dockerfile`, exports the container to a tar archive, and converts it to a sparse ext4 filesystem. The image is SHA256-versioned — each build produces a hash-named `.ext4` file with a `rootfs.ext4` symlink.
 
 After rebuilding, new VMs use the updated image. Existing VMs are unaffected.
 
@@ -337,7 +337,7 @@ Services on each VM and their corresponding binaries:
 
 | Service | Binary | Port | Description |
 |---------|--------|------|-------------|
-| `vmid` | `vmid` | :80 + `/run/vmid/admin.sock` | VM identity, fwmark-based |
+| `vmid` | `vmid` | 169.254.169.254:80 + `/run/vmid/admin.sock` | VM identity + metadata, fwmark-based |
 | `boxcutter-proxy` | `boxcutter-proxy` | :8080 | MITM proxy, sentinel tokens |
 | `boxcutter-node` | `boxcutter-node` | :8800 | Node agent, VM lifecycle API |
 | `boxcutter-net` | (shell script) | — | Network setup (oneshot) |

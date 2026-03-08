@@ -162,14 +162,15 @@ Each VM joins Tailscale with its generated name as the hostname. If you have Mag
 
 ## The golden image
 
-The base rootfs is built with `debootstrap` — the same tool Debian/Ubuntu use to bootstrap a root filesystem. Phase 1 creates a minimal system with SSH, systemd, Tailscale, and the NSS catchall module. Phase 2 boots it as a temporary Firecracker VM and installs dev tools via SSH.
+The golden image is defined as a Dockerfile (Ubuntu noble base) and converted to a sparse ext4 rootfs via `docker-to-ext4.sh`. This creates a minimal bootable system with SSH, systemd, Tailscale, and the NSS catchall module.
 
 The image includes some Firecracker-specific tweaks:
 
 - **Entropy seeding:** Firecracker VMs lack a hardware RNG. `systemd-random-seed` blocks boot waiting for entropy. I mask it and seed `/dev/urandom` from a oneshot service instead.
 - **No network manager:** systemd-networkd's DHCP client fights with the kernel `ip=` parameter. I just don't install it. Kernel networking is all you need.
 - **Static DNS:** A simple `/etc/resolv.conf` pointing at 8.8.8.8. No `systemd-resolved`, no extra daemons.
-- **Tailscale auto-join:** After a VM boots, the Node VM SSHes in over the internal network and runs `tailscale up` with an ephemeral auth key. The key lives only on the Node VM — never on VM disk images. When a VM is destroyed and disconnects, Tailscale automatically removes it from the tailnet.
+- **Cloud metadata service:** VMs fetch SSH keys and CA certificates from vmid at `169.254.169.254` on first boot, just like AWS/GCP instances. No need to mount the rootfs and inject files during VM creation.
+- **Tailscale auto-join:** After a VM boots, the Node VM runs `tailscale up` with an ephemeral auth key. The key lives only on the Node VM — never on VM disk images. When a VM is destroyed and disconnects, Tailscale automatically removes it from the tailnet.
 
 ## The control interface
 
@@ -210,10 +211,9 @@ Since VMs have Tailscale IPs, any service running in a VM is directly reachable 
 - **VM creation:** ~0.25 seconds (COW snapshot + Firecracker config generation)
 - **VM boot to SSH-ready:** ~1 second (internal network)
 - **Tailscale connection:** ~3-5 seconds additional
-- **Golden image build:** ~5 minutes (debootstrap + provision)
+- **Golden image build:** ~2 minutes (Docker cached), ~8 minutes (cold)
 - **Per-VM overhead:** ~30MB RSS for the Firecracker process
 - **Disk per VM:** Starts at ~0 bytes, grows with writes
-- **Total codebase:** ~800 lines of bash, ~60 lines of C, ~500 lines of Go, no dependencies beyond standard Linux tools + Tailscale
 
 The whole thing runs on a single machine under my desk. No cloud, no Kubernetes, no container registry, no orchestrator. Just Linux doing what Linux does well, with Tailscale making it accessible from everywhere.
 

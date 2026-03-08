@@ -315,8 +315,8 @@ boxcutter/
 |   |   +-- cmd/node/            # HTTP API server (:8800)
 |   |   +-- internal/            # vm manager, fcapi, networking, mqtt, golden
 |   +-- golden/                  # Golden image (Firecracker rootfs)
-|   |   +-- build.sh             # Phase 1: debootstrap rootfs
-|   |   +-- provision.sh         # Phase 2: install dev tools
+|   |   +-- Dockerfile           # Golden image definition
+|   |   +-- docker-to-ext4.sh    # Build Dockerfile -> ext4 rootfs
 |   |   +-- nss_catchall.c       # NSS module for any-username SSH
 |   |   +-- vsock_listen.c       # vsock listener for migration nudge
 |   +-- proxy/                   # MITM forward proxy (Go)

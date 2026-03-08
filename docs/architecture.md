@@ -108,7 +108,7 @@ QEMU VMs running Firecracker microVMs. Each node is immutable — upgrade by lau
 
 **Services on each node:**
 - `boxcutter-node` (:8800) — Node agent, HTTP API for VM lifecycle + migration
-- `vmid` (:80) — VM identity via fwmark, JWT tokens, GitHub tokens, sentinel store
+- `vmid` (169.254.169.254:80) — VM identity via fwmark, JWT tokens, GitHub tokens, metadata service
 - `boxcutter-proxy` (:8080) — MITM forward proxy, sentinel token swapping
 - `derper` (:443) — Local Tailscale DERP relay
 - `caddy` (:8880/:8443) — Reverse proxy
@@ -259,8 +259,9 @@ boxcutter/
 │   │   ├── cmd/node/               # HTTP API server (:8800)
 │   │   └── internal/               # vm, fcapi, networking, mqtt, golden
 │   ├── golden/                     # Golden image (Firecracker rootfs)
-│   │   ├── build.sh                # Phase 1: debootstrap rootfs
-│   │   ├── provision.sh            # Phase 2: install dev tools
+│   │   ├── Dockerfile              # Golden image definition (Ubuntu noble)
+│   │   ├── docker-to-ext4.sh       # Build Dockerfile -> ext4 rootfs
+│   │   ├── config/                 # systemd units, SSH config, metadata fetch
 │   │   ├── nss_catchall.c          # NSS module for any-username SSH
 │   │   └── vsock_listen.c          # vsock listener for migration nudge
 │   ├── proxy/                      # MITM forward proxy (Go)
