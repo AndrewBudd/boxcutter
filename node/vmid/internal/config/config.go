@@ -9,16 +9,23 @@ import (
 )
 
 type Config struct {
-	Listen ListenConfig `yaml:"listen"`
-	JWT    JWTConfig    `yaml:"jwt"`
-	GitHub *GitHubConfig `yaml:"github,omitempty"`
-	Policies []Policy   `yaml:"policies,omitempty"`
-	Log    LogConfig    `yaml:"log"`
+	Listen   ListenConfig        `yaml:"listen"`
+	JWT      JWTConfig           `yaml:"jwt"`
+	GitHub   *GitHubConfig       `yaml:"github,omitempty"`
+	Policies []Policy            `yaml:"policies,omitempty"`
+	Metadata MetadataFilesConfig `yaml:"metadata"`
+	Log      LogConfig           `yaml:"log"`
 }
 
 type ListenConfig struct {
+	VMAddr      string `yaml:"vm_addr"`
 	VMPort      int    `yaml:"vm_port"`
 	AdminSocket string `yaml:"admin_socket"`
+}
+
+type MetadataFilesConfig struct {
+	SSHAuthorizedKeys []string `yaml:"ssh_authorized_keys"`
+	CACertPath        string   `yaml:"ca_cert_path"`
 }
 
 type JWTConfig struct {
@@ -104,8 +111,16 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		Listen: ListenConfig{
+			VMAddr:      "169.254.169.254",
 			VMPort:      80,
 			AdminSocket: "/run/vmid/admin.sock",
+		},
+		Metadata: MetadataFilesConfig{
+			SSHAuthorizedKeys: []string{
+				"/etc/boxcutter/secrets/cluster-ssh.key.pub",
+				"/etc/boxcutter/secrets/authorized-keys",
+			},
+			CACertPath: "/etc/boxcutter/secrets/ca.crt",
 		},
 		JWT: JWTConfig{
 			TTL: 10 * time.Minute,

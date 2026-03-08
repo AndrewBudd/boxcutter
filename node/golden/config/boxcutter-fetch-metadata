@@ -1,0 +1,35 @@
+#!/bin/bash
+# Fetch SSH keys and CA cert from the node metadata service.
+# Runs once on boot before sshd starts.
+set -e
+
+METADATA="http://169.254.169.254"
+MAX_RETRIES=30
+RETRY_INTERVAL=1
+
+# Wait for metadata service to be reachable
+for i in $(seq 1 $MAX_RETRIES); do
+  if curl -sf -o /dev/null --max-time 2 "${METADATA}/metadata/ssh-keys" 2>/dev/null; then
+    break
+  fi
+  [ "$i" -eq "$MAX_RETRIES" ] && { echo "metadata: service not reachable after ${MAX_RETRIES}s"; exit 1; }
+  sleep $RETRY_INTERVAL
+done
+
+# Fetch SSH authorized keys
+mkdir -p /home/dev/.ssh
+curl -sf "${METADATA}/metadata/ssh-keys" > /home/dev/.ssh/authorized_keys
+chown -R 1000:1000 /home/dev/.ssh
+chmod 700 /home/dev/.ssh
+chmod 600 /home/dev/.ssh/authorized_keys
+echo "metadata: SSH keys installed ($(wc -l < /home/dev/.ssh/authorized_keys) keys)"
+
+# Fetch CA cert
+if curl -sf "${METADATA}/metadata/ca-cert" > /tmp/boxcutter-ca.crt 2>/dev/null; then
+  mkdir -p /usr/local/share/ca-certificates
+  mv /tmp/boxcutter-ca.crt /usr/local/share/ca-certificates/boxcutter-ca.crt
+  update-ca-certificates 2>/dev/null || true
+  echo "metadata: CA cert installed"
+else
+  echo "metadata: no CA cert available (skipping)"
+fi

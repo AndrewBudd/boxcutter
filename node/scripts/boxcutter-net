@@ -23,6 +23,10 @@ case "${1:-up}" in
     # Allow accepted TCP sockets to inherit the packet's fwmark (needed by vmid)
     sysctl -w net.ipv4.tcp_fwmark_accept=1 >/dev/null
 
+    # Cloud metadata address — vmid listens here, VMs reach it via default gateway
+    ip addr show lo | grep -q 169.254.169.254 || \
+      ip addr add 169.254.169.254/32 dev lo
+
     # Find uplink interface
     UPLINK=$(ip route | awk '/^default/{print $5; exit}')
     [ -z "$UPLINK" ] && { echo "Warning: no default route found, VMs won't have internet"; }

@@ -108,6 +108,13 @@ COPY config/boxcutter-vsock.service /etc/systemd/system/boxcutter-vsock.service
 RUN chmod 755 /usr/local/bin/boxcutter-nudge && \
     systemctl enable boxcutter-vsock 2>/dev/null || true
 
+# --- Metadata service (fetch SSH keys + CA cert from node on boot) ---
+COPY config/boxcutter-fetch-metadata /usr/local/bin/boxcutter-fetch-metadata
+COPY config/boxcutter-metadata.service /etc/systemd/system/boxcutter-metadata.service
+RUN chmod 755 /usr/local/bin/boxcutter-fetch-metadata && \
+    ln -sf /etc/systemd/system/boxcutter-metadata.service \
+      /etc/systemd/system/multi-user.target.wants/boxcutter-metadata.service
+
 # --- GitHub token refresh (infrastructure — lets VMs get GitHub tokens from vmid) ---
 COPY gh-token-refresh.sh /usr/local/bin/gh-token-refresh
 COPY gh-token-refresh.service /etc/systemd/system/gh-token-refresh.service

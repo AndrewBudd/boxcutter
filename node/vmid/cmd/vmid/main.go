@@ -100,20 +100,23 @@ func main() {
 
 	// VM-facing server (listens on the metadata IP)
 	vmMux := http.NewServeMux()
-	metaHandler := api.NewMetadataHandler(jwtIssuer, githubMinter, sentinelStore)
+	metaHandler := api.NewMetadataHandler(jwtIssuer, githubMinter, sentinelStore, cfg.Metadata)
 	metaHandler.Register(vmMux)
 
 	identityMiddleware := middleware.Identity(reg)
 
-	// JWKS is public (needed by token verifiers outside VMs)
+	// Public endpoints (no identity required)
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("GET /.well-known/jwks.json", metaHandler.HandleJWKS)
+	publicMux.HandleFunc("GET /metadata/ssh-keys", metaHandler.HandleSSHKeys)
+	publicMux.HandleFunc("GET /metadata/ca-cert", metaHandler.HandleCACert)
 	publicMux.Handle("/", identityMiddleware(vmMux))
 
-	// Listen with mark-aware listener
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Listen.VMPort))
+	// Listen with mark-aware listener on metadata address
+	listenAddr := fmt.Sprintf("%s:%d", cfg.Listen.VMAddr, cfg.Listen.VMPort)
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("listening on :%d: %v", cfg.Listen.VMPort, err)
+		log.Fatalf("listening on %s: %v", listenAddr, err)
 	}
 
 	vmServer := &http.Server{
@@ -152,7 +155,7 @@ func main() {
 
 	// Start servers
 	go func() {
-		log.Printf("VM metadata server listening on :%d", cfg.Listen.VMPort)
+		log.Printf("VM metadata server listening on %s", listenAddr)
 		if err := vmServer.Serve(&markListener{Listener: ln}); err != http.ErrServerClosed {
 			log.Fatalf("VM server error: %v", err)
 		}

@@ -311,40 +311,8 @@ cmd_create() {
 }
 EOF
 
-  # Inject CA cert into rootfs for internal TLS
-  if [ -f /etc/boxcutter/secrets/ca.crt ]; then
-    echo "  Injecting CA cert..."
-    MOUNT_DIR=$(mktemp -d)
-    mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
-    mkdir -p "${MOUNT_DIR}/usr/local/share/ca-certificates"
-    cp /etc/boxcutter/secrets/ca.crt "${MOUNT_DIR}/usr/local/share/ca-certificates/boxcutter-ca.crt"
-    chroot "$MOUNT_DIR" update-ca-certificates 2>/dev/null || true
-    umount "$MOUNT_DIR"
-    rmdir "$MOUNT_DIR"
-  fi
-
-  # Inject SSH keys (golden image has no keys baked in — all injected here)
-  echo "  Injecting SSH keys..."
-  MOUNT_DIR=$(mktemp -d)
-  mount "/dev/mapper/bc-${name}" "$MOUNT_DIR"
-  mkdir -p "${MOUNT_DIR}/home/dev/.ssh"
-  : > "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-
-  # Cluster SSH key (for node→VM access via boxcutter-ctl shell)
-  if [ -f /etc/boxcutter/secrets/cluster-ssh.key.pub ]; then
-    cat /etc/boxcutter/secrets/cluster-ssh.key.pub >> "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-  fi
-
-  # User-provided trusted keys
-  if [ -f /etc/boxcutter/secrets/authorized-keys ]; then
-    cat /etc/boxcutter/secrets/authorized-keys >> "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-  fi
-
-  chown -R 1000:1000 "${MOUNT_DIR}/home/dev/.ssh"
-  chmod 700 "${MOUNT_DIR}/home/dev/.ssh"
-  chmod 600 "${MOUNT_DIR}/home/dev/.ssh/authorized_keys"
-  umount "$MOUNT_DIR"
-  rmdir "$MOUNT_DIR"
+  # SSH keys and CA cert are fetched from the metadata service (169.254.169.254)
+  # on first boot by boxcutter-metadata.service — no mount/inject needed.
 
   echo "  VM created: ${name} (mark: ${mark}, mode: ${mode})"
   echo "  Start with: boxcutter-ctl start ${name}"

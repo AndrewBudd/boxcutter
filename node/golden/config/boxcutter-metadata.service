@@ -1,0 +1,13 @@
+[Unit]
+Description=Fetch SSH keys and CA cert from metadata service
+After=network-online.target
+Wants=network-online.target
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/boxcutter-fetch-metadata
+
+[Install]
+WantedBy=multi-user.target
