@@ -6,7 +6,9 @@ Wants=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/boxcutter-host run
-Environment=BOXCUTTER_REPO=/home/budda/boxcutter
+# Set BOXCUTTER_REPO to the repo checkout for dev mode.
+# In prod mode, the binary uses /var/lib/boxcutter as the data directory.
+#Environment=BOXCUTTER_REPO=/path/to/boxcutter
 Restart=on-failure
 RestartSec=5
 

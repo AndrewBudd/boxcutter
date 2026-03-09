@@ -23,6 +23,9 @@ import (
 	"github.com/AndrewBudd/boxcutter/host/internal/qemu"
 )
 
+// version is set at build time via -ldflags "-X main.version=..."
+var version = "dev"
+
 // Config for the host control plane, loaded from boxcutter.env equivalents.
 type HostConfig struct {
 	RepoDir       string
@@ -79,8 +82,8 @@ func defaultConfig() HostConfig {
 		}
 	}
 	if repoDir == "" {
-		home, _ := os.UserHomeDir()
-		repoDir = home + "/boxcutter"
+		// No repo found — use /var/lib/boxcutter as data directory (prod mode)
+		repoDir = "/var/lib/boxcutter"
 	}
 	return HostConfig{
 		RepoDir:            repoDir,
@@ -172,7 +175,11 @@ func main() {
 	case "push-golden":
 		cliPushGolden()
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|version|build-image|push-golden>\n")
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|version|build-image|push-golden>\n\n")
+		fmt.Fprintf(os.Stderr, "Bootstrap modes:\n")
+		fmt.Fprintf(os.Stderr, "  bootstrap                    Pull OCI images and create VMs (prod)\n")
+		fmt.Fprintf(os.Stderr, "  bootstrap --from-source      Build from local repo and create VMs (dev)\n")
+		fmt.Fprintf(os.Stderr, "  bootstrap --version v0.1.0   Pull specific version of OCI images\n")
 		os.Exit(1)
 	}
 }
@@ -1413,6 +1420,7 @@ func cliVersion() {
 		os.Exit(1)
 	}
 
+	fmt.Printf("boxcutter-host: %s\n\n", version)
 	fmt.Println("Running versions:")
 	if state.Orchestrator != nil {
 		v := state.Orchestrator.ImageVersion
@@ -1763,7 +1771,28 @@ func startMosquitto(cfg HostConfig) *exec.Cmd {
 
 // ensureBaseImage pulls and decompresses a base image from OCI if it doesn't already exist.
 // Retries up to 3 times on network failure.
-func ensureBaseImage(cfg HostConfig, vmType string) (string, *oci.ImageMetadata, error) {
+// buildFromSource runs provision.sh to build binaries, create VM disks and cloud-init ISOs
+// from the local repo. After this, phases 3 and 4 of bootstrap are no-ops since the files
+// already exist.
+func buildFromSource(cfg HostConfig, vmType string) error {
+	args := []string{filepath.Join(cfg.RepoDir, "host", "provision.sh"), vmType}
+	if vmType == "node" {
+		args = append(args, "boxcutter-node-1")
+	}
+	args = append(args, "--rebuild")
+
+	log.Printf("  Building %s from source...", vmType)
+	cmd := exec.Command("bash", args...)
+	cmd.Dir = cfg.RepoDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("provision.sh %s: %w", vmType, err)
+	}
+	return nil
+}
+
+func ensureBaseImage(cfg HostConfig, vmType string, tag string) (string, *oci.ImageMetadata, error) {
 	basePath := filepath.Join(cfg.ImagesDir, fmt.Sprintf("%s-base.qcow2", vmType))
 
 	if fileExists(basePath) {
@@ -1785,13 +1814,13 @@ func ensureBaseImage(cfg HostConfig, vmType string) (string, *oci.ImageMetadata,
 			time.Sleep(delay)
 		}
 
-		log.Printf("  Pulling %s image from OCI registry...", vmType)
+		log.Printf("  Pulling %s image from OCI registry (tag: %s)...", vmType, tag)
 		ctx := context.Background()
 		meta, outputFile, err = oci.Pull(ctx, oci.PullOptions{
 			Registry:   cfg.OCIRegistry,
 			Repository: cfg.OCIRepository,
 			VMType:     vmType,
-			Tag:        "latest",
+			Tag:        tag,
 			OutputDir:  cfg.ImagesDir,
 			Auth:       cfg.ociAuth(),
 		})
@@ -1820,7 +1849,34 @@ func ensureBaseImage(cfg HostConfig, vmType string) (string, *oci.ImageMetadata,
 func runBootstrap() {
 	cfg := defaultConfig()
 	os.MkdirAll(cfg.ImagesDir, 0755)
-	log.Println("boxcutter-host bootstrap")
+
+	// Parse bootstrap flags
+	fromSource := false
+	imageTag := ""
+	for i := 2; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--from-source":
+			fromSource = true
+		case "--version", "--tag":
+			if i+1 < len(os.Args) {
+				i++
+				imageTag = os.Args[i]
+			}
+		}
+	}
+
+	if imageTag == "" && !fromSource && version != "dev" {
+		imageTag = version // default: match host binary version
+	}
+	if imageTag == "" {
+		imageTag = "latest"
+	}
+
+	if fromSource {
+		log.Printf("boxcutter-host bootstrap (from source: %s)", cfg.RepoDir)
+	} else {
+		log.Printf("boxcutter-host bootstrap (images: %s)", imageTag)
+	}
 
 	// Phase 1: Bridge
 	log.Println("--- Setting up bridge network ---")
@@ -1833,59 +1889,73 @@ func runBootstrap() {
 		log.Fatalf("Bridge setup: %v", err)
 	}
 
-	// Phase 2: Ensure base images exist (pull from OCI if needed)
-	log.Println("--- Ensuring base images ---")
-	orchBasePath, orchMeta, err := ensureBaseImage(cfg, "orchestrator")
-	if err != nil {
-		log.Fatalf("Orchestrator image: %v", err)
-	}
-	nodeBasePath, nodeMeta, err := ensureBaseImage(cfg, "node")
-	if err != nil {
-		log.Fatalf("Node image: %v", err)
-	}
-
-	// Phase 3: Create COW disks
-	log.Println("--- Creating VM disks ---")
+	// Phase 2-4: Get images, create disks, generate ISOs
+	var orchMeta, nodeMeta *oci.ImageMetadata
 	orchDisk := filepath.Join(cfg.ImagesDir, "orchestrator.qcow2")
-	if !fileExists(orchDisk) {
-		log.Println("  Creating orchestrator COW disk...")
-		if err := createCOWDisk(orchBasePath, orchDisk, cfg.OrchestratorDisk); err != nil {
-			log.Fatalf("Orchestrator disk: %v", err)
-		}
-	} else {
-		log.Println("  Orchestrator disk already exists")
-	}
-
 	node1Disk := filepath.Join(cfg.ImagesDir, "boxcutter-node-1.qcow2")
-	if !fileExists(node1Disk) {
-		log.Println("  Creating node-1 COW disk...")
-		if err := createCOWDisk(nodeBasePath, node1Disk, cfg.NodeDisk); err != nil {
-			log.Fatalf("Node-1 disk: %v", err)
-		}
-	} else {
-		log.Println("  Node-1 disk already exists")
-	}
-
-	// Phase 4: Generate cloud-init ISOs
-	log.Println("--- Generating cloud-init ISOs ---")
 	orchISO := filepath.Join(cfg.ImagesDir, "orchestrator-cloud-init.iso")
-	if !fileExists(orchISO) {
-		log.Println("  Generating orchestrator ISO...")
-		if err := generateCloudInitISO(cfg, "orchestrator", ""); err != nil {
-			log.Fatalf("Orchestrator ISO: %v", err)
-		}
-	} else {
-		log.Println("  Orchestrator ISO already exists")
-	}
-
 	node1ISO := filepath.Join(cfg.ImagesDir, "boxcutter-node-1-cloud-init.iso")
-	if !fileExists(node1ISO) {
-		log.Println("  Generating node-1 ISO...")
-		if err := generateCloudInitISO(cfg, "node", "boxcutter-node-1"); err != nil {
-			log.Fatalf("Node-1 ISO: %v", err)
+
+	if fromSource {
+		// provision.sh builds binaries, creates COW disks, and generates ISOs
+		log.Println("--- Building from source ---")
+		if err := buildFromSource(cfg, "orchestrator"); err != nil {
+			log.Fatalf("Orchestrator build: %v", err)
+		}
+		if err := buildFromSource(cfg, "node"); err != nil {
+			log.Fatalf("Node build: %v", err)
 		}
 	} else {
-		log.Println("  Node-1 ISO already exists")
+		// Pull pre-built OCI images, create COW disks, generate config-only ISOs
+		log.Println("--- Ensuring base images ---")
+		orchBasePath, orchM, err := ensureBaseImage(cfg, "orchestrator", imageTag)
+		if err != nil {
+			log.Fatalf("Orchestrator image: %v", err)
+		}
+		orchMeta = orchM
+		nodeBasePath, nodeM, err := ensureBaseImage(cfg, "node", imageTag)
+		if err != nil {
+			log.Fatalf("Node image: %v", err)
+		}
+		nodeMeta = nodeM
+
+		log.Println("--- Creating VM disks ---")
+		if !fileExists(orchDisk) {
+			log.Println("  Creating orchestrator COW disk...")
+			if err := createCOWDisk(orchBasePath, orchDisk, cfg.OrchestratorDisk); err != nil {
+				log.Fatalf("Orchestrator disk: %v", err)
+			}
+		} else {
+			log.Println("  Orchestrator disk already exists")
+		}
+
+		if !fileExists(node1Disk) {
+			log.Println("  Creating node-1 COW disk...")
+			if err := createCOWDisk(nodeBasePath, node1Disk, cfg.NodeDisk); err != nil {
+				log.Fatalf("Node-1 disk: %v", err)
+			}
+		} else {
+			log.Println("  Node-1 disk already exists")
+		}
+
+		log.Println("--- Generating cloud-init ISOs ---")
+		if !fileExists(orchISO) {
+			log.Println("  Generating orchestrator ISO...")
+			if err := generateCloudInitISO(cfg, "orchestrator", ""); err != nil {
+				log.Fatalf("Orchestrator ISO: %v", err)
+			}
+		} else {
+			log.Println("  Orchestrator ISO already exists")
+		}
+
+		if !fileExists(node1ISO) {
+			log.Println("  Generating node-1 ISO...")
+			if err := generateCloudInitISO(cfg, "node", "boxcutter-node-1"); err != nil {
+				log.Fatalf("Node-1 ISO: %v", err)
+			}
+		} else {
+			log.Println("  Node-1 ISO already exists")
+		}
 	}
 
 	// Phase 5: Launch VMs

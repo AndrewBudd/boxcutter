@@ -45,14 +45,23 @@ ssh-node:                 ## SSH into Node VM 1 (use host/ssh.sh for others)
 
 # --- Host Control Plane ---
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 build-host:               ## Build boxcutter-host binary
-	@cd host && go build -o boxcutter-host ./cmd/host/
+	@cd host && go build -ldflags "-X main.version=$(VERSION)" -o boxcutter-host ./cmd/host/
 
 install-host: build-host  ## Install boxcutter-host binary + systemd service
 	@sudo cp host/boxcutter-host /usr/local/bin/boxcutter-host
 	@sudo cp host/boxcutter-host.service /etc/systemd/system/
 	@sudo systemctl daemon-reload
 	@echo "Installed. Run: sudo systemctl enable --now boxcutter-host"
+
+release-host: build-host  ## Create release tarball for boxcutter-host
+	@mkdir -p .release
+	@tar czf .release/boxcutter-host-$(VERSION)-linux-amd64.tar.gz \
+		-C host boxcutter-host \
+		-C .. host/boxcutter-host.service
+	@echo "Release tarball: .release/boxcutter-host-$(VERSION)-linux-amd64.tar.gz"
 
 # --- OCI Images ---
 
