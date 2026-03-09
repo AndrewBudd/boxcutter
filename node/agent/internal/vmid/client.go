@@ -29,11 +29,60 @@ func NewClient(socketPath string) *Client {
 }
 
 type RegisterRequest struct {
-	VMID       string `json:"vm_id"`
-	IP         string `json:"ip"`
-	Mark       int    `json:"mark"`
-	Mode       string `json:"mode"`
-	GitHubRepo string `json:"github_repo,omitempty"`
+	VMID        string   `json:"vm_id"`
+	IP          string   `json:"ip"`
+	Mark        int      `json:"mark"`
+	Mode        string   `json:"mode"`
+	GitHubRepo  string   `json:"github_repo,omitempty"`
+	GitHubRepos []string `json:"github_repos,omitempty"`
+}
+
+type ReposResponse struct {
+	Repos []string `json:"repos"`
+}
+
+func (c *Client) AddRepo(vmID, repo string) (*ReposResponse, error) {
+	body, _ := json.Marshal(map[string]string{"repo": repo})
+	resp, err := c.http.Post("http://localhost/internal/vms/"+vmID+"/repos", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("vmid add repo: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vmid add repo: status %d", resp.StatusCode)
+	}
+	var result ReposResponse
+	json.NewDecoder(resp.Body).Decode(&result)
+	return &result, nil
+}
+
+func (c *Client) RemoveRepo(vmID, repo string) (*ReposResponse, error) {
+	req, _ := http.NewRequest("DELETE", "http://localhost/internal/vms/"+vmID+"/repos/"+repo, nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("vmid remove repo: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vmid remove repo: status %d", resp.StatusCode)
+	}
+	var result ReposResponse
+	json.NewDecoder(resp.Body).Decode(&result)
+	return &result, nil
+}
+
+func (c *Client) ListRepos(vmID string) ([]string, error) {
+	resp, err := c.http.Get("http://localhost/internal/vms/" + vmID + "/repos")
+	if err != nil {
+		return nil, fmt.Errorf("vmid list repos: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vmid list repos: status %d", resp.StatusCode)
+	}
+	var result ReposResponse
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Repos, nil
 }
 
 func (c *Client) Register(req *RegisterRequest) error {

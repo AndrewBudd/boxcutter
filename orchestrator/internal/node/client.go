@@ -30,6 +30,7 @@ type CreateRequest struct {
 	RAMMIB         int      `json:"ram_mib,omitempty"`
 	Disk           string   `json:"disk,omitempty"`
 	CloneURL       string   `json:"clone_url,omitempty"`
+	CloneURLs      []string `json:"clone_urls,omitempty"`
 	Mode           string   `json:"mode,omitempty"`
 	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
 }
@@ -388,6 +389,62 @@ func (c *FastClient) Health() *HealthResponse {
 		return nil
 	}
 	return &hr
+}
+
+// AddRepo adds a GitHub repo to a VM's policy on the node.
+func (c *Client) AddRepo(vmName, repo string) ([]string, error) {
+	body, _ := json.Marshal(map[string]string{"repo": repo})
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+vmName+"/repos", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", string(errBody))
+	}
+	var result struct {
+		Repos []string `json:"repos"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Repos, nil
+}
+
+// RemoveRepo removes a GitHub repo from a VM's policy on the node.
+func (c *Client) RemoveRepo(vmName, repo string) ([]string, error) {
+	req, _ := http.NewRequest("DELETE", c.baseURL+"/api/vms/"+vmName+"/repos/"+repo, nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", string(errBody))
+	}
+	var result struct {
+		Repos []string `json:"repos"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Repos, nil
+}
+
+// ListRepos returns the GitHub repos for a VM on the node.
+func (c *Client) ListRepos(vmName string) ([]string, error) {
+	resp, err := c.http.Get(c.baseURL + "/api/vms/" + vmName + "/repos")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", string(errBody))
+	}
+	var result struct {
+		Repos []string `json:"repos"`
+	}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Repos, nil
 }
 
 func (c *Client) ListVMs() ([]json.RawMessage, error) {

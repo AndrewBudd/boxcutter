@@ -250,11 +250,12 @@ func (g *GitHubTokenMinter) createInstallationToken(appJWT string, repos []strin
 }
 
 // ResolvePolicy finds the first matching policy for a VM record.
-// If the VM was registered with a github_repo, that takes precedence.
+// If the VM was registered with github_repos, that takes precedence.
 func (g *GitHubTokenMinter) ResolvePolicy(rec *registry.VMRecord) (repos []string, perms map[string]string, err error) {
 	// On-the-fly policy from provisioner — dev VMs need full repo access
-	if rec.GitHubRepo != "" {
-		return []string{rec.GitHubRepo}, map[string]string{
+	allRepos := rec.AllGitHubRepos()
+	if len(allRepos) > 0 {
+		return allRepos, map[string]string{
 			"contents":      "write",
 			"pull_requests": "write",
 			"issues":        "write",

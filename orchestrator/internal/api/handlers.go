@@ -118,6 +118,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/stop", h.handleVMStop)
 	mux.HandleFunc("POST /api/vms/{name}/start", h.handleVMStart)
 	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleVMCopy)
+	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleVMAddRepo)
+	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleVMRemoveRepo)
+	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleVMListRepos)
 
 	// Golden images
 	mux.HandleFunc("GET /api/golden", h.handleGoldenList)
@@ -229,13 +232,14 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 // --- VM handlers ---
 
 type vmCreateRequest struct {
-	Name     string `json:"name"`
-	VCPU     int    `json:"vcpu,omitempty"`
-	RAMMIB   int    `json:"ram_mib,omitempty"`
-	Disk     string `json:"disk,omitempty"`
-	CloneURL string `json:"clone_url,omitempty"`
-	Mode     string `json:"mode,omitempty"`
-	NodeID   string `json:"node_id,omitempty"` // optional: pin to specific node
+	Name      string   `json:"name"`
+	VCPU      int      `json:"vcpu,omitempty"`
+	RAMMIB    int      `json:"ram_mib,omitempty"`
+	Disk      string   `json:"disk,omitempty"`
+	CloneURL  string   `json:"clone_url,omitempty"`
+	CloneURLs []string `json:"clone_urls,omitempty"`
+	Mode      string   `json:"mode,omitempty"`
+	NodeID    string   `json:"node_id,omitempty"` // optional: pin to specific node
 }
 
 func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
@@ -348,6 +352,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 			RAMMIB:         req.RAMMIB,
 			Disk:           req.Disk,
 			CloneURL:       req.CloneURL,
+			CloneURLs:      req.CloneURLs,
 			Mode:           req.Mode,
 			AuthorizedKeys: sshKeys,
 		}, func(evt *node.ProgressEvent) {
@@ -708,6 +713,85 @@ func (h *Handler) handleVMCopy(w http.ResponseWriter, r *http.Request) {
 	if canFlush {
 		flusher.Flush()
 	}
+}
+
+// --- VM repos ---
+
+func (h *Handler) handleVMAddRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractPathSegment(r.URL.Path, "/api/vms/", "/repos")
+	}
+	vm, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Repo string `json:"repo"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Repo == "" {
+		http.Error(w, "repo is required", http.StatusBadRequest)
+		return
+	}
+	n, _ := h.db.GetNode(vm.NodeID)
+	if n == nil {
+		http.Error(w, "node not found", http.StatusInternalServerError)
+		return
+	}
+	client := node.NewClient(n.APIAddr)
+	repos, err := client.AddRepo(name, req.Repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"repos": repos})
+}
+
+func (h *Handler) handleVMRemoveRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	repo := r.PathValue("repo")
+	vm, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+	n, _ := h.db.GetNode(vm.NodeID)
+	if n == nil {
+		http.Error(w, "node not found", http.StatusInternalServerError)
+		return
+	}
+	client := node.NewClient(n.APIAddr)
+	repos, err := client.RemoveRepo(name, repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"repos": repos})
+}
+
+func (h *Handler) handleVMListRepos(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+	}
+	vm, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+	n, _ := h.db.GetNode(vm.NodeID)
+	if n == nil {
+		http.Error(w, "node not found", http.StatusInternalServerError)
+		return
+	}
+	client := node.NewClient(n.APIAddr)
+	repos, err := client.ListRepos(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"repos": repos})
 }
 
 // --- Golden images ---

@@ -26,18 +26,22 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/vms", h.handleList)
 	mux.HandleFunc("GET /internal/vms/{id}", h.handleGet)
 	mux.HandleFunc("POST /internal/vms/{id}/github-token", h.handleMintGitHubToken)
+	mux.HandleFunc("POST /internal/vms/{id}/repos", h.handleAddRepo)
+	mux.HandleFunc("DELETE /internal/vms/{id}/repos/{repo...}", h.handleRemoveRepo)
+	mux.HandleFunc("GET /internal/vms/{id}/repos", h.handleListRepos)
 	mux.HandleFunc("POST /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/sentinel/{sentinel}", h.handleSentinelSwap)
 }
 
 type registerRequest struct {
-	VMID       string            `json:"vm_id"`
-	IP         string            `json:"ip"`
-	Mark       int               `json:"mark"`
-	Mode       string            `json:"mode"`
-	Labels     map[string]string `json:"labels,omitempty"`
-	GitHubRepo string            `json:"github_repo,omitempty"`
+	VMID        string            `json:"vm_id"`
+	IP          string            `json:"ip"`
+	Mark        int               `json:"mark"`
+	Mode        string            `json:"mode"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	GitHubRepo  string            `json:"github_repo,omitempty"`
+	GitHubRepos []string          `json:"github_repos,omitempty"`
 }
 
 func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -55,12 +59,13 @@ func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := &registry.VMRecord{
-		VMID:       req.VMID,
-		IP:         req.IP,
-		Mark:       req.Mark,
-		Mode:       req.Mode,
-		Labels:     req.Labels,
-		GitHubRepo: req.GitHubRepo,
+		VMID:        req.VMID,
+		IP:          req.IP,
+		Mark:        req.Mark,
+		Mode:        req.Mode,
+		Labels:      req.Labels,
+		GitHubRepo:  req.GitHubRepo,
+		GitHubRepos: req.GitHubRepos,
 	}
 	h.reg.Register(rec)
 
@@ -126,6 +131,61 @@ func (h *AdminHandler) handleMintGitHubToken(w http.ResponseWriter, r *http.Requ
 	}
 
 	writeJSON(w, tok)
+}
+
+func (h *AdminHandler) handleAddRepo(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	rec, ok := h.reg.LookupID(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Repo string `json:"repo"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Repo == "" {
+		http.Error(w, "repo is required", http.StatusBadRequest)
+		return
+	}
+	rec.AddRepo(req.Repo)
+	writeJSON(w, map[string]interface{}{
+		"repos": rec.AllGitHubRepos(),
+	})
+}
+
+func (h *AdminHandler) handleRemoveRepo(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	repo := r.PathValue("repo")
+	rec, ok := h.reg.LookupID(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	if !rec.RemoveRepo(repo) {
+		http.Error(w, "repo not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"repos": rec.AllGitHubRepos(),
+	})
+}
+
+func (h *AdminHandler) handleListRepos(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	rec, ok := h.reg.LookupID(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"repos": rec.AllGitHubRepos(),
+	})
 }
 
 func (h *AdminHandler) handleGHCRToken(w http.ResponseWriter, r *http.Request) {

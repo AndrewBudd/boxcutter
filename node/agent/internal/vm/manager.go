@@ -45,10 +45,22 @@ type CreateRequest struct {
 	RAMMIB         int      `json:"ram_mib,omitempty"`
 	Disk           string   `json:"disk,omitempty"`
 	CloneURL       string   `json:"clone_url,omitempty"`
+	CloneURLs      []string `json:"clone_urls,omitempty"`
 	Mode           string   `json:"mode,omitempty"`
 	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
 
 	progressFn ProgressFunc `json:"-"`
+}
+
+// AllCloneURLs returns all clone URLs, merging single and plural fields.
+func (r *CreateRequest) AllCloneURLs() []string {
+	if len(r.CloneURLs) > 0 {
+		return r.CloneURLs
+	}
+	if r.CloneURL != "" {
+		return []string{r.CloneURL}
+	}
+	return nil
 }
 
 func (r *CreateRequest) SetProgress(fn ProgressFunc) {
@@ -120,10 +132,13 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 	mark := AllocateMark(req.Name, existingMarks)
 	tap := TAPName(req.Name)
 
-	// Parse clone URL to owner/repo
-	githubRepo := ""
-	if req.CloneURL != "" {
-		githubRepo = parseRepoURL(req.CloneURL)
+	// Parse clone URLs to owner/repo list
+	cloneURLs := req.AllCloneURLs()
+	var githubRepos []string
+	for _, u := range cloneURLs {
+		if repo := parseRepoURL(u); repo != "" {
+			githubRepos = append(githubRepos, repo)
+		}
 	}
 
 	// Create COW snapshot
@@ -137,18 +152,20 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 
 	// Save VM state
 	st := &VMState{
-		Name:       req.Name,
-		VCPU:       req.VCPU,
-		RAMMIB:     req.RAMMIB,
-		Mark:       mark,
-		Mode:       req.Mode,
-		MAC:        fixedMAC,
-		Disk:       req.Disk,
-		TAP:        tap,
-		Created:    time.Now().Format(time.RFC3339),
-		CloneURL:   req.CloneURL,
-		GitHubRepo: githubRepo,
-		GoldenVer:  goldenVer,
+		Name:        req.Name,
+		VCPU:        req.VCPU,
+		RAMMIB:      req.RAMMIB,
+		Mark:        mark,
+		Mode:        req.Mode,
+		MAC:         fixedMAC,
+		Disk:        req.Disk,
+		TAP:         tap,
+		Created:     time.Now().Format(time.RFC3339),
+		CloneURL:    req.CloneURL,
+		CloneURLs:   cloneURLs,
+		GitHubRepo:  firstOrEmpty(githubRepos),
+		GitHubRepos: githubRepos,
+		GoldenVer:   goldenVer,
 	}
 	if err := SaveVMState(vmDir, st); err != nil {
 		CleanupSnapshot(vmDir)
@@ -279,11 +296,12 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 	// Register with vmid
 	if m.vmid != nil {
 		m.vmid.Register(&vmid.RegisterRequest{
-			VMID:       st.Name,
-			IP:         "10.0.0.2",
-			Mark:       st.Mark,
-			Mode:       st.Mode,
-			GitHubRepo: st.GitHubRepo,
+			VMID:        st.Name,
+			IP:          "10.0.0.2",
+			Mark:        st.Mark,
+			Mode:        st.Mode,
+			GitHubRepo:  st.GitHubRepo,
+			GitHubRepos: st.AllGitHubRepos(),
 		})
 	}
 
@@ -293,10 +311,11 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 		m.injectProxyEnv(st)
 	}
 
-	// Clone repo if specified
-	if st.CloneURL != "" {
-		emit("clone", fmt.Sprintf("Cloning %s...", st.CloneURL))
-		if err := m.cloneRepo(st); err != nil {
+	// Clone repos if specified
+	cloneUrls := st.AllCloneURLs()
+	if len(cloneUrls) > 0 {
+		emit("clone", fmt.Sprintf("Cloning %d repo(s)...", len(cloneUrls)))
+		if err := m.cloneRepos(st); err != nil {
 			emit("clone_failed", fmt.Sprintf("Warning: %s", err))
 		}
 	}
@@ -846,37 +865,23 @@ PROXYEOF`
 	VMSSH(st.TAP, sshKey, "sudo bash -c '"+proxyScript+"'")
 }
 
-func (m *Manager) cloneRepo(st *VMState) error {
+func (m *Manager) cloneRepos(st *VMState) error {
 	sshKey := m.cfg.SSH.PrivateKeyPath
+	repos := st.AllGitHubRepos()
+	cloneURLs := st.AllCloneURLs()
 
-	// Try to get GitHub token
+	// Try to get GitHub token (scoped to all repos)
 	var ghToken string
-	if m.vmid != nil && st.GitHubRepo != "" {
+	if m.vmid != nil && len(repos) > 0 {
 		tok, err := m.vmid.MintGitHubToken(st.Name)
 		if err == nil && tok.Token != "" {
 			ghToken = tok.Token
 		}
 	}
 
-	cloneURL := st.CloneURL
-	// Expand shorthand owner/repo to full GitHub URL
-	if !strings.Contains(cloneURL, "://") && !strings.HasPrefix(cloneURL, "git@") {
-		cloneURL = fmt.Sprintf("https://github.com/%s.git", cloneURL)
-	}
-	if ghToken != "" && st.GitHubRepo != "" {
-		cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s.git", ghToken, st.GitHubRepo)
-	}
-
-	out, err := VMSSH(st.TAP, sshKey, fmt.Sprintf("git clone '%s' ~/project 2>&1", cloneURL))
-	if err != nil {
-		log.Printf("Clone failed for %s: %s", st.Name, out)
-		return fmt.Errorf("clone failed: %s", strings.TrimSpace(out))
-	}
-
+	// Set up credential helper once if we have a token
 	if ghToken != "" {
-		// Strip token from remote, set up git credential helper
-		setupCmd := fmt.Sprintf(`cd ~/project && git remote set-url origin 'https://github.com/%s.git'
-mkdir -p ~/.config/gh
+		setupCmd := fmt.Sprintf(`mkdir -p ~/.config/gh
 cat > ~/.config/gh/hosts.yml <<GHEOF
 github.com:
     oauth_token: %s
@@ -884,11 +889,69 @@ github.com:
     git_protocol: https
 GHEOF
 git config --global credential.helper '!f() { echo username=x-access-token; echo password=%s; }; f'`,
-			st.GitHubRepo, ghToken, ghToken)
+			ghToken, ghToken)
 		VMSSH(st.TAP, sshKey, setupCmd)
 	}
 
-	log.Printf("VM %s: cloned %s", st.Name, st.CloneURL)
+	// Determine clone target directory
+	// Single repo → ~/project (backwards compat), multiple → ~/projects/<name>
+	multiRepo := len(cloneURLs) > 1
+
+	for i, rawURL := range cloneURLs {
+		cloneURL := rawURL
+		// Expand shorthand owner/repo to full GitHub URL
+		if !strings.Contains(cloneURL, "://") && !strings.HasPrefix(cloneURL, "git@") {
+			cloneURL = fmt.Sprintf("https://github.com/%s.git", cloneURL)
+		}
+
+		// Use token-authed URL for clone (will be stripped after)
+		var repoName string
+		if i < len(repos) {
+			repoName = repos[i]
+			if ghToken != "" {
+				cloneURL = fmt.Sprintf("https://x-access-token:%s@github.com/%s.git", ghToken, repoName)
+			}
+		}
+
+		// Target directory
+		targetDir := "~/project"
+		if multiRepo {
+			// Use the repo name (after the /) as directory name
+			parts := strings.SplitN(repoName, "/", 2)
+			dirName := repoName
+			if len(parts) == 2 {
+				dirName = parts[1]
+			}
+			if dirName == "" {
+				dirName = fmt.Sprintf("repo-%d", i)
+			}
+			targetDir = fmt.Sprintf("~/projects/%s", dirName)
+		}
+
+		out, err := VMSSH(st.TAP, sshKey, fmt.Sprintf("git clone '%s' %s 2>&1", cloneURL, targetDir))
+		if err != nil {
+			log.Printf("Clone failed for %s repo %s: %s", st.Name, rawURL, out)
+			continue // don't fail all clones if one fails
+		}
+
+		// Strip token from remote URL
+		if ghToken != "" && repoName != "" {
+			VMSSH(st.TAP, sshKey, fmt.Sprintf("cd %s && git remote set-url origin 'https://github.com/%s.git'", targetDir, repoName))
+		}
+
+		log.Printf("VM %s: cloned %s -> %s", st.Name, rawURL, targetDir)
+	}
+
+	// If multiple repos, symlink ~/project to first one for convenience
+	if multiRepo && len(repos) > 0 {
+		parts := strings.SplitN(repos[0], "/", 2)
+		dirName := repos[0]
+		if len(parts) == 2 {
+			dirName = parts[1]
+		}
+		VMSSH(st.TAP, sshKey, fmt.Sprintf("ln -sf ~/projects/%s ~/project", dirName))
+	}
+
 	return nil
 }
 
@@ -1009,6 +1072,94 @@ func parseRepoURL(url string) string {
 		}
 	}
 	return url
+}
+
+func firstOrEmpty(s []string) string {
+	if len(s) > 0 {
+		return s[0]
+	}
+	return ""
+}
+
+// AddRepo adds a GitHub repo to a VM's policy and registers it with vmid.
+func (m *Manager) AddRepo(name, repo string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+
+	// Update state
+	repos := st.AllGitHubRepos()
+	for _, r := range repos {
+		if r == repo {
+			return repos, nil // already present
+		}
+	}
+	repos = append(repos, repo)
+	st.GitHubRepos = repos
+	st.GitHubRepo = firstOrEmpty(repos)
+	if err := SaveVMState(vmDir, st); err != nil {
+		return nil, err
+	}
+
+	// Update vmid registration
+	if m.vmid != nil {
+		m.vmid.AddRepo(name, repo)
+	}
+
+	return repos, nil
+}
+
+// RemoveRepo removes a GitHub repo from a VM's policy.
+func (m *Manager) RemoveRepo(name, repo string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+
+	repos := st.AllGitHubRepos()
+	found := false
+	var newRepos []string
+	for _, r := range repos {
+		if r == repo {
+			found = true
+			continue
+		}
+		newRepos = append(newRepos, r)
+	}
+	if !found {
+		return nil, fmt.Errorf("repo '%s' not in VM policy", repo)
+	}
+
+	st.GitHubRepos = newRepos
+	st.GitHubRepo = firstOrEmpty(newRepos)
+	if err := SaveVMState(vmDir, st); err != nil {
+		return nil, err
+	}
+
+	if m.vmid != nil {
+		m.vmid.RemoveRepo(name, repo)
+	}
+
+	return newRepos, nil
+}
+
+// ListRepos returns the GitHub repos configured for a VM.
+func (m *Manager) ListRepos(name string) ([]string, error) {
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+	return st.AllGitHubRepos(), nil
 }
 
 // ExportVM stops a VM and returns the path to its COW image for transfer.
@@ -1385,11 +1536,12 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	// Register with vmid
 	if m.vmid != nil {
 		m.vmid.Register(&vmid.RegisterRequest{
-			VMID:       st.Name,
-			IP:         "10.0.0.2",
-			Mark:       st.Mark,
-			Mode:       st.Mode,
-			GitHubRepo: st.GitHubRepo,
+			VMID:        st.Name,
+			IP:          "10.0.0.2",
+			Mark:        st.Mark,
+			Mode:        st.Mode,
+			GitHubRepo:  st.GitHubRepo,
+			GitHubRepos: st.AllGitHubRepos(),
 		})
 	}
 

@@ -10,19 +10,45 @@ import (
 
 // VMState is the persistent state for a VM, stored as vm.json.
 type VMState struct {
-	Name        string `json:"name"`
-	VCPU        int    `json:"vcpu"`
-	RAMMIB      int    `json:"ram_mib"`
-	Mark        int    `json:"mark"`
-	Mode        string `json:"mode"`
-	MAC         string `json:"mac"`
-	Disk        string `json:"disk"`
-	TAP         string `json:"tap"`
-	Created     string `json:"created"`
-	CloneURL    string `json:"clone_url,omitempty"`
-	GitHubRepo  string `json:"github_repo,omitempty"`
-	TailscaleIP string `json:"tailscale_ip,omitempty"`
-	GoldenVer   string `json:"golden_version,omitempty"`
+	Name        string   `json:"name"`
+	VCPU        int      `json:"vcpu"`
+	RAMMIB      int      `json:"ram_mib"`
+	Mark        int      `json:"mark"`
+	Mode        string   `json:"mode"`
+	MAC         string   `json:"mac"`
+	Disk        string   `json:"disk"`
+	TAP         string   `json:"tap"`
+	Created     string   `json:"created"`
+	CloneURL    string   `json:"clone_url,omitempty"`    // first/primary clone URL (backwards compat)
+	CloneURLs   []string `json:"clone_urls,omitempty"`   // all clone URLs
+	GitHubRepo  string   `json:"github_repo,omitempty"`  // backwards compat — single repo
+	GitHubRepos []string `json:"github_repos,omitempty"` // all GitHub repos (owner/repo)
+	TailscaleIP string   `json:"tailscale_ip,omitempty"`
+	GoldenVer   string   `json:"golden_version,omitempty"`
+}
+
+// AllGitHubRepos returns the list of GitHub repos, falling back to the single
+// GitHubRepo field for backwards compatibility with older vm.json files.
+func (st *VMState) AllGitHubRepos() []string {
+	if len(st.GitHubRepos) > 0 {
+		return st.GitHubRepos
+	}
+	if st.GitHubRepo != "" {
+		return []string{st.GitHubRepo}
+	}
+	return nil
+}
+
+// AllCloneURLs returns the list of clone URLs, falling back to the single
+// CloneURL field for backwards compatibility.
+func (st *VMState) AllCloneURLs() []string {
+	if len(st.CloneURLs) > 0 {
+		return st.CloneURLs
+	}
+	if st.CloneURL != "" {
+		return []string{st.CloneURL}
+	}
+	return nil
 }
 
 // SnapshotState tracks dm-snapshot loop devices.

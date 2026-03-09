@@ -91,6 +91,8 @@ func (h *Handler) Run(args []string) int {
 		return h.cmdRemoveUser(target)
 	case "keys":
 		return h.cmdListKeys()
+	case "repos":
+		return h.cmdRepos(args[1:])
 	case "help":
 		h.printHelp()
 		return 0
@@ -102,11 +104,12 @@ func (h *Handler) Run(args []string) int {
 
 func (h *Handler) cmdNew(args []string) int {
 	body := map[string]interface{}{}
+	var cloneURLs []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--clone":
 			if i+1 < len(args) {
-				body["clone_url"] = args[i+1]
+				cloneURLs = append(cloneURLs, args[i+1])
 				i++
 			}
 		case "--vcpu":
@@ -139,6 +142,13 @@ func (h *Handler) cmdNew(args []string) int {
 				i++
 			}
 		}
+	}
+
+	// Set clone URLs in request body
+	if len(cloneURLs) == 1 {
+		body["clone_url"] = cloneURLs[0]
+	} else if len(cloneURLs) > 1 {
+		body["clone_urls"] = cloneURLs
 	}
 
 	resp, err := h.postStream("/api/vms", body, func(evt map[string]interface{}) {
@@ -495,12 +505,98 @@ func (h *Handler) cmdListKeys() int {
 	return 0
 }
 
+func (h *Handler) cmdRepos(args []string) int {
+	if len(args) < 1 {
+		fmt.Println("Usage: ssh <host> repos <list|add|remove> <vm-name> [repo]")
+		return 1
+	}
+
+	action := args[0]
+	switch action {
+	case "list":
+		if len(args) < 2 {
+			fmt.Println("Usage: ssh <host> repos list <vm-name>")
+			return 1
+		}
+		vmName := args[1]
+		resp, err := h.get("/api/vms/" + vmName + "/repos")
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		var result struct {
+			Repos []string `json:"repos"`
+		}
+		json.Unmarshal(resp, &result)
+		if len(result.Repos) == 0 {
+			fmt.Printf("No repos configured for %s.\n", vmName)
+			return 0
+		}
+		fmt.Printf("Repos for %s:\n", vmName)
+		for _, r := range result.Repos {
+			fmt.Printf("  %s\n", r)
+		}
+		return 0
+
+	case "add":
+		if len(args) < 3 {
+			fmt.Println("Usage: ssh <host> repos add <vm-name> <owner/repo>")
+			return 1
+		}
+		vmName := args[1]
+		repo := args[2]
+		result, err := h.post("/api/vms/"+vmName+"/repos", map[string]string{"repo": repo})
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		var res struct {
+			Repos []string `json:"repos"`
+		}
+		json.Unmarshal(result, &res)
+		fmt.Printf("Added %s. Repos for %s:\n", repo, vmName)
+		for _, r := range res.Repos {
+			fmt.Printf("  %s\n", r)
+		}
+		return 0
+
+	case "remove":
+		if len(args) < 3 {
+			fmt.Println("Usage: ssh <host> repos remove <vm-name> <owner/repo>")
+			return 1
+		}
+		vmName := args[1]
+		repo := args[2]
+		result, err := h.delete("/api/vms/" + vmName + "/repos/" + repo)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		var res struct {
+			Repos []string `json:"repos"`
+		}
+		json.Unmarshal(result, &res)
+		fmt.Printf("Removed %s. Repos for %s:\n", repo, vmName)
+		for _, r := range res.Repos {
+			fmt.Printf("  %s\n", r)
+		}
+		if len(res.Repos) == 0 {
+			fmt.Println("  (none)")
+		}
+		return 0
+
+	default:
+		fmt.Println("Usage: ssh <host> repos <list|add|remove> <vm-name> [repo]")
+		return 1
+	}
+}
+
 func (h *Handler) printHelp() {
 	fmt.Print(`Boxcutter — ephemeral dev environments
 
 Commands:
   new [options]           Create and start a new VM
-    --clone <repo>          Clone repo on creation
+    --clone <repo>          Clone repo on creation (repeatable)
     --vcpu <N>              CPU cores (default: 2)
     --ram <MiB>             RAM in MiB (default: 2048)
     --disk <size>           Disk size (default: 50G)
@@ -511,6 +607,10 @@ Commands:
   stop <name>             Stop a running VM
   start <name>            Start a stopped VM
   cp <name> [new-name]    Copy a VM (clone its disk)
+  repos list <name>       List GitHub repos for a VM
+  repos add <name> <repo> Add a repo to VM's GitHub policy
+  repos remove <name> <repo>
+                          Remove a repo from VM's GitHub policy
   images                  List golden images across all nodes
   golden set-head <ver>   Set golden image head version (nodes pull via MQTT)
   status                  Cluster capacity summary

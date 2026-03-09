@@ -42,6 +42,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/import-snapshot", h.handleImportSnapshot)
 	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleCopy)
 	mux.HandleFunc("POST /api/vms/{name}/migrate", h.handleMigrate)
+	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleAddRepo)
+	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleRemoveRepo)
+	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleListRepos)
 	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
 	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
@@ -385,6 +388,54 @@ func (h *Handler) handleCopy(w http.ResponseWriter, r *http.Request) {
 	if canFlush {
 		flusher.Flush()
 	}
+}
+
+func (h *Handler) handleAddRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+	var req struct {
+		Repo string `json:"repo"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Repo == "" {
+		http.Error(w, "repo is required", http.StatusBadRequest)
+		return
+	}
+	repos, err := h.mgr.AddRepo(name, req.Repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"repos": repos})
+}
+
+func (h *Handler) handleRemoveRepo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	repo := r.PathValue("repo")
+	repos, err := h.mgr.RemoveRepo(name, repo)
+	if err != nil {
+		status := http.StatusNotFound
+		if strings.Contains(err.Error(), "not in VM policy") {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"repos": repos})
+}
+
+func (h *Handler) handleListRepos(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+	repos, err := h.mgr.ListRepos(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"repos": repos})
 }
 
 func (h *Handler) handleGoldenVersions(w http.ResponseWriter, r *http.Request) {
