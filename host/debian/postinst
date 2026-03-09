@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+# Create data directory
+mkdir -p /var/lib/boxcutter/.images
+
+# Reload systemd to pick up the service file
+systemctl daemon-reload
+
+# Enable but don't start — user needs to run bootstrap first
+systemctl enable boxcutter-host.service 2>/dev/null || true
+
+echo ""
+echo "boxcutter-host installed successfully!"
+echo ""
+echo "Next steps:"
+echo "  1. Place your bootstrap bundle at ~/.boxcutter/ (boxcutter.yaml + secrets/)"
+echo "  2. Run: sudo boxcutter-host bootstrap [--version TAG]"
+echo "  3. Or for dev mode: sudo boxcutter-host bootstrap --from-source"
+echo ""

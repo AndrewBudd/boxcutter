@@ -14,6 +14,9 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -64,6 +67,22 @@ type HostConfig struct {
 	GitHubPrivateKeyPath string
 }
 
+// detectDefaultNIC finds the network interface used for the default route.
+// Falls back to "eth0" if detection fails.
+func detectDefaultNIC() string {
+	out, err := exec.Command("ip", "route", "show", "default").Output()
+	if err == nil {
+		// "default via 10.0.0.1 dev eth0 proto ..."
+		fields := strings.Fields(string(out))
+		for i, f := range fields {
+			if f == "dev" && i+1 < len(fields) {
+				return fields[i+1]
+			}
+		}
+	}
+	return "eth0"
+}
+
 func defaultConfig() HostConfig {
 	// Find repo dir: check env, then try relative to binary, then home
 	repoDir := os.Getenv("BOXCUTTER_REPO")
@@ -88,7 +107,7 @@ func defaultConfig() HostConfig {
 	return HostConfig{
 		RepoDir:            repoDir,
 		ImagesDir:          repoDir + "/.images",
-		HostNIC:            "enp34s0",
+		HostNIC:            detectDefaultNIC(),
 		BridgeDevice:       "br-boxcutter",
 		BridgeIP:           "192.168.50.1",
 		BridgeCIDR:         "24",
@@ -174,12 +193,19 @@ func main() {
 		cliBuildImage()
 	case "push-golden":
 		cliPushGolden()
+	case "recover":
+		cliRecover()
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|version|build-image|push-golden>\n\n")
-		fmt.Fprintf(os.Stderr, "Bootstrap modes:\n")
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|recover|version|build-image|push-golden>\n\n")
+		fmt.Fprintf(os.Stderr, "Commands:\n")
+		fmt.Fprintf(os.Stderr, "  run                          Run the host daemon\n")
+		fmt.Fprintf(os.Stderr, "  status                       Show cluster status\n")
 		fmt.Fprintf(os.Stderr, "  bootstrap                    Pull OCI images and create VMs (prod)\n")
 		fmt.Fprintf(os.Stderr, "  bootstrap --from-source      Build from local repo and create VMs (dev)\n")
 		fmt.Fprintf(os.Stderr, "  bootstrap --version v0.1.0   Pull specific version of OCI images\n")
+		fmt.Fprintf(os.Stderr, "  recover                      Scan for running VMs and rebuild cluster.json\n")
+		fmt.Fprintf(os.Stderr, "  pull <type> [--tag TAG]      Pull a VM image from OCI registry\n")
+		fmt.Fprintf(os.Stderr, "  upgrade <type> [--tag TAG]   Rolling upgrade of VMs\n")
 		os.Exit(1)
 	}
 }
@@ -236,7 +262,153 @@ func runDaemon() {
 	log.Println("boxcutter-host shutting down")
 }
 
+// discoverOrphanedVMs scans /proc for running qemu-system-x86_64 processes
+// that are not tracked in the cluster state. This handles the case where
+// cluster.json was lost or corrupted but VMs are still running.
+func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		log.Printf("WARNING: cannot scan /proc: %v", err)
+		return
+	}
+
+	// Build set of PIDs already tracked
+	knownPIDs := map[int]bool{}
+	if state.Orchestrator != nil {
+		knownPIDs[state.Orchestrator.PID] = true
+	}
+	for _, n := range state.Nodes {
+		knownPIDs[n.PID] = true
+	}
+
+	discovered := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		if knownPIDs[pid] {
+			continue
+		}
+
+		// Read cmdline
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(cmdline), "\x00")
+		if len(args) < 2 || !strings.HasSuffix(args[0], "qemu-system-x86_64") {
+			continue
+		}
+
+		// Parse QEMU args to extract VM identity
+		vmEntry := parseQEMUArgs(args, pid)
+		if vmEntry == nil {
+			continue
+		}
+
+		if vmEntry.Type == "orchestrator" {
+			if state.Orchestrator != nil && qemu.IsRunning(state.Orchestrator.PID) {
+				continue // already have a running orchestrator
+			}
+			log.Printf("  Discovered orphaned orchestrator (PID %d, disk %s)", pid, vmEntry.Disk)
+			state.SetOrchestrator(*vmEntry)
+			discovered++
+		} else if vmEntry.Type == "node" {
+			existing := state.GetNode(vmEntry.ID)
+			if existing != nil && qemu.IsRunning(existing.PID) {
+				continue
+			}
+			log.Printf("  Discovered orphaned node %s (PID %d, disk %s)", vmEntry.ID, pid, vmEntry.Disk)
+			state.AddNode(*vmEntry)
+			discovered++
+		}
+	}
+
+	if discovered > 0 {
+		log.Printf("  Recovered %d orphaned VM(s) from running QEMU processes", discovered)
+		state.Save()
+	}
+}
+
+// parseQEMUArgs extracts VM identity from QEMU command-line arguments.
+func parseQEMUArgs(args []string, pid int) *cluster.VMEntry {
+	entry := &cluster.VMEntry{PID: pid}
+
+	nodeNameRe := regexp.MustCompile(`boxcutter-node-(\d+)`)
+
+	for i, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "file=") && strings.Contains(arg, ".qcow2"):
+			// "-drive" "file=/path/to/vm.qcow2,format=qcow2,if=virtio"
+			parts := strings.SplitN(arg, ",", 2)
+			entry.Disk = strings.TrimPrefix(parts[0], "file=")
+		case i > 0 && args[i-1] == "-drive" && strings.HasPrefix(arg, "file=") && strings.Contains(arg, ".qcow2"):
+			parts := strings.SplitN(arg, ",", 2)
+			entry.Disk = strings.TrimPrefix(parts[0], "file=")
+		case strings.HasPrefix(arg, "tap,id="):
+			// "-netdev" "tap,id=net0,ifname=tap-node1,script=no,downscript=no"
+			for _, kv := range strings.Split(arg, ",") {
+				if strings.HasPrefix(kv, "ifname=") {
+					entry.TAP = strings.TrimPrefix(kv, "ifname=")
+				}
+			}
+		case strings.HasPrefix(arg, "virtio-net-pci,netdev="):
+			// "-device" "virtio-net-pci,netdev=net0,mac=52:54:00:00:00:03"
+			for _, kv := range strings.Split(arg, ",") {
+				if strings.HasPrefix(kv, "mac=") {
+					entry.MAC = strings.TrimPrefix(kv, "mac=")
+				}
+			}
+		case arg == "-smp" && i+1 < len(args):
+			entry.VCPU, _ = strconv.Atoi(args[i+1])
+		case arg == "-m" && i+1 < len(args):
+			entry.RAM = args[i+1]
+		}
+	}
+
+	if entry.Disk == "" {
+		return nil
+	}
+
+	// Identify VM type and name from disk path or TAP name
+	diskBase := filepath.Base(entry.Disk)
+	if strings.HasPrefix(diskBase, "orchestrator") {
+		entry.Type = "orchestrator"
+		entry.ID = "orchestrator"
+		entry.BridgeIP = "192.168.50.2" // convention
+	} else if m := nodeNameRe.FindStringSubmatch(diskBase); m != nil {
+		entry.Type = "node"
+		entry.ID = "boxcutter-node-" + m[1]
+		nodeNum, _ := strconv.Atoi(m[1])
+		entry.BridgeIP = fmt.Sprintf("192.168.50.%d", 2+nodeNum)
+	} else if m := nodeNameRe.FindStringSubmatch(entry.TAP); m != nil {
+		entry.Type = "node"
+		entry.ID = "boxcutter-node-" + m[1]
+		nodeNum, _ := strconv.Atoi(m[1])
+		entry.BridgeIP = fmt.Sprintf("192.168.50.%d", 2+nodeNum)
+	} else {
+		return nil // unrecognized VM
+	}
+
+	// Find the cloud-init ISO from args
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "file=") && strings.Contains(arg, "cloud-init.iso") {
+			parts := strings.SplitN(arg, ",", 2)
+			entry.ISO = strings.TrimPrefix(parts[0], "file=")
+		}
+	}
+
+	return entry
+}
+
 func bootRecover(cfg HostConfig, state *cluster.State) {
+	// First, discover any running QEMU VMs not tracked in state
+	discoverOrphanedVMs(cfg, state)
+
 	currentUser, _ := user.Current()
 	username := "root"
 	if currentUser != nil {
@@ -496,7 +668,7 @@ func addNode(cfg HostConfig, state *cluster.State) {
 	// Auto-provision disk from base image if not already present
 	if _, err := os.Stat(disk); err != nil {
 		log.Printf("Node %s disk not found, provisioning from base image...", nodeID)
-		provisionCmd := exec.Command("bash", filepath.Join(cfg.RepoDir, "host/provision.sh"),
+		provisionCmd := exec.Command("bash", hostFile(cfg, "provision.sh"),
 			"node", nodeID, "--from-image")
 		provisionCmd.Dir = cfg.RepoDir
 		if out, err := provisionCmd.CombinedOutput(); err != nil {
@@ -809,6 +981,20 @@ func printOfflineStatus(state *cluster.State) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// hostFile resolves a host script/config file path. In dev mode (BOXCUTTER_REPO set),
+// files are at $REPO/host/FILE. In prod/deb mode, files are at /usr/share/boxcutter/FILE.
+func hostFile(cfg HostConfig, name string) string {
+	repoPath := filepath.Join(cfg.RepoDir, "host", name)
+	if fileExists(repoPath) {
+		return repoPath
+	}
+	debPath := filepath.Join("/usr/share/boxcutter", name)
+	if fileExists(debPath) {
+		return debPath
+	}
+	return repoPath // fallback to repo path for error messages
 }
 
 // cliPull downloads a pre-built VM image from an OCI registry.
@@ -1391,7 +1577,7 @@ func generateCloudInitISO(cfg HostConfig, vmType, name string) error {
 // generateCloudInitISOWithOutput is like generateCloudInitISO but allows specifying
 // the output path, IP, and MAC for the cloud-init ISO.
 func generateCloudInitISOWithOutput(cfg HostConfig, vmType, name, outputPath string, envOverrides ...string) error {
-	script := filepath.Join(cfg.RepoDir, "host", "provision.sh")
+	script := hostFile(cfg, "provision.sh")
 	args := []string{script, vmType}
 	if name != "" {
 		args = append(args, name)
@@ -1512,7 +1698,7 @@ func cliBuildImage() {
 
 	if !pushOnly {
 		// Run the build script
-		buildScript := filepath.Join(cfg.RepoDir, "host", "build-image.sh")
+		buildScript := hostFile(cfg, "build-image.sh")
 		if !fileExists(buildScript) {
 			fmt.Fprintf(os.Stderr, "Build script not found: %s\n", buildScript)
 			os.Exit(1)
@@ -1678,6 +1864,50 @@ func cliPushGolden() {
 	fmt.Printf("Pushed golden image %s to %s/%s/golden:%s\n", versions.Head, cfg.OCIRegistry, cfg.OCIRepository, tag)
 }
 
+// cliRecover scans for running QEMU VMs and rebuilds cluster.json.
+// Use this when cluster.json is lost/corrupted but VMs are still running.
+func cliRecover() {
+	cfg := defaultConfig()
+
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		// If corrupted, start fresh
+		log.Printf("Could not load existing state (%v), starting fresh", err)
+		state, _ = cluster.Load("/dev/null/nonexistent") // force empty state
+	}
+
+	fmt.Println("Scanning for running QEMU VMs...")
+	discoverOrphanedVMs(cfg, state)
+
+	// Print what we found
+	if state.Orchestrator != nil {
+		running := qemu.IsRunning(state.Orchestrator.PID)
+		status := "stopped"
+		if running {
+			status = "running"
+		}
+		fmt.Printf("  Orchestrator: %s (IP %s, PID %d, %s)\n",
+			state.Orchestrator.ID, state.Orchestrator.BridgeIP, state.Orchestrator.PID, status)
+	}
+	for _, n := range state.Nodes {
+		running := qemu.IsRunning(n.PID)
+		status := "stopped"
+		if running {
+			status = "running"
+		}
+		fmt.Printf("  Node: %s (IP %s, PID %d, %s)\n", n.ID, n.BridgeIP, n.PID, status)
+	}
+
+	if state.Orchestrator == nil && len(state.Nodes) == 0 {
+		fmt.Println("No QEMU VMs found.")
+		return
+	}
+
+	state.Save()
+	fmt.Printf("\nState saved to %s\n", cfg.StatePath)
+	fmt.Println("You can now run: boxcutter-host run")
+}
+
 func parsePullArgs() (string, string) {
 	if len(os.Args) < 3 {
 		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host %s <node|orchestrator|golden|all> [--tag TAG]\n", os.Args[1])
@@ -1749,7 +1979,7 @@ func waitForNodeHealth(bridgeIP string, timeout time.Duration) bool {
 
 // startMosquitto launches the MQTT broker as a subprocess.
 func startMosquitto(cfg HostConfig) *exec.Cmd {
-	confPath := filepath.Join(cfg.RepoDir, "host", "mosquitto.conf")
+	confPath := hostFile(cfg, "mosquitto.conf")
 	if !fileExists(confPath) {
 		log.Printf("mosquitto config not found at %s, skipping MQTT broker", confPath)
 		return nil
@@ -1775,7 +2005,7 @@ func startMosquitto(cfg HostConfig) *exec.Cmd {
 // from the local repo. After this, phases 3 and 4 of bootstrap are no-ops since the files
 // already exist.
 func buildFromSource(cfg HostConfig, vmType string) error {
-	args := []string{filepath.Join(cfg.RepoDir, "host", "provision.sh"), vmType}
+	args := []string{hostFile(cfg, "provision.sh"), vmType}
 	if vmType == "node" {
 		args = append(args, "boxcutter-node-1")
 	}
@@ -2059,15 +2289,20 @@ func runBootstrap() {
 	state.Save()
 
 	// Phase 6: Wait for health
-	log.Println("--- Waiting for VMs to become healthy ---")
-	if !waitForHealth(fmt.Sprintf("http://%s:8801/healthz", cfg.OrchestratorIP), 120*time.Second) {
-		log.Println("WARNING: Orchestrator did not become healthy within 120s")
+	// From-source builds need much longer: cloud-init installs packages from scratch
+	healthTimeout := 120 * time.Second
+	if fromSource {
+		healthTimeout = 600 * time.Second
+	}
+	log.Printf("--- Waiting for VMs to become healthy (timeout: %s) ---", healthTimeout)
+	if !waitForHealth(fmt.Sprintf("http://%s:8801/healthz", cfg.OrchestratorIP), healthTimeout) {
+		log.Printf("WARNING: Orchestrator did not become healthy within %s", healthTimeout)
 	} else {
 		log.Println("  Orchestrator healthy")
 	}
 
-	if !waitForNodeHealth(node1BridgeIP, 120*time.Second) {
-		log.Println("WARNING: Node-1 did not become healthy within 120s")
+	if !waitForNodeHealth(node1BridgeIP, healthTimeout) {
+		log.Printf("WARNING: Node-1 did not become healthy within %s", healthTimeout)
 	} else {
 		log.Println("  Node-1 healthy")
 	}

@@ -1,6 +1,6 @@
 .PHONY: help provision-node provision-orchestrator launch-node launch-orchestrator \
        stop-node stop-orchestrator ssh-node ssh-orchestrator status clean \
-       build-host install-host \
+       build-host install-host deb-host \
        build-image pull upgrade version provision-from-image
 
 # --- Orchestrator ---
@@ -62,6 +62,9 @@ release-host: build-host  ## Create release tarball for boxcutter-host
 		-C host boxcutter-host \
 		-C .. host/boxcutter-host.service
 	@echo "Release tarball: .release/boxcutter-host-$(VERSION)-linux-amd64.tar.gz"
+
+deb-host:                 ## Build .deb package for boxcutter-host
+	@bash host/build-deb.sh $(VERSION)
 
 # --- OCI Images ---
 

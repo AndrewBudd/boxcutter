@@ -1,0 +1,11 @@
+Package: boxcutter-host
+Version: VERSION_PLACEHOLDER
+Section: admin
+Priority: optional
+Architecture: amd64
+Depends: qemu-system-x86, qemu-utils, genisoimage, mosquitto, iptables, iproute2, zstd
+Maintainer: Andrew Budd <andrew@boxcutter.dev>
+Description: Boxcutter host control plane
+ Manages QEMU VMs (orchestrator + nodes) on bare metal hosts.
+ Provides bootstrap, auto-scaling, health monitoring, rolling upgrades,
+ and state recovery for the Boxcutter VM infrastructure.

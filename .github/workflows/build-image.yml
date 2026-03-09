@@ -78,10 +78,14 @@ jobs:
       - name: Build release tarball
         run: make release-host VERSION=${{ steps.tag.outputs.tag }}
 
+      - name: Build deb package
+        run: make deb-host VERSION=${{ steps.tag.outputs.tag }}
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create ${{ steps.tag.outputs.tag }} \
             --generate-notes \
-            .release/boxcutter-host-${{ steps.tag.outputs.tag }}-linux-amd64.tar.gz
+            .release/boxcutter-host-${{ steps.tag.outputs.tag }}-linux-amd64.tar.gz \
+            .release/boxcutter-host_${{ steps.tag.outputs.tag }}_amd64.deb
