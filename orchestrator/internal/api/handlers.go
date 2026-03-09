@@ -556,13 +556,12 @@ func (h *Handler) handleVMDestroy(w http.ResponseWriter, r *http.Request) {
 	if n != nil {
 		client := node.NewClient(n.APIAddr)
 		if err := client.Destroy(name); err != nil {
-			log.Printf("Node destroy failed for %s: %v (marked destroying, will retry)", name, err)
-			http.Error(w, fmt.Sprintf("destroy in progress but node error: %v", err), http.StatusAccepted)
-			return
+			log.Printf("Node destroy failed for %s: %v (cleaning up DB record anyway)", name, err)
 		}
 	}
 
-	// Confirmed destroyed on node — remove from DB
+	// Always remove from DB — a stale record is worse than a phantom VM on a node,
+	// and the health monitor's SyncNodeVMs will catch any real orphans.
 	h.db.DeleteVM(name)
 	log.Printf("VM destroyed: %s", name)
 	w.WriteHeader(http.StatusNoContent)

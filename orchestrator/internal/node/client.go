@@ -132,6 +132,9 @@ func (c *Client) Destroy(name string) error {
 		return fmt.Errorf("node destroy: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // VM already gone
+	}
 	if resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("node destroy: %s", string(errBody))
