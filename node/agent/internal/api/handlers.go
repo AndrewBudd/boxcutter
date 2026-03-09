@@ -323,14 +323,22 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.mgr.MigrateVM(name, req.TargetAddr, req.TargetBridgeIP)
-	if err != nil {
-		log.Printf("Migration failed for %s: %v", name, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	// Set migration marker — DeriveStatus() will report "migrating"
+	vm.SetMigrating(vm.VMDir(name), true)
 
-	writeJSON(w, resp)
+	// Start migration in background — caller polls GET /api/vms/{name} for status
+	go func() {
+		_, err := h.mgr.MigrateVM(name, req.TargetAddr, req.TargetBridgeIP)
+		if err != nil {
+			log.Printf("Migration failed for %s: %v", name, err)
+			// Clear marker — MigrateVM already rolled back (resumed source)
+			vm.SetMigrating(vm.VMDir(name), false)
+		}
+		// On success, MigrateVM removes the VM directory — marker goes with it
+	}()
+
+	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, map[string]string{"name": name, "status": "migrating"})
 }
 
 func (h *Handler) handleCopy(w http.ResponseWriter, r *http.Request) {

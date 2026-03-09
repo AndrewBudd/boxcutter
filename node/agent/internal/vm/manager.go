@@ -343,6 +343,7 @@ func (m *Manager) Stop(name string) error {
 	return m.stopVM(name)
 }
 
+
 func (m *Manager) stopVM(name string) error {
 	vmDir := VMDir(name)
 	st, err := LoadVMState(vmDir)
@@ -431,17 +432,14 @@ func (m *Manager) Destroy(name string) error {
 }
 
 // Get returns the state and status of a VM.
+// Status is always derived from reality (process + migration marker), never stored.
 func (m *Manager) Get(name string) (*VMState, string, error) {
 	vmDir := VMDir(name)
 	st, err := LoadVMState(vmDir)
 	if err != nil {
 		return nil, "", fmt.Errorf("VM '%s' not found", name)
 	}
-	status := "stopped"
-	if IsRunning(vmDir) {
-		status = "running"
-	}
-	return st, status, nil
+	return st, DeriveStatus(vmDir), nil
 }
 
 // List returns all VMs with their status.
@@ -452,10 +450,7 @@ func (m *Manager) List() ([]map[string]interface{}, error) {
 	}
 	var result []map[string]interface{}
 	for _, st := range vms {
-		status := "stopped"
-		if IsRunning(VMDir(st.Name)) {
-			status = "running"
-		}
+		status := DeriveStatus(VMDir(st.Name))
 		result = append(result, map[string]interface{}{
 			"name":         st.Name,
 			"tailscale_ip": st.TailscaleIP,
@@ -1333,8 +1328,11 @@ func copyFile(src, dst string) error {
 //
 // Flow:
 //   Phase 1 (VM running):  Pre-stage golden image + create target dirs
-//   Phase 2 (VM paused):   Snapshot → transfer COW + snapshot + mem → load on target
-//   Phase 3:               Cleanup source
+//   Phase 2 (VM paused):   Snapshot → transfer → resume on target → verify healthy
+//   Phase 3 (verified):    Stop source, cleanup (or rollback: resume source)
+//
+// Safety invariant: source VM stays PAUSED (not stopped) until target is confirmed
+// healthy. If anything fails, source is resumed and migration is rolled back.
 func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateResponse, error) {
 	vmDir := VMDir(name)
 	st, err := LoadVMState(vmDir)
@@ -1342,45 +1340,63 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return nil, fmt.Errorf("VM '%s' not found", name)
 	}
 
-	clusterKey := "/root/.ssh/cluster-ssh.key"
+	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
 	dstVMDir := fmt.Sprintf("/var/lib/boxcutter/vms/%s/", name)
 
-	// --- Phase 1: Pre-stage while VM is still running ---
+	// --- Stopped VM: just transfer files, no snapshot needed ---
+	if !IsRunning(vmDir) {
+		return m.relocateStoppedVM(name, st, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey)
+	}
+
+	sshArgs := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
+	cowPath := filepath.Join(vmDir, "cow.img")
+
+	// --- Phase 1: Pre-stage while VM is still running (zero downtime) ---
 	log.Printf("Migrating %s to %s: pre-staging (VM still running)", name, targetAddr)
 
-	// 1a. Transfer golden image if needed (this is the slow part)
 	if st.GoldenVer != "" && st.GoldenVer != "unversioned" {
 		if err := m.ensureTargetHasGolden(st.GoldenVer, targetAddr, targetBridgeIP); err != nil {
 			return nil, fmt.Errorf("golden transfer: %w", err)
 		}
 	}
 
-	// 1b. Create destination directory on target
-	mkdirCmd := exec.Command("ssh",
-		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", dstVMDir)
+	mkdirCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", dstVMDir)...)
 	if out, err := mkdirCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
 	}
 
-	// --- Phase 2: Pause + Snapshot + Transfer (downtime starts) ---
-	downtimeStart := time.Now()
-
-	if !IsRunning(vmDir) {
-		return nil, fmt.Errorf("VM '%s' is not running — cannot snapshot", name)
+	// Pre-sync COW image while VM still runs (dirty blocks will be re-synced after pause)
+	log.Printf("Migrating %s: pre-syncing COW image", name)
+	preSyncCmd := exec.Command("rsync", "--sparse", "--inplace",
+		"-e", sshOpts, "--rsync-path", "sudo rsync",
+		cowPath, fmt.Sprintf("ubuntu@%s:%scow.img", targetBridgeIP, dstVMDir))
+	if out, err := preSyncCmd.CombinedOutput(); err != nil {
+		log.Printf("Migrating %s: pre-sync warning (non-fatal): %s", name, string(out))
 	}
 
-	// 2a. Pause the VM (freezes vCPUs instantly, sub-millisecond)
+	// --- Phase 2: Pause + Snapshot via FIFO + delta transfer (downtime starts) ---
+	downtimeStart := time.Now()
+
 	log.Printf("Migrating %s: pausing VM (downtime starts)", name)
 	if err := fcPause(vmDir); err != nil {
 		return nil, fmt.Errorf("pause: %w", err)
 	}
 
-	// 2b. Create Firecracker snapshot (writes vm.snap + vm.mem)
-	_, memPath, err := fcSnapshot(vmDir)
+	// From here on, any error must resume the source VM
+	rollback := func(reason string) {
+		log.Printf("Migrating %s: ROLLBACK — %s, resuming source VM", name, reason)
+		if err := fcResume(vmDir); err != nil {
+			log.Printf("Migrating %s: WARNING — failed to resume source: %v", name, err)
+		}
+		cleanCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP, "sudo", "rm", "-rf", dstVMDir)...)
+		cleanCmd.Run()
+	}
+
+	// Snapshot to regular files (Firecracker requires truncatable mem file, not FIFO)
+	snapPath, memPath, err := fcSnapshot(vmDir)
 	if err != nil {
-		// Resume VM on failure so we don't leave it frozen
-		fcResume(vmDir)
+		rollback("snapshot failed: " + err.Error())
 		return nil, fmt.Errorf("snapshot: %w", err)
 	}
 
@@ -1390,49 +1406,120 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		memSize = memInfo.Size()
 	}
 
-	// 2c. Stream COW + snapshot + mem to target using tar --sparse (uncompressed)
-	// On a local bridge, raw throughput beats CPU-bound compression
-	log.Printf("Migrating %s: transferring snapshot (snap + mem + cow)", name)
-	tarCmd := fmt.Sprintf(
-		"sudo tar --sparse -cf - -C %s cow.img vm.snap vm.mem | ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
-		vmDir, clusterKey, targetBridgeIP, dstVMDir)
-	streamCmd := exec.Command("bash", "-c", tarCmd)
-	if out, err := streamCmd.CombinedOutput(); err != nil {
-		// Resume VM on failure
-		fcResume(vmDir)
-		return nil, fmt.Errorf("transfer: %s: %w", string(out), err)
+	// Transfer mem + snap + COW delta in parallel to minimize downtime
+	log.Printf("Migrating %s: transferring snapshot (mem=%dMB) + COW delta in parallel", name, memSize/1024/1024)
+
+	type transferResult struct {
+		name string
+		err  error
+	}
+	xferResults := make(chan transferResult, 3)
+
+	// Stream memory file over SSH (largest — dominates downtime)
+	go func() {
+		cmd := exec.Command("bash", "-c", fmt.Sprintf(
+			"cat %s | %s ubuntu@%s 'sudo tee %svm.mem > /dev/null'",
+			memPath, sshOpts, targetBridgeIP, dstVMDir))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			xferResults <- transferResult{"mem", fmt.Errorf("%s: %w", string(out), err)}
+		} else {
+			xferResults <- transferResult{"mem", nil}
+		}
+	}()
+
+	// Transfer vm.snap (tiny, a few KB) — use rsync with sudo since target dir is root-owned
+	go func() {
+		cmd := exec.Command("rsync",
+			"-e", sshOpts, "--rsync-path", "sudo rsync",
+			snapPath, fmt.Sprintf("ubuntu@%s:%svm.snap", targetBridgeIP, dstVMDir))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			xferResults <- transferResult{"snap", fmt.Errorf("%s: %w", string(out), err)}
+		} else {
+			xferResults <- transferResult{"snap", nil}
+		}
+	}()
+
+	// COW delta sync — only blocks changed since pre-sync
+	go func() {
+		cmd := exec.Command("rsync", "--sparse", "--inplace",
+			"-e", sshOpts, "--rsync-path", "sudo rsync",
+			cowPath, fmt.Sprintf("ubuntu@%s:%scow.img", targetBridgeIP, dstVMDir))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			xferResults <- transferResult{"cow", fmt.Errorf("%s: %w", string(out), err)}
+		} else {
+			xferResults <- transferResult{"cow", nil}
+		}
+	}()
+
+	// Wait for all three transfers
+	for i := 0; i < 3; i++ {
+		r := <-xferResults
+		if r.err != nil {
+			rollback(r.name + " transfer failed: " + r.err.Error())
+			return nil, fmt.Errorf("%s transfer: %w", r.name, r.err)
+		}
 	}
 
-	// 2d. Stop the source VM now that data is transferred
-	// Deregister from vmid first
-	if m.vmid != nil {
-		m.vmid.Deregister(name)
-	}
-	m.stopVM(name)
-
-	// 2e. Load snapshot on target node (import-snapshot endpoint)
+	// --- Resume on target (import-snapshot) ---
+	log.Printf("Migrating %s: resuming on target %s", name, targetAddr)
 	stJSON, _ := json.Marshal(st)
-	targetClient := &http.Client{Timeout: 5 * time.Minute}
+	targetClient := &http.Client{Timeout: 2 * time.Minute}
 	importURL := fmt.Sprintf("http://%s/api/vms/%s/import-snapshot", targetAddr, name)
 	resp, err := targetClient.Post(importURL, "application/json", bytes.NewReader(stJSON))
 	if err != nil {
+		rollback("import-snapshot request failed: " + err.Error())
 		return nil, fmt.Errorf("import-snapshot request: %w", err)
 	}
-	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		rollback("import-snapshot returned " + fmt.Sprint(resp.StatusCode))
 		return nil, fmt.Errorf("import-snapshot failed: %s", string(body))
 	}
 
 	var importResp CreateResponse
-	json.NewDecoder(resp.Body).Decode(&importResp)
+	json.Unmarshal(body, &importResp)
 
+	// --- Phase 3: Verify target is healthy before committing ---
+	log.Printf("Migrating %s: verifying target is healthy...", name)
+	targetHealthy := false
+	for i := 0; i < 12; i++ { // up to 60 seconds
+		time.Sleep(5 * time.Second)
+		checkResp, err := targetClient.Get(fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name))
+		if err != nil {
+			continue
+		}
+		var detail map[string]interface{}
+		json.NewDecoder(checkResp.Body).Decode(&detail)
+		checkResp.Body.Close()
+		if s, _ := detail["status"].(string); s == "running" {
+			targetHealthy = true
+			break
+		}
+	}
+
+	if !targetHealthy {
+		// Target didn't come up — rollback: resume source, destroy target
+		rollback("target VM not healthy after 60s")
+		// Tell target to destroy the failed VM
+		destroyReq, _ := http.NewRequest("DELETE", fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name), nil)
+		targetClient.Do(destroyReq)
+		return nil, fmt.Errorf("target VM not healthy — rolled back to source")
+	}
+
+	// --- Target confirmed healthy — commit: stop source, cleanup ---
 	downtime := time.Since(downtimeStart)
-	log.Printf("Migration complete: %s → %s (mem: %d bytes, downtime: %s, IP: %s)",
-		name, targetAddr, memSize, downtime.Round(time.Millisecond), importResp.TailscaleIP)
+	log.Printf("Migration verified: %s → %s (mem: %d bytes, downtime: %s)",
+		name, targetAddr, memSize, downtime.Round(time.Millisecond))
 
-	// --- Phase 3: Cleanup source ---
+	if m.vmid != nil {
+		m.vmid.Deregister(name)
+	}
+	m.stopVM(name)
 	os.RemoveAll(vmDir)
 
 	return &MigrateResponse{
@@ -1441,6 +1528,73 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		Mark:        importResp.Mark,
 		TargetNode:  targetAddr,
 		Status:      "migrated",
+	}, nil
+}
+
+// relocateStoppedVM transfers a stopped VM's files to the target node.
+// No snapshot needed — just rsync vm.json + cow.img + ensure golden image.
+func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey string) (*MigrateResponse, error) {
+	log.Printf("Relocating stopped VM %s to %s", name, targetAddr)
+
+	// Ensure target has the golden image
+	if st.GoldenVer != "" && st.GoldenVer != "unversioned" {
+		if err := m.ensureTargetHasGolden(st.GoldenVer, targetAddr, targetBridgeIP); err != nil {
+			return nil, fmt.Errorf("golden transfer: %w", err)
+		}
+	}
+
+	// Create target directory
+	mkdirCmd := exec.Command("ssh",
+		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", dstVMDir)
+	if out, err := mkdirCmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
+	}
+
+	// Transfer vm.json + cow.img via rsync
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
+	rsyncDest := fmt.Sprintf("ubuntu@%s:%s", targetBridgeIP, dstVMDir)
+
+	// Transfer COW image
+	cowPath := filepath.Join(vmDir, "cow.img")
+	if _, err := os.Stat(cowPath); err == nil {
+		rsyncCmd := exec.Command("rsync", "--sparse", "--whole-file",
+			"-e", sshOpts, "--rsync-path", "sudo rsync",
+			cowPath, rsyncDest)
+		if out, err := rsyncCmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("rsync cow.img: %s: %w", string(out), err)
+		}
+	}
+
+	// Transfer vm.json
+	vmJSONPath := filepath.Join(vmDir, "vm.json")
+	rsyncCmd := exec.Command("rsync",
+		"-e", sshOpts, "--rsync-path", "sudo rsync",
+		vmJSONPath, rsyncDest)
+	if out, err := rsyncCmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("rsync vm.json: %s: %w", string(out), err)
+	}
+
+	// Transfer snapshot.json if it exists
+	snapJSONPath := filepath.Join(vmDir, "snapshot.json")
+	if _, err := os.Stat(snapJSONPath); err == nil {
+		rsyncCmd := exec.Command("rsync",
+			"-e", sshOpts, "--rsync-path", "sudo rsync",
+			snapJSONPath, rsyncDest)
+		rsyncCmd.CombinedOutput() // best effort
+	}
+
+	// Clean up source
+	if m.vmid != nil {
+		m.vmid.Deregister(name)
+	}
+	os.RemoveAll(vmDir)
+	log.Printf("Relocated stopped VM %s to %s", name, targetAddr)
+
+	return &MigrateResponse{
+		Name:       name,
+		TargetNode: targetAddr,
+		Status:     "relocated",
 	}, nil
 }
 
@@ -1596,7 +1750,7 @@ func (m *Manager) ensureTargetHasGolden(version, targetAddr, targetBridgeIP stri
 
 	log.Printf("Transferring golden image %s to %s", version, targetBridgeIP)
 
-	clusterKey := "/root/.ssh/cluster-ssh.key"
+	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
 	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
 	goldenDir := "/var/lib/boxcutter/golden/"
 

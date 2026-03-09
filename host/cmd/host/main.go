@@ -486,11 +486,17 @@ func addNode(cfg HostConfig, state *cluster.State) {
 	disk := fmt.Sprintf("%s/%s.qcow2", cfg.ImagesDir, nodeID)
 	iso := fmt.Sprintf("%s/%s-cloud-init.iso", cfg.ImagesDir, nodeID)
 
-	// Check if disk exists (node must be provisioned first)
+	// Auto-provision disk from base image if not already present
 	if _, err := os.Stat(disk); err != nil {
-		log.Printf("Node %s disk not found at %s — provision first", nodeID, disk)
-		// TODO: auto-provision from repo
-		return
+		log.Printf("Node %s disk not found, provisioning from base image...", nodeID)
+		provisionCmd := exec.Command("bash", filepath.Join(cfg.RepoDir, "host/provision.sh"),
+			"node", nodeID, "--from-image")
+		provisionCmd.Dir = cfg.RepoDir
+		if out, err := provisionCmd.CombinedOutput(); err != nil {
+			log.Printf("Failed to provision %s: %v\n%s", nodeID, err, string(out))
+			return
+		}
+		log.Printf("Node %s provisioned successfully", nodeID)
 	}
 
 	currentUser, _ := user.Current()
@@ -640,37 +646,89 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		return
 	}
 
-	// Migrate each VM
+	// Migrate VMs one at a time — each migration is async on the node,
+	// we poll until it completes before starting the next one
+	migrateClient := &http.Client{Timeout: 30 * time.Second}
+	pollClient := &http.Client{Timeout: 5 * time.Second}
+	failedMigrations := 0
+
 	for _, vm := range vms {
 		vmName, ok := vm["name"].(string)
 		if !ok {
 			continue
 		}
 
-		log.Printf("Drain: migrating %s from %s to %s", vmName, nodeID, targetNode.ID)
+		vmStatus, _ := vm["status"].(string)
+		log.Printf("Drain: migrating %s from %s to %s (status: %s)", vmName, nodeID, targetNode.ID, vmStatus)
 
 		migrateReq := map[string]string{
-			"target_addr":     fmt.Sprintf("%s:8800", targetNode.BridgeIP),
+			"target_addr":      fmt.Sprintf("%s:8800", targetNode.BridgeIP),
 			"target_bridge_ip": targetNode.BridgeIP,
 		}
 		data, _ := json.Marshal(migrateReq)
 
-		migrateResp, err := client.Post(
+		migrateResp, err := migrateClient.Post(
 			fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
 			"application/json",
 			jsonReader(data),
 		)
 		if err != nil {
-			log.Printf("Drain: migrate %s failed: %v", vmName, err)
+			log.Printf("Drain: failed to start migration of %s: %v", vmName, err)
+			failedMigrations++
 			continue
 		}
 		migrateResp.Body.Close()
-
 		if migrateResp.StatusCode >= 300 {
 			log.Printf("Drain: migrate %s returned %d", vmName, migrateResp.StatusCode)
-		} else {
-			log.Printf("Drain: %s migrated successfully", vmName)
+			failedMigrations++
+			continue
 		}
+
+		// Poll source status until migration completes (up to 5 min per VM).
+		// Simple state machine: "migrating" → keep polling, anything else → done.
+		deadline := time.Now().Add(5 * time.Minute)
+		migrated := false
+		for time.Now().Before(deadline) {
+			time.Sleep(5 * time.Second)
+
+			srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
+			if err != nil {
+				// Source unreachable — VM directory was likely cleaned up (success)
+				log.Printf("Drain: %s migrated (source unreachable)", vmName)
+				migrated = true
+				break
+			}
+			var srcDetail map[string]interface{}
+			json.NewDecoder(srcResp.Body).Decode(&srcDetail)
+			srcResp.Body.Close()
+
+			srcStatus, _ := srcDetail["status"].(string)
+
+			if srcStatus == "migrating" {
+				continue // still in progress
+			}
+
+			if srcStatus == "" {
+				// VM gone from source (404 returned non-JSON error)
+				log.Printf("Drain: %s removed from source", vmName)
+				migrated = true
+				break
+			}
+
+			// VM is back to running/stopped — migration failed and rolled back
+			log.Printf("Drain: %s migration failed (source status: %s)", vmName, srcStatus)
+			break
+		}
+
+		if !migrated {
+			log.Printf("Drain: %s migration did not complete", vmName)
+			failedMigrations++
+		}
+	}
+
+	if failedMigrations > 0 {
+		log.Printf("Drain: %d migration(s) failed — aborting drain, node %s NOT stopped", failedMigrations, nodeID)
+		return
 	}
 
 	// Remove from state FIRST so health monitor doesn't auto-restart

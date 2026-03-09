@@ -51,6 +51,36 @@ func (st *VMState) AllCloneURLs() []string {
 	return nil
 }
 
+// IsMigrating checks if the VM has an in-flight migration marker.
+// This is a filesystem marker (not persisted state) that exists only during
+// the migration operation.
+func IsMigrating(vmDir string) bool {
+	_, err := os.Stat(filepath.Join(vmDir, "migrating"))
+	return err == nil
+}
+
+// SetMigrating creates or removes the migration marker file.
+func SetMigrating(vmDir string, migrating bool) {
+	marker := filepath.Join(vmDir, "migrating")
+	if migrating {
+		os.WriteFile(marker, []byte("1"), 0644)
+	} else {
+		os.Remove(marker)
+	}
+}
+
+// DeriveStatus computes VM status from reality, never from stored state.
+// Source of truth: process existence + migration marker.
+func DeriveStatus(vmDir string) string {
+	if IsMigrating(vmDir) {
+		return "migrating"
+	}
+	if IsRunning(vmDir) {
+		return "running"
+	}
+	return "stopped"
+}
+
 // SnapshotState tracks dm-snapshot loop devices.
 type SnapshotState struct {
 	BaseLoop string `json:"base_loop"`

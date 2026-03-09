@@ -145,6 +145,26 @@ else
   echo "  vmid config: GitHub App disabled"
 fi
 
+# --- Cluster SSH key: inter-node SSH for migration ---
+
+if [ -f "${SECRETS_DIR}/cluster-ssh.key" ]; then
+  mkdir -p /root/.ssh
+  cp "${SECRETS_DIR}/cluster-ssh.key" /root/.ssh/cluster-ssh.key
+  chmod 600 /root/.ssh/cluster-ssh.key
+  printf '%s\n' 'Host 192.168.50.*' '  IdentityFile /root/.ssh/cluster-ssh.key' '  User ubuntu' '  StrictHostKeyChecking no' '  UserKnownHostsFile /dev/null' > /root/.ssh/config
+  chmod 600 /root/.ssh/config
+  echo "Cluster SSH: key installed to /root/.ssh/"
+
+  # Add cluster pubkey to ubuntu's authorized_keys (allows inter-node SSH)
+  if [ -f "${SECRETS_DIR}/cluster-ssh.key.pub" ]; then
+    CLUSTER_PUB=$(cat "${SECRETS_DIR}/cluster-ssh.key.pub")
+    if ! grep -qF "$CLUSTER_PUB" /home/ubuntu/.ssh/authorized_keys 2>/dev/null; then
+      echo "$CLUSTER_PUB" >> /home/ubuntu/.ssh/authorized_keys
+      echo "Cluster SSH: pubkey added to ubuntu authorized_keys"
+    fi
+  fi
+fi
+
 # --- Populate boxcutter user SSH keys ---
 
 if id boxcutter &>/dev/null; then
