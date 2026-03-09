@@ -261,6 +261,7 @@ func (g *GitHubTokenMinter) ResolvePolicy(rec *registry.VMRecord) (repos []strin
 			"issues":        "write",
 			"metadata":      "read",
 			"packages":      "write",
+			"workflows":     "write",
 		}, nil
 	}
 
