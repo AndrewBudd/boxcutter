@@ -260,6 +260,7 @@ func (g *GitHubTokenMinter) ResolvePolicy(rec *registry.VMRecord) (repos []strin
 			"pull_requests": "write",
 			"issues":        "write",
 			"metadata":      "read",
+			"packages":      "write",
 		}, nil
 	}
 
@@ -328,7 +329,7 @@ func (g *GitHubTokenMinter) MintPackagesToken() (*GitHubTokenResponse, error) {
 		return nil, fmt.Errorf("minting app JWT: %w", err)
 	}
 
-	perms := map[string]string{"packages": "read"}
+	perms := map[string]string{"packages": "write"}
 	instToken, err := g.createInstallationToken(appJWT, nil, perms)
 	if err != nil {
 		return nil, err
