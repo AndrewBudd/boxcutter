@@ -31,4 +31,7 @@ github.com:
     git_protocol: https
 EOF
 
+# Update git credential helper so HTTPS git operations use the fresh token
+git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password='"$token"'"; }; f'
+
 echo "vmid: GitHub token refreshed (expires: $(echo "$resp" | jq -r '.expires_at // "unknown"'))"
