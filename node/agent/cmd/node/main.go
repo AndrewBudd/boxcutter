@@ -147,7 +147,7 @@ func autoGoldenBuild(mgr *vm.Manager) {
 		return // golden image exists
 	}
 
-	buildScript := filepath.Join(filepath.Dir(goldenPath), "build.sh")
+	buildScript := filepath.Join(filepath.Dir(goldenPath), "docker-to-ext4.sh")
 	if _, err := os.Stat(buildScript); err != nil {
 		log.Printf("Golden image missing but no build script at %s", buildScript)
 		return
