@@ -141,14 +141,12 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 		}
 	}
 
-	// Create COW snapshot
-	req.progress("snapshot", "Creating disk snapshot...")
-	ss, err := CreateSnapshot(vmDir, goldenPath, req.Disk)
-	if err != nil {
+	// Create rootfs from golden image
+	req.progress("snapshot", "Creating disk...")
+	if err := CreateRootfs(vmDir, goldenPath, req.Disk); err != nil {
 		os.RemoveAll(vmDir)
-		return nil, fmt.Errorf("creating snapshot: %w", err)
+		return nil, fmt.Errorf("creating rootfs: %w", err)
 	}
-	SaveSnapshotState(vmDir, ss)
 
 	// Save VM state
 	st := &VMState{
@@ -635,7 +633,6 @@ func (m *Manager) collectExistingMarks() map[int]bool {
 
 func writeFirecrackerConfig(vmDir string, st *VMState) error {
 	bootIP := fmt.Sprintf("ip=10.0.0.2::10.0.0.1:255.255.255.252:%s:eth0:off:8.8.8.8", st.Name)
-	dmName := "bc-" + st.Name
 
 	fcConfig := map[string]interface{}{
 		"boot-source": map[string]string{
@@ -645,7 +642,7 @@ func writeFirecrackerConfig(vmDir string, st *VMState) error {
 		"drives": []map[string]interface{}{
 			{
 				"drive_id":       "rootfs",
-				"path_on_host":   "/dev/mapper/" + dmName,
+				"path_on_host":   RootfsPath(vmDir),
 				"is_root_device": true,
 				"is_read_only":   false,
 			},
@@ -684,14 +681,14 @@ func writeFirecrackerConfig(vmDir string, st *VMState) error {
 
 // prepareRootfs mounts the rootfs once and injects CA cert + SSH keys.
 func (m *Manager) prepareRootfs(st *VMState, authorizedKeys []string) {
-	dmName := "bc-" + st.Name
+	vmDir := VMDir(st.Name)
 	mountDir, err := os.MkdirTemp("", "bc-mount-")
 	if err != nil {
 		return
 	}
 	defer os.RemoveAll(mountDir)
 
-	if run("mount", "/dev/mapper/"+dmName, mountDir) != nil {
+	if run("mount", RootfsPath(vmDir), mountDir) != nil {
 		return
 	}
 	defer run("umount", mountDir)
@@ -1259,14 +1256,12 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 	mark := AllocateMark(dstName, existingMarks)
 	tap := TAPName(dstName)
 
-	// Set up DM snapshot for the destination
-	progress("copy", "Setting up disk snapshot...")
-	ss, err := CreateSnapshot(dstDir, goldenPath, srcSt.Disk)
-	if err != nil {
+	// Create rootfs for the destination
+	progress("copy", "Creating disk...")
+	if err := CreateRootfs(dstDir, goldenPath, srcSt.Disk); err != nil {
 		os.RemoveAll(dstDir)
-		return nil, fmt.Errorf("creating snapshot: %w", err)
+		return nil, fmt.Errorf("creating rootfs: %w", err)
 	}
-	SaveSnapshotState(dstDir, ss)
 
 	dstSt := &VMState{
 		Name:       dstName,
@@ -1281,22 +1276,19 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		GoldenVer:  srcSt.GoldenVer,
 	}
 	if err := SaveVMState(dstDir, dstSt); err != nil {
-		CleanupSnapshot(dstDir)
 		os.RemoveAll(dstDir)
 		return nil, err
 	}
 
 	if err := writeFirecrackerConfig(dstDir, dstSt); err != nil {
-		CleanupSnapshot(dstDir)
 		os.RemoveAll(dstDir)
 		return nil, err
 	}
 
 	// Mount the copied rootfs and update hostname
-	dmName := "bc-" + dstName
 	mountDir, err := os.MkdirTemp("", "bc-mount-")
 	if err == nil {
-		if run("mount", "/dev/mapper/"+dmName, mountDir) == nil {
+		if run("mount", RootfsPath(dstDir), mountDir) == nil {
 			// Update hostname
 			os.WriteFile(filepath.Join(mountDir, "etc/hostname"), []byte(dstName+"\n"), 0644)
 			// Remove Tailscale state so it gets a fresh identity
@@ -1350,12 +1342,21 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	sshArgs := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
 	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
-	cowPath := filepath.Join(vmDir, "cow.img")
+	fileRootfs := IsFileRootfs(vmDir)
+	var diskFile, diskName string
+	if fileRootfs {
+		diskFile = filepath.Join(vmDir, "rootfs.ext4")
+		diskName = "rootfs.ext4"
+	} else {
+		diskFile = filepath.Join(vmDir, "cow.img")
+		diskName = "cow.img"
+	}
 
 	// --- Phase 1: Pre-stage while VM is still running (zero downtime) ---
 	log.Printf("Migrating %s to %s: pre-staging (VM still running)", name, targetAddr)
 
-	if st.GoldenVer != "" && st.GoldenVer != "unversioned" {
+	// dm-snapshot VMs need the golden image on the target
+	if !fileRootfs && st.GoldenVer != "" && st.GoldenVer != "unversioned" {
 		if err := m.ensureTargetHasGolden(st.GoldenVer, targetAddr, targetBridgeIP); err != nil {
 			return nil, fmt.Errorf("golden transfer: %w", err)
 		}
@@ -1366,11 +1367,11 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
 	}
 
-	// Pre-sync COW image while VM still runs (dirty blocks will be re-synced after pause)
-	log.Printf("Migrating %s: pre-syncing COW image", name)
+	// Pre-sync disk image while VM still runs (dirty blocks will be re-synced after pause)
+	log.Printf("Migrating %s: pre-syncing %s", name, diskName)
 	preSyncCmd := exec.Command("rsync", "--sparse", "--inplace",
 		"-e", sshOpts, "--rsync-path", "sudo rsync",
-		cowPath, fmt.Sprintf("ubuntu@%s:%scow.img", targetBridgeIP, dstVMDir))
+		diskFile, fmt.Sprintf("ubuntu@%s:%s%s", targetBridgeIP, dstVMDir, diskName))
 	if out, err := preSyncCmd.CombinedOutput(); err != nil {
 		log.Printf("Migrating %s: pre-sync warning (non-fatal): %s", name, string(out))
 	}
@@ -1441,11 +1442,11 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		}
 	}()
 
-	// COW delta sync — only blocks changed since pre-sync
+	// Disk delta sync — only blocks changed since pre-sync
 	go func() {
 		cmd := exec.Command("rsync", "--sparse", "--inplace",
 			"-e", sshOpts, "--rsync-path", "sudo rsync",
-			cowPath, fmt.Sprintf("ubuntu@%s:%scow.img", targetBridgeIP, dstVMDir))
+			diskFile, fmt.Sprintf("ubuntu@%s:%s%s", targetBridgeIP, dstVMDir, diskName))
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			xferResults <- transferResult{"cow", fmt.Errorf("%s: %w", string(out), err)}
@@ -1532,12 +1533,13 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 }
 
 // relocateStoppedVM transfers a stopped VM's files to the target node.
-// No snapshot needed — just rsync vm.json + cow.img + ensure golden image.
+// No snapshot needed — just rsync vm.json + disk image + ensure golden image.
 func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey string) (*MigrateResponse, error) {
 	log.Printf("Relocating stopped VM %s to %s", name, targetAddr)
+	fileRootfs := IsFileRootfs(vmDir)
 
-	// Ensure target has the golden image
-	if st.GoldenVer != "" && st.GoldenVer != "unversioned" {
+	// dm-snapshot VMs need the golden image on the target
+	if !fileRootfs && st.GoldenVer != "" && st.GoldenVer != "unversioned" {
 		if err := m.ensureTargetHasGolden(st.GoldenVer, targetAddr, targetBridgeIP); err != nil {
 			return nil, fmt.Errorf("golden transfer: %w", err)
 		}
@@ -1551,18 +1553,27 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
 	}
 
-	// Transfer vm.json + cow.img via rsync
 	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
 	rsyncDest := fmt.Sprintf("ubuntu@%s:%s", targetBridgeIP, dstVMDir)
 
-	// Transfer COW image
-	cowPath := filepath.Join(vmDir, "cow.img")
-	if _, err := os.Stat(cowPath); err == nil {
+	// Transfer disk image (rootfs.ext4 or cow.img)
+	if fileRootfs {
+		rootfsPath := filepath.Join(vmDir, "rootfs.ext4")
 		rsyncCmd := exec.Command("rsync", "--sparse", "--whole-file",
 			"-e", sshOpts, "--rsync-path", "sudo rsync",
-			cowPath, rsyncDest)
+			rootfsPath, rsyncDest)
 		if out, err := rsyncCmd.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("rsync cow.img: %s: %w", string(out), err)
+			return nil, fmt.Errorf("rsync rootfs.ext4: %s: %w", string(out), err)
+		}
+	} else {
+		cowPath := filepath.Join(vmDir, "cow.img")
+		if _, err := os.Stat(cowPath); err == nil {
+			rsyncCmd := exec.Command("rsync", "--sparse", "--whole-file",
+				"-e", sshOpts, "--rsync-path", "sudo rsync",
+				cowPath, rsyncDest)
+			if out, err := rsyncCmd.CombinedOutput(); err != nil {
+				return nil, fmt.Errorf("rsync cow.img: %s: %w", string(out), err)
+			}
 		}
 	}
 
@@ -1575,13 +1586,15 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 		return nil, fmt.Errorf("rsync vm.json: %s: %w", string(out), err)
 	}
 
-	// Transfer snapshot.json if it exists
-	snapJSONPath := filepath.Join(vmDir, "snapshot.json")
-	if _, err := os.Stat(snapJSONPath); err == nil {
-		rsyncCmd := exec.Command("rsync",
-			"-e", sshOpts, "--rsync-path", "sudo rsync",
-			snapJSONPath, rsyncDest)
-		rsyncCmd.CombinedOutput() // best effort
+	// Transfer snapshot.json if it exists (dm-snapshot VMs only)
+	if !fileRootfs {
+		snapJSONPath := filepath.Join(vmDir, "snapshot.json")
+		if _, err := os.Stat(snapJSONPath); err == nil {
+			rsyncCmd := exec.Command("rsync",
+				"-e", sshOpts, "--rsync-path", "sudo rsync",
+				snapJSONPath, rsyncDest)
+			rsyncCmd.CombinedOutput() // best effort
+		}
 	}
 
 	// Clean up source

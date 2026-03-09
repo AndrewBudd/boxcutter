@@ -9,6 +9,44 @@ import (
 	"time"
 )
 
+// CreateRootfs creates a standalone rootfs file by copying the golden image.
+// The file is sparse — only allocated blocks are copied. Then it's expanded
+// to the requested disk size and the ext4 filesystem is resized to fill it.
+func CreateRootfs(vmDir, goldenPath, diskSize string) error {
+	rootfsPath := filepath.Join(vmDir, "rootfs.ext4")
+
+	// Sparse copy of golden image
+	if err := run("cp", "--sparse=always", goldenPath, rootfsPath); err != nil {
+		return fmt.Errorf("copying golden image: %w", err)
+	}
+
+	// Parse and apply requested disk size
+	diskBytes, err := parseSize(diskSize)
+	if err != nil {
+		diskBytes = 50 * 1024 * 1024 * 1024 // default 50G
+	}
+
+	info, _ := os.Stat(goldenPath)
+	if info != nil && diskBytes <= info.Size() {
+		diskBytes = 50 * 1024 * 1024 * 1024 // minimum 50G
+	}
+
+	// Expand the sparse file (instant — just updates metadata)
+	if err := run("truncate", "-s", fmt.Sprintf("%d", diskBytes), rootfsPath); err != nil {
+		os.Remove(rootfsPath)
+		return fmt.Errorf("expanding rootfs: %w", err)
+	}
+
+	// Resize the ext4 filesystem to fill the expanded file
+	run("e2fsck", "-f", "-y", rootfsPath)
+	if err := run("resize2fs", rootfsPath); err != nil {
+		os.Remove(rootfsPath)
+		return fmt.Errorf("resizing filesystem: %w", err)
+	}
+
+	return nil
+}
+
 // CreateSnapshot creates a dm-snapshot COW overlay on the golden image.
 func CreateSnapshot(vmDir, goldenPath, diskSize string) (*SnapshotState, error) {
 	// Get golden image size
@@ -75,7 +113,13 @@ func CreateSnapshot(vmDir, goldenPath, diskSize string) (*SnapshotState, error) 
 }
 
 // EnsureSnapshot re-creates the dm-snapshot if it's not active (after reboot).
+// For file-based rootfs VMs, this is a no-op.
 func EnsureSnapshot(vmDir, goldenPath string) error {
+	// File-based rootfs — nothing to set up
+	if IsFileRootfs(vmDir) {
+		return nil
+	}
+
 	name := filepath.Base(vmDir)
 	dmName := "bc-" + name
 
@@ -124,7 +168,12 @@ func EnsureSnapshot(vmDir, goldenPath string) error {
 }
 
 // CleanupSnapshot removes the dm-snapshot and loop devices.
+// For file-based rootfs VMs, this is a no-op.
 func CleanupSnapshot(vmDir string) {
+	if IsFileRootfs(vmDir) {
+		return
+	}
+
 	name := filepath.Base(vmDir)
 	dmName := "bc-" + name
 

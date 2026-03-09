@@ -88,6 +88,21 @@ type SnapshotState struct {
 	DMName   string `json:"dm_name"`
 }
 
+// IsFileRootfs returns true if the VM uses a standalone rootfs file
+// instead of dm-snapshot. Detected by the presence of rootfs.ext4.
+func IsFileRootfs(vmDir string) bool {
+	_, err := os.Stat(filepath.Join(vmDir, "rootfs.ext4"))
+	return err == nil
+}
+
+// RootfsPath returns the block device or file path for this VM's rootfs.
+func RootfsPath(vmDir string) string {
+	if IsFileRootfs(vmDir) {
+		return filepath.Join(vmDir, "rootfs.ext4")
+	}
+	return "/dev/mapper/bc-" + filepath.Base(vmDir)
+}
+
 func LoadVMState(vmDir string) (*VMState, error) {
 	data, err := os.ReadFile(filepath.Join(vmDir, "vm.json"))
 	if err != nil {
