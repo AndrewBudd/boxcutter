@@ -19,9 +19,13 @@ jobs:
     name: Build ${{ matrix.vm_type }} image
     runs-on: [self-hosted, kvm]
     strategy:
+      max-parallel: 1
       matrix:
         vm_type: [node, orchestrator]
     steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/.images 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
@@ -46,6 +50,10 @@ jobs:
         run: sudo env PATH="/usr/local/go/bin:$PATH" bash host/build-image.sh ${{ matrix.vm_type }}
         timeout-minutes: 30
 
+      - name: Fix permissions
+        if: always()
+        run: sudo chown -R $(whoami) .images/ 2>/dev/null || true
+
       - name: Push to OCI registry
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +72,11 @@ jobs:
     name: Release host binary
     runs-on: [self-hosted, kvm]
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
     steps:
+      - name: Clean workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/.images 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
@@ -81,10 +93,15 @@ jobs:
       - name: Build deb package
         run: make deb-host VERSION=${{ steps.tag.outputs.tag }}
 
-      - name: Create GitHub Release
+      - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Upload to existing release or create new one
+          gh release upload ${{ steps.tag.outputs.tag }} \
+            .release/boxcutter-host-${{ steps.tag.outputs.tag }}-linux-amd64.tar.gz \
+            .release/boxcutter-host_${{ steps.tag.outputs.tag }}_amd64.deb \
+            --clobber 2>/dev/null || \
           gh release create ${{ steps.tag.outputs.tag }} \
             --generate-notes \
             .release/boxcutter-host-${{ steps.tag.outputs.tag }}-linux-amd64.tar.gz \
