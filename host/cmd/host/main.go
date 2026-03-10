@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -60,6 +61,7 @@ type HostConfig struct {
 	MinFreeMemoryMB       int           // Hard floor: never scale up if host has less than this free
 	DiskUsageThresholdPct int           // Scale up when node disk usage > this %
 	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
+	MaxNodes              int           // Hard cap on node count (0 = limited only by resources)
 
 	// OCI image distribution
 	OCIRegistry   string // OCI registry (default: ghcr.io)
@@ -136,6 +138,7 @@ func defaultConfig() HostConfig {
 		MinFreeMemoryMB:       8192,  // 8GB — never launch a node if host has less than this free
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
+		MaxNodes:              0,     // 0 = no hard cap, limited only by host resources
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,
@@ -255,13 +258,16 @@ func runDaemon() {
 	// 3. Boot recovery — launch all VMs from state
 	bootRecover(cfg, state)
 
-	// 4. Start unix socket API
-	go startAPI(cfg, state)
+	// 4. Initialize health tracking
+	hs := newHealthState()
 
-	// 5. Start health monitor
-	go healthLoop(cfg, state)
+	// 5. Start unix socket API
+	go startAPI(cfg, state, hs)
 
-	// 6. Start auto-scaler
+	// 6. Start health monitor
+	go healthLoop(cfg, state, hs)
+
+	// 7. Start auto-scaler
 	go autoScaleLoop(cfg, state)
 
 	log.Println("boxcutter-host ready")
@@ -480,12 +486,42 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 	state.Save()
 }
 
-// healthLoop periodically checks that all VMs are running.
-func healthLoop(cfg HostConfig, state *cluster.State) {
+// serviceHealth tracks application-level health for VMs.
+type serviceHealth struct {
+	healthy          bool
+	consecutiveFails int
+	lastCheck        time.Time
+	lastHealthy      time.Time
+}
+
+// healthState tracks service health across health loop iterations.
+// Protected by mu since healthLoop writes and API handlers read concurrently.
+type healthState struct {
+	mu           sync.RWMutex
+	startTime    time.Time
+	orchestrator serviceHealth
+	nodes        map[string]*serviceHealth // keyed by node ID
+}
+
+func newHealthState() *healthState {
+	return &healthState{
+		startTime: time.Now(),
+		nodes:     make(map[string]*serviceHealth),
+	}
+}
+
+const serviceUnhealthyThreshold = 3 // consecutive failed checks before marking unhealthy
+
+// healthLoop periodically checks that all VMs are running and services are responsive.
+func healthLoop(cfg HostConfig, state *cluster.State, hs *healthState) {
 	ticker := time.NewTicker(cfg.HealthPollInterval)
 	defer ticker.Stop()
 
+	client := &http.Client{Timeout: 2 * time.Second}
+
 	for range ticker.C {
+		hs.mu.Lock()
+
 		// Check orchestrator
 		if state.Orchestrator != nil {
 			if !qemu.IsRunning(state.Orchestrator.PID) {
@@ -511,6 +547,12 @@ func healthLoop(cfg HostConfig, state *cluster.State) {
 					state.SetPID(state.Orchestrator.ID, pid)
 					state.Save()
 				}
+				hs.orchestrator.healthy = false
+			} else {
+				// QEMU is running — check application-level health
+				checkServiceHealth(client, "orchestrator",
+					fmt.Sprintf("http://%s:8801/healthz", state.Orchestrator.BridgeIP),
+					&hs.orchestrator)
 			}
 		}
 
@@ -539,7 +581,61 @@ func healthLoop(cfg HostConfig, state *cluster.State) {
 					state.SetPID(node.ID, pid)
 					state.Save()
 				}
+				if hs.nodes[node.ID] == nil {
+					hs.nodes[node.ID] = &serviceHealth{}
+				}
+				hs.nodes[node.ID].healthy = false
+			} else {
+				// QEMU is running — check application-level health
+				if hs.nodes[node.ID] == nil {
+					hs.nodes[node.ID] = &serviceHealth{}
+				}
+				checkServiceHealth(client, node.ID,
+					fmt.Sprintf("http://%s:8800/api/health", node.BridgeIP),
+					hs.nodes[node.ID])
 			}
+		}
+
+		// Clean up stale node entries from healthState
+		activeNodes := make(map[string]bool)
+		for _, node := range state.Nodes {
+			activeNodes[node.ID] = true
+		}
+		for id := range hs.nodes {
+			if !activeNodes[id] {
+				delete(hs.nodes, id)
+			}
+		}
+
+		hs.mu.Unlock()
+	}
+}
+
+// checkServiceHealth hits a health endpoint and updates the serviceHealth tracker.
+func checkServiceHealth(client *http.Client, name, url string, sh *serviceHealth) {
+	sh.lastCheck = time.Now()
+	resp, err := client.Get(url)
+	if err != nil {
+		sh.consecutiveFails++
+		if sh.consecutiveFails == serviceUnhealthyThreshold {
+			log.Printf("WARNING: %s service unreachable for %d consecutive checks", name, sh.consecutiveFails)
+			sh.healthy = false
+		}
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if !sh.healthy && sh.consecutiveFails >= serviceUnhealthyThreshold {
+			log.Printf("INFO: %s service recovered after %d failed checks", name, sh.consecutiveFails)
+		}
+		sh.healthy = true
+		sh.consecutiveFails = 0
+		sh.lastHealthy = time.Now()
+	} else {
+		sh.consecutiveFails++
+		if sh.consecutiveFails == serviceUnhealthyThreshold {
+			log.Printf("WARNING: %s service returning %d for %d consecutive checks", name, resp.StatusCode, sh.consecutiveFails)
+			sh.healthy = false
 		}
 	}
 }
@@ -688,7 +784,7 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 		}
 		if scaleUpReason != "" {
 			log.Printf("Capacity pressure (%s), checking if scale-up is possible...", scaleUpReason)
-			ok, reason := canScaleUp(cfg)
+			ok, reason := canScaleUp(cfg, state.NodeCount())
 			if ok {
 				log.Printf("Scaling up: adding new node (%s)...", scaleUpReason)
 				addNode(cfg, state)
@@ -724,7 +820,12 @@ func queryNodeHealth(bridgeIP string) map[string]interface{} {
 	return result
 }
 
-func canScaleUp(cfg HostConfig) (bool, string) {
+func canScaleUp(cfg HostConfig, currentNodeCount int) (bool, string) {
+	// Hard cap: configured MaxNodes (0 = unlimited)
+	if cfg.MaxNodes > 0 && currentNodeCount >= cfg.MaxNodes {
+		return false, fmt.Sprintf("at configured maximum of %d nodes", cfg.MaxNodes)
+	}
+
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return false, "cannot read /proc/meminfo"
@@ -743,7 +844,7 @@ func canScaleUp(cfg HostConfig) (bool, string) {
 		return false, fmt.Sprintf("host has %dMB free, minimum is %dMB", availMB, cfg.MinFreeMemoryMB)
 	}
 
-	// Also need enough for the node VM itself (parse NodeRAM like "12G")
+	// Parse node RAM requirement (e.g. "12G")
 	var nodeRAMMB int
 	fmt.Sscanf(cfg.NodeRAM, "%dG", &nodeRAMMB)
 	nodeRAMMB *= 1024
@@ -751,11 +852,31 @@ func canScaleUp(cfg HostConfig) (bool, string) {
 		nodeRAMMB = 12 * 1024 // fallback
 	}
 
-	// After launching, we must still have MinFreeMemoryMB left
-	afterLaunchMB := availMB - nodeRAMMB
-	if afterLaunchMB < cfg.MinFreeMemoryMB {
-		return false, fmt.Sprintf("after launch would have %dMB free (%dMB available - %dMB node), minimum is %dMB",
-			afterLaunchMB, availMB, nodeRAMMB, cfg.MinFreeMemoryMB)
+	// Rolling upgrade reserve: after launching this node, there must still be
+	// enough memory to launch ONE MORE node (for rolling upgrades). This ensures
+	// we can always do a rolling upgrade without first draining a node.
+	// Required: availMB - thisNode - upgradeReserve >= MinFreeMemoryMB
+	requiredMB := nodeRAMMB*2 + cfg.MinFreeMemoryMB
+	if availMB < requiredMB {
+		afterLaunchMB := availMB - nodeRAMMB
+		return false, fmt.Sprintf("after launch would have %dMB free (%dMB available - %dMB node), "+
+			"need %dMB reserved for rolling upgrade + %dMB minimum free",
+			afterLaunchMB, availMB, nodeRAMMB, nodeRAMMB, cfg.MinFreeMemoryMB)
+	}
+
+	// Also enforce MaxNodes against memory-based ceiling:
+	// memory-based max = floor((availMB - MinFreeMemoryMB) / nodeRAMMB) - 1 (rolling upgrade reserve)
+	memoryBasedMax := (availMB - cfg.MinFreeMemoryMB) / nodeRAMMB
+	if memoryBasedMax > 1 {
+		memoryBasedMax-- // reserve one slot for rolling upgrade
+	}
+	effectiveMax := memoryBasedMax
+	if cfg.MaxNodes > 0 && cfg.MaxNodes < effectiveMax {
+		effectiveMax = cfg.MaxNodes
+	}
+	if currentNodeCount >= effectiveMax {
+		return false, fmt.Sprintf("at capacity: %d nodes running, effective max is %d (memory-based: %d, configured: %d, includes rolling upgrade reserve)",
+			currentNodeCount, effectiveMax, memoryBasedMax, cfg.MaxNodes)
 	}
 
 	// Check host disk space
@@ -854,13 +975,46 @@ func addNode(cfg HostConfig, state *cluster.State) {
 }
 
 // startAPI serves the unix socket control API.
-func startAPI(cfg HostConfig, state *cluster.State) {
+func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 	os.Remove(cfg.SocketPath)
 
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		hs.mu.RLock()
+		nodesHealthy := 0
+		nodesUnhealthy := 0
+		for _, node := range state.Nodes {
+			if sh := hs.nodes[node.ID]; sh != nil && sh.healthy {
+				nodesHealthy++
+			} else {
+				nodesUnhealthy++
+			}
+		}
+		orchHealthy := hs.orchestrator.healthy
+		uptime := int(time.Since(hs.startTime).Seconds())
+		hs.mu.RUnlock()
+
+		status := "ok"
+		httpStatus := http.StatusOK
+		if !orchHealthy || nodesUnhealthy > 0 {
+			status = "degraded"
+			httpStatus = http.StatusServiceUnavailable
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(httpStatus)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":               status,
+			"uptime_seconds":       uptime,
+			"orchestrator_healthy": orchHealthy,
+			"nodes_healthy":        nodesHealthy,
+			"nodes_unhealthy":      nodesUnhealthy,
+		})
+	})
+
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
-		status := buildStatus(cfg, state)
+		status := buildStatus(cfg, state, hs)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(status)
 	})
@@ -882,17 +1036,40 @@ func startAPI(cfg HostConfig, state *cluster.State) {
 	http.Serve(listener, mux)
 }
 
-func buildStatus(cfg HostConfig, state *cluster.State) map[string]interface{} {
-	result := map[string]interface{}{}
+func buildStatus(cfg HostConfig, state *cluster.State, hs *healthState) map[string]interface{} {
+	hs.mu.RLock()
+	uptime := int(time.Since(hs.startTime).Seconds())
+
+	result := map[string]interface{}{
+		"uptime_seconds": uptime,
+	}
 
 	if state.Orchestrator != nil {
 		orch := state.Orchestrator
-		result["orchestrator"] = map[string]interface{}{
-			"id":        orch.ID,
-			"bridge_ip": orch.BridgeIP,
-			"pid":       orch.PID,
-			"running":   qemu.IsRunning(orch.PID),
+		orchStatus := map[string]interface{}{
+			"id":              orch.ID,
+			"bridge_ip":       orch.BridgeIP,
+			"pid":             orch.PID,
+			"running":         qemu.IsRunning(orch.PID),
+			"service_healthy": hs.orchestrator.healthy,
 		}
+		if !hs.orchestrator.lastHealthy.IsZero() {
+			orchStatus["last_healthy"] = hs.orchestrator.lastHealthy.Format(time.RFC3339)
+		}
+		result["orchestrator"] = orchStatus
+	}
+
+	// Scaling capacity info
+	nodeRAMMB := 0
+	fmt.Sscanf(cfg.NodeRAM, "%dG", &nodeRAMMB)
+	nodeRAMMB *= 1024
+	if nodeRAMMB == 0 {
+		nodeRAMMB = 12 * 1024
+	}
+	result["scaling"] = map[string]interface{}{
+		"current_nodes": state.NodeCount(),
+		"max_nodes":     cfg.MaxNodes,
+		"node_ram_mb":   nodeRAMMB,
 	}
 
 	nodes := []map[string]interface{}{}
@@ -903,13 +1080,23 @@ func buildStatus(cfg HostConfig, state *cluster.State) map[string]interface{} {
 			"pid":       n.PID,
 			"running":   qemu.IsRunning(n.PID),
 		}
-		// Try to get health from node agent
-		if qemu.IsRunning(n.PID) {
-			if health := queryNodeHealth(n.BridgeIP); health != nil {
-				nodeStatus["health"] = health
+		if sh := hs.nodes[n.ID]; sh != nil {
+			nodeStatus["service_healthy"] = sh.healthy
+			if !sh.lastHealthy.IsZero() {
+				nodeStatus["last_healthy"] = sh.lastHealthy.Format(time.RFC3339)
 			}
 		}
 		nodes = append(nodes, nodeStatus)
+	}
+	hs.mu.RUnlock()
+
+	// Fetch live health from node agents (outside lock — these are network calls)
+	for i, n := range state.Nodes {
+		if qemu.IsRunning(n.PID) {
+			if health := queryNodeHealth(n.BridgeIP); health != nil {
+				nodes[i]["health"] = health
+			}
+		}
 	}
 	result["nodes"] = nodes
 

@@ -22,7 +22,12 @@ On reboot, the daemon recreates bridge/NAT (idempotent) and relaunches all VMs f
 
 ## Health Monitoring
 
-10-second polling loop. Checks QEMU process liveness and auto-restarts crashed VMs. If a VM fails to restart after multiple attempts, it logs the failure but doesn't escalate.
+10-second polling loop with two layers:
+
+1. **Process health**: Checks QEMU process liveness via PID. Auto-restarts crashed VMs.
+2. **Service health**: Hits application endpoints inside running VMs (orchestrator `:8801/healthz`, nodes `:8800/api/health`) with 2s timeout. After 3 consecutive failures (~30s), marks the service as unhealthy and logs a warning. Recovery is logged when the service responds again.
+
+Service health status is exposed via the `/healthz` and `/status` unix socket API endpoints. QEMU restart only triggers on process death, not on service unresponsiveness (the service may be slow to boot after a restart).
 
 ## Auto-Scaling
 
@@ -32,8 +37,12 @@ On reboot, the daemon recreates bridge/NAT (idempotent) and relaunches all VMs f
 - **Scale down** when a node is idle AND removing it won't push remaining nodes above thresholds
 - Before scaling up: checks host has enough disk (>20GB free) and memory
 
+**Rolling upgrade reserve**: The auto-scaler always reserves enough host memory to launch one additional node beyond the current count. This ensures rolling upgrades can always proceed without first draining a node. The effective max nodes is `min(MaxNodes, memoryBasedMax) - 1` where the `-1` is the upgrade reserve.
+
 Default thresholds (in `defaultConfig()`):
 - RAM: 80%, CPU: 80%, Disk: 85%
+- MaxNodes: 0 (no hard cap, limited by host resources)
+- Min free memory on host: 8GB
 - Min free disk on host: 20GB
 - Scale cooldown: 10 minutes between any scale events
 
@@ -123,9 +132,10 @@ runDaemon()
   ├─ bridge.Setup()            — Create/verify bridge + NAT (idempotent)
   ├─ cluster.Load()            — Load cluster.json
   ├─ bootRecover()             — Relaunch dead VMs from state
-  ├─ go startAPI()             — Unix socket API server
-  ├─ go healthLoop()           — 10s polling, auto-restart crashed QEMU
-  ├─ go autoScaleLoop()        — 30s polling, scale up/down based on capacity
+  ├─ newHealthState()          — Initialize service health tracking
+  ├─ go startAPI()             — Unix socket API (/healthz, /status, /drain)
+  ├─ go healthLoop()           — 10s: process restart + service health checks
+  ├─ go autoScaleLoop()        — 30s: scale up/down based on capacity
   └─ signal.Wait(SIGINT/TERM)  — Graceful shutdown
 ```
 
@@ -159,5 +169,6 @@ runDaemon()
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /status` | Cluster status |
+| `GET /healthz` | Health check — returns 200 `ok` or 503 `degraded` with orchestrator/node service health |
+| `GET /status` | Cluster status with uptime, scaling info, per-VM service health, and live node capacity |
 | `POST /drain/{nodeID}` | Drain a node (migrate all VMs off, then stop) |
