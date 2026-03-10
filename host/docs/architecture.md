@@ -136,8 +136,33 @@ runDaemon()
   ├─ go startAPI()             — Unix socket API (/healthz, /status, /drain)
   ├─ go healthLoop()           — 10s: process restart + service health checks
   ├─ go autoScaleLoop()        — 30s: scale up/down based on capacity
+  ├─ go runReconcileLoop()     — Resume interrupted upgrades (if UpgradeGoal exists)
   └─ signal.Wait(SIGINT/TERM)  — Graceful shutdown
 ```
+
+## Upgrade Reconciler
+
+Rolling upgrades use a **reconciliation loop** (Kubernetes controller pattern), not an imperative FSM. The `UpgradeGoal` in `cluster.json` declares the desired image version. The reconciler observes reality and takes one step toward convergence each iteration.
+
+**Node upgrade flow** (per reconcile step):
+1. Pull image if not cached → observe: base QCOW2 exists?
+2. Launch replacement node → observe: new node in state with goal image?
+3. Wait for health → observe: `GET /api/health` returns 200?
+4. Wait for golden image → observe: golden versions endpoint has entries?
+5. Mark old node for drain → observe: old node status = "upgrading"
+6. Drain old node → observe: all VMs migrated, old node removed
+
+**Orchestrator upgrade flow** (per reconcile step):
+1. Pull image if not cached
+2. Assign temp bridge IP → observe: `NewOrchIP` set in goal?
+3. Launch new orchestrator on temp IP → observe: disk + QEMU process exist?
+4. Wait for health → observe: `GET /healthz` returns 200?
+5. Trigger migration (new pulls DB + Tailscale state from old) → observe: old PID stopped?
+6. Finalize swap → update `state.Orchestrator`, clean up
+
+**Crash recovery is free**: on daemon restart, if `UpgradeGoal` exists in `cluster.json`, the reconciler starts a background loop. It re-observes reality (which VMs exist, their versions, health status) and resumes from wherever the crash left off. No separate recovery code path.
+
+**CLI**: `boxcutter-host upgrade <type>` sets the goal and calls the reconciler in a blocking loop until convergence (or error). Re-running the command after a failure resumes the existing goal.
 
 ## State
 

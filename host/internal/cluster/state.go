@@ -36,33 +36,70 @@ func (e *VMEntry) IsActive() bool {
 	return e.Status == "" || e.Status == "active"
 }
 
-// UpgradeIntent records an in-progress upgrade so it can be resumed after a crash.
-type UpgradeIntent struct {
-	VMType    string   `json:"vm_type"`              // "node", "orchestrator", "all"
-	Tag       string   `json:"tag"`                  // OCI image tag
-	StartedAt string   `json:"started_at"`           // RFC3339
-	Phase     string   `json:"phase"`                // "pulling", "launching", "draining", "complete", "failed"
-	BasePath  string   `json:"base_path,omitempty"`  // path to base QCOW2 after pull
+// MatchesImage returns true if this VM was created from the given image.
+// Compares by digest first (immutable), falls back to version string.
+func (e *VMEntry) MatchesImage(ref *ImageRef) bool {
+	if ref == nil {
+		return false
+	}
+	if e.ImageDigest != "" && ref.Digest != "" {
+		return e.ImageDigest == ref.Digest
+	}
+	if e.ImageVersion != "" && ref.Version != "" {
+		return e.ImageVersion == ref.Version
+	}
+	return false
+}
 
-	// Node upgrades: old nodes still needing replacement
-	PendingNodes []string `json:"pending_nodes,omitempty"`
+// ImageRef holds resolved OCI image metadata for an upgrade goal.
+type ImageRef struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Digest  string `json:"digest"`
+}
 
-	// Orchestrator upgrades: new orchestrator's temp bridge IP
-	NewOrchIP string `json:"new_orch_ip,omitempty"`
+// UpgradeGoal declares the desired image version for VMs. The reconciler
+// observes the running cluster and takes one step toward this goal each
+// time it is called. When all VMs match the goal, it is cleared.
+type UpgradeGoal struct {
+	VMType string `json:"vm_type"` // "node", "orchestrator", "all"
+	Tag    string `json:"tag"`     // OCI image tag (e.g., "latest", "v0.6.0")
 
-	// Image metadata from pull
-	ImageVersion string `json:"image_version,omitempty"`
-	ImageCommit  string `json:"image_commit,omitempty"`
-	ImageDigest  string `json:"image_digest,omitempty"`
+	// Resolved image metadata (populated after pull)
+	NodeImage *ImageRef `json:"node_image,omitempty"`
+	OrchImage *ImageRef `json:"orch_image,omitempty"`
+
+	// Base QCOW2 paths (populated after pull + decompress)
+	NodeBasePath string `json:"node_base_path,omitempty"`
+	OrchBasePath string `json:"orch_base_path,omitempty"`
+
+	// Orchestrator upgrade: temp bridge IP/TAP/MAC for new orchestrator
+	NewOrchIP  string `json:"new_orch_ip,omitempty"`
+	NewOrchTAP string `json:"new_orch_tap,omitempty"`
+	NewOrchMAC string `json:"new_orch_mac,omitempty"`
+
+	CreatedAt string `json:"created_at"`
 }
 
 type State struct {
-	Orchestrator  *VMEntry       `json:"orchestrator,omitempty"`
-	Nodes         []VMEntry      `json:"nodes"`
-	UpgradeIntent *UpgradeIntent `json:"upgrade_intent,omitempty"`
+	Orchestrator *VMEntry     `json:"orchestrator,omitempty"`
+	Nodes        []VMEntry    `json:"nodes"`
+	UpgradeGoal  *UpgradeGoal `json:"upgrade_goal,omitempty"`
+
+	// Legacy field — read for migration, never written.
+	LegacyUpgradeIntent *legacyUpgradeIntent `json:"upgrade_intent,omitempty"`
 
 	mu   sync.RWMutex
 	path string
+}
+
+// legacyUpgradeIntent is the old imperative FSM state. Kept only for
+// reading old cluster.json files during migration.
+type legacyUpgradeIntent struct {
+	VMType   string `json:"vm_type"`
+	Tag      string `json:"tag"`
+	Phase    string `json:"phase"`
+	BasePath string `json:"base_path,omitempty"`
 }
 
 func Load(path string) (*State, error) {
@@ -81,6 +118,38 @@ func Load(path string) (*State, error) {
 	}
 	if s.Nodes == nil {
 		s.Nodes = []VMEntry{}
+	}
+
+	// Migrate legacy UpgradeIntent → UpgradeGoal
+	if s.LegacyUpgradeIntent != nil && s.UpgradeGoal == nil {
+		old := s.LegacyUpgradeIntent
+		if old.Phase != "complete" && old.Phase != "failed" {
+			s.UpgradeGoal = &UpgradeGoal{
+				VMType:    old.VMType,
+				Tag:       old.Tag,
+				CreatedAt: time.Now().Format(time.RFC3339),
+			}
+			// If the old intent had a base path and it still exists, carry it forward
+			if old.BasePath != "" {
+				if _, err := os.Stat(old.BasePath); err == nil {
+					if old.VMType == "node" {
+						s.UpgradeGoal.NodeBasePath = old.BasePath
+					} else if old.VMType == "orchestrator" {
+						s.UpgradeGoal.OrchBasePath = old.BasePath
+					}
+				}
+			}
+		}
+		s.LegacyUpgradeIntent = nil
+		// Revert any non-active nodes from old FSM state
+		for i := range s.Nodes {
+			if !s.Nodes[i].IsActive() {
+				s.Nodes[i].Status = "active"
+			}
+		}
+		if s.Orchestrator != nil && !s.Orchestrator.IsActive() {
+			s.Orchestrator.Status = "active"
+		}
 	}
 
 	return s, nil
@@ -250,17 +319,30 @@ func (s *State) SetNodeStatus(id, status string) {
 	}
 }
 
-func (s *State) SetUpgradeIntent(intent *UpgradeIntent) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if intent != nil && intent.StartedAt == "" {
-		intent.StartedAt = time.Now().Format(time.RFC3339)
+// FindNodeWithStatus returns the first node with the given status, or nil.
+func (s *State) FindNodeWithStatus(status string) *VMEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, n := range s.Nodes {
+		if n.Status == status {
+			cp := n
+			return &cp
+		}
 	}
-	s.UpgradeIntent = intent
+	return nil
 }
 
-func (s *State) ClearUpgradeIntent() {
+func (s *State) SetUpgradeGoal(goal *UpgradeGoal) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.UpgradeIntent = nil
+	if goal != nil && goal.CreatedAt == "" {
+		goal.CreatedAt = time.Now().Format(time.RFC3339)
+	}
+	s.UpgradeGoal = goal
+}
+
+func (s *State) ClearUpgradeGoal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.UpgradeGoal = nil
 }
