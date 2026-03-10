@@ -101,15 +101,36 @@ The scheduler picks a node by free RAM. On VM creation:
 
 ## State
 
-SQLite at `/var/lib/boxcutter/orchestrator.db` with WAL mode.
+SQLite at `/var/lib/boxcutter/orchestrator.db` with WAL mode. Uses `modernc.org/sqlite` (pure Go, no CGO).
 
-| Table | Purpose |
-|-------|---------|
-| `nodes` | Registered nodes with last heartbeat |
-| `vms` | VM name → node assignment (thin state, details fetched from nodes on demand) |
-| `golden_images` | Golden image versions per node |
-| `golden_config` | Current golden head version |
-| `ssh_keys` | GitHub username → public keys |
+```sql
+CREATE TABLE nodes (
+  id TEXT PRIMARY KEY,
+  tailscale_name TEXT NOT NULL, tailscale_ip TEXT, bridge_ip TEXT,
+  api_addr TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',  -- active, down, draining, retired, provisioning
+  registered_at TEXT NOT NULL, last_heartbeat TEXT
+);
+
+CREATE TABLE vms (
+  name TEXT PRIMARY KEY,
+  node_id TEXT NOT NULL REFERENCES nodes(id),
+  status TEXT DEFAULT 'running'
+);
+
+CREATE TABLE golden_images (
+  version TEXT NOT NULL, node_id TEXT NOT NULL REFERENCES nodes(id),
+  discovered_at TEXT NOT NULL, PRIMARY KEY (version, node_id)
+);
+
+CREATE TABLE golden_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE ssh_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, github_user TEXT NOT NULL,
+  public_key TEXT NOT NULL UNIQUE, added_at TEXT NOT NULL
+);
+```
+
+**Thin state design:** The `vms` table stores only `(name, node_id, status)` — not detailed state. All other info (RAM, vCPU, Tailscale IP, repos) is fetched from nodes on demand. This avoids state divergence: if a Firecracker VM crashes, the orchestrator learns at the next health sync (30s) rather than serving stale data.
 
 ## Health Monitoring
 

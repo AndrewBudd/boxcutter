@@ -165,3 +165,10 @@ Firecracker VMs migrate between nodes using snapshot/restore. The host coordinat
 | Host | [host/docs/architecture.md](../host/docs/architecture.md) | [host/docs/network.md](../host/docs/network.md) | [host/docs/development.md](../host/docs/development.md) |
 | Orchestrator | [orchestrator/docs/architecture.md](../orchestrator/docs/architecture.md) | — | [orchestrator/docs/development.md](../orchestrator/docs/development.md) |
 | Node | [node/docs/architecture.md](../node/docs/architecture.md) | [node/docs/network.md](../node/docs/network.md) | [node/docs/development.md](../node/docs/development.md) |
+
+## Improvement Proposal
+
+See [improvement-proposal.md](improvement-proposal.md) for the architecture review and phased improvement plan covering:
+- **Phase 1 (Safety):** Control plane lock, composite health checks, migration timeouts
+- **Phase 2 (Observability):** Structured logging, layered health reporting
+- **Phase 3 (Code Organization):** Split monolithic files, per-VM locks

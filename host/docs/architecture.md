@@ -26,7 +26,16 @@ On reboot, the daemon recreates bridge/NAT (idempotent) and relaunches all VMs f
 
 ## Auto-Scaling
 
-30-second polling loop. Queries all node agents for capacity (free RAM). Launches a new node VM when aggregate utilization exceeds 80%, subject to a minimum free memory floor on the host.
+30-second polling loop. Queries each node's `GET /api/health` for capacity metrics.
+
+- **Scale up** when any node exceeds: RAM >80%, vCPU >80%, or disk >85%
+- **Scale down** when a node is idle AND removing it won't push remaining nodes above thresholds
+- Before scaling up: checks host has enough disk (>20GB free) and memory
+
+Default thresholds (in `defaultConfig()`):
+- RAM: 80%, CPU: 80%, Disk: 85%
+- Min free disk on host: 20GB
+- Scale cooldown: 10 minutes between any scale events
 
 ## Drain and Migration Coordination
 
@@ -104,9 +113,45 @@ boxcutter-host push-golden  # Push golden image to OCI
 boxcutter-host self-update  # Update boxcutter-host binary from GitHub Releases
 ```
 
+## Daemon Subsystems
+
+When `boxcutter-host run` starts:
+
+```
+runDaemon()
+  ├─ startMosquitto()          — Start MQTT broker
+  ├─ bridge.Setup()            — Create/verify bridge + NAT (idempotent)
+  ├─ cluster.Load()            — Load cluster.json
+  ├─ bootRecover()             — Relaunch dead VMs from state
+  ├─ go startAPI()             — Unix socket API server
+  ├─ go healthLoop()           — 10s polling, auto-restart crashed QEMU
+  ├─ go autoScaleLoop()        — 30s polling, scale up/down based on capacity
+  └─ signal.Wait(SIGINT/TERM)  — Graceful shutdown
+```
+
 ## State
 
 `/var/lib/boxcutter/cluster.json` — tracks all QEMU VMs (orchestrator + nodes) with PIDs, disk paths, IPs, MACs, image versions/digests.
+
+```json
+{
+  "orchestrator": {
+    "id": "orchestrator", "type": "orchestrator",
+    "bridge_ip": "192.168.50.2", "pid": 12345,
+    "disk": "/var/lib/boxcutter/orchestrator.qcow2",
+    "iso": "/var/lib/boxcutter/orchestrator-cloud-init.iso",
+    "vcpu": 2, "ram": "4G",
+    "tap": "tap-orch", "mac": "52:54:00:00:00:02"
+  },
+  "nodes": [
+    {
+      "id": "boxcutter-node-1", "type": "node",
+      "bridge_ip": "192.168.50.3", "pid": 12346,
+      "vcpu": 6, "ram": "12G", ...
+    }
+  ]
+}
+```
 
 ## Unix Socket API
 

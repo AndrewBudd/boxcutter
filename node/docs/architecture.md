@@ -12,6 +12,35 @@ The node is the fundamental system that manages Firecracker VMs as a resource. I
 | `boxcutter-net` | Network setup | — (oneshot) | Shell script |
 | `boxcutter-derper` | DERP relay | `:443` | External binary |
 
+## Per-VM State
+
+Each VM gets a directory at `/var/lib/boxcutter/vms/{name}/`:
+
+```
+/var/lib/boxcutter/vms/my-dev-vm/
+├── vm.json              — VM config + state
+├── rootfs.ext4          — Sparse ext4 disk (~50GB allocated on-demand)
+├── firecracker.json     — Firecracker VM config
+├── metadata.json        — Cloud-init style metadata
+├── firecracker.pid      — PID of running Firecracker process
+├── firecracker.sock     — Firecracker API Unix socket
+└── migrating            — Marker file (present only during migration)
+```
+
+**vm.json** contains all VM config:
+```json
+{
+  "name": "my-dev-vm", "vcpu": 2, "ram_mib": 2048,
+  "mark": 101, "mode": "normal", "mac": "AA:FC:00:00:00:65",
+  "disk": "50G", "tap": "tap-my-dev-vm",
+  "created": "2026-03-10T12:00:00Z",
+  "clone_urls": ["https://github.com/user/repo"],
+  "tailscale_ip": "100.x.x.x", "golden_version": "v0.1.0-abc123"
+}
+```
+
+**Storage models:** New VMs use file-based rootfs (standalone sparse ext4 copied from golden image via `CreateRootfs()`). Legacy VMs may use dm-snapshot COW overlays (`cow.img` on shared golden). `IsFileRootfs(vmDir)` distinguishes between the two.
+
 ## Node Agent
 
 The node agent manages Firecracker VM lifecycle via an HTTP API on `:8800`.
@@ -147,3 +176,22 @@ Downtime: ~10 seconds for a 2GB RAM VM (dominated by memory file transfer over b
 **Normal mode:** Full direct internet access via NAT. Real credentials from vmid token endpoints. No proxy required.
 
 **Paranoid mode:** All outbound traffic must go through the forward proxy. iptables rules block direct internet access but allow traffic to the proxy. VMs receive sentinel tokens instead of real credentials. The proxy swaps sentinels for real tokens before forwarding.
+
+## Health Endpoint
+
+`GET /api/health` returns capacity and status:
+
+```json
+{
+  "hostname": "boxcutter-node-1",
+  "vcpu_total": 6, "vcpu_allocated": 4,
+  "ram_total_mib": 12288, "ram_allocated_mib": 4096, "ram_free_mib": 8192,
+  "disk_total_mb": 40960, "disk_used_mb": 12000,
+  "vms_total": 3, "vms_running": 2,
+  "golden_ready": true, "status": "active"
+}
+```
+
+## Concurrency
+
+The VM manager uses a single global `sync.Mutex` — all VM operations (create, destroy, start, stop, migrate) are serialized. Creating VM #1 (60s) blocks all other operations. This is the biggest performance bottleneck. See the [improvement proposal](../../docs/improvement-proposal.md) for the per-VM lock plan.
