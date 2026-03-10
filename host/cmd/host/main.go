@@ -58,6 +58,8 @@ type HostConfig struct {
 	ScaleDownThresholdPct int           // Scale down when VM capacity used < this % (and >1 node)
 	ScaleCooldown         time.Duration // Minimum time between scale events
 	MinFreeMemoryMB       int           // Hard floor: never scale up if host has less than this free
+	DiskUsageThresholdPct int           // Scale up when node disk usage > this %
+	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
 
 	// OCI image distribution
 	OCIRegistry   string // OCI registry (default: ghcr.io)
@@ -131,7 +133,9 @@ func defaultConfig() HostConfig {
 		ScaleUpThresholdPct:  80,
 		ScaleDownThresholdPct: 30,
 		ScaleCooldown:        10 * time.Minute,
-		MinFreeMemoryMB:      8192, // 8GB — never launch a node if host has less than this free
+		MinFreeMemoryMB:       8192,  // 8GB — never launch a node if host has less than this free
+		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
+		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,
@@ -542,11 +546,15 @@ func healthLoop(cfg HostConfig, state *cluster.State) {
 
 // nodeCapacity holds per-node capacity info collected during a poll.
 type nodeCapacity struct {
-	nodeID    string
-	bridgeIP  string
-	totalRAM  int
-	usedRAM   int
-	vmsRunning int
+	nodeID       string
+	bridgeIP     string
+	totalRAM     int
+	usedRAM      int
+	totalVCPU    int
+	usedVCPU     int
+	diskTotalMB  int
+	diskUsedMB   int
+	vmsRunning   int
 }
 
 // scaleDownCandidate evaluates whether to scale down and returns the node ID to drain.
@@ -602,6 +610,10 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 		var nodes []nodeCapacity
 		totalRAM := 0
 		usedRAM := 0
+		totalVCPU := 0
+		usedVCPU := 0
+		totalDiskMB := 0
+		usedDiskMB := 0
 		totalVMs := 0
 
 		for _, node := range state.Nodes {
@@ -621,6 +633,22 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 				nc.usedRAM = int(v)
 				usedRAM += int(v)
 			}
+			if v, ok := health["vcpu_total"].(float64); ok {
+				nc.totalVCPU = int(v)
+				totalVCPU += int(v)
+			}
+			if v, ok := health["vcpu_allocated"].(float64); ok {
+				nc.usedVCPU = int(v)
+				usedVCPU += int(v)
+			}
+			if v, ok := health["disk_total_mb"].(float64); ok {
+				nc.diskTotalMB = int(v)
+				totalDiskMB += int(v)
+			}
+			if v, ok := health["disk_used_mb"].(float64); ok {
+				nc.diskUsedMB = int(v)
+				usedDiskMB += int(v)
+			}
 			if v, ok := health["vms_running"].(float64); ok {
 				nc.vmsRunning = int(v)
 				totalVMs += int(v)
@@ -633,19 +661,36 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 		}
 
 		usedPct := (usedRAM * 100) / totalRAM
-		log.Printf("Capacity: %d/%d MiB (%d%%), %d VMs across %d nodes",
-			usedRAM, totalRAM, usedPct, totalVMs, len(nodes))
+		cpuPct := 0
+		if totalVCPU > 0 {
+			cpuPct = (usedVCPU * 100) / totalVCPU
+		}
+		diskPct := 0
+		if totalDiskMB > 0 {
+			diskPct = (usedDiskMB * 100) / totalDiskMB
+		}
+		log.Printf("Capacity: RAM %d/%d MiB (%d%%), CPU %d/%d vCPU (%d%%), Disk %d/%dMB (%d%%), %d VMs across %d nodes",
+			usedRAM, totalRAM, usedPct, usedVCPU, totalVCPU, cpuPct, usedDiskMB, totalDiskMB, diskPct, totalVMs, len(nodes))
 
 		// Enforce cooldown between scale events
 		if time.Since(lastScaleEvent) < cfg.ScaleCooldown {
 			continue
 		}
 
+		// Scale up if RAM, CPU, or disk usage exceeds threshold
+		scaleUpReason := ""
 		if usedPct >= cfg.ScaleUpThresholdPct {
-			log.Printf("Capacity above %d%%, checking if scale-up is possible...", cfg.ScaleUpThresholdPct)
+			scaleUpReason = fmt.Sprintf("RAM at %d%%", usedPct)
+		} else if cpuPct >= cfg.ScaleUpThresholdPct {
+			scaleUpReason = fmt.Sprintf("CPU at %d%%", cpuPct)
+		} else if diskPct >= cfg.DiskUsageThresholdPct {
+			scaleUpReason = fmt.Sprintf("disk at %d%%", diskPct)
+		}
+		if scaleUpReason != "" {
+			log.Printf("Capacity pressure (%s), checking if scale-up is possible...", scaleUpReason)
 			ok, reason := canScaleUp(cfg)
 			if ok {
-				log.Printf("Scaling up: adding new node...")
+				log.Printf("Scaling up: adding new node (%s)...", scaleUpReason)
 				addNode(cfg, state)
 				lastScaleEvent = time.Now()
 			} else {
@@ -711,6 +756,19 @@ func canScaleUp(cfg HostConfig) (bool, string) {
 	if afterLaunchMB < cfg.MinFreeMemoryMB {
 		return false, fmt.Sprintf("after launch would have %dMB free (%dMB available - %dMB node), minimum is %dMB",
 			afterLaunchMB, availMB, nodeRAMMB, cfg.MinFreeMemoryMB)
+	}
+
+	// Check host disk space
+	var diskAvailMB int
+	dfOut, err := exec.Command("df", "-BM", "--output=avail", cfg.ImagesDir).Output()
+	if err == nil {
+		lines := strings.Split(strings.TrimSpace(string(dfOut)), "\n")
+		if len(lines) >= 2 {
+			fmt.Sscanf(strings.ReplaceAll(lines[1], "M", ""), "%d", &diskAvailMB)
+		}
+	}
+	if diskAvailMB > 0 && diskAvailMB < cfg.MinFreeDiskMB {
+		return false, fmt.Sprintf("host has %dMB disk free, minimum is %dMB", diskAvailMB, cfg.MinFreeDiskMB)
 	}
 
 	return true, ""

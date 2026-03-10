@@ -599,7 +599,24 @@ sudo bash -c '
   rm -f /home/ubuntu/.ssh/authorized_keys
   truncate -s 0 /home/ubuntu/.ssh/authorized_keys
 
+  # Remove snapd — not needed, saves ~1.5GB of disk
+  systemctl stop snapd snapd.socket 2>/dev/null || true
+  apt-get purge -y snapd 2>/dev/null || true
+  rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd
+  mkdir -p /etc/apt/preferences.d
+  printf "Package: snapd\nPin: release a=*\nPin-Priority: -10\n" > /etc/apt/preferences.d/nosnap.pref
+
+  # Disable unattended-upgrades to prevent background apt disk usage
+  systemctl disable unattended-upgrades 2>/dev/null || true
+  apt-get purge -y unattended-upgrades 2>/dev/null || true
+
+  # Limit journald disk usage to prevent log growth from filling disk
+  mkdir -p /etc/systemd/journald.conf.d
+  printf "[Journal]\nSystemMaxUse=200M\nSystemMaxFileSize=50M\nMaxRetentionSec=7day\n" \
+    > /etc/systemd/journald.conf.d/size-limit.conf
+
   # Clean apt cache
+  apt-get autoremove -y 2>/dev/null || true
   apt-get clean
   rm -rf /var/lib/apt/lists/*
 
