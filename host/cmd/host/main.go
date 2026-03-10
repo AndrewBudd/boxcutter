@@ -258,16 +258,19 @@ func runDaemon() {
 	// 3. Boot recovery — launch all VMs from state
 	bootRecover(cfg, state)
 
-	// 4. Initialize health tracking
+	// 4. Reconcile any interrupted upgrade
+	reconcileUpgrade(cfg, state)
+
+	// 5. Initialize health tracking
 	hs := newHealthState()
 
-	// 5. Start unix socket API
+	// 6. Start unix socket API
 	go startAPI(cfg, state, hs)
 
-	// 6. Start health monitor
+	// 7. Start health monitor
 	go healthLoop(cfg, state, hs)
 
-	// 7. Start auto-scaler
+	// 8. Start auto-scaler
 	go autoScaleLoop(cfg, state)
 
 	log.Println("boxcutter-host ready")
@@ -432,36 +435,50 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 		username = currentUser.Username
 	}
 
-	// Launch orchestrator
+	// Launch orchestrator (skip if being upgraded)
 	if state.Orchestrator != nil {
 		orch := state.Orchestrator
-		if qemu.IsRunning(orch.PID) {
+		if !orch.IsActive() {
+			log.Printf("  orchestrator status=%s, skipping relaunch", orch.Status)
+		} else if qemu.IsRunning(orch.PID) {
 			log.Printf("  orchestrator already running (PID %d)", orch.PID)
 		} else {
-			if err := bridge.EnsureTAP(orch.TAP, cfg.BridgeDevice, username); err != nil {
-				log.Printf("WARNING: orchestrator TAP: %v", err)
-			}
-			pid, err := qemu.Launch(qemu.VMConfig{
-				Name: orch.ID,
-				VCPU: orch.VCPU,
-				RAM:  orch.RAM,
-				Disk: orch.Disk,
-				ISO:  orch.ISO,
-				TAP:  orch.TAP,
-				MAC:  orch.MAC,
-			}, cfg.ImagesDir)
-			if err != nil {
-				log.Printf("WARNING: orchestrator launch failed: %v", err)
+			if !fileExists(orch.Disk) {
+				log.Printf("WARNING: orchestrator disk missing: %s", orch.Disk)
 			} else {
-				state.SetPID(orch.ID, pid)
+				if err := bridge.EnsureTAP(orch.TAP, cfg.BridgeDevice, username); err != nil {
+					log.Printf("WARNING: orchestrator TAP: %v", err)
+				}
+				pid, err := qemu.Launch(qemu.VMConfig{
+					Name: orch.ID,
+					VCPU: orch.VCPU,
+					RAM:  orch.RAM,
+					Disk: orch.Disk,
+					ISO:  orch.ISO,
+					TAP:  orch.TAP,
+					MAC:  orch.MAC,
+				}, cfg.ImagesDir)
+				if err != nil {
+					log.Printf("WARNING: orchestrator launch failed: %v", err)
+				} else {
+					state.SetPID(orch.ID, pid)
+				}
 			}
 		}
 	}
 
-	// Launch nodes
+	// Launch nodes (skip those being drained/upgraded)
 	for _, node := range state.Nodes {
+		if !node.IsActive() {
+			log.Printf("  %s status=%s, skipping relaunch", node.ID, node.Status)
+			continue
+		}
 		if qemu.IsRunning(node.PID) {
 			log.Printf("  %s already running (PID %d)", node.ID, node.PID)
+			continue
+		}
+		if !fileExists(node.Disk) {
+			log.Printf("WARNING: %s disk missing: %s", node.ID, node.Disk)
 			continue
 		}
 		if err := bridge.EnsureTAP(node.TAP, cfg.BridgeDevice, username); err != nil {
@@ -522,8 +539,8 @@ func healthLoop(cfg HostConfig, state *cluster.State, hs *healthState) {
 	for range ticker.C {
 		hs.mu.Lock()
 
-		// Check orchestrator
-		if state.Orchestrator != nil {
+		// Check orchestrator (skip if draining/upgrading)
+		if state.Orchestrator != nil && state.Orchestrator.IsActive() {
 			if !qemu.IsRunning(state.Orchestrator.PID) {
 				log.Printf("ALERT: orchestrator not running, restarting...")
 				currentUser, _ := user.Current()
@@ -556,8 +573,11 @@ func healthLoop(cfg HostConfig, state *cluster.State, hs *healthState) {
 			}
 		}
 
-		// Check nodes
+		// Check nodes (skip those being drained/upgraded)
 		for _, node := range state.Nodes {
+			if !node.IsActive() {
+				continue
+			}
 			if !qemu.IsRunning(node.PID) {
 				log.Printf("ALERT: node %s not running, restarting...", node.ID)
 				currentUser, _ := user.Current()
@@ -713,7 +733,7 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 		totalVMs := 0
 
 		for _, node := range state.Nodes {
-			if !qemu.IsRunning(node.PID) {
+			if !node.IsActive() || !qemu.IsRunning(node.PID) {
 				continue
 			}
 			health := queryNodeHealth(node.BridgeIP)
@@ -1100,6 +1120,10 @@ func buildStatus(cfg HostConfig, state *cluster.State, hs *healthState) map[stri
 	}
 	result["nodes"] = nodes
 
+	if state.UpgradeIntent != nil {
+		result["upgrade"] = state.UpgradeIntent
+	}
+
 	return result
 }
 
@@ -1111,6 +1135,10 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		return
 	}
 
+	// Mark as draining so health monitor won't auto-restart if we stop it
+	state.SetNodeStatus(nodeID, "draining")
+	state.Save()
+
 	log.Printf("Draining node %s...", nodeID)
 
 	// Get list of VMs on this node
@@ -1118,32 +1146,41 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/vms", node.BridgeIP))
 	if err != nil {
 		log.Printf("Drain: cannot list VMs on %s: %v", nodeID, err)
+		state.SetNodeStatus(nodeID, "active") // revert
+		state.Save()
 		return
 	}
 	defer resp.Body.Close()
 
 	var vms []map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&vms)
-
-	if len(vms) == 0 {
-		log.Printf("Drain: %s has no VMs, stopping", nodeID)
-		state.RemoveNode(nodeID)
+	if err := json.NewDecoder(resp.Body).Decode(&vms); err != nil {
+		log.Printf("Drain: invalid VM list from %s: %v", nodeID, err)
+		state.SetNodeStatus(nodeID, "active") // revert
 		state.Save()
-		qemu.Stop(nodeID, node.PID)
 		return
 	}
 
-	// Find a target node
+	if len(vms) == 0 {
+		log.Printf("Drain: %s has no VMs, stopping", nodeID)
+		qemu.Stop(nodeID, node.PID)
+		state.RemoveNode(nodeID)
+		state.Save()
+		return
+	}
+
+	// Find a target node (must be active and running)
 	var targetNode *cluster.VMEntry
 	for _, n := range state.Nodes {
-		if n.ID != nodeID && qemu.IsRunning(n.PID) {
+		if n.ID != nodeID && n.IsActive() && qemu.IsRunning(n.PID) {
 			entry := n
 			targetNode = &entry
 			break
 		}
 	}
 	if targetNode == nil {
-		log.Printf("Drain: no target node available for migration")
+		log.Printf("Drain: no active target node available for migration")
+		state.SetNodeStatus(nodeID, "active") // revert
+		state.Save()
 		return
 	}
 
@@ -1186,7 +1223,6 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		}
 
 		// Poll source status until migration completes (up to 5 min per VM).
-		// Simple state machine: "migrating" → keep polling, anything else → done.
 		deadline := time.Now().Add(5 * time.Minute)
 		migrated := false
 		for time.Now().Before(deadline) {
@@ -1194,8 +1230,8 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 			srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
 			if err != nil {
-				// Source unreachable — VM directory was likely cleaned up (success)
-				log.Printf("Drain: %s migrated (source unreachable)", vmName)
+				// Source unreachable — need to verify at target
+				log.Printf("Drain: %s source unreachable, verifying at target...", vmName)
 				migrated = true
 				break
 			}
@@ -1210,7 +1246,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			}
 
 			if srcStatus == "" {
-				// VM gone from source (404 returned non-JSON error)
+				// VM gone from source
 				log.Printf("Drain: %s removed from source", vmName)
 				migrated = true
 				break
@@ -1221,6 +1257,32 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			break
 		}
 
+		// Improvement 3: verify migration at destination
+		if migrated {
+			verifyResp, err := pollClient.Get(
+				fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, vmName))
+			if err != nil {
+				log.Printf("Drain: WARNING: %s gone from source but target %s unreachable: %v",
+					vmName, targetNode.ID, err)
+				failedMigrations++
+				migrated = false
+			} else {
+				var targetDetail map[string]interface{}
+				json.NewDecoder(verifyResp.Body).Decode(&targetDetail)
+				verifyResp.Body.Close()
+				targetStatus, _ := targetDetail["status"].(string)
+				if targetStatus == "" {
+					log.Printf("Drain: WARNING: %s not found on target %s after migration",
+						vmName, targetNode.ID)
+					failedMigrations++
+					migrated = false
+				} else {
+					log.Printf("Drain: %s verified on target %s (status: %s)",
+						vmName, targetNode.ID, targetStatus)
+				}
+			}
+		}
+
 		if !migrated {
 			log.Printf("Drain: %s migration did not complete", vmName)
 			failedMigrations++
@@ -1229,14 +1291,16 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 	if failedMigrations > 0 {
 		log.Printf("Drain: %d migration(s) failed — aborting drain, node %s NOT stopped", failedMigrations, nodeID)
+		state.SetNodeStatus(nodeID, "active") // revert so health monitor manages it
+		state.Save()
 		return
 	}
 
-	// Remove from state FIRST so health monitor doesn't auto-restart
+	// All VMs migrated and verified — stop the node
 	log.Printf("Drain: stopping %s", nodeID)
+	qemu.Stop(nodeID, node.PID)
 	state.RemoveNode(nodeID)
 	state.Save()
-	qemu.Stop(nodeID, node.PID)
 	log.Printf("Drain: %s complete", nodeID)
 }
 
@@ -1404,12 +1468,29 @@ func cliUpgrade() {
 		types = []string{"node", "orchestrator"}
 	}
 
+	// Check for an incomplete upgrade from a previous run
+	if state.UpgradeIntent != nil && state.UpgradeIntent.Phase != "complete" && state.UpgradeIntent.Phase != "failed" {
+		fmt.Printf("Found incomplete upgrade: %s %s (phase: %s)\n",
+			state.UpgradeIntent.VMType, state.UpgradeIntent.Tag, state.UpgradeIntent.Phase)
+		fmt.Printf("Resuming...\n")
+		reconcileUpgrade(cfg, state)
+		return
+	}
+
 	for _, t := range types {
 		if t == "golden" {
 			// Golden image upgrade: tell orchestrator to set head, nodes pull via MQTT
 			upgradeGolden(cfg, state, tag)
 			continue
 		}
+
+		// Record intent before pulling
+		state.SetUpgradeIntent(&cluster.UpgradeIntent{
+			VMType: t,
+			Tag:    tag,
+			Phase:  "pulling",
+		})
+		state.Save()
 
 		fmt.Printf("Pulling %s image (tag: %s)...\n", t, tag)
 		meta, outputFile, err := oci.Pull(ctx, oci.PullOptions{
@@ -1422,6 +1503,8 @@ func cliUpgrade() {
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Pull failed for %s: %v\n", t, err)
+			state.ClearUpgradeIntent()
+			state.Save()
 			os.Exit(1)
 		}
 
@@ -1431,6 +1514,8 @@ func cliUpgrade() {
 			fmt.Printf("  Decompressing...\n")
 			if err := decompressZstd(outputFile, basePath); err != nil {
 				fmt.Fprintf(os.Stderr, "Decompression failed: %v\n", err)
+				state.ClearUpgradeIntent()
+				state.Save()
 				os.Exit(1)
 			}
 			os.Remove(outputFile)
@@ -1444,6 +1529,56 @@ func cliUpgrade() {
 		case "orchestrator":
 			upgradeOrchestrator(cfg, state, basePath, meta)
 		}
+	}
+}
+
+// reconcileUpgrade resumes an interrupted upgrade from cluster.json's UpgradeIntent.
+func reconcileUpgrade(cfg HostConfig, state *cluster.State) {
+	intent := state.UpgradeIntent
+	if intent == nil {
+		return
+	}
+
+	switch intent.Phase {
+	case "draining":
+		// Resume draining remaining nodes
+		if intent.VMType == "node" && len(intent.PendingNodes) > 0 {
+			log.Printf("Resuming drain of %d pending node(s)", len(intent.PendingNodes))
+			for _, oldID := range intent.PendingNodes {
+				node := state.GetNode(oldID)
+				if node == nil {
+					continue // already drained
+				}
+				if !node.IsActive() {
+					log.Printf("Resuming drain of %s (status: %s)", oldID, node.Status)
+					drainNode(cfg, state, oldID)
+				}
+			}
+			state.ClearUpgradeIntent()
+			state.Save()
+			log.Printf("Upgrade reconciliation complete")
+		}
+
+	case "pulling", "launching":
+		// These phases are hard to resume safely (may need to re-pull).
+		// Mark as failed so the operator can re-run `upgrade`.
+		log.Printf("Upgrade was interrupted during '%s' phase — marking failed. Re-run the upgrade command.", intent.Phase)
+		// Revert any nodes marked as upgrading
+		for _, n := range state.Nodes {
+			if !n.IsActive() {
+				state.SetNodeStatus(n.ID, "active")
+			}
+		}
+		if state.Orchestrator != nil && !state.Orchestrator.IsActive() {
+			state.SetNodeStatus("orchestrator", "active")
+		}
+		state.ClearUpgradeIntent()
+		state.Save()
+
+	default:
+		log.Printf("Unknown upgrade phase '%s', clearing intent", intent.Phase)
+		state.ClearUpgradeIntent()
+		state.Save()
 	}
 }
 
@@ -1606,8 +1741,33 @@ func upgradeGolden(cfg HostConfig, state *cluster.State, tag string) {
 func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *oci.ImageMetadata) {
 	fmt.Printf("\n--- Upgrading nodes ---\n")
 
-	for _, oldNode := range state.Nodes {
-		fmt.Printf("Upgrading %s...\n", oldNode.ID)
+	// Collect old node IDs to upgrade (snapshot the list since we'll modify state.Nodes)
+	var oldNodeIDs []string
+	for _, n := range state.Nodes {
+		if n.IsActive() {
+			oldNodeIDs = append(oldNodeIDs, n.ID)
+		}
+	}
+
+	// Record upgrade intent so we can resume after a crash
+	state.SetUpgradeIntent(&cluster.UpgradeIntent{
+		VMType:       "node",
+		Tag:          meta.Version,
+		Phase:        "launching",
+		BasePath:     basePath,
+		PendingNodes: oldNodeIDs,
+		ImageVersion: meta.Version,
+		ImageCommit:  meta.Commit,
+		ImageDigest:  meta.Digest,
+	})
+	state.Save()
+
+	for _, oldNodeID := range oldNodeIDs {
+		oldNode := state.GetNode(oldNodeID)
+		if oldNode == nil {
+			continue // already removed
+		}
+		fmt.Printf("Upgrading %s...\n", oldNodeID)
 
 		newNum := state.NextNodeNum()
 		newID := fmt.Sprintf("boxcutter-node-%d", newNum)
@@ -1677,7 +1837,7 @@ func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *o
 		fmt.Printf("  New node %s launched (PID %d). Waiting for health...\n", newID, pid)
 
 		if !waitForNodeHealth(newBridgeIP, 120*time.Second) {
-			log.Printf("New node %s did not become healthy, skipping drain of %s", newID, oldNode.ID)
+			log.Printf("New node %s did not become healthy, skipping drain of %s", newID, oldNodeID)
 			continue
 		}
 
@@ -1687,10 +1847,37 @@ func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *o
 			log.Printf("New node %s golden image not ready, proceeding anyway", newID)
 		}
 
-		fmt.Printf("  Draining old node %s...\n", oldNode.ID)
-		drainNode(cfg, state, oldNode.ID)
-		fmt.Printf("  Node %s upgraded to %s\n", oldNode.ID, newID)
+		// Mark old node as upgrading, then drain
+		state.SetNodeStatus(oldNodeID, "upgrading")
+		state.SetUpgradeIntent(&cluster.UpgradeIntent{
+			VMType:       "node",
+			Tag:          meta.Version,
+			Phase:        "draining",
+			BasePath:     basePath,
+			PendingNodes: remainingNodes(oldNodeIDs, oldNodeID),
+			ImageVersion: meta.Version,
+			ImageCommit:  meta.Commit,
+			ImageDigest:  meta.Digest,
+		})
+		state.Save()
+
+		fmt.Printf("  Draining old node %s...\n", oldNodeID)
+		drainNode(cfg, state, oldNodeID)
+		fmt.Printf("  Node %s upgraded to %s\n", oldNodeID, newID)
 	}
+
+	state.ClearUpgradeIntent()
+	state.Save()
+}
+
+// remainingNodes returns nodeIDs after (and including) the given current node.
+func remainingNodes(nodeIDs []string, current string) []string {
+	for i, id := range nodeIDs {
+		if id == current {
+			return nodeIDs[i:]
+		}
+	}
+	return nil
 }
 
 func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, meta *oci.ImageMetadata) {
@@ -1703,6 +1890,18 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 
 	oldOrch := state.Orchestrator
 
+	// Mark old orchestrator as upgrading so health monitor won't restart it
+	state.SetNodeStatus("orchestrator", "upgrading")
+	state.SetUpgradeIntent(&cluster.UpgradeIntent{
+		VMType:       "orchestrator",
+		Tag:          meta.Version,
+		Phase:        "launching",
+		ImageVersion: meta.Version,
+		ImageCommit:  meta.Commit,
+		ImageDigest:  meta.Digest,
+	})
+	state.Save()
+
 	// 1. Provision new orchestrator with a fresh bridge IP
 	newNum := state.NextNodeNum() + 100 // use high octet to avoid collision with nodes
 	newOctet := cfg.NodeIPOffset + newNum
@@ -1712,6 +1911,13 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 	newDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
 	orchISO := fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir)
 
+	// Helper to revert orchestrator to active on failure
+	revertOrch := func() {
+		state.SetNodeStatus("orchestrator", "active")
+		state.ClearUpgradeIntent()
+		state.Save()
+	}
+
 	// Generate a fresh cloud-init ISO with the temp bridge IP and MAC
 	fmt.Printf("  Generating cloud-init ISO for orchestrator...\n")
 	if err := generateCloudInitISOWithOutput(cfg, "orchestrator", "", orchISO,
@@ -1719,12 +1925,14 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		"CLOUD_INIT_MAC="+newMAC,
 	); err != nil {
 		log.Printf("Failed to generate cloud-init ISO for orchestrator: %v", err)
+		revertOrch()
 		return
 	}
 
 	fmt.Printf("  Creating new orchestrator disk from base image...\n")
 	if err := createCOWDisk(basePath, newDisk, cfg.OrchestratorDisk); err != nil {
 		log.Printf("Failed to create orchestrator disk: %v", err)
+		revertOrch()
 		return
 	}
 
@@ -1737,6 +1945,7 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 	if err := bridge.EnsureTAP(newTAP, cfg.BridgeDevice, username); err != nil {
 		log.Printf("Failed to create TAP for new orchestrator: %v", err)
 		os.Remove(newDisk)
+		revertOrch()
 		return
 	}
 
@@ -1754,6 +1963,7 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 	if err != nil {
 		log.Printf("New orchestrator launch failed: %v", err)
 		os.Remove(newDisk)
+		revertOrch()
 		return
 	}
 
@@ -1763,6 +1973,7 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		log.Printf("New orchestrator did not become healthy")
 		qemu.Stop("orchestrator-new", pid)
 		os.Remove(newDisk)
+		revertOrch()
 		return
 	}
 
@@ -1784,6 +1995,7 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		log.Printf("Migration request failed: %v", err)
 		qemu.Stop("orchestrator-new", pid)
 		os.Remove(newDisk)
+		revertOrch()
 		return
 	}
 	defer resp.Body.Close()
@@ -1793,11 +2005,11 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		log.Printf("Migration failed (HTTP %d): %s", resp.StatusCode, string(body))
 		qemu.Stop("orchestrator-new", pid)
 		os.Remove(newDisk)
+		revertOrch()
 		return
 	}
 
 	// 5. Migration succeeded — old orchestrator is shut down by the new one.
-	// Wait for old orchestrator to stop.
 	fmt.Printf("  Waiting for old orchestrator to shut down...\n")
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1832,6 +2044,7 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		ImageCommit:  meta.Commit,
 		ImageDigest:  meta.Digest,
 	})
+	state.ClearUpgradeIntent()
 	state.Save()
 
 	// Clean up old disk
