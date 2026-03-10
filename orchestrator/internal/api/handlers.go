@@ -21,15 +21,40 @@ type Handler struct {
 	db   *db.DB
 	mqtt *orchmqtt.Client
 
-	// migrating is true when this orchestrator is in pre-migrate mode
-	migrating bool
-	migrateMu sync.Mutex
+	// Migration state: when preparing for migration, mutating requests are rejected.
+	// Auto-expires after migrateDeadline to prevent permanent lockout if migration fails.
+	migrating       bool
+	migrateDeadline time.Time
+	migrateMu       sync.Mutex
 }
 
 func NewHandler(database *db.DB) *Handler {
 	h := &Handler{db: database}
 	go h.healthMonitorLoop()
 	return h
+}
+
+// isMigrating returns true if this orchestrator is in pre-migrate mode.
+// Automatically expires the migration state after the deadline.
+func (h *Handler) isMigrating() bool {
+	h.migrateMu.Lock()
+	defer h.migrateMu.Unlock()
+	if h.migrating && time.Now().After(h.migrateDeadline) {
+		log.Printf("Migration mode expired (deadline passed), reverting to active")
+		h.migrating = false
+	}
+	return h.migrating
+}
+
+// migrationGuard wraps a handler to reject requests when migrating.
+func (h *Handler) migrationGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.isMigrating() {
+			http.Error(w, "orchestrator is preparing for migration, please retry shortly", http.StatusServiceUnavailable)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // SetMQTT sets the MQTT client for publishing golden head updates.
@@ -110,16 +135,16 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/nodes", h.handleNodeList)
 	mux.HandleFunc("GET /api/nodes/{id}", h.handleNodeGet)
 
-	// VM management
-	mux.HandleFunc("POST /api/vms", h.handleVMCreate)
+	// VM management (mutating endpoints guarded during migration)
+	mux.HandleFunc("POST /api/vms", h.migrationGuard(h.handleVMCreate))
 	mux.HandleFunc("GET /api/vms", h.handleVMList)
 	mux.HandleFunc("GET /api/vms/{name}", h.handleVMGet)
-	mux.HandleFunc("DELETE /api/vms/{name}", h.handleVMDestroy)
-	mux.HandleFunc("POST /api/vms/{name}/stop", h.handleVMStop)
-	mux.HandleFunc("POST /api/vms/{name}/start", h.handleVMStart)
-	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleVMCopy)
-	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleVMAddRepo)
-	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleVMRemoveRepo)
+	mux.HandleFunc("DELETE /api/vms/{name}", h.migrationGuard(h.handleVMDestroy))
+	mux.HandleFunc("POST /api/vms/{name}/stop", h.migrationGuard(h.handleVMStop))
+	mux.HandleFunc("POST /api/vms/{name}/start", h.migrationGuard(h.handleVMStart))
+	mux.HandleFunc("POST /api/vms/{name}/copy", h.migrationGuard(h.handleVMCopy))
+	mux.HandleFunc("POST /api/vms/{name}/repos", h.migrationGuard(h.handleVMAddRepo))
+	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.migrationGuard(h.handleVMRemoveRepo))
 	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleVMListRepos)
 
 	// Golden images
@@ -972,11 +997,14 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 // handlePrepareMigrate is called on the OLD orchestrator by the new one.
 // It stops accepting new work and prepares for state transfer.
 func (h *Handler) handlePrepareMigrate(w http.ResponseWriter, r *http.Request) {
+	const migrationTimeout = 5 * time.Minute
+
 	h.migrateMu.Lock()
 	h.migrating = true
+	h.migrateDeadline = time.Now().Add(migrationTimeout)
 	h.migrateMu.Unlock()
 
-	log.Printf("Prepare-migrate: entering migration mode, new requests will be rejected")
+	log.Printf("Prepare-migrate: entering migration mode (expires in %v), new requests will be rejected", migrationTimeout)
 
 	writeJSON(w, map[string]string{
 		"status":  "ready",

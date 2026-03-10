@@ -7,13 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 const DefaultStatePath = "/var/lib/boxcutter/cluster.json"
 
 type VMEntry struct {
 	ID       string `json:"id"`
-	Type     string `json:"type"` // "orchestrator" or "node"
+	Type     string `json:"type"`                 // "orchestrator" or "node"
+	Status   string `json:"status,omitempty"`      // "active", "draining", "upgrading"; empty = active
 	BridgeIP string `json:"bridge_ip"`
 	Disk     string `json:"disk"`
 	ISO      string `json:"iso"`
@@ -29,9 +31,35 @@ type VMEntry struct {
 	ImageDigest  string `json:"image_digest,omitempty"`  // OCI manifest digest
 }
 
+// IsActive returns true when the VM should be treated as active (not being drained/upgraded).
+func (e *VMEntry) IsActive() bool {
+	return e.Status == "" || e.Status == "active"
+}
+
+// UpgradeIntent records an in-progress upgrade so it can be resumed after a crash.
+type UpgradeIntent struct {
+	VMType    string   `json:"vm_type"`              // "node", "orchestrator", "all"
+	Tag       string   `json:"tag"`                  // OCI image tag
+	StartedAt string   `json:"started_at"`           // RFC3339
+	Phase     string   `json:"phase"`                // "pulling", "launching", "draining", "complete", "failed"
+	BasePath  string   `json:"base_path,omitempty"`  // path to base QCOW2 after pull
+
+	// Node upgrades: old nodes still needing replacement
+	PendingNodes []string `json:"pending_nodes,omitempty"`
+
+	// Orchestrator upgrades: new orchestrator's temp bridge IP
+	NewOrchIP string `json:"new_orch_ip,omitempty"`
+
+	// Image metadata from pull
+	ImageVersion string `json:"image_version,omitempty"`
+	ImageCommit  string `json:"image_commit,omitempty"`
+	ImageDigest  string `json:"image_digest,omitempty"`
+}
+
 type State struct {
-	Orchestrator *VMEntry  `json:"orchestrator,omitempty"`
-	Nodes        []VMEntry `json:"nodes"`
+	Orchestrator  *VMEntry       `json:"orchestrator,omitempty"`
+	Nodes         []VMEntry      `json:"nodes"`
+	UpgradeIntent *UpgradeIntent `json:"upgrade_intent,omitempty"`
 
 	mu   sync.RWMutex
 	path string
@@ -58,6 +86,7 @@ func Load(path string) (*State, error) {
 	return s, nil
 }
 
+// Save atomically writes the state to disk using write-fsync-rename.
 func (s *State) Save() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -73,16 +102,46 @@ func (s *State) Save() error {
 	}
 
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	f, err := os.Create(tmp)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+
+	// Sync parent directory to persist the rename
+	d, err := os.Open(dir)
+	if err != nil {
+		return nil // non-fatal: file is already renamed
+	}
+	d.Sync()
+	d.Close()
+	return nil
 }
 
 func (s *State) SetOrchestrator(entry VMEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry.Type = "orchestrator"
+	if entry.Status == "" {
+		entry.Status = "active"
+	}
 	s.Orchestrator = &entry
 }
 
@@ -90,6 +149,9 @@ func (s *State) AddNode(entry VMEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry.Type = "node"
+	if entry.Status == "" {
+		entry.Status = "active"
+	}
 	// Replace if exists
 	for i, n := range s.Nodes {
 		if n.ID == entry.ID {
@@ -128,6 +190,19 @@ func (s *State) NodeCount() int {
 	return len(s.Nodes)
 }
 
+// ActiveNodeCount returns the number of nodes not being drained/upgraded.
+func (s *State) ActiveNodeCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, n := range s.Nodes {
+		if n.IsActive() {
+			count++
+		}
+	}
+	return count
+}
+
 func (s *State) NextNodeNum() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -157,4 +232,35 @@ func (s *State) SetPID(id string, pid int) {
 			return
 		}
 	}
+}
+
+// SetNodeStatus sets the status field on a VM entry (node or orchestrator).
+func (s *State) SetNodeStatus(id, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Orchestrator != nil && s.Orchestrator.ID == id {
+		s.Orchestrator.Status = status
+		return
+	}
+	for i, n := range s.Nodes {
+		if n.ID == id {
+			s.Nodes[i].Status = status
+			return
+		}
+	}
+}
+
+func (s *State) SetUpgradeIntent(intent *UpgradeIntent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if intent != nil && intent.StartedAt == "" {
+		intent.StartedAt = time.Now().Format(time.RFC3339)
+	}
+	s.UpgradeIntent = intent
+}
+
+func (s *State) ClearUpgradeIntent() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.UpgradeIntent = nil
 }
