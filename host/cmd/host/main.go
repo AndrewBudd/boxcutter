@@ -1659,7 +1659,13 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		time.Sleep(2 * time.Second)
 	}
 	if qemu.IsRunning(oldOrch.PID) {
-		log.Printf("Old orchestrator still running, force stopping")
+		log.Printf("Old orchestrator still running, trying tailscale logout before force stop")
+		sshKey := filepath.Join(cfg.RepoDir, ".boxcutter", "secrets", "cluster-ssh.key")
+		logoutCmd := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+			"-o", "ConnectTimeout=5", "-i", sshKey, fmt.Sprintf("ubuntu@%s", oldOrch.BridgeIP),
+			"sudo tailscale logout")
+		logoutCmd.Run() // best-effort
+		time.Sleep(2 * time.Second)
 		qemu.Stop("orchestrator", oldOrch.PID)
 	}
 

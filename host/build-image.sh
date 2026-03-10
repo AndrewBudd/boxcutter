@@ -646,6 +646,11 @@ done
 if kill -0 "$BUILD_PID" 2>/dev/null; then
   echo "  QEMU still running after ${WAIT}s, force killing..."
   kill -9 "$BUILD_PID" 2>/dev/null || true
+  # Wait for process to fully exit and release file locks
+  for i in $(seq 1 30); do
+    kill -0 "$BUILD_PID" 2>/dev/null || break
+    sleep 1
+  done
   sleep 2
 fi
 rm -f "${IMAGES_DIR}/build-${VM_TYPE}.pid"
@@ -657,7 +662,19 @@ sudo ip link del "$BUILD_TAP" 2>/dev/null || true
 echo ""
 echo "--- Converting to standalone QCOW2 ---"
 OUTPUT_QCOW2="${IMAGES_DIR}/${VM_TYPE}-image.qcow2"
-qemu-img convert -c -O qcow2 "$DISK" "$OUTPUT_QCOW2"
+
+# Retry qemu-img convert in case file lock is slow to release
+for attempt in 1 2 3; do
+  if qemu-img convert -c -O qcow2 "$DISK" "$OUTPUT_QCOW2" 2>/dev/null; then
+    break
+  fi
+  if [ "$attempt" -eq 3 ]; then
+    echo "  qemu-img convert failed after 3 attempts"
+    qemu-img convert -c -O qcow2 "$DISK" "$OUTPUT_QCOW2"
+  fi
+  echo "  qemu-img convert attempt $attempt failed, retrying in 5s..."
+  sleep 5
+done
 echo "  QCOW2: ${OUTPUT_QCOW2} ($(du -h "$OUTPUT_QCOW2" | cut -f1))"
 
 # --- Compress with zstd ---
