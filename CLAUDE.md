@@ -73,6 +73,7 @@ Top-level:
 - `docs/architecture.md` — System overview, domain boundaries, communication patterns
 - `docs/development.md` — Prerequisites, code layout, build targets, CI/CD
 - `docs/README.md` — Quick start / bootstrap guide
+- `docs/improvement-proposal.md` — Architecture review + phased improvement plan
 
 Domain-specific (architecture, networking, development):
 - `host/docs/` — Host control plane internals
