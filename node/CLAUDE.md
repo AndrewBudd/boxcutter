@@ -71,7 +71,7 @@ Service units for all node-side daemons: `boxcutter-node`, `vmid`, `boxcutter-pr
 
 ## Key Architectural Concepts
 
-**Networking**: Every Firecracker VM gets IP `10.0.0.2` on its own TAP device. VMs are distinguished by fwmark-based policy routing — each TAP gets a unique fwmark, and iptables/ip-rule uses fwmarks to route traffic correctly. See `docs/network-architecture.md`.
+**Networking**: Every Firecracker VM gets IP `10.0.0.2` on its own TAP device. VMs are distinguished by fwmark-based policy routing — each TAP gets a unique fwmark, and iptables/ip-rule uses fwmarks to route traffic correctly. See `node/docs/network.md`.
 
 **Identity**: The vmid service identifies which VM a request comes from by reading the fwmark from the socket. This allows it to serve VM-specific metadata and tokens without VMs needing to authenticate.
 
@@ -95,6 +95,12 @@ ssh ubuntu@192.168.50.3 "sudo mv /tmp/boxcutter-node /usr/local/bin/ && sudo sys
 ```
 
 Same pattern for vmid and boxcutter-proxy.
+
+## Detailed Documentation
+
+- `docs/architecture.md` — Agent API, vmid endpoints, proxy, golden image, migration, normal/paranoid mode
+- `docs/network.md` — fwmark routing, TAP setup, vmid identity, sentinel tokens, TLS, DERP, packet flows
+- `docs/development.md` — Building, deploying, debugging, golden image rebuilding
 
 ## Domain Boundary
 

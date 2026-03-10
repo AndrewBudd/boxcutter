@@ -55,6 +55,11 @@ ssh ubuntu@192.168.50.2 "sudo mv /tmp/boxcutter-orchestrator /usr/local/bin/ && 
 
 SSH binary doesn't need a restart — it's invoked fresh per connection.
 
+## Detailed Documentation
+
+- `docs/architecture.md` — SSH interface, HTTP API surface, scheduling, state, MQTT, health monitoring
+- `docs/development.md` — Building, deploying, debugging
+
 ## Domain Boundary
 
 This component **owns**:
