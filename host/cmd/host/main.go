@@ -52,10 +52,12 @@ type HostConfig struct {
 	SocketPath    string
 
 	// Auto-scaling
-	ScalePollInterval   time.Duration
-	HealthPollInterval  time.Duration
-	ScaleUpThresholdPct int // Scale up when VM capacity used > this %
-	MinFreeMemoryMB     int // Hard floor: never scale up if host has less than this free
+	ScalePollInterval     time.Duration
+	HealthPollInterval    time.Duration
+	ScaleUpThresholdPct   int           // Scale up when VM capacity used > this %
+	ScaleDownThresholdPct int           // Scale down when VM capacity used < this % (and >1 node)
+	ScaleCooldown         time.Duration // Minimum time between scale events
+	MinFreeMemoryMB       int           // Hard floor: never scale up if host has less than this free
 
 	// OCI image distribution
 	OCIRegistry   string // OCI registry (default: ghcr.io)
@@ -124,10 +126,12 @@ func defaultConfig() HostConfig {
 		NodeIPOffset:       2,
 		StatePath:          "/var/lib/boxcutter/cluster.json",
 		SocketPath:         "/run/boxcutter-host.sock",
-		ScalePollInterval:   30 * time.Second,
-		HealthPollInterval:  10 * time.Second,
-		ScaleUpThresholdPct: 80,
-		MinFreeMemoryMB:     8192, // 8GB — never launch a node if host has less than this free
+		ScalePollInterval:     30 * time.Second,
+		HealthPollInterval:   10 * time.Second,
+		ScaleUpThresholdPct:  80,
+		ScaleDownThresholdPct: 30,
+		ScaleCooldown:        10 * time.Minute,
+		MinFreeMemoryMB:      8192, // 8GB — never launch a node if host has less than this free
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,
@@ -536,6 +540,50 @@ func healthLoop(cfg HostConfig, state *cluster.State) {
 	}
 }
 
+// nodeCapacity holds per-node capacity info collected during a poll.
+type nodeCapacity struct {
+	nodeID    string
+	bridgeIP  string
+	totalRAM  int
+	usedRAM   int
+	vmsRunning int
+}
+
+// scaleDownCandidate evaluates whether to scale down and returns the node ID to drain.
+// Returns empty string if no scale-down should happen.
+func scaleDownCandidate(nodes []nodeCapacity, totalRAM, usedRAM, scaleDownPct, scaleUpPct int) string {
+	if len(nodes) <= 1 || totalRAM == 0 {
+		return ""
+	}
+
+	usedPct := (usedRAM * 100) / totalRAM
+	if usedPct > scaleDownPct {
+		return ""
+	}
+
+	// Find the least-loaded node
+	leastIdx := 0
+	for i, nc := range nodes {
+		if nc.usedRAM < nodes[leastIdx].usedRAM {
+			leastIdx = i
+		}
+	}
+	candidate := nodes[leastIdx]
+
+	// Check: would removing this node push remaining capacity above scale-up threshold?
+	remainRAM := totalRAM - candidate.totalRAM
+	if remainRAM <= 0 {
+		return ""
+	}
+	// After drain, all VMs migrate to remaining nodes, so total used RAM stays the same
+	afterPct := (usedRAM * 100) / remainRAM
+	if afterPct >= scaleUpPct {
+		return ""
+	}
+
+	return candidate.nodeID
+}
+
 // autoScaleLoop polls nodes for capacity and scales up/down.
 func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 	// Wait for VMs to boot before polling
@@ -544,11 +592,14 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 	ticker := time.NewTicker(cfg.ScalePollInterval)
 	defer ticker.Stop()
 
+	var lastScaleEvent time.Time
+
 	for range ticker.C {
 		if state.NodeCount() == 0 {
 			continue
 		}
 
+		var nodes []nodeCapacity
 		totalRAM := 0
 		usedRAM := 0
 		totalVMs := 0
@@ -561,15 +612,20 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 			if health == nil {
 				continue
 			}
+			nc := nodeCapacity{nodeID: node.ID, bridgeIP: node.BridgeIP}
 			if v, ok := health["ram_total_mib"].(float64); ok {
+				nc.totalRAM = int(v)
 				totalRAM += int(v)
 			}
 			if v, ok := health["ram_allocated_mib"].(float64); ok {
+				nc.usedRAM = int(v)
 				usedRAM += int(v)
 			}
 			if v, ok := health["vms_running"].(float64); ok {
+				nc.vmsRunning = int(v)
 				totalVMs += int(v)
 			}
+			nodes = append(nodes, nc)
 		}
 
 		if totalRAM == 0 {
@@ -578,7 +634,12 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 
 		usedPct := (usedRAM * 100) / totalRAM
 		log.Printf("Capacity: %d/%d MiB (%d%%), %d VMs across %d nodes",
-			usedRAM, totalRAM, usedPct, totalVMs, state.NodeCount())
+			usedRAM, totalRAM, usedPct, totalVMs, len(nodes))
+
+		// Enforce cooldown between scale events
+		if time.Since(lastScaleEvent) < cfg.ScaleCooldown {
+			continue
+		}
 
 		if usedPct >= cfg.ScaleUpThresholdPct {
 			log.Printf("Capacity above %d%%, checking if scale-up is possible...", cfg.ScaleUpThresholdPct)
@@ -586,9 +647,21 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 			if ok {
 				log.Printf("Scaling up: adding new node...")
 				addNode(cfg, state)
+				lastScaleEvent = time.Now()
 			} else {
 				log.Printf("Cannot scale up: %s", reason)
 			}
+		} else if candidateID := scaleDownCandidate(nodes, totalRAM, usedRAM, cfg.ScaleDownThresholdPct, cfg.ScaleUpThresholdPct); candidateID != "" {
+			// Find the candidate's info for logging
+			for _, nc := range nodes {
+				if nc.nodeID == candidateID {
+					log.Printf("Capacity below %d%% with %d nodes, scaling down: draining %s (%d MiB used, %d VMs)",
+						cfg.ScaleDownThresholdPct, len(nodes), nc.nodeID, nc.usedRAM, nc.vmsRunning)
+					break
+				}
+			}
+			drainNode(cfg, state, candidateID)
+			lastScaleEvent = time.Now()
 		}
 	}
 }
