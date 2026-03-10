@@ -18,7 +18,7 @@ import (
 func fcClient(vmDir string) *http.Client {
 	sockPath := filepath.Join(vmDir, "api.sock")
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 2 * time.Minute,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return net.DialTimeout("unix", sockPath, 5*time.Second)

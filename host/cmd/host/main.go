@@ -1225,18 +1225,25 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			continue
 		}
 
-		// Poll source status until migration completes (up to 5 min per VM).
-		deadline := time.Now().Add(5 * time.Minute)
+		// Poll source status until migration completes. No hard timeout —
+		// as long as the VM is actively "migrating", keep waiting. Only give
+		// up on inactivity (source unreachable for 2 min) or status change
+		// back to running (meaning migration failed).
+		const inactivityTimeout = 2 * time.Minute
+		lastActivity := time.Now()
 		migrated := false
-		for time.Now().Before(deadline) {
+		for {
 			time.Sleep(5 * time.Second)
 
 			srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
 			if err != nil {
-				// Source unreachable — need to verify at target
-				log.Printf("Drain: %s source unreachable, verifying at target...", vmName)
-				migrated = true
-				break
+				// Source unreachable — could be temporary or VM is gone
+				if time.Since(lastActivity) > inactivityTimeout {
+					log.Printf("Drain: %s source unreachable for %v, verifying at target...", vmName, inactivityTimeout)
+					migrated = true
+					break
+				}
+				continue
 			}
 			var srcDetail map[string]interface{}
 			json.NewDecoder(srcResp.Body).Decode(&srcDetail)
@@ -1245,7 +1252,8 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			srcStatus, _ := srcDetail["status"].(string)
 
 			if srcStatus == "migrating" {
-				continue // still in progress
+				lastActivity = time.Now() // still working
+				continue
 			}
 
 			if srcStatus == "" {
