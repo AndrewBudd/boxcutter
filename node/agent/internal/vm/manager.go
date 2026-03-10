@@ -605,12 +605,33 @@ func (m *Manager) Health() map[string]interface{} {
 		goldenReady = true
 	}
 
+	// CPU allocated across running VMs
+	var allocatedVCPU int
+	for _, st := range vms {
+		if IsRunning(VMDir(st.Name)) {
+			allocatedVCPU += st.VCPU
+		}
+	}
+
+	// Disk usage
+	var diskTotalMB, diskUsedMB int
+	out, err = runOutput("df", "-BM", "--output=size,used", "/var/lib/boxcutter")
+	if err == nil {
+		lines := strings.Split(out, "\n")
+		if len(lines) >= 2 {
+			fmt.Sscanf(strings.ReplaceAll(lines[1], "M", ""), "%d %d", &diskTotalMB, &diskUsedMB)
+		}
+	}
+
 	return map[string]interface{}{
 		"hostname":          hostname,
 		"vcpu_total":        cpuCount,
+		"vcpu_allocated":    allocatedVCPU,
 		"ram_total_mib":     sysRAM,
 		"ram_allocated_mib": totalRAM,
 		"ram_free_mib":      sysRAM - totalRAM,
+		"disk_total_mb":     diskTotalMB,
+		"disk_used_mb":      diskUsedMB,
 		"vms_total":         len(vms),
 		"vms_running":       running,
 		"golden_ready":      goldenReady,
@@ -1216,25 +1237,39 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		}
 	}
 
-	// Ensure source DM snapshot is set up so we can read the COW
-	srcCowPath := filepath.Join(srcDir, "cow.img")
-	if _, err := os.Stat(srcCowPath); err != nil {
-		if wasRunning {
-			fcResume(srcDir)
-		}
-		return nil, fmt.Errorf("source COW image not found")
-	}
-
-	// Create destination dir and copy COW
+	// Copy disk: file-based rootfs or legacy COW
+	fileRootfs := IsFileRootfs(srcDir)
 	progress("copy", "Copying disk image...")
 	os.MkdirAll(dstDir, 0755)
-	dstCowPath := filepath.Join(dstDir, "cow.img")
-	if err := copyFile(srcCowPath, dstCowPath); err != nil {
-		if wasRunning {
-			fcResume(srcDir)
+
+	if fileRootfs {
+		// File-based rootfs: copy the standalone ext4 directly
+		srcRootfs := filepath.Join(srcDir, "rootfs.ext4")
+		dstRootfs := filepath.Join(dstDir, "rootfs.ext4")
+		if err := copyFile(srcRootfs, dstRootfs); err != nil {
+			if wasRunning {
+				fcResume(srcDir)
+			}
+			os.RemoveAll(dstDir)
+			return nil, fmt.Errorf("copying rootfs: %w", err)
 		}
-		os.RemoveAll(dstDir)
-		return nil, fmt.Errorf("copying COW: %w", err)
+	} else {
+		// Legacy dm-snapshot: copy the COW overlay
+		srcCowPath := filepath.Join(srcDir, "cow.img")
+		if _, err := os.Stat(srcCowPath); err != nil {
+			if wasRunning {
+				fcResume(srcDir)
+			}
+			return nil, fmt.Errorf("source COW image not found")
+		}
+		dstCowPath := filepath.Join(dstDir, "cow.img")
+		if err := copyFile(srcCowPath, dstCowPath); err != nil {
+			if wasRunning {
+				fcResume(srcDir)
+			}
+			os.RemoveAll(dstDir)
+			return nil, fmt.Errorf("copying COW: %w", err)
+		}
 	}
 
 	// Resume source VM immediately after copy
@@ -1256,11 +1291,14 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 	mark := AllocateMark(dstName, existingMarks)
 	tap := TAPName(dstName)
 
-	// Create rootfs for the destination
-	progress("copy", "Creating disk...")
-	if err := CreateRootfs(dstDir, goldenPath, srcSt.Disk); err != nil {
-		os.RemoveAll(dstDir)
-		return nil, fmt.Errorf("creating rootfs: %w", err)
+	// For legacy COW VMs, create a file-based rootfs from golden for the destination.
+	// For file-based VMs, the rootfs was already copied above.
+	if !fileRootfs {
+		progress("copy", "Creating disk...")
+		if err := CreateRootfs(dstDir, goldenPath, srcSt.Disk); err != nil {
+			os.RemoveAll(dstDir)
+			return nil, fmt.Errorf("creating rootfs: %w", err)
+		}
 	}
 
 	dstSt := &VMState{
