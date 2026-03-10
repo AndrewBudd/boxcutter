@@ -620,13 +620,17 @@ echo ""
 echo "--- Shutting down build VM ---"
 ssh $SSH_OPTS ubuntu@${BUILD_IP} "sudo poweroff" 2>/dev/null || true
 
-# Wait for QEMU to exit
+# Wait for QEMU to exit (up to 60s, then force kill)
 WAIT=0
-while kill -0 "$BUILD_PID" 2>/dev/null && [ $WAIT -lt 30 ]; do
+while kill -0 "$BUILD_PID" 2>/dev/null && [ $WAIT -lt 60 ]; do
   sleep 1
   WAIT=$((WAIT + 1))
 done
-kill "$BUILD_PID" 2>/dev/null || true
+if kill -0 "$BUILD_PID" 2>/dev/null; then
+  echo "  QEMU still running after ${WAIT}s, force killing..."
+  kill -9 "$BUILD_PID" 2>/dev/null || true
+  sleep 2
+fi
 rm -f "${IMAGES_DIR}/build-${VM_TYPE}.pid"
 
 # Clean up TAP
