@@ -1478,8 +1478,9 @@ func cliUpgrade() {
 		fmt.Printf("Resuming upgrade: %s (tag: %s)\n", state.UpgradeGoal.VMType, state.UpgradeGoal.Tag)
 	} else {
 		state.SetUpgradeGoal(&cluster.UpgradeGoal{
-			VMType: vmType,
-			Tag:    tag,
+			VMType:           vmType,
+			Tag:              tag,
+			InitialNodeCount: state.ActiveNodeCount(),
 		})
 		state.Save()
 		fmt.Printf("Upgrade goal set: %s (tag: %s)\n", vmType, tag)
@@ -1609,25 +1610,29 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		return true, "", nil // all nodes match
 	}
 
-	// Is there already a recently-launched replacement node with the goal image?
-	// (A node matching the goal that is not yet confirmed healthy)
-	replacement := findReplacementNode(state, goal)
-	if replacement != nil {
-		// Check if it's healthy
-		if queryNodeHealth(replacement.BridgeIP) != nil {
-			// New node healthy — wait for golden image, then mark old node for drain
-			if !isGoldenReady(replacement.BridgeIP) {
-				return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil
+	// Check for a pending replacement: we've launched a new node but haven't
+	// drained its counterpart yet. This is true when the total active count
+	// exceeds the initial count (each launch adds 1, each drain removes 1).
+	totalActive := state.ActiveNodeCount()
+	if totalActive > goal.InitialNodeCount && goal.InitialNodeCount > 0 {
+		// There's a surplus node — find it (newest node matching goal image)
+		replacement := findReplacementNode(state, goal)
+		if replacement != nil {
+			if queryNodeHealth(replacement.BridgeIP) != nil {
+				// New node healthy — wait for golden image, then mark old node for drain
+				if !isGoldenReady(replacement.BridgeIP) {
+					return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil
+				}
+				state.SetNodeStatus(oldNode.ID, "upgrading")
+				state.Save()
+				return false, fmt.Sprintf("New node %s healthy, marked %s for drain", replacement.ID, oldNode.ID), nil
 			}
-			state.SetNodeStatus(oldNode.ID, "upgrading")
-			state.Save()
-			return false, fmt.Sprintf("New node %s healthy, marked %s for drain", replacement.ID, oldNode.ID), nil
+			// Not healthy yet — wait
+			return false, fmt.Sprintf("Waiting for new node %s to become healthy", replacement.ID), nil
 		}
-		// Not healthy yet — wait
-		return false, fmt.Sprintf("Waiting for new node %s to become healthy", replacement.ID), nil
 	}
 
-	// No replacement in progress — launch one
+	// No pending replacement — launch one
 	newEntry, err := launchReplacementNode(cfg, state, goal)
 	if err != nil {
 		return false, "", fmt.Errorf("launching replacement for %s: %w", oldNode.ID, err)

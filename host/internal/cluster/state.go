@@ -73,6 +73,9 @@ type UpgradeGoal struct {
 	NodeBasePath string `json:"node_base_path,omitempty"`
 	OrchBasePath string `json:"orch_base_path,omitempty"`
 
+	// Node upgrade: initial count at goal creation, used to detect surplus
+	InitialNodeCount int `json:"initial_node_count,omitempty"`
+
 	// Orchestrator upgrade: temp bridge IP/TAP/MAC for new orchestrator
 	NewOrchIP  string `json:"new_orch_ip,omitempty"`
 	NewOrchTAP string `json:"new_orch_tap,omitempty"`
