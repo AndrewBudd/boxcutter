@@ -97,12 +97,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          TAG=${{ steps.tag.outputs.tag }}
+          DEB_VER="${TAG#v}"
           # Upload to existing release or create new one
-          gh release upload ${{ steps.tag.outputs.tag }} \
-            .release/boxcutter-host-${{ steps.tag.outputs.tag }}-linux-amd64.tar.gz \
-            .release/boxcutter-host_${{ steps.tag.outputs.tag }}_amd64.deb \
+          gh release upload "$TAG" \
+            .release/boxcutter-host-${TAG}-linux-amd64.tar.gz \
+            .release/boxcutter-host_${DEB_VER}_amd64.deb \
             --clobber 2>/dev/null || \
-          gh release create ${{ steps.tag.outputs.tag }} \
+          gh release create "$TAG" \
             --generate-notes \
-            .release/boxcutter-host-${{ steps.tag.outputs.tag }}-linux-amd64.tar.gz \
-            .release/boxcutter-host_${{ steps.tag.outputs.tag }}_amd64.deb
+            .release/boxcutter-host-${TAG}-linux-amd64.tar.gz \
+            .release/boxcutter-host_${DEB_VER}_amd64.deb
