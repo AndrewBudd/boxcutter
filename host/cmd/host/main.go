@@ -1766,45 +1766,6 @@ func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, 
 		return
 	}
 
-	// 3.5. Deploy latest orchestrator binary (base image may have older version)
-	fmt.Printf("  Deploying latest orchestrator binary...\n")
-	orchBinary := filepath.Join(cfg.RepoDir, "orchestrator", "cmd", "orchestrator")
-	// Build fresh
-	buildCmd := exec.Command("go", "build", "-o", "/tmp/boxcutter-orchestrator-new", "./cmd/orchestrator/")
-	buildCmd.Dir = filepath.Join(cfg.RepoDir, "orchestrator")
-	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
-	if err := buildCmd.Run(); err != nil {
-		log.Printf("Warning: could not build latest orchestrator binary: %v", err)
-	} else {
-		_ = orchBinary // suppress unused
-		sshKey := filepath.Join(cfg.RepoDir, ".boxcutter", "secrets", "cluster-ssh.key")
-		sshOpts := fmt.Sprintf("-i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", sshKey)
-		scpCmd := exec.Command("scp", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-			"-i", sshKey,
-			"/tmp/boxcutter-orchestrator-new", fmt.Sprintf("ubuntu@%s:/tmp/boxcutter-orchestrator", newBridgeIP))
-		scpCmd.Stdout = os.Stdout
-		scpCmd.Stderr = os.Stderr
-		if err := scpCmd.Run(); err != nil {
-			log.Printf("Warning: SCP binary failed: %v (continuing with existing)", err)
-		} else {
-			// Install and restart
-			installCmd := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-				"-i", sshKey, fmt.Sprintf("ubuntu@%s", newBridgeIP),
-				"sudo systemctl stop boxcutter-orchestrator && sudo cp /tmp/boxcutter-orchestrator /usr/local/bin/ && sudo systemctl start boxcutter-orchestrator")
-			installCmd.Stdout = os.Stdout
-			installCmd.Stderr = os.Stderr
-			_ = sshOpts // suppress unused
-			if err := installCmd.Run(); err != nil {
-				log.Printf("Warning: binary install failed: %v", err)
-			}
-			// Wait for new orchestrator to be healthy again after restart
-			if !waitForHealth(fmt.Sprintf("http://%s:8801/healthz", newBridgeIP), 30*time.Second) {
-				log.Printf("Warning: orchestrator not healthy after binary update")
-			}
-		}
-		os.Remove("/tmp/boxcutter-orchestrator-new")
-	}
-
 	// 4. Tell new orchestrator to migrate from the old one
 	fmt.Printf("  Triggering migration: new (%s) <- old (%s)...\n", newBridgeIP, oldOrch.BridgeIP)
 	migrateReq := map[string]string{
