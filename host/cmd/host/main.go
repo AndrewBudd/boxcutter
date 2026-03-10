@@ -258,20 +258,23 @@ func runDaemon() {
 	// 3. Boot recovery — launch all VMs from state
 	bootRecover(cfg, state)
 
-	// 4. Reconcile any interrupted upgrade
-	reconcileUpgrade(cfg, state)
-
-	// 5. Initialize health tracking
+	// 4. Initialize health tracking
 	hs := newHealthState()
 
-	// 6. Start unix socket API
+	// 5. Start unix socket API
 	go startAPI(cfg, state, hs)
 
-	// 7. Start health monitor
+	// 6. Start health monitor
 	go healthLoop(cfg, state, hs)
 
-	// 8. Start auto-scaler
+	// 7. Start auto-scaler
 	go autoScaleLoop(cfg, state)
+
+	// 8. Resume any interrupted upgrade in background
+	if state.UpgradeGoal != nil {
+		log.Printf("Found incomplete upgrade goal: %s (tag: %s)", state.UpgradeGoal.VMType, state.UpgradeGoal.Tag)
+		go runReconcileLoop(cfg, state)
+	}
 
 	log.Println("boxcutter-host ready")
 
@@ -1120,8 +1123,8 @@ func buildStatus(cfg HostConfig, state *cluster.State, hs *healthState) map[stri
 	}
 	result["nodes"] = nodes
 
-	if state.UpgradeIntent != nil {
-		result["upgrade"] = state.UpgradeIntent
+	if state.UpgradeGoal != nil {
+		result["upgrade"] = state.UpgradeGoal
 	}
 
 	return result
@@ -1447,12 +1450,22 @@ func cliPull() {
 	}
 }
 
-// cliUpgrade pulls a new image and performs a rolling upgrade.
+// cliUpgrade sets an upgrade goal and runs the reconciler to convergence.
 //
 //	boxcutter-host upgrade <node|orchestrator|all> [--tag TAG]
 func cliUpgrade() {
 	cfg := defaultConfig()
 	vmType, tag := parsePullArgs()
+
+	if vmType == "golden" {
+		state, err := cluster.Load(cfg.StatePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+			os.Exit(1)
+		}
+		upgradeGolden(cfg, state, tag)
+		return
+	}
 
 	state, err := cluster.Load(cfg.StatePath)
 	if err != nil {
@@ -1460,126 +1473,515 @@ func cliUpgrade() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
-
-	// For "all", upgrade both node and orchestrator
-	types := []string{vmType}
-	if vmType == "all" {
-		types = []string{"node", "orchestrator"}
-	}
-
-	// Check for an incomplete upgrade from a previous run
-	if state.UpgradeIntent != nil && state.UpgradeIntent.Phase != "complete" && state.UpgradeIntent.Phase != "failed" {
-		fmt.Printf("Found incomplete upgrade: %s %s (phase: %s)\n",
-			state.UpgradeIntent.VMType, state.UpgradeIntent.Tag, state.UpgradeIntent.Phase)
-		fmt.Printf("Resuming...\n")
-		reconcileUpgrade(cfg, state)
-		return
-	}
-
-	for _, t := range types {
-		if t == "golden" {
-			// Golden image upgrade: tell orchestrator to set head, nodes pull via MQTT
-			upgradeGolden(cfg, state, tag)
-			continue
-		}
-
-		// Record intent before pulling
-		state.SetUpgradeIntent(&cluster.UpgradeIntent{
-			VMType: t,
+	// Resume existing goal or set a new one
+	if state.UpgradeGoal != nil {
+		fmt.Printf("Resuming upgrade: %s (tag: %s)\n", state.UpgradeGoal.VMType, state.UpgradeGoal.Tag)
+	} else {
+		state.SetUpgradeGoal(&cluster.UpgradeGoal{
+			VMType: vmType,
 			Tag:    tag,
-			Phase:  "pulling",
 		})
 		state.Save()
+		fmt.Printf("Upgrade goal set: %s (tag: %s)\n", vmType, tag)
+	}
 
-		fmt.Printf("Pulling %s image (tag: %s)...\n", t, tag)
-		meta, outputFile, err := oci.Pull(ctx, oci.PullOptions{
-			Registry:   cfg.OCIRegistry,
-			Repository: cfg.OCIRepository,
-			VMType:     t,
-			Tag:        tag,
-			OutputDir:  cfg.ImagesDir,
-			Auth:       cfg.ociAuth(),
-		})
+	// Run reconciler to convergence
+	for {
+		done, action, err := reconcileUpgradeStep(cfg, state)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Pull failed for %s: %v\n", t, err)
-			state.ClearUpgradeIntent()
-			state.Save()
+			fmt.Fprintf(os.Stderr, "Upgrade step failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Goal preserved in cluster.json — re-run 'boxcutter-host upgrade' to retry\n")
 			os.Exit(1)
 		}
-
-		baseName := fmt.Sprintf("%s-base.qcow2", t)
-		basePath := filepath.Join(cfg.ImagesDir, baseName)
-		if outputFile != "" && filepath.Ext(outputFile) == ".zst" {
-			fmt.Printf("  Decompressing...\n")
-			if err := decompressZstd(outputFile, basePath); err != nil {
-				fmt.Fprintf(os.Stderr, "Decompression failed: %v\n", err)
-				state.ClearUpgradeIntent()
-				state.Save()
-				os.Exit(1)
-			}
-			os.Remove(outputFile)
-		} else if outputFile != "" {
-			os.Rename(outputFile, basePath)
+		if action != "" {
+			fmt.Printf("  %s\n", action)
 		}
-
-		switch t {
-		case "node":
-			upgradeNodes(cfg, state, basePath, meta)
-		case "orchestrator":
-			upgradeOrchestrator(cfg, state, basePath, meta)
+		if done {
+			fmt.Println("Upgrade complete.")
+			return
 		}
+		time.Sleep(5 * time.Second)
 	}
 }
 
-// reconcileUpgrade resumes an interrupted upgrade from cluster.json's UpgradeIntent.
-func reconcileUpgrade(cfg HostConfig, state *cluster.State) {
-	intent := state.UpgradeIntent
-	if intent == nil {
-		return
+// runReconcileLoop runs the upgrade reconciler in a background goroutine
+// until the goal is satisfied. Used by the daemon on startup to resume
+// interrupted upgrades.
+func runReconcileLoop(cfg HostConfig, state *cluster.State) {
+	for {
+		done, action, err := reconcileUpgradeStep(cfg, state)
+		if err != nil {
+			log.Printf("Upgrade reconciliation failed: %v (retrying in 30s)", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		if action != "" {
+			log.Printf("[reconcile] %s", action)
+		}
+		if done {
+			log.Println("Upgrade reconciliation complete")
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+// reconcileUpgradeStep observes the cluster state against the UpgradeGoal
+// and takes ONE step toward convergence. Returns done=true when the goal
+// is fully satisfied. Each step is idempotent — crash and re-entry is safe.
+func reconcileUpgradeStep(cfg HostConfig, state *cluster.State) (done bool, action string, err error) {
+	goal := state.UpgradeGoal
+	if goal == nil {
+		return true, "", nil
 	}
 
-	switch intent.Phase {
-	case "draining":
-		// Resume draining remaining nodes
-		if intent.VMType == "node" && len(intent.PendingNodes) > 0 {
-			log.Printf("Resuming drain of %d pending node(s)", len(intent.PendingNodes))
-			for _, oldID := range intent.PendingNodes {
-				node := state.GetNode(oldID)
-				if node == nil {
-					continue // already drained
-				}
-				if !node.IsActive() {
-					log.Printf("Resuming drain of %s (status: %s)", oldID, node.Status)
-					drainNode(cfg, state, oldID)
-				}
+	needsNode := goal.VMType == "node" || goal.VMType == "all"
+	needsOrch := goal.VMType == "orchestrator" || goal.VMType == "all"
+
+	// --- Step 1: Ensure images are pulled ---
+
+	if needsNode && goal.NodeImage == nil {
+		ref, basePath, err := pullAndDecompress(cfg, "node", goal.Tag)
+		if err != nil {
+			return false, "", fmt.Errorf("pulling node image: %w", err)
+		}
+		goal.NodeImage = ref
+		goal.NodeBasePath = basePath
+		state.Save()
+		return false, fmt.Sprintf("Pulled node image %s", ref.Version), nil
+	}
+
+	if needsOrch && goal.OrchImage == nil {
+		ref, basePath, err := pullAndDecompress(cfg, "orchestrator", goal.Tag)
+		if err != nil {
+			return false, "", fmt.Errorf("pulling orchestrator image: %w", err)
+		}
+		goal.OrchImage = ref
+		goal.OrchBasePath = basePath
+		state.Save()
+		return false, fmt.Sprintf("Pulled orchestrator image %s", ref.Version), nil
+	}
+
+	// --- Step 2: Node upgrades (rolling, one at a time) ---
+
+	if needsNode {
+		stepDone, stepAction, stepErr := reconcileNodeUpgrade(cfg, state, goal)
+		if stepErr != nil || !stepDone {
+			return false, stepAction, stepErr
+		}
+		// All nodes match goal — fall through to check orchestrator
+	}
+
+	// --- Step 3: Orchestrator upgrade ---
+
+	if needsOrch && orchNeedsUpgrade(state, goal) {
+		stepDone, stepAction, stepErr := reconcileOrchUpgrade(cfg, state, goal)
+		if stepErr != nil || !stepDone {
+			return false, stepAction, stepErr
+		}
+	}
+
+	// --- All done ---
+	state.ClearUpgradeGoal()
+	state.Save()
+	return true, "All VMs upgraded", nil
+}
+
+// reconcileNodeUpgrade handles one step of rolling node upgrades.
+func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.UpgradeGoal) (done bool, action string, err error) {
+	// Is there a node currently being drained?
+	if n := state.FindNodeWithStatus("draining"); n != nil {
+		drainNode(cfg, state, n.ID)
+		return false, fmt.Sprintf("Drained old node %s", n.ID), nil
+	}
+
+	// Is there a node marked as upgrading (needs to be drained)?
+	if n := state.FindNodeWithStatus("upgrading"); n != nil {
+		state.SetNodeStatus(n.ID, "draining")
+		state.Save()
+		drainNode(cfg, state, n.ID)
+		return false, fmt.Sprintf("Drained upgrading node %s", n.ID), nil
+	}
+
+	// Find the first old node that doesn't match the goal
+	oldNode := firstNodeNotMatchingGoal(state, goal)
+	if oldNode == nil {
+		return true, "", nil // all nodes match
+	}
+
+	// Is there already a recently-launched replacement node with the goal image?
+	// (A node matching the goal that is not yet confirmed healthy)
+	replacement := findReplacementNode(state, goal)
+	if replacement != nil {
+		// Check if it's healthy
+		if queryNodeHealth(replacement.BridgeIP) != nil {
+			// New node healthy — wait for golden image, then mark old node for drain
+			if !isGoldenReady(replacement.BridgeIP) {
+				return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil
 			}
-			state.ClearUpgradeIntent()
+			state.SetNodeStatus(oldNode.ID, "upgrading")
 			state.Save()
-			log.Printf("Upgrade reconciliation complete")
+			return false, fmt.Sprintf("New node %s healthy, marked %s for drain", replacement.ID, oldNode.ID), nil
 		}
-
-	case "pulling", "launching":
-		// These phases are hard to resume safely (may need to re-pull).
-		// Mark as failed so the operator can re-run `upgrade`.
-		log.Printf("Upgrade was interrupted during '%s' phase — marking failed. Re-run the upgrade command.", intent.Phase)
-		// Revert any nodes marked as upgrading
-		for _, n := range state.Nodes {
-			if !n.IsActive() {
-				state.SetNodeStatus(n.ID, "active")
-			}
-		}
-		if state.Orchestrator != nil && !state.Orchestrator.IsActive() {
-			state.SetNodeStatus("orchestrator", "active")
-		}
-		state.ClearUpgradeIntent()
-		state.Save()
-
-	default:
-		log.Printf("Unknown upgrade phase '%s', clearing intent", intent.Phase)
-		state.ClearUpgradeIntent()
-		state.Save()
+		// Not healthy yet — wait
+		return false, fmt.Sprintf("Waiting for new node %s to become healthy", replacement.ID), nil
 	}
+
+	// No replacement in progress — launch one
+	newEntry, err := launchReplacementNode(cfg, state, goal)
+	if err != nil {
+		return false, "", fmt.Errorf("launching replacement for %s: %w", oldNode.ID, err)
+	}
+	return false, fmt.Sprintf("Launched replacement node %s for %s", newEntry.ID, oldNode.ID), nil
+}
+
+// reconcileOrchUpgrade handles one step of orchestrator upgrade.
+func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.UpgradeGoal) (done bool, action string, err error) {
+	oldOrch := state.Orchestrator
+
+	// Step A: Assign temp IP if not yet set
+	if goal.NewOrchIP == "" {
+		newNum := state.NextNodeNum() + 100
+		newOctet := cfg.NodeIPOffset + newNum
+		goal.NewOrchIP = fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
+		goal.NewOrchTAP = "tap-orch-new"
+		goal.NewOrchMAC = fmt.Sprintf("52:54:00:00:01:%02x", newOctet%256)
+		state.Save()
+		return false, fmt.Sprintf("Assigned temp IP %s for new orchestrator", goal.NewOrchIP), nil
+	}
+
+	newDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
+	orchISO := fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir)
+
+	// Step B: Launch new orchestrator if not running
+	newOrchHealthy := isOrchHealthy(goal.NewOrchIP)
+	if !newOrchHealthy {
+		// Check if there's already a QEMU process for orchestrator-new
+		// by looking for the disk file — if it doesn't exist, we haven't launched yet
+		if !fileExists(newDisk) {
+			// Mark old orch as upgrading so health monitor won't restart it after we stop it
+			state.SetNodeStatus("orchestrator", "upgrading")
+
+			// Generate cloud-init ISO
+			if err := generateCloudInitISOWithOutput(cfg, "orchestrator", "", orchISO,
+				"CLOUD_INIT_IP="+goal.NewOrchIP,
+				"CLOUD_INIT_MAC="+goal.NewOrchMAC,
+			); err != nil {
+				state.SetNodeStatus("orchestrator", "active")
+				state.Save()
+				return false, "", fmt.Errorf("generating cloud-init ISO: %w", err)
+			}
+
+			// Create disk
+			if err := createCOWDisk(goal.OrchBasePath, newDisk, cfg.OrchestratorDisk); err != nil {
+				state.SetNodeStatus("orchestrator", "active")
+				state.Save()
+				return false, "", fmt.Errorf("creating orchestrator disk: %w", err)
+			}
+
+			currentUser, _ := user.Current()
+			username := "root"
+			if currentUser != nil {
+				username = currentUser.Username
+			}
+			if err := bridge.EnsureTAP(goal.NewOrchTAP, cfg.BridgeDevice, username); err != nil {
+				os.Remove(newDisk)
+				state.SetNodeStatus("orchestrator", "active")
+				state.Save()
+				return false, "", fmt.Errorf("creating TAP: %w", err)
+			}
+
+			pid, err := qemu.Launch(qemu.VMConfig{
+				Name: "orchestrator-new",
+				VCPU: cfg.OrchestratorVCPU,
+				RAM:  cfg.OrchestratorRAM,
+				Disk: newDisk,
+				ISO:  orchISO,
+				TAP:  goal.NewOrchTAP,
+				MAC:  goal.NewOrchMAC,
+			}, cfg.ImagesDir)
+			if err != nil {
+				os.Remove(newDisk)
+				state.SetNodeStatus("orchestrator", "active")
+				state.Save()
+				return false, "", fmt.Errorf("launching new orchestrator: %w", err)
+			}
+			_ = pid
+			state.Save()
+			return false, fmt.Sprintf("Launched new orchestrator at %s", goal.NewOrchIP), nil
+		}
+
+		// Disk exists but not healthy yet — wait
+		return false, fmt.Sprintf("Waiting for new orchestrator at %s to become healthy", goal.NewOrchIP), nil
+	}
+
+	// Step C: New orchestrator is healthy — trigger migration if old is still running
+	if oldOrch != nil && qemu.IsRunning(oldOrch.PID) {
+		migrateReq := map[string]string{
+			"source_addr": fmt.Sprintf("%s:8801", oldOrch.BridgeIP),
+			"source_ip":   oldOrch.BridgeIP,
+		}
+		migrateData, _ := json.Marshal(migrateReq)
+
+		client := &http.Client{Timeout: 5 * time.Minute}
+		resp, err := client.Post(
+			fmt.Sprintf("http://%s:8801/api/migrate", goal.NewOrchIP),
+			"application/json",
+			bytes.NewReader(migrateData),
+		)
+		if err != nil {
+			return false, "", fmt.Errorf("migration request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			return false, "", fmt.Errorf("migration failed (HTTP %d): %s", resp.StatusCode, string(body))
+		}
+
+		// Wait for old orchestrator to stop
+		deadline := time.Now().Add(60 * time.Second)
+		for time.Now().Before(deadline) {
+			if !qemu.IsRunning(oldOrch.PID) {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if qemu.IsRunning(oldOrch.PID) {
+			sshKey := findClusterSSHKey(cfg)
+			if sshKey != "" {
+				exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+					"-o", "ConnectTimeout=5", "-i", sshKey, fmt.Sprintf("ubuntu@%s", oldOrch.BridgeIP),
+					"sudo tailscale logout").Run()
+			}
+			time.Sleep(2 * time.Second)
+			qemu.Stop("orchestrator", oldOrch.PID)
+		}
+
+		return false, "Migration complete, old orchestrator stopped", nil
+	}
+
+	// Step D: Old orchestrator is gone — finalize swap
+	// Find the PID of the new orchestrator by scanning for its disk
+	newPID := findQEMUPID(newDisk)
+
+	oldDisk := ""
+	if oldOrch != nil {
+		oldDisk = oldOrch.Disk
+	}
+
+	state.SetOrchestrator(cluster.VMEntry{
+		ID:           "orchestrator",
+		BridgeIP:     goal.NewOrchIP,
+		Disk:         newDisk,
+		ISO:          orchISO,
+		PID:          newPID,
+		VCPU:         cfg.OrchestratorVCPU,
+		RAM:          cfg.OrchestratorRAM,
+		TAP:          goal.NewOrchTAP,
+		MAC:          goal.NewOrchMAC,
+		ImageVersion: goal.OrchImage.Version,
+		ImageCommit:  goal.OrchImage.Commit,
+		ImageDigest:  goal.OrchImage.Digest,
+	})
+	// Clear orch-specific fields from goal
+	goal.NewOrchIP = ""
+	goal.NewOrchTAP = ""
+	goal.NewOrchMAC = ""
+	state.Save()
+
+	if oldDisk != "" && oldDisk != newDisk {
+		os.Remove(oldDisk)
+	}
+
+	return true, fmt.Sprintf("Orchestrator upgraded (PID %d)", newPID), nil
+}
+
+// --- Reconciler helpers ---
+
+// firstNodeNotMatchingGoal returns the first active node whose image doesn't
+// match the goal. Returns nil if all nodes match.
+func firstNodeNotMatchingGoal(state *cluster.State, goal *cluster.UpgradeGoal) *cluster.VMEntry {
+	for _, n := range state.Nodes {
+		if n.IsActive() && !n.MatchesImage(goal.NodeImage) {
+			cp := n
+			return &cp
+		}
+	}
+	return nil
+}
+
+// findReplacementNode returns a node that has the goal's image version.
+// Used to detect an already-launched replacement that may still be booting.
+func findReplacementNode(state *cluster.State, goal *cluster.UpgradeGoal) *cluster.VMEntry {
+	for _, n := range state.Nodes {
+		if n.IsActive() && n.MatchesImage(goal.NodeImage) {
+			cp := n
+			return &cp
+		}
+	}
+	return nil
+}
+
+// orchNeedsUpgrade returns true if the orchestrator's image doesn't match the goal.
+func orchNeedsUpgrade(state *cluster.State, goal *cluster.UpgradeGoal) bool {
+	if state.Orchestrator == nil || goal.OrchImage == nil {
+		return false
+	}
+	return !state.Orchestrator.MatchesImage(goal.OrchImage)
+}
+
+// pullAndDecompress pulls an OCI image and decompresses it to a base QCOW2.
+func pullAndDecompress(cfg HostConfig, vmType, tag string) (*cluster.ImageRef, string, error) {
+	ctx := context.Background()
+	meta, outputFile, err := oci.Pull(ctx, oci.PullOptions{
+		Registry:   cfg.OCIRegistry,
+		Repository: cfg.OCIRepository,
+		VMType:     vmType,
+		Tag:        tag,
+		OutputDir:  cfg.ImagesDir,
+		Auth:       cfg.ociAuth(),
+	})
+	if err != nil {
+		return nil, "", err
+	}
+
+	baseName := fmt.Sprintf("%s-base.qcow2", vmType)
+	basePath := filepath.Join(cfg.ImagesDir, baseName)
+
+	if outputFile != "" && filepath.Ext(outputFile) == ".zst" {
+		if err := decompressZstd(outputFile, basePath); err != nil {
+			return nil, "", fmt.Errorf("decompression: %w", err)
+		}
+		os.Remove(outputFile)
+	} else if outputFile != "" {
+		os.Rename(outputFile, basePath)
+	}
+
+	ref := &cluster.ImageRef{
+		Version: meta.Version,
+		Commit:  meta.Commit,
+		Digest:  meta.Digest,
+	}
+	return ref, basePath, nil
+}
+
+// launchReplacementNode provisions and launches a new node from the upgrade goal's base image.
+func launchReplacementNode(cfg HostConfig, state *cluster.State, goal *cluster.UpgradeGoal) (*cluster.VMEntry, error) {
+	newNum := state.NextNodeNum()
+	newID := fmt.Sprintf("boxcutter-node-%d", newNum)
+	newOctet := cfg.NodeIPOffset + newNum
+	newBridgeIP := fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
+	newTAP := fmt.Sprintf("tap-node%d", newNum)
+	newMAC := fmt.Sprintf("52:54:00:00:00:%02x", newOctet)
+	newDisk := fmt.Sprintf("%s/%s.qcow2", cfg.ImagesDir, newID)
+	newISO := fmt.Sprintf("%s/%s-cloud-init.iso", cfg.ImagesDir, newID)
+
+	if err := createCOWDisk(goal.NodeBasePath, newDisk, cfg.NodeDisk); err != nil {
+		return nil, fmt.Errorf("creating disk: %w", err)
+	}
+
+	if !fileExists(newISO) {
+		if err := generateCloudInitISO(cfg, "node", newID); err != nil {
+			os.Remove(newDisk)
+			return nil, fmt.Errorf("generating cloud-init ISO: %w", err)
+		}
+	}
+
+	currentUser, _ := user.Current()
+	username := "root"
+	if currentUser != nil {
+		username = currentUser.Username
+	}
+
+	if err := bridge.EnsureTAP(newTAP, cfg.BridgeDevice, username); err != nil {
+		os.Remove(newDisk)
+		return nil, fmt.Errorf("creating TAP: %w", err)
+	}
+
+	pid, err := qemu.Launch(qemu.VMConfig{
+		Name: newID,
+		VCPU: cfg.NodeVCPU,
+		RAM:  cfg.NodeRAM,
+		Disk: newDisk,
+		ISO:  newISO,
+		TAP:  newTAP,
+		MAC:  newMAC,
+	}, cfg.ImagesDir)
+	if err != nil {
+		os.Remove(newDisk)
+		return nil, fmt.Errorf("launching QEMU: %w", err)
+	}
+
+	entry := cluster.VMEntry{
+		ID:           newID,
+		BridgeIP:     newBridgeIP,
+		Disk:         newDisk,
+		ISO:          newISO,
+		PID:          pid,
+		VCPU:         cfg.NodeVCPU,
+		RAM:          cfg.NodeRAM,
+		TAP:          newTAP,
+		MAC:          newMAC,
+		ImageVersion: goal.NodeImage.Version,
+		ImageCommit:  goal.NodeImage.Commit,
+		ImageDigest:  goal.NodeImage.Digest,
+	}
+	state.AddNode(entry)
+	state.Save()
+
+	return &entry, nil
+}
+
+// isGoldenReady returns true if the node's golden image is available (non-blocking).
+func isGoldenReady(bridgeIP string) bool {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/golden/versions", bridgeIP))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var versions struct {
+		Versions []string `json:"versions"`
+	}
+	json.NewDecoder(resp.Body).Decode(&versions)
+	return len(versions.Versions) > 0
+}
+
+// isOrchHealthy returns true if an orchestrator is responding at the given bridge IP.
+func isOrchHealthy(bridgeIP string) bool {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s:8801/healthz", bridgeIP))
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// findQEMUPID scans /proc for a QEMU process using the given disk path.
+func findQEMUPID(diskPath string) int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(cmdline), diskPath) && strings.Contains(string(cmdline), "qemu-system") {
+			return pid
+		}
+	}
+	return 0
 }
 
 // bootstrapGolden attempts to pull the golden image during bootstrap.
@@ -1736,321 +2138,6 @@ func upgradeGolden(cfg HostConfig, state *cluster.State, tag string) {
 		time.Sleep(10 * time.Second)
 	}
 	fmt.Printf("  Warning: timeout waiting for all nodes to pull golden image\n")
-}
-
-func upgradeNodes(cfg HostConfig, state *cluster.State, basePath string, meta *oci.ImageMetadata) {
-	fmt.Printf("\n--- Upgrading nodes ---\n")
-
-	// Collect old node IDs to upgrade (snapshot the list since we'll modify state.Nodes)
-	var oldNodeIDs []string
-	for _, n := range state.Nodes {
-		if n.IsActive() {
-			oldNodeIDs = append(oldNodeIDs, n.ID)
-		}
-	}
-
-	// Record upgrade intent so we can resume after a crash
-	state.SetUpgradeIntent(&cluster.UpgradeIntent{
-		VMType:       "node",
-		Tag:          meta.Version,
-		Phase:        "launching",
-		BasePath:     basePath,
-		PendingNodes: oldNodeIDs,
-		ImageVersion: meta.Version,
-		ImageCommit:  meta.Commit,
-		ImageDigest:  meta.Digest,
-	})
-	state.Save()
-
-	for _, oldNodeID := range oldNodeIDs {
-		oldNode := state.GetNode(oldNodeID)
-		if oldNode == nil {
-			continue // already removed
-		}
-		fmt.Printf("Upgrading %s...\n", oldNodeID)
-
-		newNum := state.NextNodeNum()
-		newID := fmt.Sprintf("boxcutter-node-%d", newNum)
-		newOctet := cfg.NodeIPOffset + newNum
-		newBridgeIP := fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
-		newTAP := fmt.Sprintf("tap-node%d", newNum)
-		newMAC := fmt.Sprintf("52:54:00:00:00:%02x", newOctet)
-		newDisk := fmt.Sprintf("%s/%s.qcow2", cfg.ImagesDir, newID)
-		newISO := fmt.Sprintf("%s/%s-cloud-init.iso", cfg.ImagesDir, newID)
-
-		fmt.Printf("  Creating disk from base image for %s...\n", newID)
-		if err := createCOWDisk(basePath, newDisk, cfg.NodeDisk); err != nil {
-			log.Printf("Failed to create disk for %s: %v", newID, err)
-			continue
-		}
-
-		if !fileExists(newISO) {
-			fmt.Printf("  Generating cloud-init ISO for %s...\n", newID)
-			if err := generateCloudInitISO(cfg, "node", newID); err != nil {
-				log.Printf("Failed to generate cloud-init ISO for %s: %v", newID, err)
-				os.Remove(newDisk)
-				continue
-			}
-		}
-
-		currentUser, _ := user.Current()
-		username := "root"
-		if currentUser != nil {
-			username = currentUser.Username
-		}
-
-		if err := bridge.EnsureTAP(newTAP, cfg.BridgeDevice, username); err != nil {
-			log.Printf("Failed to create TAP for %s: %v", newID, err)
-			continue
-		}
-
-		pid, err := qemu.Launch(qemu.VMConfig{
-			Name: newID,
-			VCPU: cfg.NodeVCPU,
-			RAM:  cfg.NodeRAM,
-			Disk: newDisk,
-			ISO:  newISO,
-			TAP:  newTAP,
-			MAC:  newMAC,
-		}, cfg.ImagesDir)
-		if err != nil {
-			log.Printf("Failed to launch %s: %v", newID, err)
-			continue
-		}
-
-		state.AddNode(cluster.VMEntry{
-			ID:           newID,
-			BridgeIP:     newBridgeIP,
-			Disk:         newDisk,
-			ISO:          newISO,
-			PID:          pid,
-			VCPU:         cfg.NodeVCPU,
-			RAM:          cfg.NodeRAM,
-			TAP:          newTAP,
-			MAC:          newMAC,
-			ImageVersion: meta.Version,
-			ImageCommit:  meta.Commit,
-			ImageDigest:  meta.Digest,
-		})
-		state.Save()
-
-		fmt.Printf("  New node %s launched (PID %d). Waiting for health...\n", newID, pid)
-
-		if !waitForNodeHealth(newBridgeIP, 120*time.Second) {
-			log.Printf("New node %s did not become healthy, skipping drain of %s", newID, oldNodeID)
-			continue
-		}
-
-		// Wait for golden image to be ready on new node
-		fmt.Printf("  Waiting for golden image on %s...\n", newID)
-		if !waitForGoldenReady(newBridgeIP, 300*time.Second) {
-			log.Printf("New node %s golden image not ready, proceeding anyway", newID)
-		}
-
-		// Mark old node as upgrading, then drain
-		state.SetNodeStatus(oldNodeID, "upgrading")
-		state.SetUpgradeIntent(&cluster.UpgradeIntent{
-			VMType:       "node",
-			Tag:          meta.Version,
-			Phase:        "draining",
-			BasePath:     basePath,
-			PendingNodes: remainingNodes(oldNodeIDs, oldNodeID),
-			ImageVersion: meta.Version,
-			ImageCommit:  meta.Commit,
-			ImageDigest:  meta.Digest,
-		})
-		state.Save()
-
-		fmt.Printf("  Draining old node %s...\n", oldNodeID)
-		drainNode(cfg, state, oldNodeID)
-		fmt.Printf("  Node %s upgraded to %s\n", oldNodeID, newID)
-	}
-
-	state.ClearUpgradeIntent()
-	state.Save()
-}
-
-// remainingNodes returns nodeIDs after (and including) the given current node.
-func remainingNodes(nodeIDs []string, current string) []string {
-	for i, id := range nodeIDs {
-		if id == current {
-			return nodeIDs[i:]
-		}
-	}
-	return nil
-}
-
-func upgradeOrchestrator(cfg HostConfig, state *cluster.State, basePath string, meta *oci.ImageMetadata) {
-	fmt.Printf("\n--- Upgrading orchestrator ---\n")
-
-	if state.Orchestrator == nil {
-		fmt.Println("No orchestrator to upgrade.")
-		return
-	}
-
-	oldOrch := state.Orchestrator
-
-	// Mark old orchestrator as upgrading so health monitor won't restart it
-	state.SetNodeStatus("orchestrator", "upgrading")
-	state.SetUpgradeIntent(&cluster.UpgradeIntent{
-		VMType:       "orchestrator",
-		Tag:          meta.Version,
-		Phase:        "launching",
-		ImageVersion: meta.Version,
-		ImageCommit:  meta.Commit,
-		ImageDigest:  meta.Digest,
-	})
-	state.Save()
-
-	// 1. Provision new orchestrator with a fresh bridge IP
-	newNum := state.NextNodeNum() + 100 // use high octet to avoid collision with nodes
-	newOctet := cfg.NodeIPOffset + newNum
-	newBridgeIP := fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
-	newTAP := fmt.Sprintf("tap-orch-new")
-	newMAC := fmt.Sprintf("52:54:00:00:01:%02x", newOctet%256)
-	newDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
-	orchISO := fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir)
-
-	// Helper to revert orchestrator to active on failure
-	revertOrch := func() {
-		state.SetNodeStatus("orchestrator", "active")
-		state.ClearUpgradeIntent()
-		state.Save()
-	}
-
-	// Generate a fresh cloud-init ISO with the temp bridge IP and MAC
-	fmt.Printf("  Generating cloud-init ISO for orchestrator...\n")
-	if err := generateCloudInitISOWithOutput(cfg, "orchestrator", "", orchISO,
-		"CLOUD_INIT_IP="+newBridgeIP,
-		"CLOUD_INIT_MAC="+newMAC,
-	); err != nil {
-		log.Printf("Failed to generate cloud-init ISO for orchestrator: %v", err)
-		revertOrch()
-		return
-	}
-
-	fmt.Printf("  Creating new orchestrator disk from base image...\n")
-	if err := createCOWDisk(basePath, newDisk, cfg.OrchestratorDisk); err != nil {
-		log.Printf("Failed to create orchestrator disk: %v", err)
-		revertOrch()
-		return
-	}
-
-	currentUser, _ := user.Current()
-	username := "root"
-	if currentUser != nil {
-		username = currentUser.Username
-	}
-
-	if err := bridge.EnsureTAP(newTAP, cfg.BridgeDevice, username); err != nil {
-		log.Printf("Failed to create TAP for new orchestrator: %v", err)
-		os.Remove(newDisk)
-		revertOrch()
-		return
-	}
-
-	// 2. Launch new orchestrator on temp IP
-	fmt.Printf("  Launching new orchestrator (bridge IP %s)...\n", newBridgeIP)
-	pid, err := qemu.Launch(qemu.VMConfig{
-		Name: "orchestrator-new",
-		VCPU: cfg.OrchestratorVCPU,
-		RAM:  cfg.OrchestratorRAM,
-		Disk: newDisk,
-		ISO:  orchISO,
-		TAP:  newTAP,
-		MAC:  newMAC,
-	}, cfg.ImagesDir)
-	if err != nil {
-		log.Printf("New orchestrator launch failed: %v", err)
-		os.Remove(newDisk)
-		revertOrch()
-		return
-	}
-
-	// 3. Wait for new orchestrator to become healthy
-	fmt.Printf("  Waiting for new orchestrator to become healthy...\n")
-	if !waitForHealth(fmt.Sprintf("http://%s:8801/healthz", newBridgeIP), 120*time.Second) {
-		log.Printf("New orchestrator did not become healthy")
-		qemu.Stop("orchestrator-new", pid)
-		os.Remove(newDisk)
-		revertOrch()
-		return
-	}
-
-	// 4. Tell new orchestrator to migrate from the old one
-	fmt.Printf("  Triggering migration: new (%s) <- old (%s)...\n", newBridgeIP, oldOrch.BridgeIP)
-	migrateReq := map[string]string{
-		"source_addr": fmt.Sprintf("%s:8801", oldOrch.BridgeIP),
-		"source_ip":   oldOrch.BridgeIP,
-	}
-	migrateData, _ := json.Marshal(migrateReq)
-
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Post(
-		fmt.Sprintf("http://%s:8801/api/migrate", newBridgeIP),
-		"application/json",
-		bytes.NewReader(migrateData),
-	)
-	if err != nil {
-		log.Printf("Migration request failed: %v", err)
-		qemu.Stop("orchestrator-new", pid)
-		os.Remove(newDisk)
-		revertOrch()
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("Migration failed (HTTP %d): %s", resp.StatusCode, string(body))
-		qemu.Stop("orchestrator-new", pid)
-		os.Remove(newDisk)
-		revertOrch()
-		return
-	}
-
-	// 5. Migration succeeded — old orchestrator is shut down by the new one.
-	fmt.Printf("  Waiting for old orchestrator to shut down...\n")
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		if !qemu.IsRunning(oldOrch.PID) {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if qemu.IsRunning(oldOrch.PID) {
-		log.Printf("Old orchestrator still running, trying tailscale logout before force stop")
-		sshKey := filepath.Join(cfg.RepoDir, ".boxcutter", "secrets", "cluster-ssh.key")
-		logoutCmd := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-			"-o", "ConnectTimeout=5", "-i", sshKey, fmt.Sprintf("ubuntu@%s", oldOrch.BridgeIP),
-			"sudo tailscale logout")
-		logoutCmd.Run() // best-effort
-		time.Sleep(2 * time.Second)
-		qemu.Stop("orchestrator", oldOrch.PID)
-	}
-
-	// 6. Update cluster state
-	state.SetOrchestrator(cluster.VMEntry{
-		ID:           "orchestrator",
-		BridgeIP:     newBridgeIP,
-		Disk:         newDisk,
-		ISO:          orchISO,
-		PID:          pid,
-		VCPU:         cfg.OrchestratorVCPU,
-		RAM:          cfg.OrchestratorRAM,
-		TAP:          newTAP,
-		MAC:          newMAC,
-		ImageVersion: meta.Version,
-		ImageCommit:  meta.Commit,
-		ImageDigest:  meta.Digest,
-	})
-	state.ClearUpgradeIntent()
-	state.Save()
-
-	// Clean up old disk
-	os.Remove(oldOrch.Disk)
-
-	fmt.Printf("  Orchestrator upgraded (PID %d, bridge IP %s)\n", pid, newBridgeIP)
 }
 
 // waitForHealth polls a URL until it returns 200 or timeout expires.
