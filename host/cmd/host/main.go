@@ -195,8 +195,10 @@ func main() {
 		cliPushGolden()
 	case "recover":
 		cliRecover()
+	case "self-update":
+		cliSelfUpdate()
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|recover|version|build-image|push-golden>\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|recover|self-update|version|build-image|push-golden>\n\n")
 		fmt.Fprintf(os.Stderr, "Commands:\n")
 		fmt.Fprintf(os.Stderr, "  run                          Run the host daemon\n")
 		fmt.Fprintf(os.Stderr, "  status                       Show cluster status\n")
@@ -204,6 +206,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  bootstrap --from-source      Build from local repo and create VMs (dev)\n")
 		fmt.Fprintf(os.Stderr, "  bootstrap --version v0.1.0   Pull specific version of OCI images\n")
 		fmt.Fprintf(os.Stderr, "  recover                      Scan for running VMs and rebuild cluster.json\n")
+		fmt.Fprintf(os.Stderr, "  self-update [--version TAG]  Update boxcutter-host to latest stable release\n")
 		fmt.Fprintf(os.Stderr, "  pull <type> [--tag TAG]      Pull a VM image from OCI registry\n")
 		fmt.Fprintf(os.Stderr, "  upgrade <type> [--tag TAG]   Rolling upgrade of VMs\n")
 		os.Exit(1)
@@ -1738,9 +1741,6 @@ func cliBuildImage() {
 	fmt.Printf("Pushing %s image (tag: %s)...\n", vmType, tag)
 	ctx := context.Background()
 	tags := []string{tag}
-	if tag != "latest" {
-		tags = append(tags, "latest")
-	}
 
 	if err := oci.Push(ctx, oci.PushOptions{
 		Registry:   cfg.OCIRegistry,
@@ -1846,9 +1846,6 @@ func cliPushGolden() {
 	fmt.Printf("Pushing golden image (tag: %s)...\n", tag)
 	ctx := context.Background()
 	tags := []string{tag}
-	if tag != "latest" {
-		tags = append(tags, "latest")
-	}
 
 	if err := oci.Push(ctx, oci.PushOptions{
 		Registry:   cfg.OCIRegistry,
@@ -1908,6 +1905,172 @@ func cliRecover() {
 	state.Save()
 	fmt.Printf("\nState saved to %s\n", cfg.StatePath)
 	fmt.Println("You can now run: boxcutter-host run")
+}
+
+const githubRepo = "AndrewBudd/boxcutter"
+
+// cliSelfUpdate downloads and installs the latest stable boxcutter-host deb package
+// from GitHub Releases, then restarts the systemd service.
+//
+//	boxcutter-host self-update [--version TAG]
+func cliSelfUpdate() {
+	targetVersion := ""
+	for i := 2; i < len(os.Args); i++ {
+		if (os.Args[i] == "--version" || os.Args[i] == "--tag") && i+1 < len(os.Args) {
+			targetVersion = os.Args[i+1]
+			i++
+		}
+	}
+
+	type ghAsset struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	}
+	type ghRelease struct {
+		TagName    string    `json:"tag_name"`
+		Prerelease bool      `json:"prerelease"`
+		Draft      bool      `json:"draft"`
+		Assets     []ghAsset `json:"assets"`
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	makeReq := func(url string) *http.Request {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		// Use token if available for rate limits / private repos
+		token := os.Getenv("GITHUB_TOKEN")
+		if token == "" {
+			token = os.Getenv("GH_TOKEN")
+		}
+		if token == "" {
+			if out, err := exec.Command("gh", "auth", "token").Output(); err == nil {
+				token = strings.TrimSpace(string(out))
+			}
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "token "+token)
+		}
+		return req
+	}
+
+	var release ghRelease
+
+	if targetVersion != "" {
+		// Fetch specific release by tag
+		url := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", githubRepo, targetVersion)
+		resp, err := client.Do(makeReq(url))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to query GitHub: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			fmt.Fprintf(os.Stderr, "Release %s not found (HTTP %d)\n", targetVersion, resp.StatusCode)
+			os.Exit(1)
+		}
+		json.NewDecoder(resp.Body).Decode(&release)
+	} else {
+		// Find latest stable (non-prerelease, non-draft) release
+		url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=20", githubRepo)
+		resp, err := client.Do(makeReq(url))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to query GitHub: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			fmt.Fprintf(os.Stderr, "Failed to list releases (HTTP %d)\n", resp.StatusCode)
+			os.Exit(1)
+		}
+		var releases []ghRelease
+		json.NewDecoder(resp.Body).Decode(&releases)
+
+		found := false
+		for _, r := range releases {
+			if !r.Prerelease && !r.Draft {
+				release = r
+				found = true
+				break
+			}
+		}
+		if !found {
+			fmt.Fprintf(os.Stderr, "No stable release found. Use --version to specify a pre-release.\n")
+			os.Exit(1)
+		}
+	}
+
+	// Check if already running this version
+	if release.TagName == version {
+		fmt.Printf("Already running %s\n", version)
+		return
+	}
+
+	// Find the .deb asset
+	var debURL string
+	var debName string
+	for _, a := range release.Assets {
+		if strings.HasSuffix(a.Name, "_amd64.deb") {
+			debURL = a.BrowserDownloadURL
+			debName = a.Name
+			break
+		}
+	}
+	if debURL == "" {
+		fmt.Fprintf(os.Stderr, "No .deb package found in release %s\n", release.TagName)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Updating boxcutter-host: %s -> %s\n", version, release.TagName)
+	fmt.Printf("Downloading %s...\n", debName)
+
+	// Download the .deb
+	debPath := filepath.Join(os.TempDir(), debName)
+	resp, err := client.Get(debURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	f, err := os.Create(debPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create temp file: %v\n", err)
+		os.Exit(1)
+	}
+	written, err := io.Copy(f, resp.Body)
+	f.Close()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Downloaded %s (%d bytes)\n", debName, written)
+
+	// Install the .deb
+	fmt.Println("Installing...")
+	installCmd := exec.Command("dpkg", "-i", debPath)
+	installCmd.Stdout = os.Stdout
+	installCmd.Stderr = os.Stderr
+	if err := installCmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Installation failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Clean up
+	os.Remove(debPath)
+
+	// Restart the service
+	fmt.Println("Restarting boxcutter-host service...")
+	restartCmd := exec.Command("systemctl", "restart", "boxcutter-host")
+	restartCmd.Stdout = os.Stdout
+	restartCmd.Stderr = os.Stderr
+	if err := restartCmd.Run(); err != nil {
+		// Don't fail hard — the binary is already installed
+		fmt.Printf("Warning: could not restart service: %v\n", err)
+		fmt.Println("You may need to restart manually: systemctl restart boxcutter-host")
+	}
+
+	fmt.Printf("Updated to %s\n", release.TagName)
 }
 
 func parsePullArgs() (string, string) {

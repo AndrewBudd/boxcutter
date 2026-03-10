@@ -106,5 +106,6 @@ jobs:
             --clobber 2>/dev/null || \
           gh release create "$TAG" \
             --generate-notes \
+            --prerelease \
             .release/boxcutter-host-${TAG}-linux-amd64.tar.gz \
             .release/boxcutter-host_${DEB_VER}_amd64.deb
