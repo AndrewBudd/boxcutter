@@ -992,6 +992,9 @@ func (h *Handler) handleShutdown(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		time.Sleep(2 * time.Second)
+		// Release Tailscale hostname so the replacement VM can claim it
+		exec.Command("tailscale", "logout").Run()
+		time.Sleep(1 * time.Second)
 		exec.Command("shutdown", "-h", "now").Run()
 	}()
 }
