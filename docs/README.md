@@ -161,9 +161,21 @@ The `PLACEHOLDER` values are templated automatically per-VM during provisioning.
 
 ### Step 4: Build, install, and bootstrap
 
+**Option A: Install from deb (recommended for production)**
+
+```bash
+# Download latest stable release from GitHub Releases
+sudo boxcutter-host self-update --version v0.2.0
+# Or manually: wget + dpkg -i (see "Installation via Deb Package" above)
+
+sudo boxcutter-host bootstrap --version v0.2.0
+```
+
+**Option B: Build from source (for development)**
+
 ```bash
 make install-host
-sudo env BOXCUTTER_REPO=$PWD boxcutter-host bootstrap
+sudo env BOXCUTTER_REPO=$PWD boxcutter-host bootstrap --from-source
 ```
 
 That's it. Bootstrap handles everything:
@@ -243,6 +255,94 @@ The `boxcutter-host` systemd service handles reboots automatically:
 
 No manual intervention needed.
 
+## Installation via Deb Package
+
+Instead of building from source, you can install the pre-built deb package from GitHub Releases:
+
+```bash
+# Download the latest release
+wget https://github.com/AndrewBudd/boxcutter/releases/download/v0.2.0/boxcutter-host_0.2.0_amd64.deb
+
+# Install
+sudo dpkg -i boxcutter-host_0.2.0_amd64.deb
+
+# Bootstrap the cluster
+sudo boxcutter-host bootstrap --version v0.2.0
+```
+
+The deb package installs:
+- `/usr/local/bin/boxcutter-host` -- control plane binary
+- `/etc/systemd/system/boxcutter-host.service` -- systemd unit
+- `/usr/share/boxcutter/` -- provisioning scripts, cloud-init templates, config
+- `/var/lib/boxcutter/.images/` -- VM image storage
+
+## Releases and Upgrades
+
+### Release Model
+
+Every tagged push (`v*`) triggers CI which:
+
+1. Builds node and orchestrator VM images (QCOW2) and pushes them to `ghcr.io`
+2. Builds the `boxcutter-host` binary, tarball, and deb package
+3. Creates a GitHub Release marked as **pre-release**
+
+Releases start as pre-release so you can test before promoting to stable. OCI images are tagged only with their version (e.g., `v0.3.0`) -- there is no auto-updated `latest` tag.
+
+### Promoting a Release
+
+After testing a pre-release, mark it as stable:
+
+```bash
+gh release edit v0.3.0 --prerelease=false
+```
+
+Only stable (non-prerelease) releases are picked up by `self-update`.
+
+### Upgrading boxcutter-host
+
+The `self-update` command downloads and installs the latest stable deb from GitHub Releases:
+
+```bash
+# Update to the latest stable release
+sudo boxcutter-host self-update
+
+# Update to a specific version (even pre-release)
+sudo boxcutter-host self-update --version v0.3.0
+```
+
+This downloads the deb, installs it via `dpkg -i`, and restarts the systemd service.
+
+### Upgrading VM Images
+
+After updating the binary, upgrade the running VMs:
+
+```bash
+# Rolling upgrade of all VMs (pulls new images from ghcr.io)
+sudo boxcutter-host upgrade all --tag v0.3.0
+
+# Or upgrade individually
+sudo boxcutter-host upgrade node --tag v0.3.0
+sudo boxcutter-host upgrade orchestrator --tag v0.3.0
+
+# Update the golden image (Firecracker rootfs, nodes pull via MQTT)
+sudo boxcutter-host upgrade golden --tag v0.3.0
+```
+
+If `--tag` is omitted, the binary's own version is used (set at build time).
+
+### Full Upgrade Workflow
+
+```bash
+# 1. Update the host binary
+sudo boxcutter-host self-update
+
+# 2. Upgrade the VMs to match
+sudo boxcutter-host upgrade all
+
+# 3. Verify
+sudo boxcutter-host version
+```
+
 ## Image Build and Publish
 
 VM base images are distributed as OCI artifacts via `ghcr.io`. The images are public -- anyone can pull without authentication.
@@ -269,21 +369,23 @@ make build-image TYPE=node
 
 Pushing requires `gh auth login` (GitHub CLI authentication).
 
-### Upgrading a running cluster
+## State Recovery
+
+If `cluster.json` is lost or corrupted (e.g., after replacing the `boxcutter-host` binary or reinstalling), the `recover` command scans `/proc` for running QEMU processes and reconstructs the cluster state:
 
 ```bash
-# Pull latest images from OCI and rolling-upgrade all VMs
-sudo boxcutter-host upgrade all
-
-# Upgrade just nodes (rolls out new node, drains old, zero VM downtime)
-sudo boxcutter-host upgrade node
-
-# Upgrade just the orchestrator (migrates state to new instance)
-sudo boxcutter-host upgrade orchestrator
-
-# Update the golden image (nodes pull via MQTT)
-sudo boxcutter-host upgrade golden
+sudo boxcutter-host recover
 ```
+
+This finds all running QEMU VMs, extracts their identity (disk path, TAP device, MAC address, CPU/RAM) from the process command line, and rebuilds `cluster.json`. Existing VMs are preserved -- nothing is stopped or restarted.
+
+After recovery, start the daemon as usual:
+
+```bash
+sudo systemctl restart boxcutter-host
+```
+
+The daemon also runs recovery automatically on startup before launching any VMs, so already-running VMs from a previous session are adopted rather than duplicated.
 
 ## Migration
 
