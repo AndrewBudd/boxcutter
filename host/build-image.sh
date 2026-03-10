@@ -40,14 +40,13 @@ if [ "$VM_TYPE" != "node" ] && [ "$VM_TYPE" != "orchestrator" ] && [ "$VM_TYPE" 
 fi
 
 cleanup() {
-  [ -n "$BUILD_DIR" ] && rm -rf "$BUILD_DIR"
+  set +eu  # don't fail in cleanup
+  [ -n "${BUILD_DIR:-}" ] && rm -rf "$BUILD_DIR"
   # Kill any leftover QEMU from this build
-  [ -f "${IMAGES_DIR}/build-${VM_TYPE}.pid" ] && {
-    local pid
-    pid=$(cat "${IMAGES_DIR}/build-${VM_TYPE}.pid" 2>/dev/null) || true
-    kill "$pid" 2>/dev/null || true
+  if [ -f "${IMAGES_DIR}/build-${VM_TYPE}.pid" ]; then
+    kill "$(cat "${IMAGES_DIR}/build-${VM_TYPE}.pid" 2>/dev/null)" 2>/dev/null || true
     rm -f "${IMAGES_DIR}/build-${VM_TYPE}.pid"
-  }
+  fi
 }
 trap cleanup EXIT
 
@@ -655,3 +654,5 @@ echo "Push to OCI registry:"
 echo "  oras push ghcr.io/AndrewBudd/boxcutter/${VM_TYPE}:VERSION \\"
 echo "    --artifact-type application/vnd.boxcutter.vm.v1 \\"
 echo "    ${OUTPUT_ZST}:application/vnd.boxcutter.vm.qcow2.v1+zstd"
+
+exit 0
