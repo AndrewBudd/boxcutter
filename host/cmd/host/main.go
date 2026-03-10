@@ -671,6 +671,7 @@ func addNode(cfg HostConfig, state *cluster.State) {
 		provisionCmd := exec.Command("bash", hostFile(cfg, "provision.sh"),
 			"node", nodeID, "--from-image")
 		provisionCmd.Dir = cfg.RepoDir
+		provisionCmd.Env = append(os.Environ(), "BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir)
 		if out, err := provisionCmd.CombinedOutput(); err != nil {
 			log.Printf("Failed to provision %s: %v\n%s", nodeID, err, string(out))
 			return
@@ -1588,6 +1589,7 @@ func generateCloudInitISOWithOutput(cfg HostConfig, vmType, name, outputPath str
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	env := os.Environ()
+	env = append(env, "BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir)
 	if outputPath != "" {
 		env = append(env, "CLOUD_INIT_OUTPUT="+outputPath)
 	}
@@ -2016,6 +2018,7 @@ func buildFromSource(cfg HostConfig, vmType string) error {
 	cmd.Dir = cfg.RepoDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), "BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("provision.sh %s: %w", vmType, err)
 	}

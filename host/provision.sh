@@ -9,10 +9,15 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="${SCRIPT_DIR}/.."
+# When installed via deb, cloud-init/ is under SCRIPT_DIR; in the repo it's at SCRIPT_DIR/../cloud-init
+if [ -d "${SCRIPT_DIR}/cloud-init" ]; then
+  REPO_DIR="${SCRIPT_DIR}"
+else
+  REPO_DIR="${SCRIPT_DIR}/.."
+fi
 source "${SCRIPT_DIR}/boxcutter.env"
 
-IMAGES_DIR="${REPO_DIR}/.images"
+IMAGES_DIR="${BOXCUTTER_IMAGES_DIR:-${REPO_DIR}/.images}"
 # Find bootstrap bundle: check BOXCUTTER_BUNDLE env, then SUDO_USER's home, then HOME
 if [ -n "${BOXCUTTER_BUNDLE:-}" ]; then
   BUNDLE_DIR="$BOXCUTTER_BUNDLE"
