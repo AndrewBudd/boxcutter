@@ -69,7 +69,12 @@ Other modules are validated through integration testing on real VMs.
 
 ## Documentation
 
-- `docs/architecture.md` — Full system architecture
-- `docs/network-architecture.md` — TAP/fwmark routing, vmid, proxy, packet flows
-- `docs/development.md` — Building, deploying, iterating on each component
+Top-level:
+- `docs/architecture.md` — System overview, domain boundaries, communication patterns
+- `docs/development.md` — Prerequisites, code layout, build targets, CI/CD
 - `docs/README.md` — Quick start / bootstrap guide
+
+Domain-specific (architecture, networking, development):
+- `host/docs/` — Host control plane internals
+- `orchestrator/docs/` — Orchestrator internals
+- `node/docs/` — Node internals (fwmark routing, vmid, proxy, packet flows)

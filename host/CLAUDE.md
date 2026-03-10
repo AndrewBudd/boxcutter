@@ -57,6 +57,12 @@ cd host && go build -o boxcutter-host ./cmd/host/
 make install-host    # build + copy to /usr/local/bin + install systemd unit
 ```
 
+## Detailed Documentation
+
+- `docs/architecture.md` — Bootstrap, boot recovery, health monitoring, auto-scaling, OCI distribution, secrets
+- `docs/network.md` — Bridge setup, NAT, MQTT broker
+- `docs/development.md` — Building, deploying, debugging, image publishing, upgrading
+
 ## Domain Boundary
 
 This component **owns**:
