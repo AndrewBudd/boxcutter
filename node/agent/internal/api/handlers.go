@@ -14,6 +14,7 @@ import (
 
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/golden"
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/vm"
+	"github.com/AndrewBudd/boxcutter/node/agent/internal/vmid"
 )
 
 type Handler struct {
@@ -49,6 +50,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
+
+	// Wingman endpoints
+	mux.HandleFunc("GET /api/vms/{name}/activity", h.handleGetActivity)
+	mux.HandleFunc("POST /api/vms/{name}/inbox", h.handlePostInbox)
+	mux.HandleFunc("GET /api/wingman/activity", h.handleWingmanActivity)
 }
 
 // progressEvent is a NDJSON line streamed during VM creation.
@@ -545,4 +551,43 @@ func extractStopStartName(path string) string {
 		return path[:i]
 	}
 	return path
+}
+
+func (h *Handler) handleGetActivity(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+	activity, err := h.mgr.GetActivity(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, activity)
+}
+
+func (h *Handler) handlePostInbox(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+	var msg vmid.Message
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.mgr.SendMessage(name, &msg); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) {
+	activity, err := h.mgr.AllActivity()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, activity)
 }

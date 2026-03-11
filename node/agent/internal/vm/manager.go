@@ -1864,3 +1864,35 @@ func (m *Manager) ImportVM(st *VMState) (*CreateResponse, error) {
 
 	return m.startVM(st, nil)
 }
+
+// GetActivity returns a VM's latest wingman activity report.
+func (m *Manager) GetActivity(name string) (*vmid.ActivityReport, error) {
+	if m.vmid == nil {
+		return nil, fmt.Errorf("vmid client not configured")
+	}
+	vmDir := VMDir(name)
+	if _, err := LoadVMState(vmDir); err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+	return m.vmid.GetVMActivity(name)
+}
+
+// SendMessage sends a wingman message to a VM.
+func (m *Manager) SendMessage(name string, msg *vmid.Message) error {
+	if m.vmid == nil {
+		return fmt.Errorf("vmid client not configured")
+	}
+	vmDir := VMDir(name)
+	if _, err := LoadVMState(vmDir); err != nil {
+		return fmt.Errorf("VM '%s' not found", name)
+	}
+	return m.vmid.PostMessage(name, msg)
+}
+
+// AllActivity returns wingman activity for all VMs on this node.
+func (m *Manager) AllActivity() ([]vmid.VMActivitySummary, error) {
+	if m.vmid == nil {
+		return nil, fmt.Errorf("vmid client not configured")
+	}
+	return m.vmid.GetAllActivity()
+}

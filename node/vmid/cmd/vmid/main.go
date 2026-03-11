@@ -102,6 +102,8 @@ func main() {
 	vmMux := http.NewServeMux()
 	metaHandler := api.NewMetadataHandler(jwtIssuer, githubMinter, sentinelStore, cfg.Metadata)
 	metaHandler.Register(vmMux)
+	wingmanHandler := api.NewWingmanHandler(reg)
+	wingmanHandler.Register(vmMux)
 
 	identityMiddleware := middleware.Identity(reg)
 
