@@ -1,0 +1,81 @@
+#!/bin/bash
+# Wingman agent communication daemon.
+# Periodically captures tmux pane content and posts it to the metadata service.
+# Checks for incoming messages and writes them to the inbox file.
+# Messages with send_keys=true are also injected into tmux.
+
+METADATA="http://169.254.169.254"
+INBOX_DIR="/home/dev/.wingman"
+INBOX_FILE="${INBOX_DIR}/inbox.json"
+POLL_INTERVAL=5
+
+mkdir -p "$INBOX_DIR"
+chown 1000:1000 "$INBOX_DIR"
+
+# Wait for metadata service
+for i in $(seq 1 30); do
+  if curl -sf -o /dev/null --max-time 2 "${METADATA}/identity" 2>/dev/null; then
+    break
+  fi
+  [ "$i" -eq 30 ] && { echo "wingman: metadata service not reachable"; exit 1; }
+  sleep 1
+done
+
+echo "wingman: daemon started (poll every ${POLL_INTERVAL}s)"
+
+while true; do
+    # --- Post activity ---
+    if tmux has-session 2>/dev/null; then
+        PANE_CONTENT=$(tmux capture-pane -p -t 0 2>/dev/null | tail -50)
+        if [ -n "$PANE_CONTENT" ]; then
+            STATUS="active"
+        else
+            STATUS="idle"
+        fi
+        # Build JSON payload — use jq for safe escaping
+        if command -v jq >/dev/null 2>&1; then
+            PAYLOAD=$(jq -n \
+                --arg content "$PANE_CONTENT" \
+                --arg status "$STATUS" \
+                '{pane_content: $content, status: $status}')
+        else
+            # Fallback: Python for JSON escaping
+            PAYLOAD=$(python3 -c "
+import json, sys
+print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< "$PANE_CONTENT")
+        fi
+        curl -sf -X POST "${METADATA}/wingman/activity" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            2>/dev/null || true
+    fi
+
+    # --- Check inbox ---
+    MSGS=$(curl -sf "${METADATA}/wingman/inbox" 2>/dev/null)
+    if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ] && [ "$MSGS" != "null" ]; then
+        # Append to inbox file (create if missing)
+        if [ -f "$INBOX_FILE" ]; then
+            # Merge new messages into existing array
+            if command -v jq >/dev/null 2>&1; then
+                jq -s '.[0] + .[1]' "$INBOX_FILE" <(echo "$MSGS") > "${INBOX_FILE}.tmp" \
+                    && mv "${INBOX_FILE}.tmp" "$INBOX_FILE"
+            else
+                echo "$MSGS" > "$INBOX_FILE"
+            fi
+        else
+            echo "$MSGS" > "$INBOX_FILE"
+        fi
+        chown 1000:1000 "$INBOX_FILE"
+
+        # Inject send_keys messages into tmux
+        if command -v jq >/dev/null 2>&1 && tmux has-session 2>/dev/null; then
+            echo "$MSGS" | jq -r '.[] | select(.send_keys == true or .priority == "urgent") | .body' | while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                    tmux send-keys -t 0 "$line" Enter
+                fi
+            done
+        fi
+    fi
+
+    sleep "$POLL_INTERVAL"
+done

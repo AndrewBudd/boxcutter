@@ -1,0 +1,13 @@
+[Unit]
+Description=Wingman agent communication daemon
+After=network-online.target boxcutter-metadata.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/boxcutter-wingman
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -32,6 +32,12 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/sentinel/{sentinel}", h.handleSentinelSwap)
+
+	// Wingman endpoints
+	mux.HandleFunc("GET /internal/vms/{id}/activity", h.handleGetActivity)
+	mux.HandleFunc("POST /internal/vms/{id}/inbox", h.handlePostInbox)
+	mux.HandleFunc("GET /internal/vms/{id}/inbox", h.handleGetInbox)
+	mux.HandleFunc("GET /internal/wingman/activity", h.handleAllActivity)
 }
 
 type registerRequest struct {
@@ -214,6 +220,56 @@ func (h *AdminHandler) handleSentinelSwap(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, map[string]string{"token": real})
+}
+
+func (h *AdminHandler) handleGetActivity(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	activity, ok := h.reg.GetActivity(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, activity)
+}
+
+func (h *AdminHandler) handlePostInbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	var msg registry.Message
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !h.reg.PushMessage(id, &msg) {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (h *AdminHandler) handleGetInbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	msgs, ok := h.reg.PeekInbox(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	if msgs == nil {
+		msgs = []*registry.Message{}
+	}
+	writeJSON(w, msgs)
+}
+
+func (h *AdminHandler) handleAllActivity(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, h.reg.AllActivity())
 }
 
 func extractPathID(path, prefix string) string {
