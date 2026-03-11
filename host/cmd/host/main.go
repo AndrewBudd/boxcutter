@@ -63,6 +63,9 @@ type HostConfig struct {
 	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
 	MaxNodes              int           // Hard cap on node count (0 = limited only by resources)
 
+	// Bootstrap bundle (secrets + config)
+	BundleDir string // Path to ~/.boxcutter/ bundle directory
+
 	// OCI image distribution
 	OCIRegistry   string // OCI registry (default: ghcr.io)
 	OCIRepository string // Repository path (default: AndrewBudd/boxcutter)
@@ -110,8 +113,45 @@ func defaultConfig() HostConfig {
 		// No repo found — use /var/lib/boxcutter as data directory (prod mode)
 		repoDir = "/var/lib/boxcutter"
 	}
+
+	// Find bootstrap bundle: BOXCUTTER_BUNDLE env, then SUDO_USER's home, then invoking user's home
+	bundleDir := os.Getenv("BOXCUTTER_BUNDLE")
+	if bundleDir == "" {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			if u, err := user.Lookup(sudoUser); err == nil {
+				candidate := filepath.Join(u.HomeDir, ".boxcutter")
+				if fileExists(filepath.Join(candidate, "boxcutter.yaml")) {
+					bundleDir = candidate
+				}
+			}
+		}
+	}
+	if bundleDir == "" {
+		// Try the user who owns the binary (handles systemd running as root)
+		exe, _ := os.Executable()
+		if exe != "" {
+			if info, err := os.Stat(exe); err == nil {
+				if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+					if u, err := user.LookupId(fmt.Sprintf("%d", stat.Uid)); err == nil {
+						candidate := filepath.Join(u.HomeDir, ".boxcutter")
+						if fileExists(filepath.Join(candidate, "boxcutter.yaml")) {
+							bundleDir = candidate
+						}
+					}
+				}
+			}
+		}
+	}
+	if bundleDir == "" {
+		// Fallback: current user's home
+		if u, err := user.Current(); err == nil {
+			bundleDir = filepath.Join(u.HomeDir, ".boxcutter")
+		}
+	}
+
 	return HostConfig{
 		RepoDir:            repoDir,
+		BundleDir:          bundleDir,
 		ImagesDir:          repoDir + "/.images",
 		HostNIC:            detectDefaultNIC(),
 		BridgeDevice:       "br-boxcutter",
@@ -887,12 +927,11 @@ func canScaleUp(cfg HostConfig, currentNodeCount int) (bool, string) {
 			afterLaunchMB, availMB, nodeRAMMB, nodeRAMMB, cfg.MinFreeMemoryMB)
 	}
 
-	// Also enforce MaxNodes against memory-based ceiling:
-	// memory-based max = floor((availMB - MinFreeMemoryMB) / nodeRAMMB) - 1 (rolling upgrade reserve)
+	// Also enforce MaxNodes against memory-based ceiling.
+	// The rolling upgrade reserve is already enforced by the requiredMB check above
+	// (which ensures room for thisNode + upgradeNode + minFree), so we don't subtract
+	// an additional slot here.
 	memoryBasedMax := (availMB - cfg.MinFreeMemoryMB) / nodeRAMMB
-	if memoryBasedMax > 1 {
-		memoryBasedMax-- // reserve one slot for rolling upgrade
-	}
 	effectiveMax := memoryBasedMax
 	if cfg.MaxNodes > 0 && cfg.MaxNodes < effectiveMax {
 		effectiveMax = cfg.MaxNodes
@@ -949,7 +988,9 @@ func addNode(cfg HostConfig, state *cluster.State) {
 		provisionCmd := exec.Command("bash", hostFile(cfg, "provision.sh"),
 			"node", nodeID, "--from-image")
 		provisionCmd.Dir = cfg.RepoDir
-		provisionCmd.Env = append(os.Environ(), "BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir)
+		provisionCmd.Env = append(os.Environ(),
+			"BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir,
+			"BOXCUTTER_BUNDLE="+cfg.BundleDir)
 		if out, err := provisionCmd.CombinedOutput(); err != nil {
 			log.Printf("Failed to provision %s: %v\n%s", nodeID, err, string(out))
 			return
@@ -2191,6 +2232,7 @@ func generateCloudInitISOWithOutput(cfg HostConfig, vmType, name, outputPath str
 	cmd.Stderr = os.Stderr
 	env := os.Environ()
 	env = append(env, "BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir)
+	env = append(env, "BOXCUTTER_BUNDLE="+cfg.BundleDir)
 	if outputPath != "" {
 		env = append(env, "CLOUD_INIT_OUTPUT="+outputPath)
 	}
@@ -2779,7 +2821,9 @@ func buildFromSource(cfg HostConfig, vmType string) error {
 	cmd.Dir = cfg.RepoDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir)
+	cmd.Env = append(os.Environ(),
+		"BOXCUTTER_IMAGES_DIR="+cfg.ImagesDir,
+		"BOXCUTTER_BUNDLE="+cfg.BundleDir)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("provision.sh %s: %w", vmType, err)
 	}
