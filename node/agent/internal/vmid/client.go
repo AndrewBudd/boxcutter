@@ -142,6 +142,79 @@ func (c *Client) GHCRToken() (string, error) {
 	return tok.Token, nil
 }
 
+// ActivityReport mirrors the registry type for JSON decoding.
+type ActivityReport struct {
+	Timestamp   string `json:"timestamp"`
+	PaneContent string `json:"pane_content"`
+	Status      string `json:"status"`
+	Summary     string `json:"summary,omitempty"`
+}
+
+// Message mirrors the registry type for JSON encoding/decoding.
+type Message struct {
+	ID        string  `json:"id"`
+	From      string  `json:"from"`
+	Body      string  `json:"body"`
+	Priority  string  `json:"priority"`
+	SendKeys  bool    `json:"send_keys,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	ReadAt    *string `json:"read_at,omitempty"`
+}
+
+// VMActivitySummary mirrors the registry type.
+type VMActivitySummary struct {
+	VMID            string          `json:"vm_id"`
+	LastActivity    *ActivityReport `json:"last_activity,omitempty"`
+	PendingMessages int             `json:"pending_messages"`
+}
+
+// GetVMActivity returns a VM's latest activity report.
+func (c *Client) GetVMActivity(vmID string) (*ActivityReport, error) {
+	resp, err := c.http.Get("http://localhost/internal/vms/" + vmID + "/activity")
+	if err != nil {
+		return nil, fmt.Errorf("vmid get activity: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vmid get activity: status %d", resp.StatusCode)
+	}
+	var report ActivityReport
+	json.NewDecoder(resp.Body).Decode(&report)
+	return &report, nil
+}
+
+// PostMessage sends a message to a VM's inbox.
+func (c *Client) PostMessage(vmID string, msg *Message) error {
+	body, _ := json.Marshal(msg)
+	resp, err := c.http.Post("http://localhost/internal/vms/"+vmID+"/inbox", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("vmid post message: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("vmid post message: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// GetAllActivity returns wingman activity summaries for all VMs.
+func (c *Client) GetAllActivity() ([]VMActivitySummary, error) {
+	resp, err := c.http.Get("http://localhost/internal/wingman/activity")
+	if err != nil {
+		return nil, fmt.Errorf("vmid all activity: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vmid all activity: status %d", resp.StatusCode)
+	}
+	var summaries []VMActivitySummary
+	json.NewDecoder(resp.Body).Decode(&summaries)
+	return summaries, nil
+}
+
 func (c *Client) Healthy() bool {
 	resp, err := c.http.Get("http://localhost/healthz")
 	if err != nil {

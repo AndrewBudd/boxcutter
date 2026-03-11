@@ -167,6 +167,12 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
+
+	// Wingman
+	mux.HandleFunc("GET /api/wingman/activity", h.handleWingmanActivity)
+	mux.HandleFunc("GET /api/wingman/activity/{name}", h.handleWingmanVMActivity)
+	mux.HandleFunc("POST /api/wingman/message/{name}", h.handleWingmanMessage)
+	mux.HandleFunc("POST /api/wingman/broadcast", h.handleWingmanBroadcast)
 }
 
 // --- Node handlers ---
@@ -1148,4 +1154,242 @@ func extractPathSegment(path, prefix, suffix string) string {
 	s := strings.TrimPrefix(path, prefix)
 	s = strings.TrimSuffix(s, suffix)
 	return s
+}
+
+// --- Wingman handlers ---
+
+type wingmanActivityEntry struct {
+	Name        string                       `json:"name"`
+	NodeID      string                       `json:"node_id"`
+	NodeName    string                       `json:"node_name"`
+	VMStatus    string                       `json:"vm_status"`
+	Activity    *node.WingmanActivityReport  `json:"activity,omitempty"`
+	PendingMsgs int                          `json:"pending_messages"`
+}
+
+func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) {
+	vms, err := h.db.ListVMs()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Group VMs by node
+	nodeVMs := make(map[string][]*db.VM)
+	for _, v := range vms {
+		nodeVMs[v.NodeID] = append(nodeVMs[v.NodeID], v)
+	}
+
+	// Fan out to each node
+	type nodeResult struct {
+		nodeID   string
+		activity map[string]*node.WingmanVMActivity // vmid -> activity
+	}
+	results := make(chan nodeResult, len(nodeVMs))
+
+	for nodeID := range nodeVMs {
+		go func(nid string) {
+			nr := nodeResult{nodeID: nid, activity: make(map[string]*node.WingmanVMActivity)}
+			n, err := h.db.GetNode(nid)
+			if err != nil || n.APIAddr == "" {
+				results <- nr
+				return
+			}
+			fc := node.NewFastClient(n.APIAddr)
+			activities := fc.GetAllActivity()
+			for i := range activities {
+				nr.activity[activities[i].VMID] = &activities[i]
+			}
+			results <- nr
+		}(nodeID)
+	}
+
+	// Collect
+	activityByNode := make(map[string]map[string]*node.WingmanVMActivity)
+	for range nodeVMs {
+		nr := <-results
+		activityByNode[nr.nodeID] = nr.activity
+	}
+
+	// Build response
+	var entries []wingmanActivityEntry
+	for _, v := range vms {
+		n, _ := h.db.GetNode(v.NodeID)
+		nodeName := v.NodeID
+		if n != nil {
+			nodeName = n.TailscaleName
+		}
+
+		entry := wingmanActivityEntry{
+			Name:     v.Name,
+			NodeID:   v.NodeID,
+			NodeName: nodeName,
+			VMStatus: v.Status,
+		}
+
+		if nodeAct, ok := activityByNode[v.NodeID]; ok {
+			if act, ok := nodeAct[v.Name]; ok {
+				entry.Activity = act.LastActivity
+				entry.PendingMsgs = act.PendingMessages
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+
+	writeJSON(w, entries)
+}
+
+func (h *Handler) handleWingmanVMActivity(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/wingman/activity/")
+	}
+
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+
+	n, err := h.db.GetNode(v.NodeID)
+	if err != nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	fc := node.NewFastClient(n.APIAddr)
+	activities := fc.GetAllActivity()
+	for _, act := range activities {
+		if act.VMID == name {
+			nodeName := v.NodeID
+			if n != nil {
+				nodeName = n.TailscaleName
+			}
+			writeJSON(w, wingmanActivityEntry{
+				Name:        v.Name,
+				NodeID:      v.NodeID,
+				NodeName:    nodeName,
+				VMStatus:    v.Status,
+				Activity:    act.LastActivity,
+				PendingMsgs: act.PendingMessages,
+			})
+			return
+		}
+	}
+
+	// VM exists but no activity data yet
+	nodeName := v.NodeID
+	if n != nil {
+		nodeName = n.TailscaleName
+	}
+	writeJSON(w, wingmanActivityEntry{
+		Name:     v.Name,
+		NodeID:   v.NodeID,
+		NodeName: nodeName,
+		VMStatus: v.Status,
+	})
+}
+
+func (h *Handler) handleWingmanMessage(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/wingman/message/")
+	}
+
+	var msg node.WingmanMessage
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if msg.ID == "" {
+		msg.ID = fmt.Sprintf("wm-%d", time.Now().UnixNano())
+	}
+	if msg.CreatedAt == "" {
+		msg.CreatedAt = time.Now().Format(time.RFC3339)
+	}
+
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+
+	n, err := h.db.GetNode(v.NodeID)
+	if err != nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	nc := node.NewClient(n.APIAddr)
+	if err := nc.SendWingmanMessage(name, &msg); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]string{"status": "sent", "message_id": msg.ID})
+}
+
+func (h *Handler) handleWingmanBroadcast(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Body     string `json:"body"`
+		From     string `json:"from"`
+		Priority string `json:"priority"`
+		SendKeys bool   `json:"send_keys,omitempty"`
+		Filter   string `json:"filter,omitempty"` // optional: "running", "stopped"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Body == "" {
+		http.Error(w, "body is required", http.StatusBadRequest)
+		return
+	}
+	if req.Priority == "" {
+		req.Priority = "normal"
+	}
+
+	vms, err := h.db.ListVMs()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var sent []string
+	var failed []string
+
+	for _, v := range vms {
+		if req.Filter != "" && v.Status != req.Filter {
+			continue
+		}
+
+		n, err := h.db.GetNode(v.NodeID)
+		if err != nil || n.APIAddr == "" {
+			failed = append(failed, v.Name)
+			continue
+		}
+
+		msg := &node.WingmanMessage{
+			ID:        fmt.Sprintf("wm-%d-%s", time.Now().UnixNano(), v.Name),
+			From:      req.From,
+			Body:      req.Body,
+			Priority:  req.Priority,
+			SendKeys:  req.SendKeys,
+			CreatedAt: time.Now().Format(time.RFC3339),
+		}
+
+		nc := node.NewClient(n.APIAddr)
+		if err := nc.SendWingmanMessage(v.Name, msg); err != nil {
+			failed = append(failed, v.Name)
+			continue
+		}
+		sent = append(sent, v.Name)
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"sent":   sent,
+		"failed": failed,
+	})
 }

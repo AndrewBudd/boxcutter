@@ -460,3 +460,59 @@ func (c *Client) ListVMs() ([]json.RawMessage, error) {
 	json.NewDecoder(resp.Body).Decode(&vms)
 	return vms, nil
 }
+
+// WingmanActivityReport is a VM's latest activity snapshot.
+type WingmanActivityReport struct {
+	Timestamp   string `json:"timestamp"`
+	PaneContent string `json:"pane_content"`
+	Status      string `json:"status"`
+	Summary     string `json:"summary,omitempty"`
+}
+
+// WingmanMessage is a directive sent to a VM by the wingman.
+type WingmanMessage struct {
+	ID        string  `json:"id"`
+	From      string  `json:"from"`
+	Body      string  `json:"body"`
+	Priority  string  `json:"priority"`
+	SendKeys  bool    `json:"send_keys,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	ReadAt    *string `json:"read_at,omitempty"`
+}
+
+// WingmanVMActivity is a summary of a VM's wingman state.
+type WingmanVMActivity struct {
+	VMID            string                 `json:"vm_id"`
+	LastActivity    *WingmanActivityReport `json:"last_activity,omitempty"`
+	PendingMessages int                    `json:"pending_messages"`
+}
+
+// GetAllActivity returns wingman activity for all VMs on a node. Returns nil on error.
+func (c *FastClient) GetAllActivity() []WingmanVMActivity {
+	resp, err := c.http.Get(c.baseURL + "/api/wingman/activity")
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil
+	}
+	var activity []WingmanVMActivity
+	json.NewDecoder(resp.Body).Decode(&activity)
+	return activity
+}
+
+// SendWingmanMessage sends a message to a specific VM on the node.
+func (c *Client) SendWingmanMessage(vmName string, msg *WingmanMessage) error {
+	body, _ := json.Marshal(msg)
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+vmName+"/inbox", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("wingman message: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("wingman message: %s", string(errBody))
+	}
+	return nil
+}
