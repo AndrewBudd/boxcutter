@@ -161,10 +161,17 @@ type Message struct {
 	ReadAt    *string `json:"read_at,omitempty"`
 }
 
+// StatusReport is a self-reported status from Claude Code inside the VM.
+type StatusReport struct {
+	Timestamp string `json:"timestamp"`
+	Status    string `json:"status"`
+}
+
 // VMActivitySummary mirrors the registry type.
 type VMActivitySummary struct {
 	VMID            string          `json:"vm_id"`
 	LastActivity    *ActivityReport `json:"last_activity,omitempty"`
+	LastStatus      *StatusReport   `json:"last_status,omitempty"`
 	PendingMessages int             `json:"pending_messages"`
 }
 

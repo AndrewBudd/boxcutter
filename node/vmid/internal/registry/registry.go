@@ -14,6 +14,12 @@ type ActivityReport struct {
 	Summary     string    `json:"summary,omitempty"`
 }
 
+// StatusReport is a self-reported status from Claude Code inside the VM.
+type StatusReport struct {
+	Timestamp time.Time `json:"timestamp"`
+	Status    string    `json:"status"` // last assistant message or summary
+}
+
 // Message is a directive sent to a VM by an external tapegun agent.
 type Message struct {
 	ID        string     `json:"id"`
@@ -29,6 +35,7 @@ type Message struct {
 type VMActivitySummary struct {
 	VMID            string          `json:"vm_id"`
 	LastActivity    *ActivityReport `json:"last_activity,omitempty"`
+	LastStatus      *StatusReport   `json:"last_status,omitempty"`
 	PendingMessages int             `json:"pending_messages"`
 }
 
@@ -42,6 +49,7 @@ type VMRecord struct {
 	GitHubRepos []string          `json:"github_repos,omitempty"` // all repos
 
 	LastActivity *ActivityReport `json:"last_activity,omitempty"`
+	LastStatus   *StatusReport   `json:"last_status,omitempty"`
 	Inbox        []*Message      `json:"inbox,omitempty"`
 }
 
@@ -82,6 +90,11 @@ func (r *VMRecord) RemoveRepo(repo string) bool {
 // SetActivity replaces the VM's latest activity report.
 func (r *VMRecord) SetActivity(report *ActivityReport) {
 	r.LastActivity = report
+}
+
+// SetStatus replaces the VM's latest self-reported Claude Code status.
+func (r *VMRecord) SetStatus(status *StatusReport) {
+	r.LastStatus = status
 }
 
 // PushMessage appends a message to the VM's inbox.
@@ -212,6 +225,18 @@ func (r *Registry) SetActivity(vmID string, report *ActivityReport) bool {
 	return true
 }
 
+// SetStatus updates a VM's self-reported Claude Code status under the registry lock.
+func (r *Registry) SetStatus(vmID string, status *StatusReport) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.SetStatus(status)
+	return true
+}
+
 // PushMessage adds a message to a VM's inbox under the registry lock.
 func (r *Registry) PushMessage(vmID string, msg *Message) bool {
 	r.mu.Lock()
@@ -280,6 +305,7 @@ func (r *Registry) AllActivity() []VMActivitySummary {
 		summaries = append(summaries, VMActivitySummary{
 			VMID:            rec.VMID,
 			LastActivity:    rec.LastActivity,
+			LastStatus:      rec.LastStatus,
 			PendingMessages: rec.PendingCount(),
 		})
 	}
