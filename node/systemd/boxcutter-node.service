@@ -8,6 +8,7 @@ Type=simple
 ExecStart=/usr/local/bin/boxcutter-node -config /etc/boxcutter/boxcutter.yaml
 Restart=always
 RestartSec=5
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

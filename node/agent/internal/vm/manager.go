@@ -479,6 +479,22 @@ func (m *Manager) RestartAll() {
 
 	for _, st := range vms {
 		vmDir := VMDir(st.Name)
+
+		// If a migration was in progress when the agent died, the VM might
+		// be paused with a stale "migrating" marker. Resume it.
+		if IsMigrating(vmDir) && IsRunning(vmDir) {
+			log.Printf("  %s: stale migration marker found, resuming paused VM", st.Name)
+			if err := fcResume(vmDir); err != nil {
+				log.Printf("  %s: resume failed (will restart from scratch): %v", st.Name, err)
+			} else {
+				SetMigrating(vmDir, false)
+				os.RemoveAll(filepath.Join("/dev/shm", "bc-"+st.Name))
+				log.Printf("  %s: resumed after interrupted migration", st.Name)
+				continue
+			}
+		}
+		SetMigrating(vmDir, false) // clear stale marker regardless
+
 		if IsRunning(vmDir) {
 			log.Printf("  %s: already running, skipping", st.Name)
 			continue
@@ -1481,6 +1497,11 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// 2. Blocks written during pre-sync are in the VM's page cache (part of vm.mem)
 	// 3. After snapshot/restore, page cache data is correct (comes from memory dump)
 	// 4. Skipping the disk delta eliminates the biggest downtime contributor
+	//
+	// Safety note: if the VM writes >RAM worth of unique blocks during pre-sync,
+	// some evicted dirty pages could be missing from page cache. This is extremely
+	// unlikely for typical workloads (~seconds of pre-sync, idle or light VM load).
+	// If data integrity under heavy I/O is critical, re-enable disk delta transfer.
 	xferStart := time.Now()
 	log.Printf("Migrating %s: transferring snapshot (mem=%dMB) + snap (disk pre-synced, skipping delta)", name, memSize/1024/1024)
 
