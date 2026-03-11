@@ -65,8 +65,11 @@ REAL_HOME="${HOME}"
 if [ -n "${SUDO_USER:-}" ]; then
   REAL_HOME="$(eval echo ~${SUDO_USER})"
 fi
-for keyfile in "${REAL_HOME}/.ssh/id_ed25519.pub" "${REAL_HOME}/.ssh/id_rsa.pub" ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
-  [ -f "$keyfile" ] && { SSH_PUBKEY=$(cat "$keyfile"); break; }
+for keyfile in \
+    "${BUNDLE_DIR}/secrets/authorized-keys" \
+    "${REAL_HOME}/.ssh/id_ed25519.pub" "${REAL_HOME}/.ssh/id_rsa.pub" \
+    ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
+  [ -f "$keyfile" ] && { SSH_PUBKEY=$(head -1 "$keyfile"); break; }
 done
 [ -z "$SSH_PUBKEY" ] && { echo "Error: no SSH public key found"; exit 1; }
 
