@@ -43,8 +43,8 @@ func TestPushAndPopMessages(t *testing.T) {
 	r := New()
 	r.Register(&VMRecord{VMID: "vm-1", IP: "10.0.0.2", Mark: 100})
 
-	msg1 := &Message{ID: "msg-1", From: "wingman", Body: "do task A", Priority: "normal", CreatedAt: time.Now()}
-	msg2 := &Message{ID: "msg-2", From: "wingman", Body: "do task B", Priority: "urgent", CreatedAt: time.Now()}
+	msg1 := &Message{ID: "msg-1", From: "tapegun", Body: "do task A", Priority: "normal", CreatedAt: time.Now()}
+	msg2 := &Message{ID: "msg-2", From: "tapegun", Body: "do task B", Priority: "urgent", CreatedAt: time.Now()}
 
 	r.PushMessage("vm-1", msg1)
 	r.PushMessage("vm-1", msg2)

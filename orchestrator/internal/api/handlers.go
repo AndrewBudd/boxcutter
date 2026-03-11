@@ -168,11 +168,11 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		w.Write([]byte("ok\n"))
 	})
 
-	// Wingman
-	mux.HandleFunc("GET /api/wingman/activity", h.handleWingmanActivity)
-	mux.HandleFunc("GET /api/wingman/activity/{name}", h.handleWingmanVMActivity)
-	mux.HandleFunc("POST /api/wingman/message/{name}", h.handleWingmanMessage)
-	mux.HandleFunc("POST /api/wingman/broadcast", h.handleWingmanBroadcast)
+	// Tapegun
+	mux.HandleFunc("GET /api/tapegun/activity", h.handleTapegunActivity)
+	mux.HandleFunc("GET /api/tapegun/activity/{name}", h.handleTapegunVMActivity)
+	mux.HandleFunc("POST /api/tapegun/message/{name}", h.handleTapegunMessage)
+	mux.HandleFunc("POST /api/tapegun/broadcast", h.handleTapegunBroadcast)
 }
 
 // --- Node handlers ---
@@ -1156,18 +1156,18 @@ func extractPathSegment(path, prefix, suffix string) string {
 	return s
 }
 
-// --- Wingman handlers ---
+// --- Tapegun handlers ---
 
-type wingmanActivityEntry struct {
+type tapegunActivityEntry struct {
 	Name        string                       `json:"name"`
 	NodeID      string                       `json:"node_id"`
 	NodeName    string                       `json:"node_name"`
 	VMStatus    string                       `json:"vm_status"`
-	Activity    *node.WingmanActivityReport  `json:"activity,omitempty"`
+	Activity    *node.TapegunActivityReport  `json:"activity,omitempty"`
 	PendingMsgs int                          `json:"pending_messages"`
 }
 
-func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) {
 	vms, err := h.db.ListVMs()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1183,13 +1183,13 @@ func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) 
 	// Fan out to each node
 	type nodeResult struct {
 		nodeID   string
-		activity map[string]*node.WingmanVMActivity // vmid -> activity
+		activity map[string]*node.TapegunVMActivity // vmid -> activity
 	}
 	results := make(chan nodeResult, len(nodeVMs))
 
 	for nodeID := range nodeVMs {
 		go func(nid string) {
-			nr := nodeResult{nodeID: nid, activity: make(map[string]*node.WingmanVMActivity)}
+			nr := nodeResult{nodeID: nid, activity: make(map[string]*node.TapegunVMActivity)}
 			n, err := h.db.GetNode(nid)
 			if err != nil || n.APIAddr == "" {
 				results <- nr
@@ -1205,14 +1205,14 @@ func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Collect
-	activityByNode := make(map[string]map[string]*node.WingmanVMActivity)
+	activityByNode := make(map[string]map[string]*node.TapegunVMActivity)
 	for range nodeVMs {
 		nr := <-results
 		activityByNode[nr.nodeID] = nr.activity
 	}
 
 	// Build response
-	var entries []wingmanActivityEntry
+	var entries []tapegunActivityEntry
 	for _, v := range vms {
 		n, _ := h.db.GetNode(v.NodeID)
 		nodeName := v.NodeID
@@ -1220,7 +1220,7 @@ func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) 
 			nodeName = n.TailscaleName
 		}
 
-		entry := wingmanActivityEntry{
+		entry := tapegunActivityEntry{
 			Name:     v.Name,
 			NodeID:   v.NodeID,
 			NodeName: nodeName,
@@ -1240,10 +1240,10 @@ func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, entries)
 }
 
-func (h *Handler) handleWingmanVMActivity(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleTapegunVMActivity(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
-		name = extractName(r.URL.Path, "/api/wingman/activity/")
+		name = extractName(r.URL.Path, "/api/tapegun/activity/")
 	}
 
 	v, err := h.db.GetVM(name)
@@ -1266,7 +1266,7 @@ func (h *Handler) handleWingmanVMActivity(w http.ResponseWriter, r *http.Request
 			if n != nil {
 				nodeName = n.TailscaleName
 			}
-			writeJSON(w, wingmanActivityEntry{
+			writeJSON(w, tapegunActivityEntry{
 				Name:        v.Name,
 				NodeID:      v.NodeID,
 				NodeName:    nodeName,
@@ -1283,7 +1283,7 @@ func (h *Handler) handleWingmanVMActivity(w http.ResponseWriter, r *http.Request
 	if n != nil {
 		nodeName = n.TailscaleName
 	}
-	writeJSON(w, wingmanActivityEntry{
+	writeJSON(w, tapegunActivityEntry{
 		Name:     v.Name,
 		NodeID:   v.NodeID,
 		NodeName: nodeName,
@@ -1291,19 +1291,19 @@ func (h *Handler) handleWingmanVMActivity(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (h *Handler) handleWingmanMessage(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleTapegunMessage(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
-		name = extractName(r.URL.Path, "/api/wingman/message/")
+		name = extractName(r.URL.Path, "/api/tapegun/message/")
 	}
 
-	var msg node.WingmanMessage
+	var msg node.TapegunMessage
 	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if msg.ID == "" {
-		msg.ID = fmt.Sprintf("wm-%d", time.Now().UnixNano())
+		msg.ID = fmt.Sprintf("tg-%d", time.Now().UnixNano())
 	}
 	if msg.CreatedAt == "" {
 		msg.CreatedAt = time.Now().Format(time.RFC3339)
@@ -1322,7 +1322,7 @@ func (h *Handler) handleWingmanMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nc := node.NewClient(n.APIAddr)
-	if err := nc.SendWingmanMessage(name, &msg); err != nil {
+	if err := nc.SendTapegunMessage(name, &msg); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1331,7 +1331,7 @@ func (h *Handler) handleWingmanMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "sent", "message_id": msg.ID})
 }
 
-func (h *Handler) handleWingmanBroadcast(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleTapegunBroadcast(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Body     string `json:"body"`
 		From     string `json:"from"`
@@ -1371,8 +1371,8 @@ func (h *Handler) handleWingmanBroadcast(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 
-		msg := &node.WingmanMessage{
-			ID:        fmt.Sprintf("wm-%d-%s", time.Now().UnixNano(), v.Name),
+		msg := &node.TapegunMessage{
+			ID:        fmt.Sprintf("tg-%d-%s", time.Now().UnixNano(), v.Name),
 			From:      req.From,
 			Body:      req.Body,
 			Priority:  req.Priority,
@@ -1381,7 +1381,7 @@ func (h *Handler) handleWingmanBroadcast(w http.ResponseWriter, r *http.Request)
 		}
 
 		nc := node.NewClient(n.APIAddr)
-		if err := nc.SendWingmanMessage(v.Name, msg); err != nil {
+		if err := nc.SendTapegunMessage(v.Name, msg); err != nil {
 			failed = append(failed, v.Name)
 			continue
 		}

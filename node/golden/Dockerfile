@@ -115,12 +115,12 @@ RUN chmod 755 /usr/local/bin/boxcutter-fetch-metadata && \
     ln -sf /etc/systemd/system/boxcutter-metadata.service \
       /etc/systemd/system/multi-user.target.wants/boxcutter-metadata.service
 
-# --- Wingman agent communication daemon ---
-COPY config/boxcutter-wingman /usr/local/bin/boxcutter-wingman
-COPY config/boxcutter-wingman.service /etc/systemd/system/boxcutter-wingman.service
-RUN chmod 755 /usr/local/bin/boxcutter-wingman && \
-    ln -sf /etc/systemd/system/boxcutter-wingman.service \
-      /etc/systemd/system/multi-user.target.wants/boxcutter-wingman.service
+# --- Tapegun agent communication daemon ---
+COPY config/boxcutter-tapegun /usr/local/bin/boxcutter-tapegun
+COPY config/boxcutter-tapegun.service /etc/systemd/system/boxcutter-tapegun.service
+RUN chmod 755 /usr/local/bin/boxcutter-tapegun && \
+    ln -sf /etc/systemd/system/boxcutter-tapegun.service \
+      /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service
 
 # --- GitHub token refresh (infrastructure — lets VMs get GitHub tokens from vmid) ---
 COPY gh-token-refresh.sh /usr/local/bin/gh-token-refresh

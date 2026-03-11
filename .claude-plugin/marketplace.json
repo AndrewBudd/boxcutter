@@ -17,6 +17,28 @@
       },
       "source": "./plugins/boxcutter",
       "category": "development"
+    },
+    {
+      "name": "tapegun-host",
+      "description": "Monitor and message Boxcutter VMs using the Tapegun system. For use by a Claude Code instance managing VMs from outside — check VM activity, send tasks, broadcast instructions.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Andrew Budd",
+        "email": "andrewbudd@github.com"
+      },
+      "source": "./plugins/tapegun-host",
+      "category": "development"
+    },
+    {
+      "name": "tapegun-guest",
+      "description": "Receive messages and tasks from external agents inside a Boxcutter VM. For use by a Claude Code instance running inside a VM — monitors inbox for incoming directives.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Andrew Budd",
+        "email": "andrewbudd@github.com"
+      },
+      "source": "./plugins/tapegun-guest",
+      "category": "development"
     }
   ]
 }

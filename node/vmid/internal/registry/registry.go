@@ -14,7 +14,7 @@ type ActivityReport struct {
 	Summary     string    `json:"summary,omitempty"`
 }
 
-// Message is a directive sent to a VM by an external wingman agent.
+// Message is a directive sent to a VM by an external tapegun agent.
 type Message struct {
 	ID        string     `json:"id"`
 	From      string     `json:"from"`
@@ -25,7 +25,7 @@ type Message struct {
 	ReadAt    *time.Time `json:"read_at,omitempty"`
 }
 
-// VMActivitySummary is a lightweight view of a VM's wingman state.
+// VMActivitySummary is a lightweight view of a VM's tapegun state.
 type VMActivitySummary struct {
 	VMID            string          `json:"vm_id"`
 	LastActivity    *ActivityReport `json:"last_activity,omitempty"`
@@ -271,7 +271,7 @@ func (r *Registry) GetActivity(vmID string) (*ActivityReport, bool) {
 	return rec.LastActivity, true
 }
 
-// AllActivity returns a summary of wingman state for all VMs.
+// AllActivity returns a summary of tapegun state for all VMs.
 func (r *Registry) AllActivity() []VMActivitySummary {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
