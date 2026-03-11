@@ -1865,7 +1865,7 @@ func (m *Manager) ImportVM(st *VMState) (*CreateResponse, error) {
 	return m.startVM(st, nil)
 }
 
-// GetActivity returns a VM's latest wingman activity report.
+// GetActivity returns a VM's latest tapegun activity report.
 func (m *Manager) GetActivity(name string) (*vmid.ActivityReport, error) {
 	if m.vmid == nil {
 		return nil, fmt.Errorf("vmid client not configured")
@@ -1877,7 +1877,7 @@ func (m *Manager) GetActivity(name string) (*vmid.ActivityReport, error) {
 	return m.vmid.GetVMActivity(name)
 }
 
-// SendMessage sends a wingman message to a VM.
+// SendMessage sends a tapegun message to a VM.
 func (m *Manager) SendMessage(name string, msg *vmid.Message) error {
 	if m.vmid == nil {
 		return fmt.Errorf("vmid client not configured")
@@ -1889,7 +1889,7 @@ func (m *Manager) SendMessage(name string, msg *vmid.Message) error {
 	return m.vmid.PostMessage(name, msg)
 }
 
-// AllActivity returns wingman activity for all VMs on this node.
+// AllActivity returns tapegun activity for all VMs on this node.
 func (m *Manager) AllActivity() ([]vmid.VMActivitySummary, error) {
 	if m.vmid == nil {
 		return nil, fmt.Errorf("vmid client not configured")

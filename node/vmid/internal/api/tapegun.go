@@ -9,22 +9,22 @@ import (
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/registry"
 )
 
-// WingmanHandler serves VM-facing wingman endpoints (activity reporting, inbox).
-type WingmanHandler struct {
+// TapegunHandler serves VM-facing tapegun endpoints (activity reporting, inbox).
+type TapegunHandler struct {
 	reg *registry.Registry
 }
 
-func NewWingmanHandler(reg *registry.Registry) *WingmanHandler {
-	return &WingmanHandler{reg: reg}
+func NewTapegunHandler(reg *registry.Registry) *TapegunHandler {
+	return &TapegunHandler{reg: reg}
 }
 
-func (h *WingmanHandler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /wingman/activity", h.handlePostActivity)
-	mux.HandleFunc("GET /wingman/inbox", h.handleGetInbox)
-	mux.HandleFunc("POST /wingman/inbox/ack", h.handleAckInbox)
+func (h *TapegunHandler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /tapegun/activity", h.handlePostActivity)
+	mux.HandleFunc("GET /tapegun/inbox", h.handleGetInbox)
+	mux.HandleFunc("POST /tapegun/inbox/ack", h.handleAckInbox)
 }
 
-func (h *WingmanHandler) handlePostActivity(w http.ResponseWriter, r *http.Request) {
+func (h *TapegunHandler) handlePostActivity(w http.ResponseWriter, r *http.Request) {
 	rec, ok := middleware.VMFromContext(r.Context())
 	if !ok {
 		http.Error(w, "no VM context", http.StatusInternalServerError)
@@ -44,7 +44,7 @@ func (h *WingmanHandler) handlePostActivity(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *WingmanHandler) handleGetInbox(w http.ResponseWriter, r *http.Request) {
+func (h *TapegunHandler) handleGetInbox(w http.ResponseWriter, r *http.Request) {
 	rec, ok := middleware.VMFromContext(r.Context())
 	if !ok {
 		http.Error(w, "no VM context", http.StatusInternalServerError)
@@ -58,7 +58,7 @@ func (h *WingmanHandler) handleGetInbox(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, msgs)
 }
 
-func (h *WingmanHandler) handleAckInbox(w http.ResponseWriter, r *http.Request) {
+func (h *TapegunHandler) handleAckInbox(w http.ResponseWriter, r *http.Request) {
 	rec, ok := middleware.VMFromContext(r.Context())
 	if !ok {
 		http.Error(w, "no VM context", http.StatusInternalServerError)
