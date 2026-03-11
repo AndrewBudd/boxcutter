@@ -1,0 +1,12 @@
+{
+  "hooks": [
+    {
+      "event": "PostToolUse",
+      "matcher": {
+        "tool_name": "Bash"
+      },
+      "script": "${CLAUDE_PLUGIN_ROOT}/hooks/check-inbox.sh",
+      "timeout_ms": 3000
+    }
+  ]
+}

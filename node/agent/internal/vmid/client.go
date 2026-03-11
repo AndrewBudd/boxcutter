@@ -200,9 +200,9 @@ func (c *Client) PostMessage(vmID string, msg *Message) error {
 	return nil
 }
 
-// GetAllActivity returns wingman activity summaries for all VMs.
+// GetAllActivity returns tapegun activity summaries for all VMs.
 func (c *Client) GetAllActivity() ([]VMActivitySummary, error) {
-	resp, err := c.http.Get("http://localhost/internal/wingman/activity")
+	resp, err := c.http.Get("http://localhost/internal/tapegun/activity")
 	if err != nil {
 		return nil, fmt.Errorf("vmid all activity: %w", err)
 	}

@@ -51,10 +51,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 
-	// Wingman endpoints
+	// Tapegun endpoints
 	mux.HandleFunc("GET /api/vms/{name}/activity", h.handleGetActivity)
 	mux.HandleFunc("POST /api/vms/{name}/inbox", h.handlePostInbox)
-	mux.HandleFunc("GET /api/wingman/activity", h.handleWingmanActivity)
+	mux.HandleFunc("GET /api/tapegun/activity", h.handleTapegunActivity)
 }
 
 // progressEvent is a NDJSON line streamed during VM creation.
@@ -583,7 +583,7 @@ func (h *Handler) handlePostInbox(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-func (h *Handler) handleWingmanActivity(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) {
 	activity, err := h.mgr.AllActivity()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

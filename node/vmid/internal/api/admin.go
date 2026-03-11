@@ -33,11 +33,11 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/sentinel/{sentinel}", h.handleSentinelSwap)
 
-	// Wingman endpoints
+	// Tapegun endpoints
 	mux.HandleFunc("GET /internal/vms/{id}/activity", h.handleGetActivity)
 	mux.HandleFunc("POST /internal/vms/{id}/inbox", h.handlePostInbox)
 	mux.HandleFunc("GET /internal/vms/{id}/inbox", h.handleGetInbox)
-	mux.HandleFunc("GET /internal/wingman/activity", h.handleAllActivity)
+	mux.HandleFunc("GET /internal/tapegun/activity", h.handleAllActivity)
 }
 
 type registerRequest struct {

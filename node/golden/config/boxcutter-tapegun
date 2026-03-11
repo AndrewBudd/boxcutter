@@ -1,11 +1,11 @@
 #!/bin/bash
-# Wingman agent communication daemon.
+# Tapegun agent communication daemon.
 # Periodically captures tmux pane content and posts it to the metadata service.
 # Checks for incoming messages and writes them to the inbox file.
 # Messages with send_keys=true are also injected into tmux.
 
 METADATA="http://169.254.169.254"
-INBOX_DIR="/home/dev/.wingman"
+INBOX_DIR="/home/dev/.tapegun"
 INBOX_FILE="${INBOX_DIR}/inbox.json"
 POLL_INTERVAL=5
 
@@ -17,11 +17,11 @@ for i in $(seq 1 30); do
   if curl -sf -o /dev/null --max-time 2 "${METADATA}/identity" 2>/dev/null; then
     break
   fi
-  [ "$i" -eq 30 ] && { echo "wingman: metadata service not reachable"; exit 1; }
+  [ "$i" -eq 30 ] && { echo "tapegun: metadata service not reachable"; exit 1; }
   sleep 1
 done
 
-echo "wingman: daemon started (poll every ${POLL_INTERVAL}s)"
+echo "tapegun: daemon started (poll every ${POLL_INTERVAL}s)"
 
 while true; do
     # --- Post activity ---
@@ -44,14 +44,14 @@ while true; do
 import json, sys
 print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< "$PANE_CONTENT")
         fi
-        curl -sf -X POST "${METADATA}/wingman/activity" \
+        curl -sf -X POST "${METADATA}/tapegun/activity" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             2>/dev/null || true
     fi
 
     # --- Check inbox ---
-    MSGS=$(curl -sf "${METADATA}/wingman/inbox" 2>/dev/null)
+    MSGS=$(curl -sf "${METADATA}/tapegun/inbox" 2>/dev/null)
     if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ] && [ "$MSGS" != "null" ]; then
         # Append to inbox file (create if missing)
         if [ -f "$INBOX_FILE" ]; then
