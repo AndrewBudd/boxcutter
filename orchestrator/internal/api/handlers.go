@@ -950,18 +950,7 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Also rsync Tailscale state to preserve identity
-	log.Printf("Migration: rsyncing Tailscale state from %s", req.SourceIP)
-	rsyncTS := exec.Command("rsync", "-az", "--timeout=30", "-e", sshOpts,
-		fmt.Sprintf("ubuntu@%s:/var/lib/tailscale/", req.SourceIP),
-		"/var/lib/tailscale/")
-	rsyncTS.Stdout = os.Stdout
-	rsyncTS.Stderr = os.Stderr
-	if err := rsyncTS.Run(); err != nil {
-		log.Printf("Migration: tailscale rsync failed (non-fatal): %v", err)
-	}
-
-	// 3. Tell old orchestrator to shut down
+	// 3. Tell old orchestrator to shut down (logs out of Tailscale first)
 	log.Printf("Migration: sending shutdown to %s", req.SourceAddr)
 	resp, err = client.Post(sourceURL+"/api/shutdown", "application/json", nil)
 	if err != nil {
@@ -986,11 +975,31 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Migration: activating migrated database")
 	os.Rename(dbPath+".migrated", dbPath)
 
-	// 6. Start Tailscale with the old identity
-	log.Printf("Migration: starting Tailscale")
-	exec.Command("systemctl", "restart", "tailscaled").Run()
-	time.Sleep(3 * time.Second)
-	exec.Command("tailscale", "up").Run()
+	// 6. Ensure Tailscale hostname is correct. Cloud-init may have joined as
+	// "boxcutter-2" if old orch was still running. Now that old orch has logged
+	// out, reclaim the "boxcutter" hostname. If not yet on Tailscale, join fresh.
+	log.Printf("Migration: ensuring Tailscale identity")
+	if out, err := exec.Command("tailscale", "status", "--json").CombinedOutput(); err == nil && strings.Contains(string(out), `"Self"`) {
+		// Already on Tailscale — just fix hostname
+		exec.Command("tailscale", "set", "--hostname=boxcutter").Run()
+		log.Printf("Migration: Tailscale hostname set to boxcutter")
+	} else {
+		// Not on Tailscale — join with authkey
+		tsKeyFile := "/etc/boxcutter/secrets/tailscale-orch-authkey"
+		if _, err := os.Stat(tsKeyFile); err != nil {
+			tsKeyFile = "/etc/boxcutter/secrets/tailscale-node-authkey"
+		}
+		if tsKey, err := os.ReadFile(tsKeyFile); err == nil {
+			key := strings.TrimSpace(string(tsKey))
+			if out, err := exec.Command("tailscale", "up", "--authkey="+key, "--hostname=boxcutter").CombinedOutput(); err != nil {
+				log.Printf("Migration: tailscale up failed: %s %v", string(out), err)
+			} else {
+				log.Printf("Migration: Tailscale joined as boxcutter")
+			}
+		} else {
+			log.Printf("Migration: no Tailscale authkey found, skipping")
+		}
+	}
 
 	// 7. Restart our own orchestrator service to pick up the new DB
 	log.Printf("Migration: restarting orchestrator service")
