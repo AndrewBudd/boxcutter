@@ -58,6 +58,8 @@ func fcSnapshot(vmDir string) (snapPath, memPath string, err error) {
 		"mem_file_path": memPath,
 	}
 	if err := fcPut(vmDir, "/snapshot/create", body); err != nil {
+		// Clean up partial files from failed attempt before retrying
+		os.RemoveAll(shmDir)
 		// Fall back to vmDir if /dev/shm fails (e.g., permission or space)
 		snapPath = filepath.Join(vmDir, "vm.snap")
 		memPath = filepath.Join(vmDir, "vm.mem")

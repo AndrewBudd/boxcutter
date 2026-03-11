@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1438,7 +1439,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	}
 
 	mkdirCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
-		"sudo", "mkdir", "-p", dstVMDir, fmt.Sprintf("/dev/shm/bc-%s", name))...)
+		"sudo", "mkdir", "-p", dstVMDir)...)
 	if out, err := mkdirCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
 	}
@@ -1474,7 +1475,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		cleanCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
 			"sudo", "rm", "-rf", dstVMDir, fmt.Sprintf("/dev/shm/bc-%s", name))...)
 		cleanCmd.Run()
-		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))
+		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name)) // clean source /dev/shm snapshot files
 	}
 
 	// Snapshot to regular files (Firecracker requires truncatable mem file, not FIFO)
@@ -1505,17 +1506,41 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	xferStart := time.Now()
 	log.Printf("Migrating %s: transferring snapshot (mem=%dMB) + snap (disk pre-synced, skipping delta)", name, memSize/1024/1024)
 
-	// Transfer to /dev/shm on target — avoids disk I/O contention from pre-sync writeback.
-	// ImportSnapshot will read from /dev/shm and clean up after loading.
+	// Decide where to write snapshot files on target: /dev/shm for speed if space permits,
+	// otherwise vmDir (on disk). Firecracker mmaps the mem file, so /dev/shm usage persists
+	// until the VM exits. Check available space with ~20% margin for safety.
+	dstSnapDir := dstVMDir
+	dstShmDir := fmt.Sprintf("/dev/shm/bc-%s", name)
+	shmCheckCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
+		"df", "--output=avail", "-B1", "/dev/shm")...)
+	if shmOut, err := shmCheckCmd.Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(shmOut)), "\n")
+		if len(lines) >= 2 {
+			avail, _ := strconv.ParseInt(strings.TrimSpace(lines[len(lines)-1]), 10, 64)
+			needed := memSize + memSize/5 // 20% margin
+			if avail > needed {
+				// Use /dev/shm on target for fast writes
+				mkShmCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
+					"sudo", "mkdir", "-p", dstShmDir)...)
+				mkShmCmd.Run()
+				dstSnapDir = dstShmDir
+				log.Printf("Migrating %s: target /dev/shm has %dMB free (need %dMB), using tmpfs",
+					name, avail/1024/1024, needed/1024/1024)
+			} else {
+				log.Printf("Migrating %s: target /dev/shm has %dMB free (need %dMB), using disk",
+					name, avail/1024/1024, needed/1024/1024)
+			}
+		}
+	}
+
 	// Send snap first (tiny, <1s), then mem (large). Sequential avoids SSH ControlMaster
 	// head-of-line blocking that occurs when parallel transfers share a multiplexed connection.
-	dstShmDir := fmt.Sprintf("/dev/shm/bc-%s/", name)
 
 	// vm.snap first (tiny, a few KB)
 	snapXferStart := time.Now()
 	snapCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"cat %s | %s ubuntu@%s 'sudo tee %svm.snap > /dev/null'",
-		snapPath, sshOpts, targetBridgeIP, dstShmDir))
+		"cat %s | %s ubuntu@%s 'sudo tee %s/vm.snap > /dev/null'",
+		snapPath, sshOpts, targetBridgeIP, dstSnapDir))
 	if out, err := snapCmd.CombinedOutput(); err != nil {
 		rollback("snap transfer failed: " + string(out) + ": " + err.Error())
 		return nil, fmt.Errorf("snap transfer: %w", err)
@@ -1525,8 +1550,8 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// Memory file — use dd with 4M blocks for throughput
 	memStart := time.Now()
 	memCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"dd if=%s bs=4M 2>/dev/null | %s ubuntu@%s 'sudo dd of=%svm.mem bs=4M 2>/dev/null'",
-		memPath, sshOpts, targetBridgeIP, dstShmDir))
+		"dd if=%s bs=4M 2>/dev/null | %s ubuntu@%s 'sudo dd of=%s/vm.mem bs=4M 2>/dev/null'",
+		memPath, sshOpts, targetBridgeIP, dstSnapDir))
 	if out, err := memCmd.CombinedOutput(); err != nil {
 		rollback("mem transfer failed: " + string(out) + ": " + err.Error())
 		return nil, fmt.Errorf("mem transfer: %w", err)
@@ -1742,8 +1767,8 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Load the snapshot — check /dev/shm first (migration writes there to avoid disk I/O),
-	// then fall back to vmDir.
+	// Load the snapshot. Check /dev/shm first (migration writes there when space permits),
+	// fall back to vmDir. Firecracker mmaps the mem file for the process lifetime.
 	shmDir := filepath.Join("/dev/shm", "bc-"+st.Name)
 	snapPath := filepath.Join(shmDir, "vm.snap")
 	memPath := filepath.Join(shmDir, "vm.mem")
@@ -1767,11 +1792,17 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		cmd.Process.Kill()
 		os.Remove(filepath.Join(vmDir, "firecracker.pid"))
 		TeardownTAP(st.TAP, st.Mark)
-		os.RemoveAll(shmDir) // clean up /dev/shm on failure
+		os.RemoveAll(shmDir)
 		return nil, fmt.Errorf("loading snapshot: %w", err)
 	}
-	// Clean up /dev/shm after successful load — Firecracker has the memory now
-	os.RemoveAll(shmDir)
+	// vm.snap can be removed (small, read once). vm.mem stays — Firecracker has it mmapped.
+	// If on /dev/shm, this is intentional: tmpfs-backed memory is fine for the VM's lifetime.
+	os.Remove(snapPath)
+	// If snapshot files were in vmDir, clean up the mem file too (Firecracker has it mmapped,
+	// but the disk space is freed only on unlink — we want that for disk-backed files).
+	if strings.HasPrefix(memPath, vmDir) {
+		os.Remove(memPath)
+	}
 
 	log.Printf("VM %s resumed from snapshot (PID %d, mark %d)", st.Name, cmd.Process.Pid, st.Mark)
 
