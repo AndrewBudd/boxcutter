@@ -36,6 +36,14 @@ func NewManager(cfg *config.Config, vmidClient *vmid.Client) *Manager {
 	return &Manager{cfg: cfg, vmid: vmidClient}
 }
 
+// BridgeIP returns this node's bridge IP from config.
+func (m *Manager) BridgeIP() string {
+	if m.cfg != nil {
+		return m.cfg.Node.BridgeIP
+	}
+	return ""
+}
+
 // ProgressFunc is called with phase updates during VM creation.
 type ProgressFunc func(phase, message string)
 

@@ -329,6 +329,18 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject self-migration — source and target share the same vmDir,
+	// so rollback's rm -rf would destroy the source VM's files.
+	targetHost := strings.Split(req.TargetAddr, ":")[0]
+	if targetHost == "localhost" || targetHost == "127.0.0.1" {
+		http.Error(w, "cannot migrate VM to the same node", http.StatusBadRequest)
+		return
+	}
+	if localBridge := h.mgr.BridgeIP(); localBridge != "" && targetHost == localBridge {
+		http.Error(w, "cannot migrate VM to the same node", http.StatusBadRequest)
+		return
+	}
+
 	// Validate VM exists and isn't already migrating
 	vmDir := vm.VMDir(name)
 	if _, err := vm.LoadVMState(vmDir); err != nil {
