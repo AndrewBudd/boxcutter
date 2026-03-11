@@ -133,6 +133,14 @@ build_node() {
   cp "${REPO_DIR}"/node/golden/gh-token-refresh.sh "${REPO_DIR}"/node/golden/gh-token-refresh.service "${REPO_DIR}"/node/golden/gh-token-refresh.timer "${PD}/golden/"
   cp -r "${REPO_DIR}"/node/golden/config "${PD}/golden/"
 
+  # Custom kernel with nf_tables support
+  mkdir -p "${PD}/kernel"
+  if [ -f "${REPO_DIR}/kernel/vmlinux" ]; then
+    cp "${REPO_DIR}/kernel/vmlinux" "${PD}/kernel/"
+  else
+    echo "Warning: custom kernel not found at ${REPO_DIR}/kernel/vmlinux — will fall back to S3 download"
+  fi
+
   # Template node-specific values into boxcutter.yaml
   sed -e "s|BRIDGE_IP_PLACEHOLDER|${THIS_NODE_IP}|g" \
       -e "s|ORCHESTRATOR_URL_PLACEHOLDER|http://${ORCH_IP}:8801|g" \
@@ -219,10 +227,13 @@ write_files:
         rm -rf "/tmp/release-\${FC_VERSION}-\${ARCH}"
       fi
 
-      # Firecracker kernel
-      [ -f "\$BOXCUTTER_HOME/kernel/vmlinux" ] || \
+      # Firecracker kernel (custom build with nf_tables, or fallback to S3)
+      if [ -f "\$PD/kernel/vmlinux" ]; then
+        cp "\$PD/kernel/vmlinux" "\$BOXCUTTER_HOME/kernel/vmlinux"
+      elif [ ! -f "\$BOXCUTTER_HOME/kernel/vmlinux" ]; then
         curl -sL "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/\$(uname -m)/vmlinux-6.1.128" \
           -o "\$BOXCUTTER_HOME/kernel/vmlinux"
+      fi
 
       # Caddy
       if ! command -v caddy &>/dev/null; then
