@@ -122,6 +122,9 @@ RUN chmod 755 /usr/local/bin/boxcutter-tapegun && \
     ln -sf /etc/systemd/system/boxcutter-tapegun.service \
       /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service
 
+# --- Claude Code plugin directory (tapegun-guest plugin injected by docker-to-ext4.sh) ---
+RUN mkdir -p /home/dev/.claude/plugins && chown -R 1000:1000 /home/dev/.claude
+
 # --- GitHub token refresh (infrastructure — lets VMs get GitHub tokens from vmid) ---
 COPY gh-token-refresh.sh /usr/local/bin/gh-token-refresh
 COPY gh-token-refresh.service /etc/systemd/system/gh-token-refresh.service
