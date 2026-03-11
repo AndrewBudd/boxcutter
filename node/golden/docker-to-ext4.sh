@@ -71,6 +71,16 @@ if [ -f "${WORK}/mnt/bin/ping" ]; then
   setcap cap_net_raw+ep "${WORK}/mnt/bin/ping" 2>/dev/null || true
 fi
 
+# Inject tapegun-guest plugin from repo (outside Docker build context)
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TAPEGUN_GUEST="${REPO_ROOT}/plugins/tapegun-guest"
+if [ -d "$TAPEGUN_GUEST" ]; then
+  echo "Installing tapegun-guest plugin..."
+  mkdir -p "${WORK}/mnt/home/dev/.claude/plugins"
+  cp -r "$TAPEGUN_GUEST" "${WORK}/mnt/home/dev/.claude/plugins/tapegun-guest"
+  chown -R 1000:1000 "${WORK}/mnt/home/dev/.claude"
+fi
+
 # Unmount
 umount "${WORK}/mnt"
 
