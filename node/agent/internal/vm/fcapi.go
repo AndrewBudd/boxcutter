@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -41,9 +42,15 @@ func fcResume(vmDir string) error {
 
 // fcSnapshot creates a full snapshot of a paused VM.
 // The VM must be paused first. Returns snapshot and memory file paths.
+// Writes to /dev/shm (tmpfs) when possible for faster I/O — avoids
+// writing multi-GB memory dumps through the QCOW2 virtual disk.
 func fcSnapshot(vmDir string) (snapPath, memPath string, err error) {
-	snapPath = filepath.Join(vmDir, "vm.snap")
-	memPath = filepath.Join(vmDir, "vm.mem")
+	vmName := filepath.Base(vmDir)
+	shmDir := filepath.Join("/dev/shm", "bc-"+vmName)
+	os.MkdirAll(shmDir, 0755)
+
+	snapPath = filepath.Join(shmDir, "vm.snap")
+	memPath = filepath.Join(shmDir, "vm.mem")
 
 	body := map[string]string{
 		"snapshot_type": "Full",
@@ -51,7 +58,14 @@ func fcSnapshot(vmDir string) (snapPath, memPath string, err error) {
 		"mem_file_path": memPath,
 	}
 	if err := fcPut(vmDir, "/snapshot/create", body); err != nil {
-		return "", "", fmt.Errorf("creating snapshot: %w", err)
+		// Fall back to vmDir if /dev/shm fails (e.g., permission or space)
+		snapPath = filepath.Join(vmDir, "vm.snap")
+		memPath = filepath.Join(vmDir, "vm.mem")
+		body["snapshot_path"] = snapPath
+		body["mem_file_path"] = memPath
+		if err2 := fcPut(vmDir, "/snapshot/create", body); err2 != nil {
+			return "", "", fmt.Errorf("creating snapshot: %w (shm attempt: %v)", err2, err)
+		}
 	}
 	return snapPath, memPath, nil
 }

@@ -329,8 +329,19 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate VM exists and isn't already migrating
+	vmDir := vm.VMDir(name)
+	if _, err := vm.LoadVMState(vmDir); err != nil {
+		http.Error(w, "VM '"+name+"' not found", http.StatusNotFound)
+		return
+	}
+	if vm.IsMigrating(vmDir) {
+		http.Error(w, "VM '"+name+"' is already migrating", http.StatusConflict)
+		return
+	}
+
 	// Set migration marker — DeriveStatus() will report "migrating"
-	vm.SetMigrating(vm.VMDir(name), true)
+	vm.SetMigrating(vmDir, true)
 
 	// Start migration in background — caller polls GET /api/vms/{name} for status
 	go func() {

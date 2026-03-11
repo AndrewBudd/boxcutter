@@ -88,8 +88,11 @@ if command -v tailscale &>/dev/null; then
     [ -z "$HOSTNAME" ] && HOSTNAME="boxcutter"
     NODE_KEY=$(cat "${SECRETS_DIR}/tailscale-node-authkey" | tr -d '[:space:]')
     echo "Joining Tailscale as '${HOSTNAME}'..."
-    tailscale up --authkey="$NODE_KEY" --hostname="$HOSTNAME"
-    echo "  Tailscale connected."
+    if timeout 30 tailscale up --authkey="$NODE_KEY" --hostname="$HOSTNAME"; then
+      echo "  Tailscale connected."
+    else
+      echo "  WARNING: Tailscale join timed out or failed (continuing setup)"
+    fi
   else
     echo "Tailscale: already connected"
   fi

@@ -59,18 +59,33 @@ if [ ! -f "${BUNDLE_DIR}/boxcutter.yaml" ]; then
   exit 1
 fi
 
-# --- Find SSH key ---
+# --- Find SSH keys ---
+# Build YAML list of all authorized keys for cloud-init ssh_authorized_keys
 SSH_PUBKEY=""
+SSH_KEYS_YAML=""
 REAL_HOME="${HOME}"
 if [ -n "${SUDO_USER:-}" ]; then
   REAL_HOME="$(eval echo ~${SUDO_USER})"
 fi
-for keyfile in \
-    "${BUNDLE_DIR}/secrets/authorized-keys" \
-    "${REAL_HOME}/.ssh/id_ed25519.pub" "${REAL_HOME}/.ssh/id_rsa.pub" \
-    ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
-  [ -f "$keyfile" ] && { SSH_PUBKEY=$(head -1 "$keyfile"); break; }
-done
+# First check authorized-keys file (may contain multiple keys)
+if [ -f "${BUNDLE_DIR}/secrets/authorized-keys" ]; then
+  SSH_PUBKEY=$(head -1 "${BUNDLE_DIR}/secrets/authorized-keys")
+  while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    [[ "$key" == "#"* ]] && continue
+    SSH_KEYS_YAML="${SSH_KEYS_YAML}      - ${key}
+"
+  done < "${BUNDLE_DIR}/secrets/authorized-keys"
+fi
+# Fall back to individual key files if no authorized-keys
+if [ -z "$SSH_PUBKEY" ]; then
+  for keyfile in \
+      "${REAL_HOME}/.ssh/id_ed25519.pub" "${REAL_HOME}/.ssh/id_rsa.pub" \
+      ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
+    [ -f "$keyfile" ] && { SSH_PUBKEY=$(head -1 "$keyfile"); SSH_KEYS_YAML="      - ${SSH_PUBKEY}
+"; break; }
+  done
+fi
 [ -z "$SSH_PUBKEY" ] && { echo "Error: no SSH public key found"; exit 1; }
 
 # --- Shared: download Ubuntu base image ---
@@ -170,7 +185,7 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - ${SSH_PUBKEY}
+${SSH_KEYS_YAML}
 
 package_update: true
 
@@ -396,7 +411,7 @@ build_orchestrator() {
 
   # Bundle (orchestrator only needs tailscale key + authorized keys)
   cp "${BUNDLE_DIR}/boxcutter.yaml" "${PD}/bundle/"
-  for secret in tailscale-node-authkey authorized-keys; do
+  for secret in tailscale-node-authkey tailscale-orch-authkey authorized-keys; do
     [ -f "${BUNDLE_DIR}/secrets/${secret}" ] && cp "${BUNDLE_DIR}/secrets/${secret}" "${PD}/bundle/secrets/"
   done
 
@@ -422,7 +437,7 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - ${SSH_PUBKEY}
+${SSH_KEYS_YAML}
 
 package_update: true
 
@@ -464,7 +479,11 @@ write_files:
       systemctl start tailscaled
 
       # Join Tailscale as "boxcutter" (the orchestrator hostname)
-      if [ -f /etc/boxcutter/secrets/tailscale-node-authkey ]; then
+      # Prefer dedicated orchestrator key, fall back to node key
+      if [ -f /etc/boxcutter/secrets/tailscale-orch-authkey ]; then
+        TS_KEY=\$(cat /etc/boxcutter/secrets/tailscale-orch-authkey | tr -d '[:space:]')
+        tailscale up --authkey="\$TS_KEY" --hostname=boxcutter
+      elif [ -f /etc/boxcutter/secrets/tailscale-node-authkey ]; then
         TS_KEY=\$(cat /etc/boxcutter/secrets/tailscale-node-authkey | tr -d '[:space:]')
         tailscale up --authkey="\$TS_KEY" --hostname=boxcutter
       fi
@@ -589,7 +608,7 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - ${SSH_PUBKEY}
+${SSH_KEYS_YAML}
 
 write_files:
   - path: /etc/boxcutter/boxcutter.yaml
@@ -677,7 +696,7 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - ${SSH_PUBKEY}
+${SSH_KEYS_YAML}
 
 write_files:
   - path: /etc/boxcutter/boxcutter.yaml
@@ -722,10 +741,15 @@ done)
         chmod 600 /root/.ssh/config
       fi
 
-      # Join Tailscale
-      if command -v tailscale &>/dev/null && [ -f /etc/boxcutter/secrets/tailscale-node-authkey ]; then
-        NODE_KEY=\$(cat /etc/boxcutter/secrets/tailscale-node-authkey | tr -d '[:space:]')
-        tailscale up --authkey="\$NODE_KEY" --hostname=boxcutter
+      # Join Tailscale — prefer dedicated orchestrator key
+      if command -v tailscale &>/dev/null; then
+        if [ -f /etc/boxcutter/secrets/tailscale-orch-authkey ]; then
+          ORCH_KEY=\$(cat /etc/boxcutter/secrets/tailscale-orch-authkey | tr -d '[:space:]')
+          tailscale up --authkey="\$ORCH_KEY" --hostname=boxcutter
+        elif [ -f /etc/boxcutter/secrets/tailscale-node-authkey ]; then
+          NODE_KEY=\$(cat /etc/boxcutter/secrets/tailscale-node-authkey | tr -d '[:space:]')
+          tailscale up --authkey="\$NODE_KEY" --hostname=boxcutter
+        fi
       fi
 
       systemctl restart boxcutter-orchestrator 2>/dev/null || true
