@@ -1,5 +1,6 @@
 {
   "name": "tapegun-guest",
+  "version": "1.1.0",
   "description": "Receive messages and tasks from external agents inside a Boxcutter VM via the Tapegun system. Enables Claude Code running inside a VM to receive directives, check its inbox, and coordinate with host-side management.",
   "author": {
     "name": "Andrew Budd",

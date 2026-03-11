@@ -1,5 +1,6 @@
 {
   "name": "tapegun-host",
+  "version": "1.1.0",
   "description": "Monitor and message Boxcutter VMs using the Tapegun system. Use from a host/management Claude Code instance to observe VM activity, send tasks to VMs, and broadcast messages across your fleet.",
   "author": {
     "name": "Andrew Budd",
