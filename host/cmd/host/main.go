@@ -1304,8 +1304,11 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 			return
 		}
 
-		state.SetNodeStatus(nodeID, "draining")
-		state.Save()
+		// Don't set "draining" status here — let drainNode() set it after
+		// acquiring drainMu. Otherwise, two simultaneous drain requests
+		// poison each other's target selection (Bug #82: both nodes marked
+		// "draining" before either goroutine runs, so pickDrainTarget finds
+		// no active targets).
 		go drainNode(cfg, state, nodeID)
 		json.NewEncoder(w).Encode(map[string]string{"status": "draining", "node": nodeID})
 	})
