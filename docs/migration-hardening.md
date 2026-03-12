@@ -886,6 +886,40 @@ Fix: Rollback now checks the target for a running copy before resuming source. I
 - Waits for in-flight migrations before proceeding
 - Zero VM loss
 
+## Phase 16: Parallel Drain Implementation (Tests #133-#135)
+
+### Change: Parallel drain
+`drainNode()` now fires all migration requests concurrently and polls them in parallel using goroutines. The node agent already handles per-VM concurrency internally.
+
+### Performance Results
+
+| Drain Mode | VMs | Duration |
+|-----------|-----|----------|
+| Sequential (old) | 3 × 512MB | ~60s |
+| **Parallel (new)** | 3 × 512MB | **24s** (2.5x faster) |
+| **Parallel (new)** | 3 × 512MB + 1 × 2GB | 120s (small VMs done in 24s, 2GB slow due to disk fallback) |
+
+### Test Results
+
+| Test | Scenario | Result | Notes |
+|------|----------|--------|-------|
+| #133 | Parallel drain of 4 VMs | PASS | 3 small VMs done in 24s, 2GB VM took 120s (disk fallback) |
+| #134 | SIGKILL host during parallel drain | PASS | Resumed drain, waited for in-flight migrations, completed |
+| #135 | Full lifecycle chaos (create+migrate+drain+SIGKILL) | PASS | All 8 VMs safe, drain aborted on failure, no split-brain |
+
+### Cumulative Statistics (All Phases, updated)
+
+| Metric | Value |
+|--------|-------|
+| Total tests executed | 135 |
+| Tests passed | 127 |
+| Tests partial (known limitations) | 2 |
+| Bugs found and fixed | 82 |
+| VMs migrated successfully | 300+ |
+| Drain cycles completed | 45+ |
+| Concurrent migrations tested | 3-way simultaneous, bidirectional, crossing, parallel drain |
+| Host daemon crashes survived | 17+ |
+| Node agent crashes survived | 14+ |
+
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
-- [ ] Parallel drain (migrate multiple VMs simultaneously from same source) — tested manually, works but serialized by drainMu
