@@ -1786,7 +1786,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	verifyStart := time.Now()
 	log.Printf("Migrating %s: verifying target is healthy...", name)
 	targetHealthy := false
-	for i := 0; i < 30; i++ { // up to 30 seconds (2s intervals × 15, then immediate check)
+	for i := 0; i < 30; i++ { // up to ~60 seconds (2s intervals × 30)
 		if i > 0 {
 			time.Sleep(2 * time.Second)
 		}
