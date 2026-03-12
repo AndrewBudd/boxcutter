@@ -636,28 +636,62 @@ Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapsh
 
 **Auto-scaler suppression**: During upgrades, the auto-scaler is paused to prevent it from launching nodes that the reconciler would then have to drain.
 
+## Phase 12: OCI Pull Fix + Crash Recovery + Stress Tests
+
+### Bug #71: oras file store hangs with unrelated files
+**Problem**: `oras.Copy` hangs indefinitely when the output directory (`.images/`) contains unrelated files (QCOW2s, ISOs, console logs). The oras file store scans and tracks all files, and its `copyGraph` operation gets stuck in `WaitGroup.Wait` for 8+ minutes.
+**Root cause**: `file.New(outputDir)` creates a file store rooted at `.images/` which contains many large unrelated files. The internal file tracking gets confused.
+**Fix**: Pull into a clean staging subdirectory (`os.MkdirTemp(outputDir, ".oci-pull-*")`), then `os.Rename` the downloaded `.zst` to the output directory. `defer os.RemoveAll(stageDir)` cleans up automatically.
+**Files**: `internal/oci/oci.go` Pull function
+
+### Bug #72: Auto-scaler provision fails — bootstrap bundle not found
+**Problem**: When the daemon runs as a systemd service, `addNode()` tries to provision from the bootstrap bundle but can't find it at `/root/.boxcutter/`. The binary is owned by root (from `sudo cp`), so the owner-based lookup finds root's home. `SUDO_USER` isn't set in systemd context.
+**Root cause**: Bundle path resolution checks binary owner (root) and current user (root), but never checks the repo directory owner (budda).
+**Fix**: Added repo directory owner check before binary owner check. `os.Stat(repoDir) → Stat_t.Uid → user.LookupId → HomeDir/.boxcutter`.
+**Files**: `cmd/host/main.go` config initialization
+
+### Tests
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| 71 | OCI pull with staging directory fix | **PASS** | 20s pull (was hanging 8+ min), no-op upgrade (digest match) |
+| 72 | Drain 3 VMs node-41→node-43 | **PASS** | 69s total, all VMs verified running |
+| 73 | Crash recovery: SIGKILL mid-drain | **PASS** | Daemon auto-restarted, detected in-flight migration, waited, resumed drain, completed |
+| 74 | Create VM during active drain | **PASS** | `test-during-drain` created on target while 3 VMs migrating, no interference |
+| 75 | Rapid drain ping-pong (3 nodes) | **PASS** | 3 VMs drained node-45→46→47, auto-scaler kept up, all VMs survived |
+
+### Key Findings
+
+**Staging directory isolation**: OCI pulls now use a clean temp directory, preventing oras from being confused by unrelated files. The `defer os.RemoveAll(stageDir)` ensures cleanup even on errors.
+
+**Crash recovery works end-to-end**: After SIGKILL, the daemon auto-restarts (systemd `Restart=on-failure`), detects the partially-drained node (`status=draining` in cluster.json), detects the in-flight migration (VM status `migrating`), waits for it to complete, then continues draining the remaining VMs.
+
+**VM creation during drain is safe**: The node agent handles concurrent VM creation and incoming migrations without conflicts. The drain operates at the host daemon level, while VM creation goes directly to the node agent API.
+
+**Bundle resolution for systemd**: When the daemon runs as root via systemd, the bootstrap bundle is found by checking the owner of the repo directory (the real user who checked out the code).
+
 ### Cumulative Statistics (All Phases)
 
 | Metric | Value |
 |--------|-------|
-| Total tests executed | 67+ |
-| Tests passed | 65 |
+| Total tests executed | 75+ |
+| Tests passed | 73 |
 | Tests partial (known limitations) | 2 |
-| Bugs found and fixed | 70 |
-| VMs migrated successfully | 120+ |
+| Bugs found and fixed | 72 |
+| VMs migrated successfully | 140+ |
 | VMs rolled back successfully | 7+ |
-| Drain cycles completed | 16+ |
+| Drain cycles completed | 22+ |
 | Maximum VMs in single drain | 11 |
-| Maximum consecutive migrations (same VM) | 6+ (ping-pong) |
-| Process survival verified | 5600+ entries, 0 gaps, 95+ min |
-| Tailscale reconnection verified | Multiple migrations, <10s DERP recovery |
-| Auto-scale triggers | 8+ |
-| Host daemon crashes survived | 4+ |
+| Maximum consecutive migrations (same VM) | 8+ (ping-pong across 5 nodes) |
+| Process survival verified | 7000+ entries, 95+ min |
+| Auto-scale triggers | 12+ |
+| Host daemon crashes survived | 6+ |
 | Node agent crashes survived | 4+ |
-| Rolling OCI upgrades completed | 2 (including idempotent re-upgrade) |
+| Rolling OCI upgrades completed | 3 |
+| Crash recovery tested | drain mid-flight, upgrade resume |
 
-## Phase 12: Remaining (TODO)
+## Phase 13: Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
 - [ ] Multi-target drain distribution (verify with 3+ nodes simultaneously)
-- [ ] Upgrade interrupted by daemon restart (crash recovery)
-- [ ] Upgrade with VM creation/deletion during upgrade
+- [ ] Parallel migration (drain multiple VMs concurrently)
+- [ ] Memory pressure test (migrate with low /dev/shm, verify disk fallback)

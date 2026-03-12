@@ -138,7 +138,21 @@ func defaultConfig() HostConfig {
 		}
 	}
 	if bundleDir == "" {
-		// Try the user who owns the binary (handles systemd running as root)
+		// Try the user who owns the repo directory (handles systemd running as root
+		// where the binary is owned by root but the repo is owned by the real user)
+		if info, err := os.Stat(repoDir); err == nil {
+			if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+				if u, err := user.LookupId(fmt.Sprintf("%d", stat.Uid)); err == nil {
+					candidate := filepath.Join(u.HomeDir, ".boxcutter")
+					if fileExists(filepath.Join(candidate, "boxcutter.yaml")) {
+						bundleDir = candidate
+					}
+				}
+			}
+		}
+	}
+	if bundleDir == "" {
+		// Try the user who owns the binary
 		exe, _ := os.Executable()
 		if exe != "" {
 			if info, err := os.Stat(exe); err == nil {

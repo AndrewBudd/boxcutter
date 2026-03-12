@@ -157,19 +157,15 @@ func Pull(ctx context.Context, opts PullOptions) (*ImageMetadata, string, error)
 		return nil, "", fmt.Errorf("creating output directory: %w", err)
 	}
 
-	// Remove existing .zst files and oras metadata to prevent oras.Copy from
-	// hanging when the output file already exists from a previous pull.
-	entries, _ := os.ReadDir(opts.OutputDir)
-	for _, e := range entries {
-		name := e.Name()
-		if filepath.Ext(name) == ".zst" || name == "index.json" || name == "oci-layout" {
-			os.Remove(filepath.Join(opts.OutputDir, name))
-		}
+	// Use a clean staging directory for the OCI pull to avoid oras file store
+	// conflicts with unrelated files in the output directory.
+	stageDir, err := os.MkdirTemp(opts.OutputDir, ".oci-pull-*")
+	if err != nil {
+		return nil, "", fmt.Errorf("creating staging directory: %w", err)
 	}
-	// Also remove any "blobs" directory left by oras
-	os.RemoveAll(filepath.Join(opts.OutputDir, "blobs"))
+	defer os.RemoveAll(stageDir)
 
-	store, err := file.New(opts.OutputDir)
+	store, err := file.New(stageDir)
 	if err != nil {
 		return nil, "", fmt.Errorf("creating file store: %w", err)
 	}
@@ -191,21 +187,18 @@ func Pull(ctx context.Context, opts PullOptions) (*ImageMetadata, string, error)
 		meta.Created = desc.Annotations[ocispec.AnnotationCreated]
 	}
 
-	// Find the downloaded file
+	// Move the downloaded file from staging to output directory
 	outputFile := ""
-	entries, _ = os.ReadDir(opts.OutputDir)
+	entries, _ := os.ReadDir(stageDir)
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) == ".zst" {
-			outputFile = filepath.Join(opts.OutputDir, e.Name())
-			break
-		}
-	}
-	if outputFile == "" {
-		for _, e := range entries {
-			if !e.IsDir() && e.Name() != "index.json" {
-				outputFile = filepath.Join(opts.OutputDir, e.Name())
-				break
+			src := filepath.Join(stageDir, e.Name())
+			dst := filepath.Join(opts.OutputDir, e.Name())
+			if err := os.Rename(src, dst); err != nil {
+				return nil, "", fmt.Errorf("moving downloaded file: %w", err)
 			}
+			outputFile = dst
+			break
 		}
 	}
 
