@@ -157,6 +157,15 @@ func Pull(ctx context.Context, opts PullOptions) (*ImageMetadata, string, error)
 		return nil, "", fmt.Errorf("creating output directory: %w", err)
 	}
 
+	// Clean up stale staging directories from previous crashed pulls.
+	if entries, err := os.ReadDir(opts.OutputDir); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), ".oci-pull-") && e.IsDir() {
+				os.RemoveAll(filepath.Join(opts.OutputDir, e.Name()))
+			}
+		}
+	}
+
 	// Use a clean staging directory for the OCI pull to avoid oras file store
 	// conflicts with unrelated files in the output directory.
 	stageDir, err := os.MkdirTemp(opts.OutputDir, ".oci-pull-*")

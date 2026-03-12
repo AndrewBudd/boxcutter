@@ -1356,7 +1356,7 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 	if err != nil {
 		log.Fatalf("Unix socket: %v", err)
 	}
-	os.Chmod(cfg.SocketPath, 0660)
+	os.Chmod(cfg.SocketPath, 0666)
 
 	log.Printf("Control API listening on %s", cfg.SocketPath)
 	http.Serve(listener, mux)
@@ -2075,8 +2075,17 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 
 				// New node healthy — wait for golden image, then mark old node for drain
 				if !isGoldenReady(replacement.BridgeIP) {
+					if goal.GoldenWaitStart == "" {
+						goal.GoldenWaitStart = time.Now().Format(time.RFC3339)
+						state.Save()
+					} else if t, err := time.Parse(time.RFC3339, goal.GoldenWaitStart); err == nil {
+						if time.Since(t) > 10*time.Minute {
+							return false, "", fmt.Errorf("golden image on %s not ready after 10 minutes", replacement.ID)
+						}
+					}
 					return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil
 				}
+				goal.GoldenWaitStart = "" // reset for next node
 				state.SetNodeStatus(oldNode.ID, "upgrading")
 				state.Save()
 				return false, fmt.Sprintf("New node %s healthy, marked %s for drain", replacement.ID, oldNode.ID), nil
@@ -3206,11 +3215,22 @@ func waitForNodeHealth(bridgeIP string, timeout time.Duration) bool {
 }
 
 // startMosquitto launches the MQTT broker as a subprocess.
+// If an existing mosquitto is already running (e.g., from a previous daemon
+// instance that was killed), it is adopted rather than starting a new one.
 func startMosquitto(cfg HostConfig) *exec.Cmd {
 	confPath := hostFile(cfg, "mosquitto.conf")
 	if !fileExists(confPath) {
 		log.Printf("mosquitto config not found at %s, skipping MQTT broker", confPath)
 		return nil
+	}
+
+	// Check for existing mosquitto (survives daemon restart due to KillMode=process)
+	if out, err := exec.Command("pgrep", "-f", "mosquitto -c").Output(); err == nil {
+		pids := strings.TrimSpace(string(out))
+		if pids != "" {
+			log.Printf("mosquitto already running (PID %s), reusing", strings.Split(pids, "\n")[0])
+			return nil
+		}
 	}
 
 	// Ensure persistence directory exists

@@ -80,6 +80,10 @@ type UpgradeGoal struct {
 	// Reset when a new replacement is launched.
 	DeployedNodeID string `json:"deployed_node_id,omitempty"`
 
+	// Timestamp when we started waiting for golden image on replacement node.
+	// Used to detect stuck golden image builds and time out.
+	GoldenWaitStart string `json:"golden_wait_start,omitempty"`
+
 	// Orchestrator upgrade: temp bridge IP/TAP/MAC for new orchestrator
 	NewOrchIP  string `json:"new_orch_ip,omitempty"`
 	NewOrchTAP string `json:"new_orch_tap,omitempty"`
