@@ -497,7 +497,7 @@ func (m *Manager) RestartAll() {
 				log.Printf("  %s: resume failed (will restart from scratch): %v", st.Name, err)
 			} else {
 				SetMigrating(vmDir, false)
-				os.RemoveAll(filepath.Join("/dev/shm", "bc-"+st.Name))
+				os.RemoveAll(filepath.Join("/dev/shm", "bc-"+st.Name+"-mig"))
 				log.Printf("  %s: resumed after interrupted migration", st.Name)
 				continue
 			}
@@ -1483,7 +1483,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		cleanCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
 			"sudo", "rm", "-rf", dstVMDir, fmt.Sprintf("/dev/shm/bc-%s", name))...)
 		cleanCmd.Run()
-		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name)) // clean source /dev/shm snapshot files
+		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean source /dev/shm snapshot files
 	}
 
 	// Snapshot to regular files (Firecracker requires truncatable mem file, not FIFO)
@@ -1633,7 +1633,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	}
 	m.stopVM(name)
 	os.RemoveAll(vmDir)
-	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name)) // clean up tmpfs snapshot files
+	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean up tmpfs snapshot files
 
 	return &MigrateResponse{
 		Name:        importResp.Name,

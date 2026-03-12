@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -46,27 +48,52 @@ func fcResume(vmDir string) error {
 // writing multi-GB memory dumps through the QCOW2 virtual disk.
 func fcSnapshot(vmDir string) (snapPath, memPath string, err error) {
 	vmName := filepath.Base(vmDir)
-	shmDir := filepath.Join("/dev/shm", "bc-"+vmName)
-	os.MkdirAll(shmDir, 0755)
 
-	snapPath = filepath.Join(shmDir, "vm.snap")
-	memPath = filepath.Join(shmDir, "vm.mem")
+	// Use a separate "mig" subdirectory to avoid colliding with Firecracker's mmapped
+	// vm.mem from a previous snapshot import. Writing to the same path as the mmapped
+	// file causes severe slowdown (page faults + COW for every page).
+	shmDir := filepath.Join("/dev/shm", "bc-"+vmName+"-mig")
+	useSHM := true
+	if st, err := LoadVMState(vmDir); err == nil {
+		needed := int64(st.RAMMIB) * 1024 * 1024
+		if needed > 0 {
+			var stat syscall.Statfs_t
+			if syscall.Statfs("/dev/shm", &stat) == nil {
+				avail := int64(stat.Bavail) * int64(stat.Bsize)
+				if avail < needed+needed/5 {
+					useSHM = false
+					log.Printf("fcSnapshot %s: /dev/shm has %dMB free (need %dMB), using disk",
+						vmName, avail/1024/1024, (needed+needed/5)/1024/1024)
+				}
+			}
+		}
+	}
 
 	body := map[string]string{
 		"snapshot_type": "Full",
-		"snapshot_path": snapPath,
-		"mem_file_path": memPath,
 	}
-	if err := fcPut(vmDir, "/snapshot/create", body); err != nil {
-		// Clean up partial files from failed attempt before retrying
-		os.RemoveAll(shmDir)
-		// Fall back to vmDir if /dev/shm fails (e.g., permission or space)
+
+	if useSHM {
+		os.MkdirAll(shmDir, 0755)
+		snapPath = filepath.Join(shmDir, "vm.snap")
+		memPath = filepath.Join(shmDir, "vm.mem")
+		body["snapshot_path"] = snapPath
+		body["mem_file_path"] = memPath
+		if err := fcPut(vmDir, "/snapshot/create", body); err != nil {
+			// Clean up partial files from failed attempt before retrying
+			os.RemoveAll(shmDir)
+			log.Printf("fcSnapshot %s: /dev/shm failed (%v), falling back to disk", vmName, err)
+			useSHM = false
+		}
+	}
+
+	if !useSHM {
 		snapPath = filepath.Join(vmDir, "vm.snap")
 		memPath = filepath.Join(vmDir, "vm.mem")
 		body["snapshot_path"] = snapPath
 		body["mem_file_path"] = memPath
 		if err2 := fcPut(vmDir, "/snapshot/create", body); err2 != nil {
-			return "", "", fmt.Errorf("creating snapshot: %w (shm attempt: %v)", err2, err)
+			return "", "", fmt.Errorf("creating snapshot on disk: %w", err2)
 		}
 	}
 	return snapPath, memPath, nil
