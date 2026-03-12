@@ -172,6 +172,14 @@ When both transfers write to /dev/shm (fast), they both push data through the SS
 - [x] Rapid ping-pong (3 round trips, 6 total migrations) — all succeed
 - [x] Agent restart during migration — VM correctly resumed from paused state
 - [x] Concurrent migrate race test — second request gets 409, first completes
+- [x] SSH ConnectTimeout=10 on all migration SSH commands — prevents indefinite hang
+- [x] Firecracker crash detection in ImportSnapshot — reports actual crash reason
+- [x] API socket ready timeout — fails fast if FC doesn't start within 5s
+- [x] HTTP timeout on golden version check — prevents hanging on unreachable target
+- [x] Stop() checks both in-memory and filesystem migrating marker
+- [x] /dev/shm completely clean after migration commit + destroy verified
+- [x] Full node drain (3 VMs including 2GB) — 26s total, all healthy
+- [x] Comprehensive 9-test regression suite — all pass
 
 ### Bugs Found and Fixed
 14. **ImportSnapshot /dev/shm leak** — multiple error paths in ImportSnapshot didn't clean up /dev/shm/bc-<name>. Fixed: added os.RemoveAll(shmDir) to all error returns.
@@ -187,6 +195,21 @@ When both transfers write to /dev/shm (fast), they both push data through the SS
 24. **/dev/shm leaked after migration commit** — source /dev/shm/bc-<name>/ (512MB+ mmapped import file) persisted after VM migrated away. Fixed: explicit cleanup in commit phase.
 25. **/dev/shm leaked on destroy** — same issue as #24 but for Destroy(). Fixed: os.RemoveAll in Destroy.
 26. **Orphaned /dev/shm dirs on restart** — stale empty /dev/shm/bc-* directories from previous VMs accumulated. Fixed: cleanupMigrationArtifacts removes dirs for non-existent VMs.
+27. **No SSH ConnectTimeout** — unreachable target caused SSH commands to block indefinitely during migration. Fixed: ConnectTimeout=10 on all migration SSH commands.
+28. **Stop() inconsistent migrating check** — Stop() only checked in-memory migratingSet, not filesystem marker. A stale marker from agent crash allowed Stop() to kill a VM during recovery. Fixed: check both.
+29. **ImportSnapshot silent FC crash** — if Firecracker crashed on startup, ImportSnapshot waited 5s then failed with confusing "connection refused" from snapshot load. Fixed: detect process exit during socket wait, report actual crash log.
+
+### Comprehensive Test Results
+All 9 regression tests pass:
+1. Basic migration (node-4 → node-5): PASS
+2. Migrate back (node-5 → node-4): PASS
+3. Concurrent duplicate migration: PASS (409)
+4. Stop during migration: PASS (409)
+5. Delete during migration: PASS (409)
+6. Self-migration: PASS (400)
+7. Non-existent VM: PASS (404)
+8. ImportSnapshot existing VM: PASS (rejected)
+9. Migration to unreachable target: PASS (fail + recover in 10s)
 
 ## Phase 3: Fix Orchestrator Migration (TODO)
 - [x] Switch to ephemeral Tailscale keys — separate keys for orchestrator and nodes
