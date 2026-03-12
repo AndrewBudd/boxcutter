@@ -751,7 +751,62 @@ Drain endpoint accepted any request without checking if node exists or is alread
 **Bug #79: Drain of nonexistent node silently accepted**
 Same root cause as Bug #78. Fixed with the same validation.
 
-## Phase 14: Remaining (TODO)
+## Phase 14: Concurrent Migration & Chaos Testing (2026-03-12)
+
+### Bugs Found and Fixed
+
+**Bug #77: Golden image race condition (concurrent builds)**
+Multiple `docker-to-ext4.sh` processes run simultaneously when boot-time auto-build and MQTT-triggered build fire at the same time. Observed 6 concurrent builds on a single node, all competing for Docker daemon and disk. Fix: `flock -n` in `docker-to-ext4.sh` — second build exits immediately if lock held.
+
+**Bug #80: GC deletes current golden image**
+`GCUnused()` protects the golden manager's in-memory `currentHead`, but after a killed build, `currentHead` is empty. GC then deletes the on-disk version because it's "not the head." Fix: `GCUnused()` now also reads `current-version` from disk to protect the filesystem truth.
+
+### Tests Executed
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| 98 | Concurrent manual migrations (3 VMs simultaneously) | **PASS** | 512MB VMs in ~60s, 2048MB in ~137s. All concurrent. |
+| 99 | Bidirectional concurrent migrations (2 VMs same direction) | **PASS** | 15s for both 512MB VMs |
+| 100 | Crossing migrations (VMs going opposite directions) | **PASS** | Both arrived safely, ~62s total |
+| 101 | Drain during active manual migration | **PASS** | Drain detected in-flight migration (409), waited, then drained remaining VM |
+| 102 | Self-migration guard (bridge IP, localhost, 127.0.0.1) | **PASS** | All 3 variants return 400 |
+| 103 | Migration edge cases (nonexistent VM, missing params, invalid JSON) | **PASS** | 404, 400, 400 respectively |
+| 104 | Create VM during active state (4th VM on loaded node) | **PASS** | No interference |
+| 105 | Double migration attempt (same VM) | **PASS** | First: 202, second: 409 "already migrating" |
+| 106 | Concurrent inbound migrations (2 VMs → same target) | **PASS** | Target handled both imports correctly |
+| 107 | SIGKILL source agent during concurrent migration (pre-sync) | **PASS** | Both VMs resumed on source after restart (8s recovery) |
+| 108 | SIGKILL source agent during pause phase (most dangerous) | **PASS** | Paused VM resumed on source (11s recovery) |
+| 109 | /dev/shm exhaustion on target (93% full, 2GB VM) | **PASS** | Disk fallback, 78s total (vs 50s with tmpfs) |
+| 110 | Full chaos: create + migrate + SIGKILL target + drain | **PASS** | Rollback on target kill, all 5 VMs safe |
+
+### Key Findings
+
+**Concurrent migrations work correctly**: The node agent handles multiple simultaneous migrations via per-VM goroutines with per-VM migration markers. No global lock — different VMs migrate independently. SSH ControlMasters use per-VM paths (`/tmp/bc-migrate-{name}`) to avoid collisions.
+
+**Crossing migrations safe**: VMs can migrate in opposite directions simultaneously (node A→B and B→A) without interference. Each migration has its own SSH session, /dev/shm directory, and migration marker.
+
+**Drain + manual migration interplay**: When drain finds a VM already "migrating" (409 response), it correctly waits for the in-flight migration to complete, verifies on target, then continues with remaining VMs.
+
+**Target agent kill → rollback**: When the target node's agent dies during import-snapshot, the source's `import-snapshot` POST fails, triggering automatic rollback (resume paused VM on source). The target is cleaned up on next agent restart.
+
+**Source agent kill during pause → resume**: The most dangerous crash scenario (VM is paused). On restart, the stale migration recovery checks the target for a running copy. If not found, it resumes the paused VM on source. Recovery takes ~8-11 seconds including systemd restart.
+
+### Cumulative Statistics (All Phases)
+
+| Metric | Value |
+|--------|-------|
+| Total tests executed | 110 |
+| Tests passed | 102 |
+| Tests partial (known limitations) | 2 |
+| Bugs found and fixed | 80 |
+| VMs migrated successfully | 230+ |
+| Drain cycles completed | 38+ |
+| Concurrent migrations tested | 3-way simultaneous, bidirectional, crossing |
+| SIGKILL recovery scenarios | Source pre-sync, source pause, target import |
+| /dev/shm fallback tested | 93% full → disk, verified correct |
+| Host daemon crashes survived | 14+ |
+| Node agent crashes survived | 8+ |
+
+## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
-- [ ] Golden image race fix (prevent concurrent builds on new nodes)
-- [ ] Parallel drain (migrate multiple VMs simultaneously from same source)
+- [ ] Parallel drain (migrate multiple VMs simultaneously from same source) — tested manually, works but serialized by drainMu
