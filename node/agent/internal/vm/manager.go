@@ -1879,6 +1879,10 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		})
 	}
 
+	// Pre-fault guest memory pages so the next snapshot creation is fast (~260ms
+	// instead of ~25s). Must run after snapshot load while Firecracker has the mmap.
+	go fcPrefaultMemory(cmd.Process.Pid, st.Name)
+
 	// Nudge Tailscale to re-establish its network path through the new node.
 	// Uses vsock (host→guest channel) — no SSH/network dependency needed.
 	go func() {

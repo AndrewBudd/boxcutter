@@ -147,6 +147,59 @@ func fcVsockNudge(vmDir string, port int) error {
 	return nil
 }
 
+// fcPrefaultMemory pre-populates Firecracker's guest memory page tables after
+// snapshot restore. Without this, the first snapshot creation after restore takes
+// ~25s for a 512MB VM due to 131K lazy page faults. Reading through /proc/<pid>/mem
+// forces the kernel to fault in all pages via get_user_pages(), reducing subsequent
+// snapshot creation from ~25s to ~260ms.
+func fcPrefaultMemory(pid int, vmName string) {
+	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
+	mapsData, err := os.ReadFile(mapsPath)
+	if err != nil {
+		log.Printf("prefault %s: cannot read maps: %v", vmName, err)
+		return
+	}
+
+	// Find the vm.mem mapping — it's the large MAP_PRIVATE file mapping
+	var startAddr, endAddr uint64
+	for _, line := range strings.Split(string(mapsData), "\n") {
+		if strings.Contains(line, "vm.mem") {
+			parts := strings.SplitN(line, " ", 2)
+			addrs := strings.Split(parts[0], "-")
+			if len(addrs) == 2 {
+				fmt.Sscanf(addrs[0], "%x", &startAddr)
+				fmt.Sscanf(addrs[1], "%x", &endAddr)
+			}
+			break
+		}
+	}
+	if startAddr == 0 || endAddr == 0 {
+		return // No vm.mem mapping found — fresh VM, not restored
+	}
+
+	memPath := fmt.Sprintf("/proc/%d/mem", pid)
+	f, err := os.Open(memPath)
+	if err != nil {
+		log.Printf("prefault %s: cannot open mem: %v", vmName, err)
+		return
+	}
+	defer f.Close()
+
+	size := endAddr - startAddr
+	buf := make([]byte, 4*1024*1024) // 4MB chunks
+	offset := int64(startAddr)
+	end := int64(endAddr)
+	for offset < end {
+		n := int64(len(buf))
+		if offset+n > end {
+			n = end - offset
+		}
+		f.ReadAt(buf[:n], offset)
+		offset += n
+	}
+	log.Printf("prefault %s: pre-faulted %dMB guest memory (PID %d)", vmName, size/1024/1024, pid)
+}
+
 func fcPut(vmDir, path string, body interface{}) error {
 	data, _ := json.Marshal(body)
 	req, err := http.NewRequest("PUT", "http://localhost"+path, bytes.NewReader(data))
