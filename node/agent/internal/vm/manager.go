@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/config"
@@ -1584,7 +1585,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// network partitions while the VM is paused.
 	controlPath := fmt.Sprintf("/tmp/bc-migrate-%s", name)
 	sshBase := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"}
+		"-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10"}
 	masterArgs := append([]string{"-fN", "-o", "ControlMaster=yes", "-o", "ControlPath=" + controlPath}, sshBase...)
 	masterArgs = append(masterArgs, "ubuntu@"+targetBridgeIP)
 	if out, err := exec.Command("ssh", masterArgs...).CombinedOutput(); err != nil {
@@ -1599,7 +1600,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	// Build SSH options that use the control socket when available
 	sshArgs := append([]string{}, sshBase...)
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10", clusterKey)
 	if controlPath != "" {
 		sshArgs = append(sshArgs, "-o", "ControlPath="+controlPath)
 		sshOpts += " -o ControlPath=" + controlPath
@@ -1832,12 +1833,13 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	// Create target directory
 	mkdirCmd := exec.Command("ssh",
 		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=10",
 		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", dstVMDir)
 	if out, err := mkdirCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
 	}
 
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10", clusterKey)
 
 	// Transfer all VM files using tar --sparse (reads only allocated blocks,
 	// not the full sparse extent — 7x faster for typical sparse rootfs files)
@@ -1972,13 +1974,32 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		[]byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
 	go cmd.Wait()
 
-	// Wait for API socket to be ready
+	// Wait for API socket to be ready (or detect early crash)
 	sockPath := filepath.Join(vmDir, "api.sock")
+	sockReady := false
 	for i := 0; i < 50; i++ {
 		if _, err := os.Stat(sockPath); err == nil {
+			sockReady = true
 			break
 		}
+		// Check if FC crashed (process exited before socket appeared)
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			fcLog, _ := os.ReadFile(filepath.Join(vmDir, "firecracker.log"))
+			TeardownTAP(st.TAP, st.Mark)
+			CleanupSnapshot(vmDir)
+			os.RemoveAll(shmDir)
+			os.RemoveAll(vmDir)
+			return nil, fmt.Errorf("firecracker crashed on startup: %s", string(fcLog))
+		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if !sockReady {
+		cmd.Process.Kill()
+		TeardownTAP(st.TAP, st.Mark)
+		CleanupSnapshot(vmDir)
+		os.RemoveAll(shmDir)
+		os.RemoveAll(vmDir)
+		return nil, fmt.Errorf("firecracker API socket not ready after 5s")
 	}
 
 	// Load the snapshot. Check /dev/shm first (migration writes there when space permits),
