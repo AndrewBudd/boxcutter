@@ -18,11 +18,15 @@ import (
 )
 
 // fcClient returns an HTTP client that talks to a Firecracker API socket.
+// DisableKeepAlives ensures each request opens and closes its own connection,
+// preventing idle connection accumulation that triggers Firecracker's
+// "Too many open connections" error during rapid migration retries.
 func fcClient(vmDir string) *http.Client {
 	sockPath := filepath.Join(vmDir, "api.sock")
 	return &http.Client{
 		Timeout: 2 * time.Minute,
 		Transport: &http.Transport{
+			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return net.DialTimeout("unix", sockPath, 5*time.Second)
 			},

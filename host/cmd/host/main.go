@@ -1909,6 +1909,15 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		replacement := findReplacementNode(state, goal)
 		if replacement != nil {
 			if queryNodeHealth(replacement.BridgeIP) != nil {
+				// Deploy latest agent binary from source before relying on this node.
+				// OCI images may contain stale binaries from build time.
+				if goal.DeployedNodeID != replacement.ID {
+					deployNodeBinary(cfg, replacement.BridgeIP, replacement.ID)
+					goal.DeployedNodeID = replacement.ID
+					state.Save()
+					return false, fmt.Sprintf("Deployed latest binary to %s", replacement.ID), nil
+				}
+
 				// New node healthy — wait for golden image, then mark old node for drain
 				if !isGoldenReady(replacement.BridgeIP) {
 					return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil

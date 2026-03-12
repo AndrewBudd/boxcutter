@@ -76,6 +76,10 @@ type UpgradeGoal struct {
 	// Node upgrade: initial count at goal creation, used to detect surplus
 	InitialNodeCount int `json:"initial_node_count,omitempty"`
 
+	// Node upgrade: ID of the replacement node that has received the latest agent binary.
+	// Reset when a new replacement is launched.
+	DeployedNodeID string `json:"deployed_node_id,omitempty"`
+
 	// Orchestrator upgrade: temp bridge IP/TAP/MAC for new orchestrator
 	NewOrchIP  string `json:"new_orch_ip,omitempty"`
 	NewOrchTAP string `json:"new_orch_tap,omitempty"`

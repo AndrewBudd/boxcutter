@@ -2078,6 +2078,22 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		memPath = filepath.Join(vmDir, "vm.mem")
 	}
 
+	// Verify snapshot files exist before calling Firecracker API
+	snapStat, snapErr := os.Stat(snapPath)
+	memStat, memErr := os.Stat(memPath)
+	if snapErr != nil || memErr != nil {
+		cmd.Process.Kill()
+		os.Remove(filepath.Join(vmDir, "firecracker.pid"))
+		TeardownTAP(st.TAP, st.Mark)
+		CleanupSnapshot(vmDir)
+		os.RemoveAll(shmDir)
+		os.RemoveAll(vmDir)
+		return nil, fmt.Errorf("snapshot files missing: snap=%s (err=%v), mem=%s (err=%v)",
+			snapPath, snapErr, memPath, memErr)
+	}
+	log.Printf("ImportSnapshot %s: loading snap=%s (%d bytes), mem=%s (%d bytes)",
+		st.Name, snapPath, snapStat.Size(), memPath, memStat.Size())
+
 	loadBody := map[string]interface{}{
 		"snapshot_path": snapPath,
 		"mem_backend": map[string]string{
@@ -2088,6 +2104,10 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		"resume_vm":             true,
 	}
 	if err := fcPut(vmDir, "/snapshot/load", loadBody); err != nil {
+		// Log Firecracker output before cleanup
+		if fcLog, readErr := os.ReadFile(filepath.Join(vmDir, "firecracker.log")); readErr == nil && len(fcLog) > 0 {
+			log.Printf("ImportSnapshot %s: Firecracker log:\n%s", st.Name, string(fcLog))
+		}
 		// Kill Firecracker on failure
 		cmd.Process.Kill()
 		os.Remove(filepath.Join(vmDir, "firecracker.pid"))
