@@ -510,6 +510,19 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 		}
 	}
 
+	// Clean up stale draining/upgrading nodes with dead QEMU processes.
+	// If a drain was interrupted by a host crash, the node can't be recovered.
+	var cleanNodes []string
+	for _, node := range state.Nodes {
+		if !node.IsActive() && !qemu.IsRunning(node.PID) {
+			log.Printf("  %s status=%s with dead QEMU (PID %d) — removing from cluster state", node.ID, node.Status, node.PID)
+			cleanNodes = append(cleanNodes, node.ID)
+		}
+	}
+	for _, id := range cleanNodes {
+		state.RemoveNode(id)
+	}
+
 	// Launch nodes (skip those being drained/upgraded)
 	for _, node := range state.Nodes {
 		if !node.IsActive() {
