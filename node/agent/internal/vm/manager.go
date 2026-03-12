@@ -253,6 +253,9 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 
 // Start starts an existing stopped VM.
 func (m *Manager) Start(name string) (*CreateResponse, error) {
+	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+		return nil, fmt.Errorf("VM '%s' is being migrated", name)
+	}
 	st, err := m.startSetup(name)
 	if err != nil {
 		return nil, err
@@ -2107,13 +2110,13 @@ func (m *Manager) ensureTargetHasGolden(version, targetAddr, targetBridgeIP stri
 	log.Printf("Transferring golden image %s to %s", version, targetBridgeIP)
 
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
 	goldenDir := "/var/lib/boxcutter/golden/"
 
 	// Ensure target golden dir exists
 	mkdirCmd := exec.Command("ssh",
 		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=10",
+		"-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
 		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", goldenDir)
 	if out, err := mkdirCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("mkdir golden on target: %s: %w", string(out), err)
