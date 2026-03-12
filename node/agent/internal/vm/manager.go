@@ -1609,6 +1609,19 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		sshOpts += " -o ControlPath=" + controlPath
 	}
 
+	// cleanTarget removes pre-staged and snapshot files from the target node.
+	// Tries the ControlMaster connection first; falls back to direct SSH if dead.
+	cleanTarget := func() {
+		cleanArgs := []string{"sudo", "rm", "-rf", dstVMDir, fmt.Sprintf("/dev/shm/bc-%s", name)}
+		cleanCmd := exec.Command("ssh", append(append([]string{}, sshArgs...), append([]string{"ubuntu@" + targetBridgeIP}, cleanArgs...)...)...)
+		if err := cleanCmd.Run(); err != nil && controlPath != "" {
+			// ControlMaster may be dead — retry with direct SSH (no ControlPath)
+			log.Printf("Migrating %s: cleanup via ControlMaster failed, retrying direct SSH", name)
+			directArgs := append(append([]string{}, sshBase...), append([]string{"ubuntu@" + targetBridgeIP}, cleanArgs...)...)
+			exec.Command("ssh", directArgs...).Run()
+		}
+	}
+
 	// --- Phase 1: Pre-stage while VM is still running (zero downtime) ---
 	phase1Start := time.Now()
 	log.Printf("Migrating %s to %s: pre-staging (VM still running)", name, targetAddr)
@@ -1635,6 +1648,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := preSyncCmd.CombinedOutput(); err != nil {
+		cleanTarget() // clean up mkdir + any partial pre-sync files on target
 		return nil, fmt.Errorf("pre-sync disk transfer failed (aborting migration): %s: %w", string(out), err)
 	}
 	log.Printf("Migrating %s: pre-sync completed in %s (phase 1 total: %s)",
@@ -1644,6 +1658,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	downtimeStart := time.Now()
 	log.Printf("Migrating %s: pausing VM (downtime starts)", name)
 	if err := fcPause(vmDir); err != nil {
+		cleanTarget() // clean up pre-synced files on target
 		return nil, fmt.Errorf("pause: %w", err)
 	}
 	log.Printf("Migrating %s: VM paused in %s", name, time.Since(downtimeStart).Round(time.Millisecond))
@@ -1654,9 +1669,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		if err := fcResume(vmDir); err != nil {
 			log.Printf("Migrating %s: WARNING — failed to resume source: %v", name, err)
 		}
-		cleanCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
-			"sudo", "rm", "-rf", dstVMDir, fmt.Sprintf("/dev/shm/bc-%s", name))...)
-		cleanCmd.Run()
+		cleanTarget()
 		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean source /dev/shm snapshot files
 	}
 
