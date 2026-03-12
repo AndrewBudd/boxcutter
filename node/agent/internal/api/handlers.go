@@ -150,7 +150,11 @@ func (h *Handler) handleDestroy(w http.ResponseWriter, r *http.Request) {
 		name = extractName(r.URL.Path, "/api/vms/")
 	}
 	if err := h.mgr.Destroy(name); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if strings.Contains(err.Error(), "is being migrated") {
+			http.Error(w, err.Error(), http.StatusConflict)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 

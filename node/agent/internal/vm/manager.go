@@ -467,6 +467,13 @@ func (m *Manager) Destroy(name string) error {
 		return fmt.Errorf("VM '%s' not found", name)
 	}
 
+	// Reject destroy during active migration to prevent race conditions.
+	// Destroying mid-migration leaves orphaned files on the target and causes
+	// the migration goroutine to fail with confusing errors.
+	if IsMigrating(vmDir) {
+		return fmt.Errorf("VM '%s' is being migrated", name)
+	}
+
 	// Deregister from vmid
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
