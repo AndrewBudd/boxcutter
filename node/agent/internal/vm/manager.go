@@ -1740,7 +1740,9 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	// Decide where to write snapshot files on target: /dev/shm for speed if space permits,
 	// otherwise vmDir (on disk). Firecracker mmaps the mem file, so /dev/shm usage persists
-	// until the VM exits. Check available space with ~20% margin for safety.
+	// until the VM exits. Reserve 2x memory: 1x stays mmapped for the running VM, plus
+	// 1x headroom so a future export snapshot (drain) also fits in /dev/shm. Without this
+	// headroom, nodes full of imported VMs fall back to disk snapshots on export (~60x slower).
 	dstSnapDir := dstVMDir
 	dstShmDir := fmt.Sprintf("/dev/shm/bc-%s", name)
 	shmCheckCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
@@ -1749,7 +1751,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		lines := strings.Split(strings.TrimSpace(string(shmOut)), "\n")
 		if len(lines) >= 2 {
 			avail, _ := strconv.ParseInt(strings.TrimSpace(lines[len(lines)-1]), 10, 64)
-			needed := memSize + memSize/5 // 20% margin
+			needed := memSize*2 + memSize/5 // 2x mem (import + future export headroom) + 20% margin
 			if avail > needed {
 				// Use /dev/shm on target for fast writes
 				mkShmCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
