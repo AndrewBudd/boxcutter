@@ -1435,7 +1435,12 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			continue
 		}
 		migrateResp.Body.Close()
-		if migrateResp.StatusCode >= 300 {
+		if migrateResp.StatusCode == 409 {
+			// 409 = VM already migrating (e.g., from a previous drain attempt
+			// that was interrupted). Don't count as failure — fall through to
+			// poll loop which will wait for the in-flight migration to finish.
+			log.Printf("Drain: %s already migrating — waiting for in-flight migration", vmName)
+		} else if migrateResp.StatusCode >= 300 {
 			log.Printf("Drain: migrate %s returned %d", vmName, migrateResp.StatusCode)
 			failedMigrations++
 			continue
