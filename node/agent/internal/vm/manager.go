@@ -1964,7 +1964,8 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
-	// Set up TAP + fwmark routing
+	// Clean stale TAP/rules (idempotent) then set up fresh
+	TeardownTAP(st.TAP, st.Mark)
 	if err := SetupTAP(st.TAP, st.Mark); err != nil {
 		CleanupSnapshot(vmDir)
 		os.RemoveAll(shmDir)
