@@ -82,15 +82,15 @@ func main() {
 	// Restart VMs that were running before node restarted
 	go mgr.RestartAll()
 
-	// Auto-build golden image if missing
-	go autoGoldenBuild(mgr)
-
 	// Golden image manager — handles OCI pulls and version switching
 	goldenMgr := golden.NewManager(golden.Config{
 		GoldenDir:     filepath.Dir(cfg.Storage.GoldenLocalPath),
 		OCIRegistry:   cfg.OCI.Registry,
 		OCIRepository: cfg.OCI.Repository,
 	})
+
+	// Auto-build golden image if missing (uses goldenMgr to prevent races with MQTT builds)
+	go autoGoldenBuild(goldenMgr)
 
 	// MQTT client — connect to broker on host bridge
 	brokerAddr := cfg.MQTT.BrokerAddr
@@ -141,23 +141,12 @@ func main() {
 	server.Close()
 }
 
-func autoGoldenBuild(mgr *vm.Manager) {
-	goldenPath := mgr.GoldenPath()
-	if _, err := os.Stat(goldenPath); err == nil {
-		return // golden image exists
+func autoGoldenBuild(goldenMgr *golden.Manager) {
+	if goldenMgr.CurrentHead() != "" {
+		return // golden image already exists
 	}
-
-	buildScript := filepath.Join(filepath.Dir(goldenPath), "docker-to-ext4.sh")
-	if _, err := os.Stat(buildScript); err != nil {
-		log.Printf("Golden image missing but no build script at %s", buildScript)
-		return
-	}
-
 	log.Printf("Golden image missing — starting automatic build...")
-	cmd := exec.Command("bash", buildScript)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := goldenMgr.SetHead("build"); err != nil {
 		log.Printf("Golden image auto-build failed: %v", err)
 		return
 	}

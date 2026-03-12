@@ -110,6 +110,17 @@ func defaultConfig() HostConfig {
 		}
 	}
 	if repoDir == "" {
+		// Check SUDO_USER's home for the repo (common when running 'sudo boxcutter-host upgrade')
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			if u, err := user.Lookup(sudoUser); err == nil {
+				candidate := filepath.Join(u.HomeDir, "boxcutter")
+				if fileExists(filepath.Join(candidate, "host", "boxcutter.env")) {
+					repoDir = candidate
+				}
+			}
+		}
+	}
+	if repoDir == "" {
 		// No repo found — use /var/lib/boxcutter as data directory (prod mode)
 		repoDir = "/var/lib/boxcutter"
 	}

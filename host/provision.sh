@@ -636,9 +636,24 @@ done)
       sed -i "s|bridge_ip:.*|bridge_ip: ${THIS_NODE_IP}|" /etc/boxcutter/boxcutter.yaml
       sed -i "s|url:.*ORCHESTRATOR_URL_PLACEHOLDER|url: http://${ORCH_IP}:8801|" /etc/boxcutter/boxcutter.yaml
 
+      # Cluster SSH key: set up BEFORE boxcutter-setup (OCI image may have stale script)
+      if [ -f /etc/boxcutter/secrets/cluster-ssh.key ]; then
+        mkdir -p /root/.ssh
+        cp /etc/boxcutter/secrets/cluster-ssh.key /root/.ssh/cluster-ssh.key
+        chmod 600 /root/.ssh/cluster-ssh.key
+        printf '%s\n' 'Host 192.168.50.*' '  IdentityFile /root/.ssh/cluster-ssh.key' '  User ubuntu' '  StrictHostKeyChecking no' '  UserKnownHostsFile /dev/null' > /root/.ssh/config
+        chmod 600 /root/.ssh/config
+        if [ -f /etc/boxcutter/secrets/cluster-ssh.key.pub ]; then
+          CLUSTER_PUB=\$(cat /etc/boxcutter/secrets/cluster-ssh.key.pub)
+          grep -qF "\$CLUSTER_PUB" /home/ubuntu/.ssh/authorized_keys 2>/dev/null || \
+            echo "\$CLUSTER_PUB" >> /home/ubuntu/.ssh/authorized_keys
+        fi
+      fi
+
       # Run boxcutter-setup if available (generates derived secrets, joins Tailscale)
+      # Use || true to prevent stale boxcutter-setup from aborting config on Tailscale errors
       if [ -x /usr/local/bin/boxcutter-setup ]; then
-        /usr/local/bin/boxcutter-setup
+        /usr/local/bin/boxcutter-setup || echo "WARNING: boxcutter-setup failed (non-fatal)"
       fi
 
       # Restart services to pick up new config
@@ -741,14 +756,14 @@ done)
         chmod 600 /root/.ssh/config
       fi
 
-      # Join Tailscale — prefer dedicated orchestrator key
+      # Join Tailscale — prefer dedicated orchestrator key (non-fatal on failure)
       if command -v tailscale &>/dev/null; then
         if [ -f /etc/boxcutter/secrets/tailscale-orch-authkey ]; then
           ORCH_KEY=\$(cat /etc/boxcutter/secrets/tailscale-orch-authkey | tr -d '[:space:]')
-          tailscale up --authkey="\$ORCH_KEY" --hostname=boxcutter
+          tailscale up --authkey="\$ORCH_KEY" --hostname=boxcutter || echo "WARNING: Tailscale join failed (non-fatal)"
         elif [ -f /etc/boxcutter/secrets/tailscale-node-authkey ]; then
           NODE_KEY=\$(cat /etc/boxcutter/secrets/tailscale-node-authkey | tr -d '[:space:]')
-          tailscale up --authkey="\$NODE_KEY" --hostname=boxcutter
+          tailscale up --authkey="\$NODE_KEY" --hostname=boxcutter || echo "WARNING: Tailscale join failed (non-fatal)"
         fi
       fi
 
