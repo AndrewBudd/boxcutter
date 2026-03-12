@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -1691,6 +1692,19 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	log.Printf("Migrating %s: pre-sync completed in %s (phase 1 total: %s)",
 		name, time.Since(preSyncStart).Round(time.Millisecond), time.Since(phase1Start).Round(time.Millisecond))
 
+	// Ensure guest memory pages are faulted in before snapshotting. After snapshot
+	// restore, Firecracker lazily faults pages from the mmapped vm.mem file. If the
+	// background prefault goroutine (from ImportSnapshot) hasn't completed yet, the
+	// snapshot creation will be extremely slow (~32s vs ~260ms for 512MB).
+	pidData, _ := os.ReadFile(filepath.Join(vmDir, "firecracker.pid"))
+	if len(pidData) > 0 {
+		var pid int
+		fmt.Sscanf(string(pidData), "%d", &pid)
+		if pid > 0 {
+			fcPrefaultMemory(pid, name)
+		}
+	}
+
 	// --- Phase 2: Pause + Snapshot + delta transfer (downtime starts) ---
 	downtimeStart := time.Now()
 	log.Printf("Migrating %s: pausing VM (downtime starts)", name)
@@ -2040,11 +2054,15 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		[]byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
 	go cmd.Wait()
 
-	// Wait for API socket to be ready (or detect early crash)
+	// Wait for API socket to be ready by actually connecting (not just file existence).
+	// os.Stat alone can return true before Firecracker is accepting connections, causing
+	// the subsequent /snapshot/load PUT to timeout with "dial unix ... i/o timeout".
 	sockPath := filepath.Join(vmDir, "api.sock")
 	sockReady := false
 	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(sockPath); err == nil {
+		conn, dialErr := net.DialTimeout("unix", sockPath, 500*time.Millisecond)
+		if dialErr == nil {
+			conn.Close()
 			sockReady = true
 			break
 		}
