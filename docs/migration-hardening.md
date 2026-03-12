@@ -302,10 +302,61 @@ All 9 regression tests pass:
 
 Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapshot) because Firecracker writes 2GB through QCOW2 virtual disk with COW page faults. Target disk fallback adds only ~20% overhead.
 
-## Phase 5: Stress Testing (TODO)
-- [x] 5+ VMs concurrent migration — tested: 5 VMs simultaneously, all completed
+## Phase 5: Host Infrastructure Hardening
+
+### Bugs Found
+
+**Bug #45 (Critical): Auto-scaled nodes get stale binaries**
+- Auto-scaler provisions new nodes from the base QCOW2 image, which has an old boxcutter-node binary
+- Source node transfers snapshot files to `/dev/shm/bc-<name>/` on target
+- Old target binary doesn't support `/dev/shm` import paths, causing all migrations to fail with "Failed to open snapshot file: No such file or directory"
+- Fix: `deployNodeBinary()` goroutine in `addNode()` — builds latest binary from source, SCPs to new node after SSH ready, restarts service
+- Had to resolve: go binary not in root's PATH (use absolute path), VCS stamping errors (-buildvcs=false), HOME not writable (set to /tmp)
+
+**Bug #46 (Low): ORCHESTRATOR_URL_PLACEHOLDER on one auto-scaled node**
+- node-7 had `ORCHESTRATOR_URL_PLACEHOLDER` instead of real URL in boxcutter.yaml
+- Could not reproduce on node-8+ — cloud-init provisioning works correctly
+- Likely a one-off cloud-init race or stale ISO; not a systemic bug
+
+**Bug #47 (Critical): Host systemd unit kills QEMU VMs on daemon crash**
+- Default `KillMode=control-group` sends SIGTERM to all processes in the cgroup
+- When host daemon crashes, all QEMU VMs (orchestrator + nodes) are killed
+- Fix: `KillMode=process` in `boxcutter-host.service` (matches boxcutter-node pattern)
+- Verified: after fix, `kill -9 <host-pid>` leaves QEMU processes running
+
+**Bug #48 (Medium): Auto-scaler yo-yo — CPU/RAM threshold mismatch**
+- CPU at 100% triggers scale-up, but RAM at 19% (across 2 nodes) triggers immediate scale-down
+- New empty node gets created, then immediately drained because combined RAM is low
+- Fix: `scaleDownCandidate()` now checks both RAM AND CPU utilization
+- Won't scale down if either metric exceeds the scale-down threshold
+
+**Bug #49 (Medium): Drain mutex needed for concurrent drain prevention**
+- API handler, auto-scaler, and upgrade reconciler can all call `drainNode()` concurrently
+- Without serialization, two drains could pick the same target or double-drain a node
+- Fix: `drainMu sync.Mutex` + early-exit when node already in "draining" status
+- Tested: second drain attempt blocks until first completes, then finds node gone
+
+**Bug #50 (Low): findClusterSSHKey fails in systemd context**
+- When running as systemd service, SUDO_USER is not set
+- Function couldn't find `~/.boxcutter/secrets/cluster-ssh.key`
+- Fix: also check owner of BOXCUTTER_REPO directory via stat to find the right home
+
+### Test Results
+
+| Test | Result |
+|------|--------|
+| Single VM migration (node-to-node) | Pass — 3.3s |
+| Concurrent 2-VM migration | Pass — both succeed, serialized import on target |
+| 3-VM concurrent migration (mixed sizes) | Pass — all succeed |
+| Full node drain (3 VMs sequential) | Pass — 10s + 80s + 70s (disk fallback for 2GB VMs) |
+| Full node drain (6 VMs sequential) | Pass — all migrated, node stopped |
+| Double-drain prevention (mutex) | Pass — second drain blocked, found node gone |
+| Host daemon crash mid-drain (KillMode=process) | Pass — QEMU VMs survive |
+| Auto-deploy to new auto-scaled node | Pass — binary built from source, deployed via SCP |
+| Migration to auto-deployed node (both directions) | Pass — 3.3s |
+| CPU-aware scale-down (no yo-yo) | Pass — node stays up when CPU > 30% |
+
+## Phase 6: Remaining (TODO)
 - [ ] Rolling node upgrade with live VMs
-- [x] Failure injection (kill source/target mid-migration) — tested both, correct recovery
-- [x] /dev/shm exhaustion (VM too large for tmpfs) — graceful fallback to disk
-- [x] Network partition during migration — rollback in ~39s (was: indefinite)
-- [x] Source/target agent restart during migration — correct recovery in all cases
+- [ ] Stale draining node cleanup on host restart
+- [ ] Handle draining node with dead QEMU (clean up cluster state)
