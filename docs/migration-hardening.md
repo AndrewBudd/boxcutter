@@ -412,7 +412,58 @@ Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapsh
 | Auto-scale-up triggers | 4 |
 | Disk space recovered | 109GB (stale QCOW2 cleanup) |
 
-## Phase 7: Remaining (TODO)
+## Phase 7: Edge Cases & Resilience (complete)
+
+### Bugs Found
+
+**Bug #55 (High): /dev/shm exhaustion causes 60x slower export snapshots during drain**
+- Symptom: 2048MB VMs have 1m24s downtime instead of ~2s
+- Root cause: VMs imported via snapshot keep memory mmapped in /dev/shm. Nodes that received many migrations filled /dev/shm to 95%, leaving no space for export snapshots. Export fell back to disk through QEMU I/O stack — 60x slower.
+- Fix: When importing snapshot to target, reserve 2x VM memory in /dev/shm (1x for import mmap + 1x headroom for future export). Changed `needed = memSize + memSize/5` to `needed = memSize*2 + memSize/5`.
+- Result: /dev/shm stays at ~69% instead of 95%. dark-igloo drain downtime improved from 1m13s to 48s (37% reduction).
+
+**Bug #56 (High): 409 during drain resume counted as permanent failure**
+- Symptom: After host daemon crash mid-drain, resumed drain gets 409 on in-flight VM, counts as failure, aborts drain. Node left running with 0 VMs.
+- Root cause: 409 = "already migrating" from source agent. The in-flight migration was still running but drain treated 409 like any other error.
+- Fix: 409 now falls through to the poll loop, which waits for the in-flight migration to complete (source goes to 404).
+- Tested: crash + resume + 409 wait + all VMs migrated + node stopped ✓
+
+**Bug #57 (Medium): Single-target drain fails on target exhaustion**
+- Symptom: If drain target fills up or dies mid-drain, all remaining VMs fail.
+- Root cause: Target was selected ONCE at drain start — no re-selection.
+- Fix: `pickDrainTarget()` selects target per-VM based on most free RAM. Drain adapts to target failure, capacity exhaustion, and distributes across multiple targets naturally.
+
+### Tests Executed
+
+1. **Double drain request (same node)** — drainMu serializes correctly, second drain sees "not found" ✓
+2. **Drain to node with golden_ready=false** — works (migration doesn't need golden) ✓
+3. **Drain to node with agent still booting** — migration waited, completed (90s) ✓
+4. **Host daemon crash mid-drain + resume** — 409 handling verified, all VMs migrated ✓
+5. **Source agent crash mid-drain** — bold-doe rolled back, remaining 5 migrated, re-drain got bold-doe ✓
+6. **Empty node drain** — immediate stop, no migration attempt ✓
+7. **Re-drain after partial failure** — remaining VM migrated, node stopped ✓
+8. **4 consecutive drains** — validated /dev/shm headroom across 3 generations ✓
+
+### Key Architecture Observations
+
+1. **Per-VM target selection** prevents cascade failures. Each migration picks the node with most free RAM, naturally distributing VMs and adapting to failures.
+2. **409 as continuation signal** is critical for crash recovery. Without it, every crash-resumed drain aborts even though all VMs ultimately migrate.
+3. **/dev/shm is a shared resource** between import (read-heavy mmap) and export (write-heavy snapshot). The 2x headroom ensures both can coexist.
+4. **Agent crash is recoverable**: KillMode=process preserves Firecracker VMs. Agent restarts, detects existing VMs, stale migration markers get cleaned up. Drain can be re-triggered.
+
+### Migration Statistics (Phase 7)
+
+| Metric | Value |
+|--------|-------|
+| VMs migrated successfully | 36 |
+| Failed migrations (rolled back) | 1 (source agent killed mid-flight) |
+| Drains completed | 8 |
+| Drain resume after crash | 2 (all successful with 409 fix) |
+| Consecutive drain cycles | 4 (nodes 15→16→17→18→19→20→21→22→23) |
+| /dev/shm headroom improvement | 95% → 69% utilization |
+
+## Phase 8: Remaining (TODO)
 - [ ] Rolling node upgrade with live VMs via OCI images
 - [ ] Orchestrator upgrade with state migration
 - [ ] Test with real Tailscale-connected VMs (verify Tailscale reconnects after migration)
+- [ ] Multi-target drain distribution (verify with 3+ nodes)
