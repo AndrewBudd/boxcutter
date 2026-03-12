@@ -429,7 +429,7 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 
 // Stop stops a running VM.
 func (m *Manager) Stop(name string) error {
-	if m.IsMigratingVM(name) {
+	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
 		return fmt.Errorf("VM '%s' is being migrated", name)
 	}
 	m.mu.Lock()
