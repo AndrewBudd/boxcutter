@@ -295,6 +295,11 @@ func (m *Manager) startSetup(name string) (*VMState, error) {
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
+	// Regenerate FC config (may be missing after relocation, or have stale paths)
+	if err := writeFirecrackerConfig(vmDir, st); err != nil {
+		return nil, fmt.Errorf("writing firecracker config: %w", err)
+	}
+
 	return st, nil
 }
 
