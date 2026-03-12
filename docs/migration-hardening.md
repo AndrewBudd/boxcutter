@@ -606,26 +606,58 @@ Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapsh
 | 512MB from building node | 3.3s | 27s | 3.7s | 29.4s | Docker IO contention |
 | 2GB concurrent | 5.3s | 1.8s | 57.8s | 60.4s | SSH bandwidth contention |
 
+## Phase 11: Rolling Upgrade via OCI Images (2026-03-12)
+
+### Bugs Found
+
+| # | Bug | Severity | Fix |
+|---|-----|----------|-----|
+| 66 | OCI node has stale binary — snapshot import fails | **Critical** | `deployNodeBinary` now returns errors; reconciler retries on failure |
+| 67 | CLI/daemon state race — separate processes overwrite cluster.json | **Critical** | Upgrades now go through daemon's Unix socket API (single state owner) |
+| 68 | Auto-scaler races with upgrade reconciler — launches unwanted nodes | Medium | Auto-scaling disabled during active upgrade goal |
+| 69 | `oci.Pull` hangs when output file already exists | High | Remove existing .zst/oras artifacts before pulling |
+| 70 | `findReplacementNode` returns wrong node — stale binary on replacement | **Critical** | Deploy binary in `launchReplacementNode` immediately (like `addNode`) |
+
+### Tests Executed
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| 63 | Rolling node upgrade via OCI (retry) | **PASS** | All 3 VMs migrated, counter process survived, 6m total |
+| 64 | Re-upgrade already-upgraded cluster | **PASS** | Pull + digest check → no-op, 35s total |
+| 65 | Daemon restart during upgrade | **PASS** | Goal preserved in cluster.json, reconciler resumes at boot |
+| 66 | Migration to OCI upgrade node | **PASS** | 16s for 2GB VM after deploy fix |
+| 67 | Ping-pong migration (same VM back and forth) | **PASS** | Two migrations in quick succession, no issues |
+
+### Key Findings
+
+**Daemon-managed upgrades**: The upgrade CLI now sends requests through the daemon's Unix socket API (`POST /upgrade`). The daemon owns the in-memory state and runs the reconciler — no more file-level races between processes.
+
+**Deploy verification**: `deployNodeBinary` now returns errors instead of silently logging failures. The reconciler retries the deploy step until it succeeds. A post-deploy health check waits up to 60s for the agent to come back healthy.
+
+**Auto-scaler suppression**: During upgrades, the auto-scaler is paused to prevent it from launching nodes that the reconciler would then have to drain.
+
 ### Cumulative Statistics (All Phases)
 
 | Metric | Value |
 |--------|-------|
-| Total tests executed | 60+ |
-| Tests passed | 58 |
+| Total tests executed | 67+ |
+| Tests passed | 65 |
 | Tests partial (known limitations) | 2 |
-| Bugs found and fixed | 65 |
-| VMs migrated successfully | 100+ |
-| VMs rolled back successfully | 6+ |
-| Drain cycles completed | 12+ |
+| Bugs found and fixed | 70 |
+| VMs migrated successfully | 120+ |
+| VMs rolled back successfully | 7+ |
+| Drain cycles completed | 16+ |
 | Maximum VMs in single drain | 11 |
-| Maximum consecutive migrations (same VM) | 4 |
-| Process survival verified | 2561 entries, 0 gaps |
+| Maximum consecutive migrations (same VM) | 6+ (ping-pong) |
+| Process survival verified | 5600+ entries, 0 gaps, 95+ min |
 | Tailscale reconnection verified | Multiple migrations, <10s DERP recovery |
 | Auto-scale triggers | 8+ |
-| Host daemon crashes survived | 3+ |
+| Host daemon crashes survived | 4+ |
 | Node agent crashes survived | 4+ |
+| Rolling OCI upgrades completed | 2 (including idempotent re-upgrade) |
 
-## Phase 11: Remaining (TODO)
+## Phase 12: Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
-- [ ] Rolling node upgrade with live VMs via OCI images
 - [ ] Multi-target drain distribution (verify with 3+ nodes simultaneously)
+- [ ] Upgrade interrupted by daemon restart (crash recovery)
+- [ ] Upgrade with VM creation/deletion during upgrade

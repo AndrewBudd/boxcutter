@@ -690,7 +690,11 @@ func healthLoop(cfg HostConfig, state *cluster.State, hs *healthState) {
 					// Re-deploy latest binary after QEMU restart.
 					// An ungraceful QEMU shutdown (kill -9) may lose
 					// filesystem writes from a prior auto-deploy.
-					go deployNodeBinary(cfg, node.BridgeIP, node.ID)
+					go func(ip, id string) {
+						if err := deployNodeBinary(cfg, ip, id); err != nil {
+							log.Printf("Deploy %s (background): %v", id, err)
+						}
+					}(node.BridgeIP, node.ID)
 				}
 				if hs.nodes[node.ID] == nil {
 					hs.nodes[node.ID] = &serviceHealth{}
@@ -827,6 +831,11 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 
 	for range ticker.C {
 		if state.NodeCount() == 0 {
+			continue
+		}
+
+		// Don't auto-scale during upgrades — the reconciler manages node count
+		if state.UpgradeGoal != nil {
 			continue
 		}
 
@@ -1103,23 +1112,26 @@ func addNode(cfg HostConfig, state *cluster.State) {
 
 	// Deploy latest node agent binary in background after the node boots.
 	// Auto-scaled nodes use the base image which may have a stale binary.
-	go deployNodeBinary(cfg, bridgeIP, nodeID)
+	go func() {
+		if err := deployNodeBinary(cfg, bridgeIP, nodeID); err != nil {
+			log.Printf("Deploy %s (background): %v", nodeID, err)
+		}
+	}()
 }
 
 // deployNodeBinary builds the node agent from source and deploys it to a node.
 // Waits for SSH to become available, then SCPs the binary and restarts the service.
-func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) {
+// Returns an error if any step fails so callers can retry.
+func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 	sshKey := findClusterSSHKey(cfg)
 	if sshKey == "" {
-		log.Printf("Deploy %s: no cluster SSH key found, skipping binary deploy", nodeID)
-		return
+		return fmt.Errorf("no cluster SSH key found")
 	}
 
 	// Build the binary from source
 	agentDir := filepath.Join(cfg.RepoDir, "node", "agent")
 	if _, err := os.Stat(agentDir); err != nil {
-		log.Printf("Deploy %s: agent source not found at %s, skipping", nodeID, agentDir)
-		return
+		return fmt.Errorf("agent source not found at %s", agentDir)
 	}
 
 	tmpBin := filepath.Join(os.TempDir(), fmt.Sprintf("boxcutter-node-%s", nodeID))
@@ -1141,8 +1153,7 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) {
 		"PATH=/usr/local/go/bin:"+os.Getenv("PATH"),
 		"HOME="+os.TempDir()) // go needs a writable HOME for cache
 	if out, err := buildCmd.CombinedOutput(); err != nil {
-		log.Printf("Deploy %s: build failed: %v\n%s", nodeID, err, string(out))
-		return
+		return fmt.Errorf("build failed: %v\n%s", err, string(out))
 	}
 
 	sshOpts := []string{
@@ -1153,23 +1164,23 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) {
 	}
 
 	// Wait for SSH (up to 3 minutes)
+	sshReady := false
 	for i := 0; i < 36; i++ {
 		testCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP, "true")...)
 		if testCmd.Run() == nil {
+			sshReady = true
 			break
 		}
-		if i == 35 {
-			log.Printf("Deploy %s: SSH not ready after 3 minutes, giving up", nodeID)
-			return
-		}
 		time.Sleep(5 * time.Second)
+	}
+	if !sshReady {
+		return fmt.Errorf("SSH not ready after 3 minutes")
 	}
 
 	// SCP binary to node
 	scpCmd := exec.Command("scp", append(sshOpts, tmpBin, "ubuntu@"+bridgeIP+":/tmp/boxcutter-node")...)
 	if out, err := scpCmd.CombinedOutput(); err != nil {
-		log.Printf("Deploy %s: SCP failed: %v\n%s", nodeID, err, string(out))
-		return
+		return fmt.Errorf("SCP failed: %v\n%s", err, string(out))
 	}
 
 	// Also deploy the systemd service file (ensures KillMode=process is set)
@@ -1193,11 +1204,29 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) {
 		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
 		"&&", "sudo", "systemctl", "restart", "boxcutter-node")...)
 	if out, err := installCmd.CombinedOutput(); err != nil {
-		log.Printf("Deploy %s: install failed: %v\n%s", nodeID, err, string(out))
-		return
+		return fmt.Errorf("install failed: %v\n%s", err, string(out))
+	}
+
+	// Verify: wait for agent to come back healthy after restart
+	client := &http.Client{Timeout: 5 * time.Second}
+	healthOK := false
+	for i := 0; i < 12; i++ {
+		time.Sleep(5 * time.Second)
+		resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", bridgeIP))
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				healthOK = true
+				break
+			}
+		}
+	}
+	if !healthOK {
+		return fmt.Errorf("agent not healthy after restart (waited 60s)")
 	}
 
 	log.Printf("Deploy %s: latest node agent binary deployed successfully", nodeID)
+	return nil
 }
 
 // startAPI serves the unix socket control API.
@@ -1250,6 +1279,63 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 		go drainNode(cfg, state, nodeID)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "draining", "node": nodeID})
+	})
+
+	// upgradeMu prevents concurrent upgrades. Only one upgrade can run at a time.
+	var upgradeMu sync.Mutex
+	var upgradeRunning bool
+
+	mux.HandleFunc("POST /upgrade", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			VMType string `json:"vm_type"` // "node", "orchestrator", "all"
+			Tag    string `json:"tag"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+			return
+		}
+		if req.VMType == "" {
+			req.VMType = "node"
+		}
+		if req.Tag == "" {
+			req.Tag = "latest"
+		}
+
+		upgradeMu.Lock()
+		if upgradeRunning {
+			upgradeMu.Unlock()
+			http.Error(w, `{"error":"upgrade already in progress"}`, http.StatusConflict)
+			return
+		}
+		upgradeRunning = true
+		upgradeMu.Unlock()
+
+		// Set upgrade goal in daemon's state (single source of truth)
+		if state.UpgradeGoal == nil {
+			state.SetUpgradeGoal(&cluster.UpgradeGoal{
+				VMType:           req.VMType,
+				Tag:              req.Tag,
+				InitialNodeCount: state.ActiveNodeCount(),
+			})
+			state.Save()
+		}
+
+		// Run reconciler in background
+		go func() {
+			defer func() {
+				upgradeMu.Lock()
+				upgradeRunning = false
+				upgradeMu.Unlock()
+			}()
+			runReconcileLoop(cfg, state)
+		}()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "started",
+			"vm_type": req.VMType,
+			"tag":     req.Tag,
+		})
 	})
 
 	listener, err := net.Listen("unix", cfg.SocketPath)
@@ -1778,41 +1864,72 @@ func cliUpgrade() {
 		return
 	}
 
-	state, err := cluster.Load(cfg.StatePath)
+	// Send upgrade request to the daemon via Unix socket.
+	// The daemon manages all state in-process — no file-level races.
+	sockClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", cfg.SocketPath)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	reqBody, _ := json.Marshal(map[string]string{
+		"vm_type": vmType,
+		"tag":     tag,
+	})
+	resp, err := sockClient.Post("http://localhost/upgrade", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Cannot reach daemon (is boxcutter-host running?): %v\n", err)
 		os.Exit(1)
 	}
-
-	// Resume existing goal or set a new one
-	if state.UpgradeGoal != nil {
-		fmt.Printf("Resuming upgrade: %s (tag: %s)\n", state.UpgradeGoal.VMType, state.UpgradeGoal.Tag)
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		fmt.Println("Upgrade already in progress — polling for completion...")
+	} else if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "Upgrade request failed (%d): %s\n", resp.StatusCode, string(body))
+		os.Exit(1)
 	} else {
-		state.SetUpgradeGoal(&cluster.UpgradeGoal{
-			VMType:           vmType,
-			Tag:              tag,
-			InitialNodeCount: state.ActiveNodeCount(),
-		})
-		state.Save()
-		fmt.Printf("Upgrade goal set: %s (tag: %s)\n", vmType, tag)
+		fmt.Printf("Upgrade started: %s (tag: %s)\n", vmType, tag)
 	}
 
-	// Run reconciler to convergence
+	// Poll daemon status until upgrade goal is cleared (complete)
+	fmt.Println("Polling for completion...")
+	pollClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", cfg.SocketPath)
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+	lastAction := ""
 	for {
-		done, action, err := reconcileUpgradeStep(cfg, state)
+		time.Sleep(5 * time.Second)
+
+		statusResp, err := pollClient.Get("http://localhost/status")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Upgrade step failed: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Goal preserved in cluster.json — re-run 'boxcutter-host upgrade' to retry\n")
-			os.Exit(1)
+			continue
 		}
-		if action != "" {
-			fmt.Printf("  %s\n", action)
-		}
-		if done {
+		var status map[string]interface{}
+		json.NewDecoder(statusResp.Body).Decode(&status)
+		statusResp.Body.Close()
+
+		if upgrade, ok := status["upgrade"]; ok && upgrade != nil {
+			if goal, ok := upgrade.(map[string]interface{}); ok {
+				deployed := goal["deployed_node_id"]
+				action := fmt.Sprintf("type=%v tag=%v deployed=%v", goal["vm_type"], goal["tag"], deployed)
+				if action != lastAction {
+					fmt.Printf("  %s\n", action)
+					lastAction = action
+				}
+			}
+		} else {
 			fmt.Println("Upgrade complete.")
 			return
 		}
-		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -1933,7 +2050,10 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 				// Deploy latest agent binary from source before relying on this node.
 				// OCI images may contain stale binaries from build time.
 				if goal.DeployedNodeID != replacement.ID {
-					deployNodeBinary(cfg, replacement.BridgeIP, replacement.ID)
+					if err := deployNodeBinary(cfg, replacement.BridgeIP, replacement.ID); err != nil {
+						log.Printf("Deploy %s failed: %v (will retry)", replacement.ID, err)
+						return false, fmt.Sprintf("Deploy to %s failed, retrying", replacement.ID), nil
+					}
 					goal.DeployedNodeID = replacement.ID
 					state.Save()
 					return false, fmt.Sprintf("Deployed latest binary to %s", replacement.ID), nil
@@ -2254,6 +2374,15 @@ func launchReplacementNode(cfg HostConfig, state *cluster.State, goal *cluster.U
 	}
 	state.AddNode(entry)
 	state.Save()
+
+	// Deploy latest binary in background. OCI images contain stale binaries
+	// from build time. This ensures the node has the latest agent binary
+	// before the reconciler tries to use it for migrations.
+	go func() {
+		if err := deployNodeBinary(cfg, newBridgeIP, newID); err != nil {
+			log.Printf("Deploy %s (background): %v", newID, err)
+		}
+	}()
 
 	return &entry, nil
 }
