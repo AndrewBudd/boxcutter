@@ -393,6 +393,25 @@ Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapsh
 
 4. **Auto-deploy must include service files** — deploying only the binary leaves systemd configuration stale. The service file (with KillMode=process) is as important as the binary itself.
 
+5. **Health monitor must re-deploy after QEMU restart** — an ungraceful QEMU shutdown (kill -9) can lose auto-deploy writes. The health monitor now triggers `deployNodeBinary()` after each restart.
+
+6. **Disk cleanup on drain** — drained node's QCOW2, cloud-init ISO, and console log are now removed after stop. Prevents disk space leak from accumulated stale node images.
+
+7. **Target failure mid-drain is safe** — if the target node dies mid-drain (QEMU killed), migrations roll back cleanly (SSH connection refused → resume source). The drain aborts and reverts the node to "active". Health monitor restarts the target, and a subsequent drain attempt will work.
+
+### Migration Statistics (Phase 6)
+
+| Metric | Value |
+|--------|-------|
+| VMs migrated successfully | 40+ |
+| VMs rolled back successfully | 4 |
+| Maximum VMs in single drain | 11 |
+| Drain resume after crash | 3 (all successful) |
+| Host daemon crashes survived | 3 |
+| Node agent crashes survived | 2 |
+| Auto-scale-up triggers | 4 |
+| Disk space recovered | 109GB (stale QCOW2 cleanup) |
+
 ## Phase 7: Remaining (TODO)
 - [ ] Rolling node upgrade with live VMs via OCI images
 - [ ] Orchestrator upgrade with state migration
