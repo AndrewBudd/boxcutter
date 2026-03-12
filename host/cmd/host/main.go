@@ -1503,30 +1503,27 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		return
 	}
 
-	// Migrate VMs one at a time — each migration is async on the node,
-	// we poll until it completes before starting the next one.
-	// Target is selected per-VM based on available RAM, so drain adapts
-	// if a target fills up or fails mid-drain.
+	// Migrate all VMs concurrently — the node agent handles per-VM
+	// concurrency and /dev/shm pressure internally. Fire all migrations
+	// at once and poll them in parallel to minimize total drain time.
+	targetNode := pickDrainTarget(state, nodeID)
+	if targetNode == nil {
+		log.Printf("Drain: no active target node — aborting")
+		state.SetNodeStatus(nodeID, "active")
+		state.Save()
+		return
+	}
+
 	migrateClient := &http.Client{Timeout: 30 * time.Second}
 	pollClient := &http.Client{Timeout: 5 * time.Second}
-	failedMigrations := 0
 
+	// Build list of VMs to migrate (skip already-migrated ones)
+	var toMigrate []string
 	for _, vm := range vms {
 		vmName, ok := vm["name"].(string)
 		if !ok {
 			continue
 		}
-
-		vmStatus, _ := vm["status"].(string)
-
-		// Pick target for this VM: choose node with most free RAM
-		targetNode := pickDrainTarget(state, nodeID)
-		if targetNode == nil {
-			log.Printf("Drain: no active target node for %s — aborting", vmName)
-			failedMigrations++
-			break
-		}
-
 		// Skip VMs that already exist on the target (from a previously
 		// interrupted drain). The source still has a stale copy.
 		checkResp, err := pollClient.Get(
@@ -1540,15 +1537,22 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 				continue
 			}
 		}
+		toMigrate = append(toMigrate, vmName)
+	}
 
-		log.Printf("Drain: migrating %s from %s to %s (status: %s)", vmName, nodeID, targetNode.ID, vmStatus)
+	if len(toMigrate) == 0 {
+		log.Printf("Drain: all VMs already migrated from %s", nodeID)
+	} else {
+		log.Printf("Drain: migrating %d VMs concurrently from %s to %s", len(toMigrate), nodeID, targetNode.ID)
+	}
 
+	// Fire all migrations
+	for _, vmName := range toMigrate {
 		migrateReq := map[string]string{
 			"target_addr":      fmt.Sprintf("%s:8800", targetNode.BridgeIP),
 			"target_bridge_ip": targetNode.BridgeIP,
 		}
 		data, _ := json.Marshal(migrateReq)
-
 		migrateResp, err := migrateClient.Post(
 			fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
 			"application/json",
@@ -1556,124 +1560,109 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		)
 		if err != nil {
 			log.Printf("Drain: failed to start migration of %s: %v", vmName, err)
-			failedMigrations++
 			continue
 		}
 		migrateResp.Body.Close()
 		if migrateResp.StatusCode == 409 {
-			// 409 = VM already migrating (e.g., from a previous drain attempt
-			// that was interrupted). Check if it already completed (VM on target).
-			log.Printf("Drain: %s already migrating — waiting for in-flight migration", vmName)
-			tgtResp, tgtErr := pollClient.Get(
-				fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, vmName))
-			if tgtErr == nil {
-				var tgtDetail map[string]interface{}
-				json.NewDecoder(tgtResp.Body).Decode(&tgtDetail)
-				tgtResp.Body.Close()
-				if st, _ := tgtDetail["status"].(string); st == "running" {
-					log.Printf("Drain: %s already running on target %s — skipping wait", vmName, targetNode.ID)
-					continue
-				}
-			}
+			log.Printf("Drain: %s already migrating — will poll", vmName)
 		} else if migrateResp.StatusCode >= 300 {
 			log.Printf("Drain: migrate %s returned %d", vmName, migrateResp.StatusCode)
-			failedMigrations++
-			continue
+		} else {
+			log.Printf("Drain: started migration of %s", vmName)
 		}
+	}
 
-		// Poll source status until migration completes. No hard timeout —
-		// as long as the VM is actively "migrating", keep waiting. Only give
-		// up on inactivity (source unreachable for 2 min) or status change.
-		const inactivityTimeout = 2 * time.Minute
-		lastActivity := time.Now()
-		migrated := false
-		for {
-			time.Sleep(5 * time.Second)
+	// Poll all migrations concurrently
+	type drainResult struct {
+		name     string
+		migrated bool
+	}
+	results := make(chan drainResult, len(toMigrate))
 
-			srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
-			if err != nil {
-				// Source unreachable — could be temporary or VM is gone
-				if time.Since(lastActivity) > inactivityTimeout {
-					log.Printf("Drain: %s source unreachable for %v, verifying at target...", vmName, inactivityTimeout)
+	for _, vmName := range toMigrate {
+		go func(name string) {
+			const inactivityTimeout = 2 * time.Minute
+			lastActivity := time.Now()
+			migrated := false
+
+			for {
+				time.Sleep(3 * time.Second)
+
+				srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, name))
+				if err != nil {
+					if time.Since(lastActivity) > inactivityTimeout {
+						log.Printf("Drain: %s source unreachable for %v, verifying at target...", name, inactivityTimeout)
+						migrated = true
+						break
+					}
+					continue
+				}
+
+				if srcResp.StatusCode == 404 {
+					srcResp.Body.Close()
+					log.Printf("Drain: %s removed from source", name)
 					migrated = true
 					break
 				}
-				continue
-			}
 
-			// 404 = VM gone from source (successful migration cleans up vmDir)
-			if srcResp.StatusCode == 404 {
+				if srcResp.StatusCode != 200 {
+					srcResp.Body.Close()
+					lastActivity = time.Now()
+					continue
+				}
+
+				var srcDetail map[string]interface{}
+				json.NewDecoder(srcResp.Body).Decode(&srcDetail)
 				srcResp.Body.Close()
-				log.Printf("Drain: %s removed from source", vmName)
-				migrated = true
-				break
-			}
 
-			// Non-200 responses (500, etc.) — source is having issues, treat as activity
-			if srcResp.StatusCode != 200 {
-				srcResp.Body.Close()
+				srcStatus, _ := srcDetail["status"].(string)
+
+				if srcStatus == "migrating" {
+					lastActivity = time.Now()
+					continue
+				}
+				if srcStatus == "stopped" {
+					lastActivity = time.Now()
+					continue
+				}
+				if srcStatus == "running" {
+					log.Printf("Drain: %s migration failed (source status: running)", name)
+					break
+				}
 				lastActivity = time.Now()
-				continue
 			}
 
-			var srcDetail map[string]interface{}
-			json.NewDecoder(srcResp.Body).Decode(&srcDetail)
-			srcResp.Body.Close()
-
-			srcStatus, _ := srcDetail["status"].(string)
-
-			if srcStatus == "migrating" {
-				lastActivity = time.Now() // still working
-				continue
-			}
-
-			if srcStatus == "stopped" {
-				// Brief race: source VM is stopped but vmDir not yet removed.
-				// This happens between stopVM() and os.RemoveAll() in MigrateVM.
-				// Wait for the next poll — it will likely return 404.
-				lastActivity = time.Now()
-				continue
-			}
-
-			if srcStatus == "running" {
-				// VM is back to running — migration failed and rolled back
-				log.Printf("Drain: %s migration failed (source status: running)", vmName)
-				break
-			}
-
-			// Unknown status — keep waiting
-			lastActivity = time.Now()
-			continue
-		}
-
-		// Always verify at target — whether source shows gone or we timed out
-		if migrated {
-			verifyResp, err := pollClient.Get(
-				fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, vmName))
-			if err != nil {
-				log.Printf("Drain: WARNING: %s gone from source but target %s unreachable: %v",
-					vmName, targetNode.ID, err)
-				failedMigrations++
-				migrated = false
-			} else {
-				var targetDetail map[string]interface{}
-				json.NewDecoder(verifyResp.Body).Decode(&targetDetail)
-				verifyResp.Body.Close()
-				targetStatus, _ := targetDetail["status"].(string)
-				if targetStatus == "" {
-					log.Printf("Drain: WARNING: %s not found on target %s after migration",
-						vmName, targetNode.ID)
-					failedMigrations++
+			// Verify at target
+			if migrated {
+				verifyResp, err := pollClient.Get(
+					fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, name))
+				if err != nil {
+					log.Printf("Drain: WARNING: %s gone from source but target %s unreachable: %v", name, targetNode.ID, err)
 					migrated = false
 				} else {
-					log.Printf("Drain: %s verified on target %s (status: %s)",
-						vmName, targetNode.ID, targetStatus)
+					var targetDetail map[string]interface{}
+					json.NewDecoder(verifyResp.Body).Decode(&targetDetail)
+					verifyResp.Body.Close()
+					targetStatus, _ := targetDetail["status"].(string)
+					if targetStatus == "" {
+						log.Printf("Drain: WARNING: %s not found on target %s after migration", name, targetNode.ID)
+						migrated = false
+					} else {
+						log.Printf("Drain: %s verified on target %s (status: %s)", name, targetNode.ID, targetStatus)
+					}
 				}
 			}
-		}
 
-		if !migrated {
-			log.Printf("Drain: %s migration did not complete", vmName)
+			results <- drainResult{name: name, migrated: migrated}
+		}(vmName)
+	}
+
+	// Collect results
+	failedMigrations := 0
+	for range toMigrate {
+		r := <-results
+		if !r.migrated {
+			log.Printf("Drain: %s migration did not complete", r.name)
 			failedMigrations++
 		}
 	}
