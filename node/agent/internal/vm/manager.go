@@ -93,9 +93,29 @@ type CreateResponse struct {
 
 // Create creates and starts a VM.
 func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	st, err := m.createSetup(req)
+	if err != nil {
+		return nil, err
+	}
 
+	// Start the VM (TAP, Firecracker launch) — still fast, no lock needed
+	vmDir := VMDir(st.Name)
+	resp, err := m.startVM(st, req.progress)
+	if err != nil {
+		CleanupSnapshot(vmDir)
+		os.RemoveAll(vmDir)
+		return nil, fmt.Errorf("starting VM: %w", err)
+	}
+
+	// Post-start: SSH wait, Tailscale, vmid, clone (slow, no lock needed)
+	m.postStartVM(st, resp, req.progress)
+
+	return resp, nil
+}
+
+// createSetup handles VM creation: validates, allocates resources (locked), then
+// creates rootfs and prepares config (unlocked, I/O heavy).
+func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 	if req.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
@@ -112,97 +132,110 @@ func (m *Manager) Create(req *CreateRequest) (*CreateResponse, error) {
 		req.Mode = m.cfg.VMDefaults.Mode
 	}
 
-	// Check capacity: reject if adding this VM would exceed 90% of system RAM
-	sysRAM := m.getSystemRAMMiB()
-	if sysRAM > 0 {
-		allocatedRAM := m.getAllocatedRAMMiB()
-		if allocatedRAM+req.RAMMIB > sysRAM*90/100 {
-			return nil, &CapacityError{msg: "node is full"}
+	// Phase 1: Lock for validation, capacity check, mark allocation, state save.
+	var st *VMState
+	var goldenPath string
+	err := func() error {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		// Check capacity: reject if adding this VM would exceed 90% of system RAM
+		sysRAM := m.getSystemRAMMiB()
+		if sysRAM > 0 {
+			allocatedRAM := m.getAllocatedRAMMiB()
+			if allocatedRAM+req.RAMMIB > sysRAM*90/100 {
+				return &CapacityError{msg: "node is full"}
+			}
 		}
+
+		vmDir := VMDir(req.Name)
+		if _, err := os.Stat(vmDir); err == nil {
+			return fmt.Errorf("VM '%s' already exists", req.Name)
+		}
+
+		goldenPath = m.cfg.Storage.GoldenLocalPath
+		if _, err := os.Stat(goldenPath); err != nil {
+			return fmt.Errorf("golden image not found at %s", goldenPath)
+		}
+
+		goldenVer := resolveGoldenVersion(goldenPath)
+		os.MkdirAll(vmDir, 0755)
+
+		existingMarks := m.collectExistingMarks()
+		mark := AllocateMark(req.Name, existingMarks)
+		tap := TAPName(req.Name)
+
+		cloneURLs := req.AllCloneURLs()
+		var githubRepos []string
+		for _, u := range cloneURLs {
+			if repo := parseRepoURL(u); repo != "" {
+				githubRepos = append(githubRepos, repo)
+			}
+		}
+
+		st = &VMState{
+			Name:        req.Name,
+			VCPU:        req.VCPU,
+			RAMMIB:      req.RAMMIB,
+			Mark:        mark,
+			Mode:        req.Mode,
+			MAC:         fixedMAC,
+			Disk:        req.Disk,
+			TAP:         tap,
+			Created:     time.Now().Format(time.RFC3339),
+			CloneURL:    req.CloneURL,
+			CloneURLs:   cloneURLs,
+			GitHubRepo:  firstOrEmpty(githubRepos),
+			GitHubRepos: githubRepos,
+			GoldenVer:   goldenVer,
+		}
+		if err := SaveVMState(vmDir, st); err != nil {
+			os.RemoveAll(vmDir)
+			return err
+		}
+		return nil
+	}()
+	if err != nil {
+		return nil, err
 	}
 
+	// Phase 2: I/O-heavy work — no lock needed (vmDir exists, mark allocated).
 	vmDir := VMDir(req.Name)
-	if _, err := os.Stat(vmDir); err == nil {
-		return nil, fmt.Errorf("VM '%s' already exists", req.Name)
-	}
-
-	goldenPath := m.cfg.Storage.GoldenLocalPath
-	if _, err := os.Stat(goldenPath); err != nil {
-		return nil, fmt.Errorf("golden image not found at %s", goldenPath)
-	}
-
-	// Resolve golden version
-	goldenVer := resolveGoldenVersion(goldenPath)
-
-	os.MkdirAll(vmDir, 0755)
-
-	// Allocate mark
-	existingMarks := m.collectExistingMarks()
-	mark := AllocateMark(req.Name, existingMarks)
-	tap := TAPName(req.Name)
-
-	// Parse clone URLs to owner/repo list
-	cloneURLs := req.AllCloneURLs()
-	var githubRepos []string
-	for _, u := range cloneURLs {
-		if repo := parseRepoURL(u); repo != "" {
-			githubRepos = append(githubRepos, repo)
-		}
-	}
-
-	// Create rootfs from golden image
 	req.progress("snapshot", "Creating disk...")
 	if err := CreateRootfs(vmDir, goldenPath, req.Disk); err != nil {
 		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("creating rootfs: %w", err)
 	}
 
-	// Save VM state
-	st := &VMState{
-		Name:        req.Name,
-		VCPU:        req.VCPU,
-		RAMMIB:      req.RAMMIB,
-		Mark:        mark,
-		Mode:        req.Mode,
-		MAC:         fixedMAC,
-		Disk:        req.Disk,
-		TAP:         tap,
-		Created:     time.Now().Format(time.RFC3339),
-		CloneURL:    req.CloneURL,
-		CloneURLs:   cloneURLs,
-		GitHubRepo:  firstOrEmpty(githubRepos),
-		GitHubRepos: githubRepos,
-		GoldenVer:   goldenVer,
-	}
-	if err := SaveVMState(vmDir, st); err != nil {
-		CleanupSnapshot(vmDir)
-		os.RemoveAll(vmDir)
-		return nil, err
-	}
-
-	// Write Firecracker config
 	if err := writeFirecrackerConfig(vmDir, st); err != nil {
 		CleanupSnapshot(vmDir)
 		os.RemoveAll(vmDir)
 		return nil, err
 	}
 
-	// Inject CA cert + SSH keys in a single mount
 	m.prepareRootfs(st, req.AuthorizedKeys)
 
-	// Start the VM
-	resp, err := m.startVM(st, req.progress)
-	if err != nil {
-		CleanupSnapshot(vmDir)
-		os.RemoveAll(vmDir)
-		return nil, fmt.Errorf("starting VM: %w", err)
-	}
-
-	return resp, nil
+	return st, nil
 }
 
 // Start starts an existing stopped VM.
 func (m *Manager) Start(name string) (*CreateResponse, error) {
+	st, err := m.startSetup(name)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := m.startVM(st, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	m.postStartVM(st, resp, nil)
+	return resp, nil
+}
+
+// startSetup handles the locked phase of starting a VM.
+func (m *Manager) startSetup(name string) (*VMState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -226,9 +259,11 @@ func (m *Manager) Start(name string) (*CreateResponse, error) {
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
-	return m.startVM(st, nil)
+	return st, nil
 }
 
+// startVM sets up TAP networking and launches Firecracker. This is fast (sub-second)
+// and safe to call with or without the Manager mutex held.
 func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, error) {
 	emit := func(phase, msg string) {
 		if progress != nil {
@@ -279,14 +314,27 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 
 	log.Printf("VM %s started (PID %d, mark %d)", st.Name, cmd.Process.Pid, st.Mark)
 
+	return &CreateResponse{
+		Name:   st.Name,
+		Mark:   st.Mark,
+		Mode:   st.Mode,
+		Status: "running",
+	}, nil
+}
+
+// postStartVM handles slow post-launch operations: SSH wait, Tailscale join,
+// vmid registration, repo cloning. Called WITHOUT the Manager mutex.
+func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress ProgressFunc) {
+	emit := func(phase, msg string) {
+		if progress != nil {
+			progress(phase, msg)
+		}
+	}
+	vmDir := VMDir(st.Name)
+
 	// Skip Tailscale/vmid for internal provision VMs
 	if strings.HasPrefix(st.Name, "_") {
-		return &CreateResponse{
-			Name:   st.Name,
-			Mark:   st.Mark,
-			Mode:   st.Mode,
-			Status: "running",
-		}, nil
+		return
 	}
 
 	// Wait for SSH
@@ -296,9 +344,21 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 		log.Printf("Warning: SSH not ready for %s: %v", st.Name, err)
 	}
 
+	// Check if VM was deleted/migrated while we waited
+	if !IsRunning(vmDir) {
+		log.Printf("VM %s no longer running after SSH wait, aborting post-start", st.Name)
+		return
+	}
+
 	// Join Tailscale
 	emit("tailscale", "Joining Tailscale network...")
 	tsIP := m.joinTailscale(st)
+
+	// Check again after Tailscale (another slow operation)
+	if !IsRunning(vmDir) {
+		log.Printf("VM %s no longer running after Tailscale join, aborting post-start", st.Name)
+		return
+	}
 
 	// Register with vmid
 	if m.vmid != nil {
@@ -327,19 +387,12 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 		}
 	}
 
-	// Update state with Tailscale IP
+	// Update state and response with Tailscale IP
 	if tsIP != "" {
 		st.TailscaleIP = tsIP
 		SaveVMState(vmDir, st)
+		resp.TailscaleIP = tsIP
 	}
-
-	return &CreateResponse{
-		Name:        st.Name,
-		TailscaleIP: tsIP,
-		Mark:        st.Mark,
-		Mode:        st.Mode,
-		Status:      "running",
-	}, nil
 }
 
 // Stop stops a running VM.
