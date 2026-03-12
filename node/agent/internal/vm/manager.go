@@ -1844,6 +1844,15 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	log.Printf("Relocating stopped VM %s to %s", name, targetAddr)
 	fileRootfs := IsFileRootfs(vmDir)
 
+	sshBase := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"}
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
+
+	cleanTarget := func() {
+		exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
+			"sudo", "rm", "-rf", dstVMDir)...).Run()
+	}
+
 	// dm-snapshot VMs need the golden image on the target
 	if !fileRootfs && st.GoldenVer != "" && st.GoldenVer != "unversioned" {
 		if err := m.ensureTargetHasGolden(st.GoldenVer, targetAddr, targetBridgeIP); err != nil {
@@ -1852,15 +1861,11 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	}
 
 	// Create target directory
-	mkdirCmd := exec.Command("ssh",
-		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		"-o", "ConnectTimeout=10",
-		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", dstVMDir)
+	mkdirCmd := exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
+		"sudo", "mkdir", "-p", dstVMDir)...)
 	if out, err := mkdirCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
 	}
-
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10", clusterKey)
 
 	// Transfer all VM files using tar --sparse (reads only allocated blocks,
 	// not the full sparse extent — 7x faster for typical sparse rootfs files)
@@ -1875,6 +1880,7 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 		"tar --sparse -cf - -C %s %s vm.json | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := tarCmd.CombinedOutput(); err != nil {
+		cleanTarget()
 		return nil, fmt.Errorf("tar transfer %s: %s: %w", diskName, string(out), err)
 	}
 
@@ -1891,15 +1897,16 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	log.Printf("Relocated stopped VM %s: file transfer took %s", name, time.Since(xferStart).Round(time.Millisecond))
 
 	// Verify target has the VM files before deleting source
-	verifyCmd := exec.Command("ssh",
-		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		"ubuntu@"+targetBridgeIP, "test", "-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+diskName)
+	verifyCmd := exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
+		"test", "-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+diskName)...)
 	if err := verifyCmd.Run(); err != nil {
+		cleanTarget()
 		return nil, fmt.Errorf("target verification failed — source preserved: %w", err)
 	}
 
 	// Guard: if VM was started concurrently, abort (don't delete a running VM's files)
 	if IsRunning(vmDir) {
+		cleanTarget()
 		return nil, fmt.Errorf("VM '%s' was started during relocation — aborting", name)
 	}
 
