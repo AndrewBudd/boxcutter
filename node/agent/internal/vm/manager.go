@@ -525,9 +525,57 @@ func (m *Manager) List() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
+// cleanupMigrationArtifacts kills orphaned SSH ControlMaster processes,
+// removes stale migration socket files, and cleans up orphaned VM directories
+// left by interrupted inbound migrations.
+func cleanupMigrationArtifacts() {
+	// Kill SSH ControlMaster connections from interrupted migrations.
+	// These are background processes (ssh -fN -o ControlMaster=yes) that persist
+	// after agent death because KillMode=process only kills the main Go process.
+	//
+	// Two cleanup passes:
+	// 1. Close via control socket (graceful)
+	// 2. Kill processes by pattern (catches cases where socket was already removed)
+	sockets, _ := filepath.Glob("/tmp/bc-migrate-*")
+	for _, sock := range sockets {
+		vmName := strings.TrimPrefix(filepath.Base(sock), "bc-migrate-")
+		exec.Command("ssh", "-o", "ControlPath="+sock, "-O", "exit", "dummy").Run()
+		os.Remove(sock) // remove socket file regardless
+		log.Printf("Cleaned up orphaned SSH ControlMaster socket for %s", vmName)
+	}
+
+	// Kill any remaining ssh ControlMaster processes by pattern.
+	// These can outlive their socket files if the socket was cleaned up
+	// by a successful migration's defer before the agent died.
+	exec.Command("pkill", "-f", "ssh.*ControlPath=/tmp/bc-migrate-").Run()
+
+	// Clean up orphaned VM directories from interrupted inbound migrations.
+	// These have a rootfs.ext4 from pre-sync but no vm.json (import-snapshot
+	// never completed). Safe to remove because the source VM was resumed.
+	vmBase := "/var/lib/boxcutter/vms"
+	entries, _ := os.ReadDir(vmBase)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(vmBase, e.Name())
+		if _, err := os.Stat(filepath.Join(dir, "vm.json")); err == nil {
+			continue // has state file — legitimate VM
+		}
+		// No vm.json — this is an orphan from an interrupted migration
+		log.Printf("Removing orphaned migration directory: %s", dir)
+		os.RemoveAll(dir)
+	}
+}
+
 // RestartAll restarts all VMs found on disk. Called on node agent startup
 // to recover VMs after a node reboot.
 func (m *Manager) RestartAll() {
+	// Kill orphaned SSH ControlMaster processes from interrupted migrations.
+	// These survive agent restart (KillMode=process) because they're forked
+	// background processes (ssh -fN). The control sockets also need cleanup.
+	cleanupMigrationArtifacts()
+
 	vms, err := ListVMs()
 	if err != nil || len(vms) == 0 {
 		return
@@ -1466,8 +1514,12 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	// Set up SSH ControlMaster — one key exchange shared by all transfers.
 	// This eliminates repeated SSH handshakes (saves ~0.5s per connection).
+	// ServerAliveInterval/CountMax detect dead connections in ~30s instead of
+	// waiting for TCP keepalive (~15min), preventing indefinite hangs during
+	// network partitions while the VM is paused.
 	controlPath := fmt.Sprintf("/tmp/bc-migrate-%s", name)
-	sshBase := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
+	sshBase := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"}
 	masterArgs := append([]string{"-fN", "-o", "ControlMaster=yes", "-o", "ControlPath=" + controlPath}, sshBase...)
 	masterArgs = append(masterArgs, "ubuntu@"+targetBridgeIP)
 	if out, err := exec.Command("ssh", masterArgs...).CombinedOutput(); err != nil {
@@ -1482,7 +1534,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	// Build SSH options that use the control socket when available
 	sshArgs := append([]string{}, sshBase...)
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
 	if controlPath != "" {
 		sshArgs = append(sshArgs, "-o", "ControlPath="+controlPath)
 		sshOpts += " -o ControlPath=" + controlPath
