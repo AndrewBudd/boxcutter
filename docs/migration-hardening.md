@@ -997,24 +997,47 @@ Fix: Rollback now checks the target for a running copy before resuming source. I
 | #156 | Marathon drain (3 rounds) | PARTIAL | Round 1 succeeded (86s), Rounds 2-3 correctly aborted (no healthy target) |
 | #157 | Ultimate chaos (kill host + kill source agent) | PASS | Crash recovery: stale markers detected, split-brain checked, drain auto-resumed, completed |
 
+## Phase 19: Agent Crash Recovery & Drain Resilience (tests #161-#170)
+
+Focus: Kill agents during active migrations, test recovery. Fix snapshot timeout for large VMs.
+
+**Bugs found:**
+- **Bug #85**: Orphaned `docker-to-ext4.sh` processes survive agent restart (KillMode=process). Every auto-scaled node gets old base image without flock fix, causing 3-4 concurrent Docker builds. Fixed: agent now kills orphaned build processes on startup.
+- **Bug #86**: Orphaned rootfs.ext4 (50GB sparse) left on target after interrupted migration. Already handled by `cleanupMigrationArtifacts()` on next agent restart — acceptable behavior.
+- **Bug #87**: Disk-based snapshots of 2GB VMs timeout during concurrent drain. `/dev/shm` exhaustion forces disk fallback, I/O contention from 5 simultaneous migrations causes snapshot to exceed 2-minute FC API timeout. Fixed: snapshot operations now use dedicated 5-minute timeout client.
+
+| Test | Scenario | Result | Notes |
+|------|----------|--------|-------|
+| #161 | Kill source agent during early migration | PASS | Agent died before pause — VM stayed running, no split-brain |
+| #162 | Kill source agent after VM pause (SIGKILL) | PASS | Stale migration recovery: checked target, no copy → resumed locally |
+| #163 | Concurrent cross-migrations (node↔node swap) | PASS | Both VMs migrated simultaneously, no conflicts |
+| #165 | Kill source during 2GB mem transfer | PASS | Orphaned SSH cleaned up, stale marker detected, VM resumed |
+| #166 | Kill source agent mid-drain (5 VMs) | PASS | Host daemon detected all 5 failures, aborted drain, node kept running |
+| #167 | Retry drain immediately after failure | PASS | All 5 VMs migrated successfully on retry (192s) |
+| #168 | Drain 6 VMs (incl. 2x 2GB) with old timeout | PARTIAL | 5/6 migrated, big-vm snapshot timed out at 2min (Bug #87) |
+| #169 | Migrate 2GB VM with extended timeout | PASS | Snapshot 897ms, mem transfer 22.7s (disk), total downtime 23.8s |
+| #170 | Ping-pong drain (2 full rounds, 6 VMs each) | PASS | Round 1: 192s, Round 2: 241s. All VMs survived both rounds |
+
 ### Cumulative Statistics (All Phases, updated)
 
 | Metric | Value |
 |--------|-------|
-| Total tests executed | 157 |
-| Tests passed | 147 |
-| Tests partial (known limitations) | 3 |
-| Bugs found and fixed | 84 |
-| VMs migrated successfully | 380+ |
-| Drain cycles completed | 56+ |
+| Total tests executed | 170 |
+| Tests passed | 158 |
+| Tests partial (known limitations) | 4 |
+| Bugs found and fixed | 87 |
+| VMs migrated successfully | 400+ |
+| Drain cycles completed | 62+ |
 | Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition |
-| Host daemon crashes survived | 21+ |
-| Node agent crashes survived | 16+ |
+| Host daemon crashes survived | 22+ |
+| Node agent crashes survived | 20+ |
 | Network partitions survived | 2 (pre-sync and post-pause) |
-| Successive migrations per VM | 10+ (bold-yak, dark-igloo, sunny-marmot endurance tested) |
+| Successive migrations per VM | 12+ (bold-yak, dark-igloo endurance tested across ping-pong drains) |
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
-- [ ] Add timeout to Firecracker pause API call (currently hangs indefinitely)
-- [ ] Add timeout to import-snapshot HTTP call (currently blocks indefinitely during partition)
+- [x] ~~Add timeout to Firecracker pause API call~~ — already 2-minute timeout in `fcClient()` (fcapi.go:27)
+- [x] ~~Add timeout to import-snapshot HTTP call~~ — already 2-minute timeout in `targetClient` (manager.go:1841)
+- [x] ~~Snapshot timeout too short for disk-based large VMs~~ — extended to 5-minute dedicated client (Bug #87)
 - [ ] Consider pre-faulting optimization before snapshot to reduce KVM lazy page fault penalty
+- [x] ~~Orphaned golden builds on agent restart~~ — agent kills orphans on startup (Bug #85)
