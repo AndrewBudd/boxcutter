@@ -563,9 +563,69 @@ Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapsh
 | Process survival verified | Yes (counter across 2 migrations) |
 | Tailscale reconnection verified | Yes (DERP re-established) |
 
-## Phase 10: Remaining (TODO)
+## Phase 10: Drain, Auto-Scale, and Stress Testing (2026-03-12)
+
+### Tests Executed
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| 46 | Full drain-and-rebuild (4 VMs) | **PASS** | 2m05s total, auto-scaler launched node |
+| 47 | Auto-scaler response to CPU pressure | **PASS** | 200% CPU → new node in 30s |
+| 48 | Kill source Firecracker during migration | **PASS** | Pause detects "connection refused", aborts cleanly, VM restartable |
+| 49 | Rapid stop-start-migrate sequence | **PASS** | All operations succeed in sequence |
+| 50 | Source agent restart during snapshot transfer | **PASS** | Stale marker recovery: target checked, source resumed |
+| 51 | Create VM during active drain | **PASS** | Orch retries on drained node, succeeds on other |
+| 52 | Cross-node migration to fresh OCI node | **PASS** | Works as expected |
+| 53 | Dual drain (both nodes simultaneously) | **PASS** | drainMu serializes; second drain fails "no target node", VMs preserved |
+| 54 | Migrate to node with golden building | **PASS** | Snapshot restore doesn't need golden |
+| 55 | Migrate from node with golden building | **PASS** | 29.4s downtime (IO contention with docker build) |
+| 56 | Full drain across 3 nodes | **PASS** | All VMs migrated, node stopped |
+| 57 | Migrate VM with active 500MB disk write | **PASS** | 13.5s downtime (dirty pages + larger rootfs) |
+| 58 | Stop/start recently-migrated VM | **PASS** | Restarts from rootfs correctly |
+| 59 | Self-migration guard (3 variations) | **PASS** | 127.0.0.1, localhost, bridge IP all rejected |
+| 60 | Counter process survival (4 migrations) | **PASS** | 2561 entries, zero gaps, PID unchanged |
+
+### Key Findings
+
+**Dual drain is safe**: Attempting to drain both nodes simultaneously is handled by drainMu serialization. The first drain completes normally. The second drain finds no viable target and aborts without stopping its node.
+
+**Auto-scaler integration**: When drain concentrates all VMs on one node, the auto-scaler detects CPU/RAM pressure and launches new nodes. This creates a natural cycle: drain → consolidate → auto-scale → rebalance.
+
+**Process survival across 4+ migrations**: A counter process running inside sunny-marmot survived 4 consecutive migrations (nodes 37→36→37→38→39) over 45+ minutes. 2561 entries with zero gaps. The same PID (539) throughout. Firecracker snapshot/restore is truly transparent.
+
+**Disk I/O during migration**: Active writes increase both pre-sync time (more data) and snapshot time (dirty pages), but migration succeeds. 500MB of random writes added ~7s to total downtime.
+
+**Golden image build doesn't block migration**: Snapshot restore is independent of golden image presence. Migration to a building node works, but migration FROM a building node suffers IO contention.
+
+### Performance Under Stress
+
+| Scenario | Pre-sync | Snapshot | Transfer | Downtime | Notes |
+|----------|----------|----------|----------|----------|-------|
+| Normal 2GB | 4s | 0.9s | 4.2s | 5.3s | Baseline |
+| 2GB with disk stress | 24.3s | 4.1s | 6.2s | 13.5s | Dirty pages |
+| 512MB from building node | 3.3s | 27s | 3.7s | 29.4s | Docker IO contention |
+| 2GB concurrent | 5.3s | 1.8s | 57.8s | 60.4s | SSH bandwidth contention |
+
+### Cumulative Statistics (All Phases)
+
+| Metric | Value |
+|--------|-------|
+| Total tests executed | 60+ |
+| Tests passed | 58 |
+| Tests partial (known limitations) | 2 |
+| Bugs found and fixed | 65 |
+| VMs migrated successfully | 100+ |
+| VMs rolled back successfully | 6+ |
+| Drain cycles completed | 12+ |
+| Maximum VMs in single drain | 11 |
+| Maximum consecutive migrations (same VM) | 4 |
+| Process survival verified | 2561 entries, 0 gaps |
+| Tailscale reconnection verified | Multiple migrations, <10s DERP recovery |
+| Auto-scale triggers | 8+ |
+| Host daemon crashes survived | 3+ |
+| Node agent crashes survived | 4+ |
+
+## Phase 11: Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
 - [ ] Rolling node upgrade with live VMs via OCI images
-- [ ] Multi-target drain distribution (verify with 3+ nodes)
-- [ ] Migration during golden image build
-- [ ] MQTT golden image update during migration
+- [ ] Multi-target drain distribution (verify with 3+ nodes simultaneously)
