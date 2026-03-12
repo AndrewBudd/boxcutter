@@ -154,6 +154,40 @@ When both transfers write to /dev/shm (fast), they both push data through the SS
 | test-g | 2048MB | node-5→node-4 | 42.1s | Large VM + contention |
 | shiny-egret | 512MB | node-4→node-5 | 1m15s | Sending node busy receiving 4 VMs |
 
+## Phase 2.9: Code Audit & Systematic Hardening (complete)
+- [x] Pre-sync failure now fatal — was silently ignored, causing corrupted disk on target
+- [x] ImportSnapshot rejects existing running VM — prevents state corruption
+- [x] Atomic migration guard — in-memory sync.Mutex set prevents race between concurrent migrate requests
+- [x] Stop during migration returns 409 — was unguarded, could kill VM mid-migration
+- [x] relocateStoppedVM verifies target files before deleting source — prevents data loss
+- [x] relocateStoppedVM checks IsRunning before delete — prevents deleting rootfs under concurrently-started VM
+- [x] ImportSnapshot error paths release loop devices (CleanupSnapshot) — prevents leaked /dev/loop*
+- [x] ImportSnapshot error paths remove vmDir — prevents orphaned dirs confusing RestartAll
+- [x] /dev/shm cleanup on migration commit and destroy — was leaking 512MB+ per migration
+- [x] /dev/shm orphan cleanup on agent restart — removes stale dirs for deleted VMs
+- [x] Removed contradictory double-delete of snapshot files in ImportSnapshot
+- [x] MigrateVM commit cleans up dm-snapshot resources before removing source files
+- [x] relocateStoppedVM cleans up dm-snapshot resources before removing source files
+- [x] Bidirectional 3-VM cross-migration — all succeed simultaneously
+- [x] Rapid ping-pong (3 round trips, 6 total migrations) — all succeed
+- [x] Agent restart during migration — VM correctly resumed from paused state
+- [x] Concurrent migrate race test — second request gets 409, first completes
+
+### Bugs Found and Fixed
+14. **ImportSnapshot /dev/shm leak** — multiple error paths in ImportSnapshot didn't clean up /dev/shm/bc-<name>. Fixed: added os.RemoveAll(shmDir) to all error returns.
+15. **ImportSnapshot leaks loop devices** — error paths after EnsureSnapshot didn't call CleanupSnapshot, leaking /dev/loop* and dm-snapshot targets. Fixed: added CleanupSnapshot to all error paths.
+16. **ImportSnapshot orphans vmDir** — error paths left vmDir with vm.json, causing RestartAll to try restarting a broken VM. Fixed: os.RemoveAll(vmDir) on all error paths.
+17. **Pre-sync failure silently ignored** — if tar --sparse pre-sync failed, migration continued. Target had empty/partial disk, causing data corruption after snapshot restore. Fixed: pre-sync failure is now fatal.
+18. **ImportSnapshot overwrites existing VM** — no check for existing running VM. Could corrupt state and orphan processes. Fixed: reject if IsRunning(vmDir).
+19. **Duplicate migration race** — two concurrent migrate requests both pass IsMigrating check (TOCTOU). Both proceed, causing competing snapshots. Fixed: atomic StartMigration() with sync.Mutex.
+20. **Stop during migration unguarded** — Stop() didn't check IsMigrating. Killing VM mid-migration causes snapshot failure + confusing rollback. Fixed: Stop() returns error if migrating.
+21. **relocateStoppedVM deletes source without verifying target** — tar transfer could silently fail, source deleted, data lost. Fixed: verify target files exist before source cleanup.
+22. **relocateStoppedVM concurrent Start race** — concurrent Start() could launch VM while relocateStoppedVM is transferring files, then RemoveAll deletes rootfs under running VM. Fixed: IsRunning check before delete.
+23. **relocateStoppedVM leaks dm-snapshot** — os.RemoveAll without CleanupSnapshot leaves loop devices and dm targets. Fixed: CleanupSnapshot before RemoveAll.
+24. **/dev/shm leaked after migration commit** — source /dev/shm/bc-<name>/ (512MB+ mmapped import file) persisted after VM migrated away. Fixed: explicit cleanup in commit phase.
+25. **/dev/shm leaked on destroy** — same issue as #24 but for Destroy(). Fixed: os.RemoveAll in Destroy.
+26. **Orphaned /dev/shm dirs on restart** — stale empty /dev/shm/bc-* directories from previous VMs accumulated. Fixed: cleanupMigrationArtifacts removes dirs for non-existent VMs.
+
 ## Phase 3: Fix Orchestrator Migration (TODO)
 - [x] Switch to ephemeral Tailscale keys — separate keys for orchestrator and nodes
 - [x] Fixed `provision.sh` to include ALL authorized SSH keys
