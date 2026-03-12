@@ -175,7 +175,11 @@ func (h *Handler) handleStop(w http.ResponseWriter, r *http.Request) {
 		name = extractStopStartName(r.URL.Path)
 	}
 	if err := h.mgr.Stop(name); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if strings.Contains(err.Error(), "is being migrated") {
+			http.Error(w, err.Error(), http.StatusConflict)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	writeJSON(w, map[string]string{"status": "stopped"})
@@ -345,29 +349,28 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate VM exists and isn't already migrating
+	// Validate VM exists
 	vmDir := vm.VMDir(name)
 	if _, err := vm.LoadVMState(vmDir); err != nil {
 		http.Error(w, "VM '"+name+"' not found", http.StatusNotFound)
 		return
 	}
-	if vm.IsMigrating(vmDir) {
+
+	// Atomically check and set migration marker (prevents race with concurrent requests)
+	if !h.mgr.StartMigration(name) {
 		http.Error(w, "VM '"+name+"' is already migrating", http.StatusConflict)
 		return
 	}
-
-	// Set migration marker — DeriveStatus() will report "migrating"
-	vm.SetMigrating(vmDir, true)
 
 	// Start migration in background — caller polls GET /api/vms/{name} for status
 	go func() {
 		_, err := h.mgr.MigrateVM(name, req.TargetAddr, req.TargetBridgeIP)
 		if err != nil {
 			log.Printf("Migration failed for %s: %v", name, err)
-			// Clear marker — MigrateVM already rolled back (resumed source)
-			vm.SetMigrating(vm.VMDir(name), false)
 		}
-		// On success, MigrateVM removes the VM directory — marker goes with it
+		// EndMigration clears both in-memory set and filesystem marker.
+		// On success, MigrateVM already removed vmDir, so SetMigrating is a no-op.
+		h.mgr.EndMigration(name)
 	}()
 
 	w.WriteHeader(http.StatusAccepted)

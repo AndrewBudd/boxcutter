@@ -27,13 +27,45 @@ const (
 
 // Manager handles VM lifecycle operations.
 type Manager struct {
-	mu     sync.Mutex
-	cfg    *config.Config
-	vmid   *vmid.Client
+	mu          sync.Mutex
+	cfg         *config.Config
+	vmid        *vmid.Client
+	migratingMu sync.Mutex
+	migratingSet map[string]bool // names of VMs currently being migrated
 }
 
 func NewManager(cfg *config.Config, vmidClient *vmid.Client) *Manager {
-	return &Manager{cfg: cfg, vmid: vmidClient}
+	return &Manager{cfg: cfg, vmid: vmidClient, migratingSet: make(map[string]bool)}
+}
+
+// StartMigration atomically checks if a VM is already migrating and marks it.
+// Returns true if migration was started, false if already migrating.
+func (m *Manager) StartMigration(name string) bool {
+	m.migratingMu.Lock()
+	defer m.migratingMu.Unlock()
+	if m.migratingSet[name] {
+		return false
+	}
+	m.migratingSet[name] = true
+	vmDir := VMDir(name)
+	SetMigrating(vmDir, true)
+	return true
+}
+
+// EndMigration clears the migration marker for a VM.
+func (m *Manager) EndMigration(name string) {
+	m.migratingMu.Lock()
+	defer m.migratingMu.Unlock()
+	delete(m.migratingSet, name)
+	vmDir := VMDir(name)
+	SetMigrating(vmDir, false)
+}
+
+// IsMigratingVM checks if a VM is currently being migrated (in-memory check).
+func (m *Manager) IsMigratingVM(name string) bool {
+	m.migratingMu.Lock()
+	defer m.migratingMu.Unlock()
+	return m.migratingSet[name]
 }
 
 // BridgeIP returns this node's bridge IP from config.
@@ -397,6 +429,9 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 
 // Stop stops a running VM.
 func (m *Manager) Stop(name string) error {
+	if m.IsMigratingVM(name) {
+		return fmt.Errorf("VM '%s' is being migrated", name)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -470,7 +505,7 @@ func (m *Manager) Destroy(name string) error {
 	// Reject destroy during active migration to prevent race conditions.
 	// Destroying mid-migration leaves orphaned files on the target and causes
 	// the migration goroutine to fail with confusing errors.
-	if IsMigrating(vmDir) {
+	if m.IsMigratingVM(name) || IsMigrating(vmDir) {
 		return fmt.Errorf("VM '%s' is being migrated", name)
 	}
 
@@ -572,6 +607,27 @@ func cleanupMigrationArtifacts() {
 		// No vm.json — this is an orphan from an interrupted migration
 		log.Printf("Removing orphaned migration directory: %s", dir)
 		os.RemoveAll(dir)
+	}
+
+	// Clean up orphaned /dev/shm directories for VMs that no longer exist.
+	// These persist after VM destruction because Firecracker mmaps vm.mem from
+	// /dev/shm — the unlinked file's tmpfs space stays until FC exits. After
+	// the FC process is gone, the empty directory remains.
+	shmEntries, _ := os.ReadDir("/dev/shm")
+	for _, e := range shmEntries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "bc-") {
+			continue
+		}
+		// Extract VM name: bc-<name> or bc-<name>-mig
+		vmName := strings.TrimPrefix(e.Name(), "bc-")
+		vmName = strings.TrimSuffix(vmName, "-mig")
+		vmDir := filepath.Join(vmBase, vmName)
+		if _, err := os.Stat(filepath.Join(vmDir, "vm.json")); err == nil {
+			continue // VM still exists — keep its /dev/shm files
+		}
+		shmDir := filepath.Join("/dev/shm", e.Name())
+		log.Printf("Removing orphaned /dev/shm directory: %s", shmDir)
+		os.RemoveAll(shmDir)
 	}
 }
 
@@ -1573,7 +1629,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := preSyncCmd.CombinedOutput(); err != nil {
-		log.Printf("Migrating %s: pre-sync warning (non-fatal): %s %v", name, string(out), err)
+		return nil, fmt.Errorf("pre-sync disk transfer failed (aborting migration): %s: %w", string(out), err)
 	}
 	log.Printf("Migrating %s: pre-sync completed in %s (phase 1 total: %s)",
 		name, time.Since(preSyncStart).Round(time.Millisecond), time.Since(phase1Start).Round(time.Millisecond))
@@ -1807,10 +1863,24 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	}
 	log.Printf("Relocated stopped VM %s: file transfer took %s", name, time.Since(xferStart).Round(time.Millisecond))
 
+	// Verify target has the VM files before deleting source
+	verifyCmd := exec.Command("ssh",
+		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"ubuntu@"+targetBridgeIP, "test", "-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+diskName)
+	if err := verifyCmd.Run(); err != nil {
+		return nil, fmt.Errorf("target verification failed — source preserved: %w", err)
+	}
+
+	// Guard: if VM was started concurrently, abort (don't delete a running VM's files)
+	if IsRunning(vmDir) {
+		return nil, fmt.Errorf("VM '%s' was started during relocation — aborting", name)
+	}
+
 	// Clean up source
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
 	}
+	CleanupSnapshot(vmDir) // clean up dm-snapshot loop devices before removing files
 	os.RemoveAll(vmDir)
 	log.Printf("Relocated stopped VM %s to %s", name, targetAddr)
 
@@ -1830,6 +1900,12 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 
 	vmDir := VMDir(st.Name)
 	shmDir := filepath.Join("/dev/shm", "bc-"+st.Name)
+
+	// Check if a VM with this name already exists and is running
+	if IsRunning(vmDir) {
+		return nil, fmt.Errorf("VM '%s' already exists and is running", st.Name)
+	}
+
 	os.MkdirAll(vmDir, 0755)
 
 	// Reallocate mark/TAP on this node
@@ -1839,6 +1915,7 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 
 	if err := SaveVMState(vmDir, st); err != nil {
 		os.RemoveAll(shmDir)
+		os.RemoveAll(vmDir)
 		return nil, err
 	}
 
@@ -1846,19 +1923,24 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	goldenPath := m.goldenPathForVM(st)
 	if err := EnsureSnapshot(vmDir, goldenPath); err != nil {
 		os.RemoveAll(shmDir)
+		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
 	// Set up TAP + fwmark routing
 	if err := SetupTAP(st.TAP, st.Mark); err != nil {
+		CleanupSnapshot(vmDir)
 		os.RemoveAll(shmDir)
+		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("setting up TAP: %w", err)
 	}
 
 	if st.Mode == "paranoid" {
 		if err := SetupParanoidMode(st.TAP); err != nil {
 			TeardownTAP(st.TAP, st.Mark)
+			CleanupSnapshot(vmDir)
 			os.RemoveAll(shmDir)
+			os.RemoveAll(vmDir)
 			return nil, fmt.Errorf("paranoid mode: %w", err)
 		}
 	}
@@ -1875,7 +1957,9 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		TeardownTAP(st.TAP, st.Mark)
+		CleanupSnapshot(vmDir)
 		os.RemoveAll(shmDir)
+		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("starting firecracker: %w", err)
 	}
 	logFile.Close()
@@ -1917,7 +2001,9 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		cmd.Process.Kill()
 		os.Remove(filepath.Join(vmDir, "firecracker.pid"))
 		TeardownTAP(st.TAP, st.Mark)
+		CleanupSnapshot(vmDir)
 		os.RemoveAll(shmDir)
+		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("loading snapshot: %w", err)
 	}
 	// vm.snap can be removed (small, read once). vm.mem stays — Firecracker has it mmapped.
@@ -1960,10 +2046,6 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		}
 		log.Printf("Warning: vsock nudge failed for %s after migration", st.Name)
 	}()
-
-	// Clean up snapshot files (no longer needed after load)
-	os.Remove(snapPath)
-	os.Remove(memPath)
 
 	return &CreateResponse{
 		Name:        st.Name,
