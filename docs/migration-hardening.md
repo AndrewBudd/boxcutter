@@ -921,5 +921,74 @@ Fix: Rollback now checks the target for a running copy before resuming source. I
 | Host daemon crashes survived | 17+ |
 | Node agent crashes survived | 14+ |
 
+## Phase 17: Network Partition, KVM Penalty, and Chaos (tests #138-#151)
+
+### Bugs Found
+
+**Bug #83**: Orphaned `docker-to-ext4.sh` processes survive agent restart (`KillMode=process`). Three concurrent builds running on a freshly auto-scaled node — two orphans from a previous agent + the current agent's build. Fix: flock-based serialization already existed in the repo but hadn't been deployed to the base image.
+
+**Bug #84**: Stale TAP devices accumulate during drain. Drain cleanup removed QCOW2 disk but never called `bridge.DeleteTAP()`. After many drain cycles, 63 orphaned TAP devices were on the bridge. Fix: Added `bridge.DeleteTAP(node.TAP)` after `qemu.Stop()` in `drainNode()`. Committed as `0f9e641`.
+
+### Key Findings
+
+**Migration works without golden_ready**: Snapshot restore only needs the VM's own rootfs + snapshot files. The golden image is only required for creating new VMs. Drain to a node with `golden_ready=false` succeeds.
+
+**KVM lazy page fault penalty is real and variable**:
+| VM | Migrations since fresh | Snapshot time | Downtime | Notes |
+|----|------------------------|--------------|----------|-------|
+| test-alpha | 1 (just restored) | 8.37s | 20.8s | Extreme — most pages un-faulted |
+| bold-yak | 1 (just restored) | 2.70s | 4.1s | Moderate |
+| test-gamma | 1 (ran longer after restore) | 284ms | 1.6s | Normal |
+| test-alpha | 2 (third migration total) | 36.2s | 37.3s | Worst case — nested lazy faults |
+
+**Pattern**: VMs that run longer after restore have more pages faulted → faster subsequent snapshots. The penalty compounds with repeated rapid migrations.
+
+**Network partition behavior**: Established TCP connections buffer data through iptables FORWARD drops. The `tc netem loss 100%` on TAP interfaces actually disrupts traffic. The HTTP import-snapshot call blocks indefinitely during partition but succeeds once connectivity restores. VM was paused for 1m22s — no data loss but long downtime.
+
+**SIGSTOP'd Firecracker**: The pause API call hangs indefinitely when the FC process is stopped. After SIGCONT, migration resumes normally. No timeout exists on the pause call.
+
+**/dev/shm exhaustion disk fallback performance**:
+| Metric | tmpfs | Disk | Penalty |
+|--------|-------|------|---------|
+| Mem transfer (512MB) | 1.2s | 8.7s | 7.2x |
+| Import-snapshot | 130ms | 9.5s | 73x |
+| Total downtime | 1.5s | 25.3s | 17x |
+
+### Test Results
+
+| Test | Scenario | Result | Notes |
+|------|----------|--------|-------|
+| #138 | Drain with target golden_ready=false | PASS | 6 VMs migrated, snapshot restore doesn't need golden |
+| #139 | Ping-pong drain (recently restored VMs) | PASS | KVM lazy page fault penalty: 1.6s-20.8s downtime |
+| #141 | tc netem partition during pre-sync | PASS | SSH transfer failed, VM stayed running on source |
+| #142 | Partition after VM pause (during transfers) | PASS | import-snapshot blocked 1m19s, completed after partition removed |
+| #143 | /dev/shm exhaustion disk fallback | PASS | 7.2x slower mem transfer, 73x slower import-snapshot |
+| #144 | SIGSTOP Firecracker during migration | PASS | Pause API hung 64s, completed after SIGCONT |
+| #145 | Create VMs on target during drain | PASS | VMs created while drain running, no conflicts |
+| #146 | Drain to freshly auto-scaled node | PASS | TAP cleanup fix verified working |
+| #147 | SIGKILL host during 6-VM drain | PASS | Node agents completed all migrations autonomously |
+| #148 | Delete VM during migration | PASS | 409 Conflict: "VM is being migrated" |
+| #149 | Double migration request | PASS | Both rejected: "already migrating" and "target already has VM" |
+| #150 | Self-migration guard | PASS | "cannot migrate VM to the same node" |
+| #151 | Opposing simultaneous migrations | PASS | Both completed, VMs swapped nodes correctly |
+
+### Cumulative Statistics (All Phases, updated)
+
+| Metric | Value |
+|--------|-------|
+| Total tests executed | 151 |
+| Tests passed | 141 |
+| Tests partial (known limitations) | 2 |
+| Bugs found and fixed | 84 |
+| VMs migrated successfully | 350+ |
+| Drain cycles completed | 50+ |
+| Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition |
+| Host daemon crashes survived | 19+ |
+| Node agent crashes survived | 14+ |
+| Network partitions survived | 2 (pre-sync and post-pause) |
+
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
+- [ ] Add timeout to Firecracker pause API call (currently hangs indefinitely)
+- [ ] Add timeout to import-snapshot HTTP call (currently blocks indefinitely during partition)
+- [ ] Consider pre-faulting optimization before snapshot to reduce KVM lazy page fault penalty
