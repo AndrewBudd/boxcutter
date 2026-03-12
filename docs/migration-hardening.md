@@ -133,11 +133,17 @@ When both transfers write to /dev/shm (fast), they both push data through the SS
 - [x] Migration under heavy guest I/O — succeeds, snapshot time proportional to dirty pages
 - [x] Double migration (immediate re-migrate) — both legs succeed
 - [x] 5-way simultaneous cross-migration — all 5 VMs arrive correctly
+- [x] DELETE during migration — returns 409 Conflict (was: race condition + orphaned files)
+- [x] Migration to unreachable target — fails fast (3s, "No route to host"), VM stays running
+- [x] Full node drain (4 VMs sequential) — all succeed, 1.5-3.4s downtime each, 92s total
+- [x] Create VM during active migration — no mutex contention, both succeed
+- [x] End-to-end state preservation — files + processes + uptime survive migration
 
 ### Bugs Found and Fixed
 10. **Orphaned SSH ControlMaster** — `ssh -fN` ControlMaster processes survive agent restart (KillMode=process only kills main Go process). Accumulate indefinitely, holding open SSH connections. Fixed: `pkill -f ssh.*ControlPath=/tmp/bc-migrate-` on startup + socket file cleanup.
 11. **Orphaned target directories** — interrupted migrations leave partial VM directories on target (rootfs.ext4 from pre-sync, no vm.json). Waste disk space and confuse subsequent operations. Fixed: `cleanupMigrationArtifacts` removes dirs without vm.json on agent restart.
 12. **No transfer timeout (network partition)** — if network drops during mem transfer, SSH blocks indefinitely waiting for TCP keepalive (~15min). VM stays paused the entire time. Fixed: added `ServerAliveInterval=10 ServerAliveCountMax=3` to migration SSH options, detecting dead connections in ~30s.
+13. **DELETE succeeds during active migration** — Destroy() didn't check IsMigrating, causing race: migration goroutine continues after VM directory is deleted, leaving orphaned files on target with no cleanup. Fixed: Destroy returns error if IsMigrating, handler returns 409 Conflict.
 
 ### Stress Test Results (5-way simultaneous)
 | VM | RAM | Direction | Downtime | Notes |
