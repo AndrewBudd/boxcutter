@@ -356,7 +356,44 @@ Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapsh
 | Migration to auto-deployed node (both directions) | Pass — 3.3s |
 | CPU-aware scale-down (no yo-yo) | Pass — node stays up when CPU > 30% |
 
-## Phase 6: Remaining (TODO)
-- [ ] Rolling node upgrade with live VMs
-- [ ] Stale draining node cleanup on host restart
-- [ ] Handle draining node with dead QEMU (clean up cluster state)
+## Phase 6: Crash Recovery & Drain Hardening (2026-03-12)
+
+### Bugs Found & Fixed
+
+| # | Bug | Severity | Fix |
+|---|-----|----------|-----|
+| 51 | **Auto-scale fails in systemd service** — BOXCUTTER_REPO not set when running as systemd service. `provision.sh` not found at prod path `/var/lib/boxcutter/host/provision.sh`. Auto-scaled node provisioning fails with "exit status 1" | **Critical** | `install-host` Makefile target now auto-sets `Environment=BOXCUTTER_REPO=$(CURDIR)` in systemd unit |
+| 52 | **Draining node stuck after host crash** — host daemon crashes mid-drain, node stays in "draining" status with live QEMU. On restart, `drainNode()` skips nodes already in "draining" status. VMs are orphaned. | **Critical** | `bootRecover()` detects draining nodes with live QEMU, schedules drain resume via goroutine (30s warmup). `drainNode()` now accepts and resumes "draining" nodes instead of skipping. |
+| 52b | **Resumed drain fails on already-migrated VMs** — when resuming a drain, VMs that completed migration before the crash still exist on source (stale). Re-migration attempt returns 409 ("already migrating" or "target already has VM"), counted as failure. Drain aborts with failedMigrations > 0. | **High** | Added pre-flight check in drain loop: before migrating, verify VM doesn't already exist on target. If running on target → skip (previously migrated). |
+| 53 | **boxcutter-node.service missing KillMode=process** — auto-scaled nodes get base image without KillMode=process. When node agent crashes/restarts, default `control-group` KillMode kills ALL Firecracker VMs. Every VM gets cold-restarted instead of preserved. | **High** | `deployNodeBinary()` now also deploys `node/systemd/boxcutter-node.service` (with KillMode=process) to auto-scaled nodes. |
+
+### Test Results
+
+| Test | Result |
+|------|--------|
+| Full drain (7 VMs, node-9→node-10) | Pass — all migrated, 5 via /dev/shm + 2 disk fallback, node stopped |
+| Auto-scale during drain (CPU at 200%) | Pass — correctly blocked by memory guard (rolling upgrade reserve) |
+| Auto-scale after drain (CPU at 233%) | Pass — added node-11, auto-deployed binary in 17s |
+| CPU-aware scale-down prevention | Pass — RAM at 27% but CPU at 116% prevents scale-down |
+| Concurrent VM creation during drain | Pass — new VM created on target node, drain continues |
+| Host crash mid-drain (kill -9) | Pass — QEMU VMs survive (KillMode=process), drain resumes on restart |
+| Drain resume after crash (8 VMs) | Pass — skips already-migrated VM, migrates remaining 8, stops node |
+| Full crash-resume-drain (11 VMs) | Pass — aqua-frog completed by agent goroutine, 10 others migrated by resumed drain |
+| Agent crash mid-migration (no KillMode) | Partial — all 10 VMs cold-restarted (default KillMode=control-group kills Firecracker) |
+| Agent crash mid-migration (with KillMode=process) | Pass — 9 VMs preserved, migrating VM detected stale marker, target checked, resumed locally |
+| Agent crash split-brain prevention | Pass — target has no copy → resume source. Target has running copy → destroy local. |
+
+### Key Architecture Observations
+
+1. **KillMode=process is critical** on both host and node systemd units. Without it, a daemon crash causes cascade failure (all child processes killed).
+
+2. **Node agent migration goroutines survive host daemon crashes** — the migration runs as a goroutine inside the node agent, independent of the host daemon. If the host daemon dies mid-drain, in-flight migrations complete on their own.
+
+3. **Drain resume is crash-safe** — the drain resume re-queries the VM list from the node, skips VMs already on the target, and continues with remaining VMs. Idempotent and convergent.
+
+4. **Auto-deploy must include service files** — deploying only the binary leaves systemd configuration stale. The service file (with KillMode=process) is as important as the binary itself.
+
+## Phase 7: Remaining (TODO)
+- [ ] Rolling node upgrade with live VMs via OCI images
+- [ ] Orchestrator upgrade with state migration
+- [ ] Test with real Tailscale-connected VMs (verify Tailscale reconnects after migration)
