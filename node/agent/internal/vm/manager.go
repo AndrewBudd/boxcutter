@@ -529,6 +529,8 @@ func (m *Manager) Destroy(name string) error {
 	}
 
 	os.RemoveAll(vmDir)
+	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))     // clean import tmpfs files
+	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean snapshot tmpfs files
 	log.Printf("VM %s destroyed", name)
 	return nil
 }
@@ -1800,8 +1802,10 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		m.vmid.Deregister(name)
 	}
 	m.stopVM(name)
+	CleanupSnapshot(vmDir)                                      // release loop devices / dm-snapshot before removing files
 	os.RemoveAll(vmDir)
 	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean up tmpfs snapshot files
+	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))        // clean up tmpfs import files (mmapped by FC, safe after stop)
 
 	return &MigrateResponse{
 		Name:        importResp.Name,
