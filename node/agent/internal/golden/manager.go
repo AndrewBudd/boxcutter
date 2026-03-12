@@ -168,10 +168,14 @@ func (m *Manager) GCUnused(inUse map[string]bool) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Also read current-version from disk in case in-memory state is stale
+	// (e.g., build was killed before updating currentHead).
+	diskHead := m.readCurrentVersion()
+
 	var removed []string
 	for _, ver := range m.Versions() {
-		if ver == m.currentHead {
-			continue // never remove head
+		if ver == m.currentHead || ver == diskHead {
+			continue // never remove head (in-memory or on-disk)
 		}
 		if inUse[ver] {
 			continue // still in use by a VM
