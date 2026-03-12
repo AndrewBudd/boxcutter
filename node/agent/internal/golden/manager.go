@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 )
 
 const (
@@ -123,7 +125,19 @@ func (m *Manager) SetHead(version string) error {
 }
 
 // buildLocal runs docker-to-ext4.sh to build the golden image from the Dockerfile.
+// It first kills any orphaned build processes left from a previous agent (Bug #85:
+// KillMode=process lets children survive agent restart, causing concurrent builds).
 func (m *Manager) buildLocal() error {
+	// Kill orphaned docker-to-ext4.sh processes from previous agent instances.
+	// With KillMode=process, these survive agent restarts and race with new builds.
+	m.killOrphanedBuilds()
+
+	// An orphaned build may have completed — re-check disk before starting a new one.
+	if ver := m.readCurrentVersion(); ver != "" {
+		log.Printf("golden: orphaned build completed (version %s), skipping new build", ver)
+		return nil
+	}
+
 	scriptPath := filepath.Join(m.goldenDir, "docker-to-ext4.sh")
 	if _, err := os.Stat(scriptPath); err != nil {
 		return fmt.Errorf("docker-to-ext4.sh not found at %s", scriptPath)
@@ -135,6 +149,86 @@ func (m *Manager) buildLocal() error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// killOrphanedBuilds finds and kills docker-to-ext4.sh processes that aren't
+// children of this agent (i.e., orphans from previous agent instances).
+func (m *Manager) killOrphanedBuilds() {
+	myPID := os.Getpid()
+	out, err := exec.Command("pgrep", "-f", "docker-to-ext4.sh").Output()
+	if err != nil {
+		return // no matching processes
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(line, "%d", &pid); err != nil {
+			continue
+		}
+		// Read the parent PID to check if it's an orphan (parent != us)
+		ppidData, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue
+		}
+		// /proc/PID/stat format: pid (comm) state ppid ...
+		// Find closing paren, then parse fields after it
+		statStr := string(ppidData)
+		closeIdx := strings.LastIndex(statStr, ")")
+		if closeIdx < 0 || closeIdx+2 >= len(statStr) {
+			continue
+		}
+		fields := strings.Fields(statStr[closeIdx+2:])
+		if len(fields) < 2 {
+			continue
+		}
+		var ppid int
+		fmt.Sscanf(fields[1], "%d", &ppid)
+
+		if ppid != myPID {
+			log.Printf("golden: killing orphaned build process PID %d (parent %d, we are %d)", pid, ppid, myPID)
+			// Kill the process group to also terminate child docker processes
+			syscall.Kill(-pid, syscall.SIGTERM)
+			syscall.Kill(pid, syscall.SIGTERM)
+		}
+	}
+	// Give processes a moment to die
+	time.Sleep(2 * time.Second)
+	// Force-kill any survivors
+	out, err = exec.Command("pgrep", "-f", "docker-to-ext4.sh").Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(line, "%d", &pid); err != nil {
+			continue
+		}
+		ppidData, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			continue
+		}
+		statStr := string(ppidData)
+		closeIdx := strings.LastIndex(statStr, ")")
+		if closeIdx < 0 || closeIdx+2 >= len(statStr) {
+			continue
+		}
+		fields := strings.Fields(statStr[closeIdx+2:])
+		if len(fields) < 2 {
+			continue
+		}
+		var ppid int
+		fmt.Sscanf(fields[1], "%d", &ppid)
+		if ppid != myPID {
+			log.Printf("golden: force-killing orphaned build PID %d", pid)
+			syscall.Kill(-pid, syscall.SIGKILL)
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
 }
 
 // CurrentHead returns the current golden head version.

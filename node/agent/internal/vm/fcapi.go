@@ -22,9 +22,20 @@ import (
 // preventing idle connection accumulation that triggers Firecracker's
 // "Too many open connections" error during rapid migration retries.
 func fcClient(vmDir string) *http.Client {
+	return fcClientWithTimeout(vmDir, 2*time.Minute)
+}
+
+// fcSnapshotClient returns an HTTP client with a longer timeout for snapshot
+// operations. Disk-based snapshots of large VMs under I/O contention can take
+// over 2 minutes (Bug #87: 2GB VM snapshot timed out during concurrent drain).
+func fcSnapshotClient(vmDir string) *http.Client {
+	return fcClientWithTimeout(vmDir, 5*time.Minute)
+}
+
+func fcClientWithTimeout(vmDir string, timeout time.Duration) *http.Client {
 	sockPath := filepath.Join(vmDir, "api.sock")
 	return &http.Client{
-		Timeout: 2 * time.Minute,
+		Timeout: timeout,
 		Transport: &http.Transport{
 			DisableKeepAlives: true,
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -83,7 +94,7 @@ func fcSnapshot(vmDir string) (snapPath, memPath string, err error) {
 		memPath = filepath.Join(shmDir, "vm.mem")
 		body["snapshot_path"] = snapPath
 		body["mem_file_path"] = memPath
-		if err := fcPut(vmDir, "/snapshot/create", body); err != nil {
+		if err := fcPutWithClient(vmDir, "/snapshot/create", body, fcSnapshotClient(vmDir)); err != nil {
 			// Clean up partial files from failed attempt before retrying
 			os.RemoveAll(shmDir)
 			log.Printf("fcSnapshot %s: /dev/shm failed (%v), falling back to disk", vmName, err)
@@ -96,7 +107,7 @@ func fcSnapshot(vmDir string) (snapPath, memPath string, err error) {
 		memPath = filepath.Join(vmDir, "vm.mem")
 		body["snapshot_path"] = snapPath
 		body["mem_file_path"] = memPath
-		if err2 := fcPut(vmDir, "/snapshot/create", body); err2 != nil {
+		if err2 := fcPutWithClient(vmDir, "/snapshot/create", body, fcSnapshotClient(vmDir)); err2 != nil {
 			return "", "", fmt.Errorf("creating snapshot on disk: %w", err2)
 		}
 	}
@@ -205,6 +216,10 @@ func fcPrefaultMemory(pid int, vmName string) {
 }
 
 func fcPut(vmDir, path string, body interface{}) error {
+	return fcPutWithClient(vmDir, path, body, fcClient(vmDir))
+}
+
+func fcPutWithClient(vmDir, path string, body interface{}, client *http.Client) error {
 	data, _ := json.Marshal(body)
 	req, err := http.NewRequest("PUT", "http://localhost"+path, bytes.NewReader(data))
 	if err != nil {
@@ -212,7 +227,7 @@ func fcPut(vmDir, path string, body interface{}) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := fcClient(vmDir).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("firecracker API %s: %w", path, err)
 	}
