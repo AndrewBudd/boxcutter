@@ -462,8 +462,110 @@ Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapsh
 | Consecutive drain cycles | 4 (nodes 15→16→17→18→19→20→21→22→23) |
 | /dev/shm headroom improvement | 95% → 69% utilization |
 
-## Phase 8: Remaining (TODO)
-- [ ] Rolling node upgrade with live VMs via OCI images
+## Phase 8: Drain Resume, Socket Fix, and Slow Snapshot (2026-03-12)
+
+### Bugs Found & Fixed
+
+| # | Bug | Severity | Fix |
+|---|-----|----------|-----|
+| 63 | **Drain hangs 2 min on stale "migrating" when VM already on target** — after host crash mid-drain, resumed drain gets 409, waits 2 min for poll timeout even though VM completed migration | Medium | Added target-check in 409 handler: if VM running on target, skip wait immediately |
+| 64 | **Import Firecracker socket timeout during rapid migration** — `os.Stat(sockPath)` returns true before Firecracker accepts connections. Subsequent `/snapshot/load` PUT times out with "dial unix ... i/o timeout" | Medium | Replaced `os.Stat` with `net.DialTimeout("unix", sockPath, 500ms)` actual connection test |
+| 65 | **Slow snapshot (~32s for 512MB) after recent import** — after snapshot restore, Firecracker lazily faults pages from mmapped vm.mem. Background prefault goroutine hasn't completed when immediate re-migration starts | Low | Added synchronous `fcPrefaultMemory` before pause in MigrateVM. Effective when VM ran >2 min (197ms snapshot), limited improvement for immediate re-migration (~18s) due to KVM-level limitation |
+
+### Tests Executed
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| 17 | Drain-crash-resume with 409 shortcut | **PASS** | Target-check skips 2-min wait |
+| 18 | Rapid sequential migration (4 rounds) | **PASS** | Guards work correctly |
+| 19 | Sequential round-trip with verification | **PARTIAL** | Exposed Bugs #64 and #65 |
+| 20 | Rapid sequential with prefault fix | **PARTIAL** | Slow post-import snapshot is KVM limitation |
+| 21 | Socket readiness under load | **PASS** | No more import timeouts (127ms consistently) |
+| 22 | /dev/shm exhaustion during migration | **PASS** | Disk fallback works |
+| 23 | Network partition (45s) | **PASS** | Survived via TCP retransmit buffer |
+| 24b | Fatal network partition (90s) | **PASS** | ROLLBACK, VM resumed on source |
+| 25 | Self-migration guard | **PASS** | 400 returned |
+| 26 | Migrate non-existent VM | **PASS** | 404 returned |
+| 27 | Destroy during migration | **PASS** | 409 returned |
+| 28 | Migrate stopped VM | **PASS** | Handled correctly |
+| 29 | Host drain mixed VM sizes | **PASS** | sudo fix for socket permissions |
+| 30 | Drain only node | **PASS** | Aborted gracefully |
+| 31 | Concurrent migrate same VM | **PASS** | One accepted, one 409 |
+| 32 | Full drain-and-rebuild cycle | **PASS** | 232s for 3 VMs |
+| 33 | Migration to new OCI-provisioned node | **PASS** | Auto-scaled node works |
+| 34 | Agent restart during migration | **PASS** | Stale marker recovery, VM resumed |
+| 35b | Kill target agent during import | **PASS** | ROLLBACK, source VM resumed |
+| 37 | Concurrent drain requests | **PASS** | drainMu serializes correctly |
+| 38 | Mass concurrent migration (6 VMs) | **PASS** | Terrible performance (see below) |
+| 39 | Orchestrator post-migration awareness | **PASS** | Orch correctly tracks VM locations |
+
+### Known Limitations Documented
+
+1. **Immediate re-migration after import**: snapshot slow (~18-32s for 512MB) due to KVM lazy page fault behavior. Background prefault helps when VM has run >2 min but not for immediate re-migration. Not fixable from userspace alone.
+
+2. **Mass concurrent migration IO contention**: 6 simultaneous migrations cause 4-55s downtime per VM (vs 1.5s sequential for 512MB). SSH ControlMaster head-of-line blocking and disk I/O contention. Serialization (as drain does) avoids this.
+
+3. **Network partition <45s**: survived via TCP retransmission buffers, VM stays paused for duration.
+
+4. **Network partition >60s**: ROLLBACK triggered correctly via SSH ServerAliveInterval/CountMax, VM resumed on source.
+
+## Phase 9: Tailscale, Disk Exhaustion, and Process Survival (2026-03-12)
+
+### Tests Executed
+
+| # | Test | Result | Notes |
+|---|------|--------|-------|
+| 40 | Tailscale reconnection after migration | **PASS** | vsock nudge triggers `tailscale netcheck`, DERP re-establishes in ~5-10s |
+| 41 | Target disk full during pre-sync | **PASS** | "No space left on device" caught during rootfs transfer, VM never paused |
+| 42 | Disk fills during snapshot transfer (post-pause) | **PASS** | vm.mem transfer fails → ROLLBACK, source VM resumed. 25s pause before rollback |
+| 43 | Large VM (2GB) migration | **PASS** | 5.3s downtime, 4.15s mem transfer, linear scaling with RAM |
+| 44 | Concurrent migration from same source (2GB + 512MB) | **PASS** | IO contention: 512MB=3s, 2GB=60s downtime (14x worse than solo) |
+| 45 | Process survival across migration | **PASS** | Background counter continued seamlessly, zero perceived gap |
+| 46 | Full drain-and-rebuild (4 VMs) | **PASS** | 2m05s total, auto-scaler launched new node |
+| 47 | Host auto-scaler response to capacity | **PASS** | Detected 200% CPU, launched node-38 within 30s |
+| 48 | Kill source Firecracker during migration | **PASS** | Pause step fails ("connection refused"), migration aborts, VM restartable |
+| 49 | Rapid stop-start-migrate sequence | **PASS** | All three operations succeed in sequence |
+| 50 | Source agent restart during migration | **PASS** | Stale marker recovery: target checked, source resumed from paused state |
+
+### Key Findings
+
+**Tailscale reconnection**: The vsock nudge mechanism works. After snapshot restore, the node agent sends `CONNECT 52\n` to the Firecracker vsock socket. Inside the guest, `boxcutter-vsock-listen` receives the connection and runs `boxcutter-nudge` (which executes `tailscale netcheck`). This triggers STUN re-probing, causing Tailscale to discover the new network path and re-establish DERP connections. Full connectivity restored in ~5-10s.
+
+**Disk exhaustion is safe at every phase**:
+- Pre-sync failure (rootfs too big): migration aborts immediately, VM never paused
+- Snapshot transfer failure (vm.mem): ROLLBACK triggered, source VM resumed after ~25s pause
+- Both leave no partial files on target
+
+**Process survival is seamless**: Firecracker snapshot/restore preserves all in-flight processes. A background counter process continued incrementing without any gap from its perspective. Guest clock freezes during pause and resumes from where it left off. From the application's perspective, zero downtime.
+
+**Source Firecracker death is handled**: If the Firecracker process dies during pre-sync (before pause), migration detects "connection refused" at the pause step and aborts cleanly. VM data is preserved and can be restarted.
+
+### Performance Summary
+
+| VM Size | Solo Migration | Concurrent (2 VMs) | Notes |
+|---------|---------------|---------------------|-------|
+| 512MB | 1.5-2.0s | 3.0s | Acceptable concurrent penalty |
+| 2GB | 5.3s | 60.4s | Concurrent IO contention is severe |
+| 2GB (post-import) | 18-32s | N/A | KVM lazy page fault limitation |
+
+### Cumulative Statistics (Phases 8-9)
+
+| Metric | Value |
+|--------|-------|
+| Tests executed | 33 |
+| Tests passed | 31 |
+| Tests partial (known limitations) | 2 |
+| Bugs found and fixed | 3 (#63-65) |
+| VMs migrated successfully | 50+ |
+| Drain cycles completed | 4 |
+| Rollbacks triggered (all successful) | 3 |
+| Agent restarts during migration (recovered) | 3 |
+| Process survival verified | Yes (counter across 2 migrations) |
+| Tailscale reconnection verified | Yes (DERP re-established) |
+
+## Phase 10: Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
-- [ ] Test with real Tailscale-connected VMs (verify Tailscale reconnects after migration)
+- [ ] Rolling node upgrade with live VMs via OCI images
 - [ ] Multi-target drain distribution (verify with 3+ nodes)
+- [ ] Migration during golden image build
+- [ ] MQTT golden image update during migration
