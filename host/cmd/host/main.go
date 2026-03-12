@@ -1680,6 +1680,15 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	state.Save()
 	qemu.Stop(nodeID, node.PID)
 
+	// Clean up TAP device (Bug #84: stale TAPs accumulate without this)
+	if node.TAP != "" {
+		if err := bridge.DeleteTAP(node.TAP); err != nil {
+			log.Printf("Drain: failed to delete TAP %s: %v", node.TAP, err)
+		} else {
+			log.Printf("Drain: removed TAP %s", node.TAP)
+		}
+	}
+
 	// Clean up disk artifacts (QCOW2 + cloud-init ISO)
 	if node.Disk != "" {
 		if err := os.Remove(node.Disk); err == nil {
