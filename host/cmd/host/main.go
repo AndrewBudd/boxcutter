@@ -1268,8 +1268,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 		// Poll source status until migration completes. No hard timeout —
 		// as long as the VM is actively "migrating", keep waiting. Only give
-		// up on inactivity (source unreachable for 2 min) or status change
-		// back to running (meaning migration failed).
+		// up on inactivity (source unreachable for 2 min) or status change.
 		const inactivityTimeout = 2 * time.Minute
 		lastActivity := time.Now()
 		migrated := false
@@ -1286,6 +1285,22 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 				}
 				continue
 			}
+
+			// 404 = VM gone from source (successful migration cleans up vmDir)
+			if srcResp.StatusCode == 404 {
+				srcResp.Body.Close()
+				log.Printf("Drain: %s removed from source", vmName)
+				migrated = true
+				break
+			}
+
+			// Non-200 responses (500, etc.) — source is having issues, treat as activity
+			if srcResp.StatusCode != 200 {
+				srcResp.Body.Close()
+				lastActivity = time.Now()
+				continue
+			}
+
 			var srcDetail map[string]interface{}
 			json.NewDecoder(srcResp.Body).Decode(&srcDetail)
 			srcResp.Body.Close()
@@ -1297,19 +1312,26 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 				continue
 			}
 
-			if srcStatus == "" {
-				// VM gone from source
-				log.Printf("Drain: %s removed from source", vmName)
-				migrated = true
+			if srcStatus == "stopped" {
+				// Brief race: source VM is stopped but vmDir not yet removed.
+				// This happens between stopVM() and os.RemoveAll() in MigrateVM.
+				// Wait for the next poll — it will likely return 404.
+				lastActivity = time.Now()
+				continue
+			}
+
+			if srcStatus == "running" {
+				// VM is back to running — migration failed and rolled back
+				log.Printf("Drain: %s migration failed (source status: running)", vmName)
 				break
 			}
 
-			// VM is back to running/stopped — migration failed and rolled back
-			log.Printf("Drain: %s migration failed (source status: %s)", vmName, srcStatus)
-			break
+			// Unknown status — keep waiting
+			lastActivity = time.Now()
+			continue
 		}
 
-		// Improvement 3: verify migration at destination
+		// Always verify at target — whether source shows gone or we timed out
 		if migrated {
 			verifyResp, err := pollClient.Get(
 				fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, vmName))
