@@ -2230,6 +2230,15 @@ func findClusterSSHKey(cfg HostConfig) string {
 			candidates = append(candidates, filepath.Join(u.HomeDir, ".boxcutter", "secrets", "cluster-ssh.key"))
 		}
 	}
+	// When running as a systemd service, SUDO_USER is not set. Try to find the
+	// key by checking the owner of the repo directory.
+	if fi, err := os.Stat(cfg.RepoDir); err == nil {
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if u, err := user.LookupId(fmt.Sprintf("%d", stat.Uid)); err == nil {
+				candidates = append(candidates, filepath.Join(u.HomeDir, ".boxcutter", "secrets", "cluster-ssh.key"))
+			}
+		}
+	}
 	candidates = append(candidates, "/etc/boxcutter/secrets/cluster-ssh.key")
 	for _, p := range candidates {
 		if fileExists(p) {
