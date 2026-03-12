@@ -6,6 +6,9 @@ Wants=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/boxcutter-host run
+# KillMode=process ensures QEMU VMs survive host daemon restarts/crashes.
+# Default (control-group) would SIGTERM all QEMU children on daemon exit.
+KillMode=process
 # Set BOXCUTTER_REPO to the repo checkout for dev mode.
 # In prod mode, the binary uses /var/lib/boxcutter as the data directory.
 #Environment=BOXCUTTER_REPO=/path/to/boxcutter
