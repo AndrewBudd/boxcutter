@@ -1378,24 +1378,10 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		return
 	}
 
-	// Find a target node (must be active and running)
-	var targetNode *cluster.VMEntry
-	for _, n := range state.Nodes {
-		if n.ID != nodeID && n.IsActive() && qemu.IsRunning(n.PID) {
-			entry := n
-			targetNode = &entry
-			break
-		}
-	}
-	if targetNode == nil {
-		log.Printf("Drain: no active target node available for migration")
-		state.SetNodeStatus(nodeID, "active") // revert
-		state.Save()
-		return
-	}
-
 	// Migrate VMs one at a time — each migration is async on the node,
-	// we poll until it completes before starting the next one
+	// we poll until it completes before starting the next one.
+	// Target is selected per-VM based on available RAM, so drain adapts
+	// if a target fills up or fails mid-drain.
 	migrateClient := &http.Client{Timeout: 30 * time.Second}
 	pollClient := &http.Client{Timeout: 5 * time.Second}
 	failedMigrations := 0
@@ -1407,6 +1393,14 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		}
 
 		vmStatus, _ := vm["status"].(string)
+
+		// Pick target for this VM: choose node with most free RAM
+		targetNode := pickDrainTarget(state, nodeID)
+		if targetNode == nil {
+			log.Printf("Drain: no active target node for %s — aborting", vmName)
+			failedMigrations++
+			break
+		}
 
 		// Skip VMs that already exist on the target (from a previously
 		// interrupted drain). The source still has a stale copy.
@@ -1575,6 +1569,31 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 func jsonReader(data []byte) io.Reader {
 	return bytes.NewReader(data)
+}
+
+// pickDrainTarget selects the best target node for a VM migration during drain.
+// Picks the active node with the most free RAM (excluding the draining node).
+// Returns nil if no suitable target exists.
+func pickDrainTarget(state *cluster.State, excludeNodeID string) *cluster.VMEntry {
+	var best *cluster.VMEntry
+	var bestFreeRAM float64 = -1
+
+	for _, n := range state.Nodes {
+		if n.ID == excludeNodeID || !n.IsActive() || !qemu.IsRunning(n.PID) {
+			continue
+		}
+		health := queryNodeHealth(n.BridgeIP)
+		if health == nil {
+			continue
+		}
+		freeRAM, _ := health["ram_free_mib"].(float64)
+		if freeRAM > bestFreeRAM {
+			bestFreeRAM = freeRAM
+			entry := n
+			best = &entry
+		}
+	}
+	return best
 }
 
 // cliStatus connects to the unix socket and prints status.
