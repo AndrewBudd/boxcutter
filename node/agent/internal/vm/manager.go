@@ -2086,7 +2086,8 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 func (m *Manager) ensureTargetHasGolden(version, targetAddr, targetBridgeIP string) error {
 	// Check if target has this version
 	checkURL := fmt.Sprintf("http://%s/api/golden/%s", targetAddr, version)
-	resp, err := http.Get(checkURL)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(checkURL)
 	if err != nil {
 		return fmt.Errorf("checking target golden: %w", err)
 	}
@@ -2106,12 +2107,13 @@ func (m *Manager) ensureTargetHasGolden(version, targetAddr, targetBridgeIP stri
 	log.Printf("Transferring golden image %s to %s", version, targetBridgeIP)
 
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10", clusterKey)
 	goldenDir := "/var/lib/boxcutter/golden/"
 
 	// Ensure target golden dir exists
 	mkdirCmd := exec.Command("ssh",
 		"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=10",
 		"ubuntu@"+targetBridgeIP, "sudo", "mkdir", "-p", goldenDir)
 	if out, err := mkdirCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("mkdir golden on target: %s: %w", string(out), err)
