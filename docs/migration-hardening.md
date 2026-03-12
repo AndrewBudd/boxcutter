@@ -224,6 +224,50 @@ All 9 regression tests pass:
 - [ ] Handle partial failures gracefully (don't lose track of VMs)
 - [ ] Add idempotent recovery (re-run should always converge)
 
+## Phase 3: Hardening Session (2026-03-12)
+
+### Bugs Found & Fixed
+
+| # | Bug | Severity | Fix |
+|---|-----|----------|-----|
+| 30 | Start() has no migration guard | Medium | Added `IsMigratingVM` + `IsMigrating` check, returns 409 |
+| 31 | Start handler returns 500 instead of 409 for migrating VM | Low | Added string match like Stop/Destroy handlers |
+| 32 | Rollback cleanup silently fails when ControlMaster is dead | High | Falls back to direct SSH when ControlMaster fails |
+| 33 | Phase 1 failures (pre-sync/pause) don't clean target | High | `cleanTarget()` moved before Phase 2, called on all Phase 1 errors |
+| 34 | Relocated stopped VM can't Start (missing fc-config.json) | Critical | `startSetup()` now regenerates `fc-config.json` every time |
+| 35 | `ensureTargetHasGolden` has no SSH keepalive | Medium | Added `ServerAliveInterval=10 ServerAliveCountMax=3` |
+| 36 | `relocateStoppedVM` has no SSH keepalive | Medium | Added to all SSH commands |
+| 37 | `relocateStoppedVM` doesn't clean target on failure | High | Added `cleanTarget()` for tar, verify, and concurrent-start failures |
+| 38 | Name collision: migrating to target with same VM name corrupts target | **Critical** | Pre-flight API check returns 409 before any file transfer |
+| 39 | `ImportSnapshot` only rejects running VMs, not stopped ones | High | Now checks `LoadVMState` existence before `IsRunning` |
+| 40 | `ImportSnapshot` stale TAP rules cause SetupTAP failure | High | Added `TeardownTAP` before `SetupTAP` (matches `startSetup` behavior) |
+| 41 | Verify loop comment says "30 seconds" but runs 60s | Low | Fixed comment |
+
+### Test Results (all passing)
+
+| Test | Result |
+|------|--------|
+| Basic migration (node-4→node-5, node-5→node-4) | Pass — 1.7s downtime (prefaulted) |
+| Double migration (409 conflict) | Pass |
+| Self-migration (400) | Pass |
+| Non-existent VM migration (404) | Pass |
+| Stop during migration (409) | Pass |
+| Destroy during migration (409) | Pass |
+| Start during migration (409) | Pass (was 500, fixed) |
+| Rapid ping-pong (back-to-back migrations) | Pass |
+| Migration to unreachable target | Pass — fast fail, VM running |
+| Agent restart during migration | Pass — source VM resumed from stale marker |
+| Simultaneous cross-migrations | Pass — both ~2s downtime |
+| Two VMs from same node simultaneously | Pass |
+| Stopped VM relocation + start | Pass (was crash, fixed) |
+| Rapid sequential migrations ×3 | Pass — no leaks |
+| Drain (3 VMs simultaneously) | Pass — all 3 in ~9s |
+| 2GB VM migration | Pass — 15.7s downtime, 4.7s transfer |
+| /dev/shm disk fallback (adaptive) | Pass — detected low space, fell back to disk |
+| Network partition during Phase 2 | Pass — 30s timeout, rollback, source resumed |
+| Name collision migration (target has same VM) | Pass — 409 Conflict, no data loss |
+| Full drain (4 VMs node-5→node-4) | Pass — all migrated |
+
 ## Phase 5: Stress Testing (TODO)
 - [x] 5+ VMs concurrent migration — tested: 5 VMs simultaneously, all completed
 - [ ] Rolling node upgrade with live VMs
