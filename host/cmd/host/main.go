@@ -676,6 +676,10 @@ func healthLoop(cfg HostConfig, state *cluster.State, hs *healthState) {
 				} else {
 					state.SetPID(node.ID, pid)
 					state.Save()
+					// Re-deploy latest binary after QEMU restart.
+					// An ungraceful QEMU shutdown (kill -9) may lose
+					// filesystem writes from a prior auto-deploy.
+					go deployNodeBinary(cfg, node.BridgeIP, node.ID)
 				}
 				if hs.nodes[node.ID] == nil {
 					hs.nodes[node.ID] = &serviceHealth{}
@@ -1549,9 +1553,23 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 	// All VMs migrated and verified — stop the node
 	log.Printf("Drain: stopping %s", nodeID)
-	qemu.Stop(nodeID, node.PID)
 	state.RemoveNode(nodeID)
 	state.Save()
+	qemu.Stop(nodeID, node.PID)
+
+	// Clean up disk artifacts (QCOW2 + cloud-init ISO)
+	if node.Disk != "" {
+		if err := os.Remove(node.Disk); err == nil {
+			log.Printf("Drain: removed disk %s", node.Disk)
+		}
+	}
+	if node.ISO != "" {
+		os.Remove(node.ISO)
+	}
+	// Also remove console log
+	consoleLog := strings.TrimSuffix(node.Disk, ".qcow2") + "-console.log"
+	os.Remove(consoleLog)
+
 	log.Printf("Drain: %s complete", nodeID)
 }
 
