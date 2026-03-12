@@ -1290,8 +1290,23 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 
 	mux.HandleFunc("POST /drain/{nodeID}", func(w http.ResponseWriter, r *http.Request) {
 		nodeID := r.PathValue("nodeID")
-		go drainNode(cfg, state, nodeID)
 		w.Header().Set("Content-Type", "application/json")
+
+		node := state.GetNode(nodeID)
+		if node == nil {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("node %s not found", nodeID)})
+			return
+		}
+		if node.Status == "draining" {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("node %s is already draining", nodeID)})
+			return
+		}
+
+		state.SetNodeStatus(nodeID, "draining")
+		state.Save()
+		go drainNode(cfg, state, nodeID)
 		json.NewEncoder(w).Encode(map[string]string{"status": "draining", "node": nodeID})
 	})
 
@@ -1450,12 +1465,8 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		return
 	}
 
-	if node.Status == "draining" {
-		// Resuming an interrupted drain (e.g., host daemon crashed mid-drain).
-		// The node is already marked, just need to continue migrating VMs.
-		log.Printf("Drain: resuming interrupted drain of %s", nodeID)
-	} else {
-		// Mark as draining so health monitor won't auto-restart if we stop it
+	// Ensure status is draining (may already be set by API handler or boot recovery)
+	if node.Status != "draining" {
 		state.SetNodeStatus(nodeID, "draining")
 		state.Save()
 	}
