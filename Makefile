@@ -53,8 +53,9 @@ build-host:               ## Build boxcutter-host binary
 install-host: build-host  ## Install boxcutter-host binary + systemd service
 	@sudo cp host/boxcutter-host /usr/local/bin/boxcutter-host
 	@sudo cp host/boxcutter-host.service /etc/systemd/system/
+	@sudo sed -i 's|^#Environment=BOXCUTTER_REPO=.*|Environment=BOXCUTTER_REPO=$(CURDIR)|' /etc/systemd/system/boxcutter-host.service
 	@sudo systemctl daemon-reload
-	@echo "Installed. Run: sudo systemctl enable --now boxcutter-host"
+	@echo "Installed with BOXCUTTER_REPO=$(CURDIR). Run: sudo systemctl enable --now boxcutter-host"
 
 release-host: build-host  ## Create release tarball for boxcutter-host
 	@mkdir -p .release

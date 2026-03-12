@@ -511,12 +511,17 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 	}
 
 	// Clean up stale draining/upgrading nodes with dead QEMU processes.
-	// If a drain was interrupted by a host crash, the node can't be recovered.
 	var cleanNodes []string
+	var resumeDrainNodes []string
 	for _, node := range state.Nodes {
 		if !node.IsActive() && !qemu.IsRunning(node.PID) {
 			log.Printf("  %s status=%s with dead QEMU (PID %d) — removing from cluster state", node.ID, node.Status, node.PID)
 			cleanNodes = append(cleanNodes, node.ID)
+		} else if node.Status == "draining" && qemu.IsRunning(node.PID) {
+			// Drain was interrupted by host daemon crash. The QEMU VM is still
+			// running with some VMs remaining. Resume the drain in background.
+			log.Printf("  %s status=draining with live QEMU (PID %d) — will resume drain", node.ID, node.PID)
+			resumeDrainNodes = append(resumeDrainNodes, node.ID)
 		}
 	}
 	for _, id := range cleanNodes {
@@ -526,7 +531,10 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 	// Launch nodes (skip those being drained/upgraded)
 	for _, node := range state.Nodes {
 		if !node.IsActive() {
-			log.Printf("  %s status=%s, skipping relaunch", node.ID, node.Status)
+			if node.Status != "draining" {
+				log.Printf("  %s status=%s, skipping relaunch", node.ID, node.Status)
+			}
+			// Draining nodes with live QEMU are handled below by resumeDrainNodes
 			continue
 		}
 		if qemu.IsRunning(node.PID) {
@@ -557,6 +565,18 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 	}
 
 	state.Save()
+
+	// Resume interrupted drains in the background. These goroutines will
+	// re-enter drainNode() which now handles the "already draining" case
+	// by continuing the drain rather than skipping it.
+	for _, id := range resumeDrainNodes {
+		nodeID := id
+		go func() {
+			// Wait for health monitor and API to be ready before draining.
+			time.Sleep(30 * time.Second)
+			drainNode(cfg, state, nodeID)
+		}()
+	}
 }
 
 // serviceHealth tracks application-level health for VMs.
@@ -1137,6 +1157,22 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) {
 		return
 	}
 
+	// Also deploy the systemd service file (ensures KillMode=process is set)
+	serviceFile := filepath.Join(cfg.RepoDir, "node", "systemd", "boxcutter-node.service")
+	if fileExists(serviceFile) {
+		scpSvc := exec.Command("scp", append(sshOpts, serviceFile, "ubuntu@"+bridgeIP+":/tmp/boxcutter-node.service")...)
+		if out, err := scpSvc.CombinedOutput(); err != nil {
+			log.Printf("Deploy %s: service file SCP failed (non-fatal): %v\n%s", nodeID, err, string(out))
+		} else {
+			svcInstall := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP,
+				"sudo", "mv", "/tmp/boxcutter-node.service", "/etc/systemd/system/boxcutter-node.service",
+				"&&", "sudo", "systemctl", "daemon-reload")...)
+			if out, err := svcInstall.CombinedOutput(); err != nil {
+				log.Printf("Deploy %s: service file install failed (non-fatal): %v\n%s", nodeID, err, string(out))
+			}
+		}
+	}
+
 	// Install and restart
 	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP,
 		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
@@ -1300,13 +1336,14 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	}
 
 	if node.Status == "draining" {
-		log.Printf("Drain: node %s already draining, skipping", nodeID)
-		return
+		// Resuming an interrupted drain (e.g., host daemon crashed mid-drain).
+		// The node is already marked, just need to continue migrating VMs.
+		log.Printf("Drain: resuming interrupted drain of %s", nodeID)
+	} else {
+		// Mark as draining so health monitor won't auto-restart if we stop it
+		state.SetNodeStatus(nodeID, "draining")
+		state.Save()
 	}
-
-	// Mark as draining so health monitor won't auto-restart if we stop it
-	state.SetNodeStatus(nodeID, "draining")
-	state.Save()
 
 	log.Printf("Draining node %s...", nodeID)
 
@@ -1366,6 +1403,21 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		}
 
 		vmStatus, _ := vm["status"].(string)
+
+		// Skip VMs that already exist on the target (from a previously
+		// interrupted drain). The source still has a stale copy.
+		checkResp, err := pollClient.Get(
+			fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, vmName))
+		if err == nil {
+			var checkDetail map[string]interface{}
+			json.NewDecoder(checkResp.Body).Decode(&checkDetail)
+			checkResp.Body.Close()
+			if tgtStatus, _ := checkDetail["status"].(string); tgtStatus == "running" {
+				log.Printf("Drain: %s already running on target %s — skipping (previously migrated)", vmName, targetNode.ID)
+				continue
+			}
+		}
+
 		log.Printf("Drain: migrating %s from %s to %s (status: %s)", vmName, nodeID, targetNode.ID, vmStatus)
 
 		migrateReq := map[string]string{
