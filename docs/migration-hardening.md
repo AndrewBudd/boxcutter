@@ -102,9 +102,24 @@ When both transfers write to /dev/shm (fast), they both push data through the SS
 4. **fcSnapshot leaks partial files** — failed /dev/shm write left partial vm.mem (e.g., 1.9GB for a 2GB VM), further reducing available space. Fixed: os.RemoveAll(shmDir) before fallback retry.
 5. **Self-migration destroys VM** — migrating VM to same node shares vmDir. Rollback's `rm -rf dstVMDir` deletes source files. Fixed: reject when target matches local bridge IP.
 
+## Phase 2.7: Concurrency & Performance (complete)
+- [x] Snapshot path collision — fcSnapshot uses `-mig` suffix to avoid writing to Firecracker's mmapped file
+- [x] Manager mutex blocks import-snapshot — reduced lock scope: Create/Start release mutex before SSH/Tailscale waits
+- [x] VM resurrection after migration — postStartVM checks IsRunning before SSH/Tailscale operations
+- [x] Guest memory prefault — reads /proc/<pid>/mem after snapshot restore to pre-populate PTEs
+- [x] Concurrent cross-migration — both directions succeed simultaneously (was: timeout + split-brain)
+- [x] Concurrent create + inbound migration — both succeed (was: 18.9s import-snapshot blocked on mutex)
+
+### Bugs Found and Fixed
+6. **Snapshot path collision** — fcSnapshot wrote to same `/dev/shm/bc-<name>/` path as mmapped import file. Firecracker's COW + page faults caused 30s+ snapshot creation for 512MB VMs. Fixed: use `-mig` suffix for snapshot output directory.
+7. **Manager mutex blocks concurrent operations** — Create() held global mutex for 30+ seconds during SSH/Tailscale waits. ImportSnapshot on same node blocked until Create released lock. Cross-migration timed out after 2 minutes, leaving split-brain state (VM on both nodes). Fixed: split Create/Start into locked setup + unlocked post-start phases. Mutex now held <1 second.
+8. **VM resurrected after migration** — Create's postStartVM continued SSH/Tailscale operations even after VM was migrated away, restarting the Firecracker process. Fixed: added IsRunning checks in postStartVM to abort if VM was deleted/migrated.
+9. **25s snapshot creation for restored VMs** — After snapshot restore, Firecracker's MAP_PRIVATE mmap has 131K lazy page faults (512MB = 25s, 2GB = 100s+). Fixed: background goroutine reads /proc/<pid>/mem to force get_user_pages() PTE population. 512MB: 25s → 200ms. 2GB: 100s+ → 850ms.
+
 ### Performance Notes
-- **Snapshot creation time varies widely** after snapshot restore (241ms → 30s for 512MB). Firecracker must fault in all memory pages from the mmapped backing file.
-- **Cross-migration I/O contention** is severe: bidirectional traffic + concurrent imports caused 3-minute downtime for 512MB VMs. The Manager mutex serializes import-snapshot, so concurrent imports queue.
+- **Prefault overhead**: ~145ms for 512MB, ~500ms for 2GB (background, doesn't block import response)
+- **Cross-migration now works**: Both VMs migrate simultaneously, ~1.5s downtime each
+- **Concurrent create + migrate**: No blocking, import-snapshot completes in ~120ms
 - **Disk fallback penalty**: ~36s for 2GB VM (vs 5s with tmpfs). Acceptable for exhaustion scenarios.
 
 ## Phase 3: Fix Orchestrator Migration (TODO)
