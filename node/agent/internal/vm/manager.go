@@ -1935,9 +1935,12 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	vmDir := VMDir(st.Name)
 	shmDir := filepath.Join("/dev/shm", "bc-"+st.Name)
 
-	// Check if a VM with this name already exists and is running
-	if IsRunning(vmDir) {
-		return nil, fmt.Errorf("VM '%s' already exists and is running", st.Name)
+	// Check if a VM with this name already exists (running or stopped)
+	if _, err := LoadVMState(vmDir); err == nil {
+		if IsRunning(vmDir) {
+			return nil, fmt.Errorf("VM '%s' already exists and is running", st.Name)
+		}
+		return nil, fmt.Errorf("VM '%s' already exists (stopped)", st.Name)
 	}
 
 	os.MkdirAll(vmDir, 0755)
