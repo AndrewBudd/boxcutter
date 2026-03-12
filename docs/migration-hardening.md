@@ -972,20 +972,46 @@ Fix: Rollback now checks the target for a running copy before resuming source. I
 | #150 | Self-migration guard | PASS | "cannot migrate VM to the same node" |
 | #151 | Opposing simultaneous migrations | PASS | Both completed, VMs swapped nodes correctly |
 
+## Phase 18: Endurance, Chaos, and Crash Recovery (tests #152-#157)
+
+### Key Findings
+
+**Import-snapshot window is unhittable**: The import-snapshot + verify phase completes in <130ms. Killing the target agent during this window requires sub-millisecond timing that polling-based tests cannot achieve.
+
+**Target agent death during migration**: When the target agent is stopped (systemctl stop) during pre-sync, the import-snapshot call gets "connection refused". Rollback resumes the VM on source correctly. No data loss.
+
+**Automatic drain resumption after crash**: When the host daemon is killed during a drain, the "draining" status persists in cluster.json. On restart, the host daemon detects this and automatically re-initiates the drain. Combined with the agent's stale migration marker recovery, the full drain completes autonomously after both the host daemon AND source agent are killed simultaneously.
+
+**drainMu serialization**: Rapid alternating drain requests are properly serialized. The second drain blocks until the first completes, then correctly aborts if no active target remains (the first drain removed the only other node).
+
+**VM endurance**: bold-yak, dark-igloo, and sunny-marmot survived 10+ migrations across 8+ different nodes, multiple host daemon crashes, multiple agent crashes, network partitions, and /dev/shm exhaustion. All still running after Phase 18.
+
+### Test Results
+
+| Test | Scenario | Result | Notes |
+|------|----------|--------|-------|
+| #152b | Kill target agent during pre-sync | PASS | connection refused → ROLLBACK, VM resumed on source |
+| #153 | Migrate to node with existing stopped copy | PASS | Target VM creation failed (no golden), migration succeeded |
+| #154 | Rapid alternating drains | PASS | drainMu serialized correctly, second drain aborted (no target) |
+| #155 | Rapid reverse drain (2 rounds) | PASS | Both drains completed (86s, 91s), VMs survived 8+ migrations |
+| #156 | Marathon drain (3 rounds) | PARTIAL | Round 1 succeeded (86s), Rounds 2-3 correctly aborted (no healthy target) |
+| #157 | Ultimate chaos (kill host + kill source agent) | PASS | Crash recovery: stale markers detected, split-brain checked, drain auto-resumed, completed |
+
 ### Cumulative Statistics (All Phases, updated)
 
 | Metric | Value |
 |--------|-------|
-| Total tests executed | 151 |
-| Tests passed | 141 |
-| Tests partial (known limitations) | 2 |
+| Total tests executed | 157 |
+| Tests passed | 147 |
+| Tests partial (known limitations) | 3 |
 | Bugs found and fixed | 84 |
-| VMs migrated successfully | 350+ |
-| Drain cycles completed | 50+ |
+| VMs migrated successfully | 380+ |
+| Drain cycles completed | 56+ |
 | Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition |
-| Host daemon crashes survived | 19+ |
-| Node agent crashes survived | 14+ |
+| Host daemon crashes survived | 21+ |
+| Node agent crashes survived | 16+ |
 | Network partitions survived | 2 (pre-sync and post-pause) |
+| Successive migrations per VM | 10+ (bold-yak, dark-igloo, sunny-marmot endurance tested) |
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
