@@ -268,6 +268,40 @@ All 9 regression tests pass:
 | Name collision migration (target has same VM) | Pass — 409 Conflict, no data loss |
 | Full drain (4 VMs node-5→node-4) | Pass — all migrated |
 
+## Phase 4: Split-Brain, Drain, and Large VM Hardening (2026-03-12)
+
+### Bugs Found & Fixed
+
+| # | Bug | Severity | Fix |
+|---|-----|----------|-----|
+| 42 | **Split-brain after agent crash** — if agent crashes after import-snapshot but before source cleanup, RestartAll blindly resumes paused source VM, creating two running copies on different nodes | **Critical** | Migration marker now stores target address. RestartAll checks target before resuming: if target has running copy → destroy local; if not → resume safely. Unreachable target times out in ~3s. |
+| 43 | **Drain "stopped" race** — between stopVM() and os.RemoveAll() in MigrateVM, source briefly reports "stopped". Drain interprets this as "migration failed and rolled back", causing false drain failure | High | Drain now treats "stopped" as activity (keeps polling for 404). Only "running" is interpreted as migration failure. |
+| 44 | **Drain HTTP status ignored** — JSON decode of non-JSON responses (404 text, 500 errors) silently failed, causing srcStatus="" which was treated as "VM gone". A 500 error would wrongly conclude migration succeeded | High | Drain now explicitly checks HTTP status: 404 = gone, non-200/non-404 = transient (keep polling) |
+
+### Test Results
+
+| Test | Result |
+|------|--------|
+| Split-brain detection (target has running copy) | Pass — local copy destroyed, target untouched |
+| No split-brain (target doesn't have copy, mid-transfer crash) | Pass — source resumed locally |
+| Unreachable target during crash recovery | Pass — 3s timeout, source resumed |
+| Full drain (3 VMs, node-6 → node-5) | Pass — all migrated, verified, node stopped |
+| Concurrent migration (2 VMs simultaneously) | Pass — both succeed, 1.7-1.9s downtime |
+| 2GB VM migration (tmpfs target) | Pass — 6.1s downtime, 4.8s transfer |
+| 2GB VM migration (disk target, /dev/shm full) | Pass — 7.3s downtime, fallback detected |
+| Source /dev/shm exhaustion during snapshot | Pass — "using disk" fallback, 66s downtime (expected) |
+| Auto-scaler re-launch after drain | Expected — high utilization triggers new node |
+
+### Performance: /dev/shm vs Disk
+
+| Scenario | Source Snapshot | Target Write | Snapshot Time | Transfer Time | Total Downtime |
+|----------|---------------|-------------|---------------|---------------|----------------|
+| Both tmpfs (ideal) | /dev/shm | /dev/shm | 1.1s | 4.8s | 6.1s |
+| Disk target | /dev/shm | vmDir | 1.2s | 5.9s | 7.3s |
+| Disk source | vmDir | /dev/shm | **61.6s** | 4.7s | **66.5s** |
+
+Key insight: source /dev/shm exhaustion is catastrophic for downtime (61s snapshot) because Firecracker writes 2GB through QCOW2 virtual disk with COW page faults. Target disk fallback adds only ~20% overhead.
+
 ## Phase 5: Stress Testing (TODO)
 - [x] 5+ VMs concurrent migration — tested: 5 VMs simultaneously, all completed
 - [ ] Rolling node upgrade with live VMs
