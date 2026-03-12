@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -60,13 +61,33 @@ func IsMigrating(vmDir string) bool {
 }
 
 // SetMigrating creates or removes the migration marker file.
-func SetMigrating(vmDir string, migrating bool) {
+// When migrating is true, the marker stores the target address (addr:port)
+// so that crash recovery can check if the target already has the VM.
+func SetMigrating(vmDir string, migrating bool, target ...string) {
 	marker := filepath.Join(vmDir, "migrating")
 	if migrating {
-		os.WriteFile(marker, []byte("1"), 0644)
+		content := "1"
+		if len(target) > 0 && target[0] != "" {
+			content = target[0]
+		}
+		os.WriteFile(marker, []byte(content), 0644)
 	} else {
 		os.Remove(marker)
 	}
+}
+
+// MigrationTarget reads the target address from the migration marker file.
+// Returns empty string if not migrating or if marker has no target info.
+func MigrationTarget(vmDir string) string {
+	data, err := os.ReadFile(filepath.Join(vmDir, "migrating"))
+	if err != nil {
+		return ""
+	}
+	target := strings.TrimSpace(string(data))
+	if target == "1" || target == "" {
+		return ""
+	}
+	return target
 }
 
 // DeriveStatus computes VM status from reality, never from stored state.

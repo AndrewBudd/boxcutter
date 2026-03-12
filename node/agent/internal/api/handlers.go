@@ -373,7 +373,7 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Atomically check and set migration marker (prevents race with concurrent requests)
-	if !h.mgr.StartMigration(name) {
+	if !h.mgr.StartMigration(name, req.TargetAddr) {
 		http.Error(w, "VM '"+name+"' is already migrating", http.StatusConflict)
 		return
 	}

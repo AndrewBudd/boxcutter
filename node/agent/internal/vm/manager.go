@@ -41,7 +41,8 @@ func NewManager(cfg *config.Config, vmidClient *vmid.Client) *Manager {
 
 // StartMigration atomically checks if a VM is already migrating and marks it.
 // Returns true if migration was started, false if already migrating.
-func (m *Manager) StartMigration(name string) bool {
+// The targetAddr is stored in the marker file for crash recovery (split-brain detection).
+func (m *Manager) StartMigration(name, targetAddr string) bool {
 	m.migratingMu.Lock()
 	defer m.migratingMu.Unlock()
 	if m.migratingSet[name] {
@@ -49,7 +50,7 @@ func (m *Manager) StartMigration(name string) bool {
 	}
 	m.migratingSet[name] = true
 	vmDir := VMDir(name)
-	SetMigrating(vmDir, true)
+	SetMigrating(vmDir, true, targetAddr)
 	return true
 }
 
@@ -665,9 +666,40 @@ func (m *Manager) RestartAll() {
 		vmDir := VMDir(st.Name)
 
 		// If a migration was in progress when the agent died, the VM might
-		// be paused with a stale "migrating" marker. Resume it.
+		// be paused with a stale "migrating" marker. Before resuming, check
+		// if the target already has this VM running (split-brain prevention).
+		// If agent crashed after import-snapshot but before stopVM, both copies
+		// would be running — we must detect this and destroy the local copy.
 		if IsMigrating(vmDir) && IsRunning(vmDir) {
-			log.Printf("  %s: stale migration marker found, resuming paused VM", st.Name)
+			target := MigrationTarget(vmDir)
+			if target != "" {
+				log.Printf("  %s: stale migration marker found (target=%s), checking for split-brain", st.Name, target)
+				targetHasVM := false
+				client := &http.Client{Timeout: 5 * time.Second}
+				checkResp, err := client.Get(fmt.Sprintf("http://%s/api/vms/%s", target, st.Name))
+				if err == nil {
+					var detail map[string]interface{}
+					json.NewDecoder(checkResp.Body).Decode(&detail)
+					checkResp.Body.Close()
+					if s, _ := detail["status"].(string); s == "running" {
+						targetHasVM = true
+					}
+				}
+				if targetHasVM {
+					// Target has a running copy — migration completed but source wasn't cleaned up.
+					// Destroy the local (paused) copy to resolve split-brain.
+					log.Printf("  %s: TARGET %s has running copy — destroying local (paused) copy to prevent split-brain", st.Name, target)
+					m.stopVM(st.Name)
+					CleanupSnapshot(vmDir)
+					os.RemoveAll(vmDir)
+					os.RemoveAll(filepath.Join("/dev/shm", "bc-"+st.Name+"-mig"))
+					os.RemoveAll(filepath.Join("/dev/shm", "bc-"+st.Name))
+					continue
+				}
+				log.Printf("  %s: target %s does not have running copy, safe to resume locally", st.Name, target)
+			} else {
+				log.Printf("  %s: stale migration marker found (no target info), resuming paused VM", st.Name)
+			}
 			if err := fcResume(vmDir); err != nil {
 				log.Printf("  %s: resume failed (will restart from scratch): %v", st.Name, err)
 			} else {
