@@ -174,7 +174,7 @@ func defaultConfig() HostConfig {
 		HealthPollInterval:   10 * time.Second,
 		ScaleUpThresholdPct:  80,
 		ScaleDownThresholdPct: 30,
-		ScaleCooldown:        10 * time.Minute,
+		ScaleCooldown:        5 * time.Minute,
 		MinFreeMemoryMB:       8192,  // 8GB — never launch a node if host has less than this free
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
@@ -728,6 +728,16 @@ func scaleDownCandidate(nodes []nodeCapacity, totalRAM, usedRAM, scaleDownPct, s
 		return ""
 	}
 
+	// Also check CPU — don't scale down if CPU is high
+	totalVCPU, usedVCPU := 0, 0
+	for _, nc := range nodes {
+		totalVCPU += nc.totalVCPU
+		usedVCPU += nc.usedVCPU
+	}
+	if totalVCPU > 0 && (usedVCPU*100)/totalVCPU > scaleDownPct {
+		return ""
+	}
+
 	// Find the least-loaded node
 	leastIdx := 0
 	for i, nc := range nodes {
@@ -745,6 +755,12 @@ func scaleDownCandidate(nodes []nodeCapacity, totalRAM, usedRAM, scaleDownPct, s
 	// After drain, all VMs migrate to remaining nodes, so total used RAM stays the same
 	afterPct := (usedRAM * 100) / remainRAM
 	if afterPct >= scaleUpPct {
+		return ""
+	}
+
+	// Also check CPU after removal
+	remainVCPU := totalVCPU - candidate.totalVCPU
+	if remainVCPU > 0 && (usedVCPU*100)/remainVCPU >= scaleUpPct {
 		return ""
 	}
 
@@ -1061,16 +1077,21 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) {
 	tmpBin := filepath.Join(os.TempDir(), fmt.Sprintf("boxcutter-node-%s", nodeID))
 	defer os.Remove(tmpBin)
 
-	buildCmd := exec.Command("go", "build", "-o", tmpBin, "./cmd/node/")
-	buildCmd.Dir = agentDir
-	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	// Ensure go is in PATH (may not be when running as root)
-	for _, p := range []string{"/usr/local/go/bin", "/usr/bin"} {
-		if _, err := os.Stat(filepath.Join(p, "go")); err == nil {
-			buildCmd.Env = append(buildCmd.Env, "PATH="+p+":"+os.Getenv("PATH"))
+	// Find go binary (may not be in root's PATH)
+	goBin := "go"
+	for _, p := range []string{"/usr/local/go/bin/go", "/usr/bin/go"} {
+		if _, err := os.Stat(p); err == nil {
+			goBin = p
 			break
 		}
 	}
+
+	buildCmd := exec.Command(goBin, "build", "-buildvcs=false", "-o", tmpBin, "./cmd/node/")
+	buildCmd.Dir = agentDir
+	buildCmd.Env = append(os.Environ(),
+		"CGO_ENABLED=0",
+		"PATH=/usr/local/go/bin:"+os.Getenv("PATH"),
+		"HOME="+os.TempDir()) // go needs a writable HOME for cache
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		log.Printf("Deploy %s: build failed: %v\n%s", nodeID, err, string(out))
 		return
