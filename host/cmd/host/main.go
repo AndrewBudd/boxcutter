@@ -1036,6 +1036,83 @@ func addNode(cfg HostConfig, state *cluster.State) {
 	})
 	state.Save()
 	log.Printf("Node %s added (PID %d, IP %s)", nodeID, pid, bridgeIP)
+
+	// Deploy latest node agent binary in background after the node boots.
+	// Auto-scaled nodes use the base image which may have a stale binary.
+	go deployNodeBinary(cfg, bridgeIP, nodeID)
+}
+
+// deployNodeBinary builds the node agent from source and deploys it to a node.
+// Waits for SSH to become available, then SCPs the binary and restarts the service.
+func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) {
+	sshKey := findClusterSSHKey(cfg)
+	if sshKey == "" {
+		log.Printf("Deploy %s: no cluster SSH key found, skipping binary deploy", nodeID)
+		return
+	}
+
+	// Build the binary from source
+	agentDir := filepath.Join(cfg.RepoDir, "node", "agent")
+	if _, err := os.Stat(agentDir); err != nil {
+		log.Printf("Deploy %s: agent source not found at %s, skipping", nodeID, agentDir)
+		return
+	}
+
+	tmpBin := filepath.Join(os.TempDir(), fmt.Sprintf("boxcutter-node-%s", nodeID))
+	defer os.Remove(tmpBin)
+
+	buildCmd := exec.Command("go", "build", "-o", tmpBin, "./cmd/node/")
+	buildCmd.Dir = agentDir
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	// Ensure go is in PATH (may not be when running as root)
+	for _, p := range []string{"/usr/local/go/bin", "/usr/bin"} {
+		if _, err := os.Stat(filepath.Join(p, "go")); err == nil {
+			buildCmd.Env = append(buildCmd.Env, "PATH="+p+":"+os.Getenv("PATH"))
+			break
+		}
+	}
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		log.Printf("Deploy %s: build failed: %v\n%s", nodeID, err, string(out))
+		return
+	}
+
+	sshOpts := []string{
+		"-i", sshKey,
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=5",
+	}
+
+	// Wait for SSH (up to 3 minutes)
+	for i := 0; i < 36; i++ {
+		testCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP, "true")...)
+		if testCmd.Run() == nil {
+			break
+		}
+		if i == 35 {
+			log.Printf("Deploy %s: SSH not ready after 3 minutes, giving up", nodeID)
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	// SCP binary to node
+	scpCmd := exec.Command("scp", append(sshOpts, tmpBin, "ubuntu@"+bridgeIP+":/tmp/boxcutter-node")...)
+	if out, err := scpCmd.CombinedOutput(); err != nil {
+		log.Printf("Deploy %s: SCP failed: %v\n%s", nodeID, err, string(out))
+		return
+	}
+
+	// Install and restart
+	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP,
+		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
+		"&&", "sudo", "systemctl", "restart", "boxcutter-node")...)
+	if out, err := installCmd.CombinedOutput(); err != nil {
+		log.Printf("Deploy %s: install failed: %v\n%s", nodeID, err, string(out))
+		return
+	}
+
+	log.Printf("Deploy %s: latest node agent binary deployed successfully", nodeID)
 }
 
 // startAPI serves the unix socket control API.
