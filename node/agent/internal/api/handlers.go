@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/golden"
 	"github.com/AndrewBudd/boxcutter/node/agent/internal/vm"
@@ -358,6 +359,17 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 	if _, err := vm.LoadVMState(vmDir); err != nil {
 		http.Error(w, "VM '"+name+"' not found", http.StatusNotFound)
 		return
+	}
+
+	// Pre-flight: reject if target already has a VM with this name
+	preflightClient := &http.Client{Timeout: 10 * time.Second}
+	preflightResp, err := preflightClient.Get(fmt.Sprintf("http://%s/api/vms/%s", req.TargetAddr, name))
+	if err == nil {
+		preflightResp.Body.Close()
+		if preflightResp.StatusCode == http.StatusOK {
+			http.Error(w, fmt.Sprintf("target already has VM '%s'", name), http.StatusConflict)
+			return
+		}
 	}
 
 	// Atomically check and set migration marker (prevents race with concurrent requests)
