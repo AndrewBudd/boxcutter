@@ -1829,6 +1829,7 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	defer m.mu.Unlock()
 
 	vmDir := VMDir(st.Name)
+	shmDir := filepath.Join("/dev/shm", "bc-"+st.Name)
 	os.MkdirAll(vmDir, 0755)
 
 	// Reallocate mark/TAP on this node
@@ -1837,23 +1838,27 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	st.TAP = TAPName(st.Name)
 
 	if err := SaveVMState(vmDir, st); err != nil {
+		os.RemoveAll(shmDir)
 		return nil, err
 	}
 
 	// Set up dm-snapshot from golden + COW (same block device path as source)
 	goldenPath := m.goldenPathForVM(st)
 	if err := EnsureSnapshot(vmDir, goldenPath); err != nil {
+		os.RemoveAll(shmDir)
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
 	// Set up TAP + fwmark routing
 	if err := SetupTAP(st.TAP, st.Mark); err != nil {
+		os.RemoveAll(shmDir)
 		return nil, fmt.Errorf("setting up TAP: %w", err)
 	}
 
 	if st.Mode == "paranoid" {
 		if err := SetupParanoidMode(st.TAP); err != nil {
 			TeardownTAP(st.TAP, st.Mark)
+			os.RemoveAll(shmDir)
 			return nil, fmt.Errorf("paranoid mode: %w", err)
 		}
 	}
@@ -1870,6 +1875,7 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		TeardownTAP(st.TAP, st.Mark)
+		os.RemoveAll(shmDir)
 		return nil, fmt.Errorf("starting firecracker: %w", err)
 	}
 	logFile.Close()
@@ -1889,7 +1895,6 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 
 	// Load the snapshot. Check /dev/shm first (migration writes there when space permits),
 	// fall back to vmDir. Firecracker mmaps the mem file for the process lifetime.
-	shmDir := filepath.Join("/dev/shm", "bc-"+st.Name)
 	snapPath := filepath.Join(shmDir, "vm.snap")
 	memPath := filepath.Join(shmDir, "vm.mem")
 	if _, err := os.Stat(memPath); err != nil {
