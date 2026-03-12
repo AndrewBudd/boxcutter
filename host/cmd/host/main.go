@@ -1171,11 +1171,25 @@ func buildStatus(cfg HostConfig, state *cluster.State, hs *healthState) map[stri
 	return result
 }
 
+// drainMu prevents concurrent drains. Multiple drains could race when the
+// API handler, auto-scaler, and upgrade reconciler all call drainNode. Without
+// this, concurrent drains for different nodes could both pick the same target,
+// or a double-drain for the same node wastes resources on 409 rejections.
+var drainMu sync.Mutex
+
 // drainNode migrates all Firecrackers off a node, then stops it.
 func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
+	drainMu.Lock()
+	defer drainMu.Unlock()
+
 	node := state.GetNode(nodeID)
 	if node == nil {
 		log.Printf("Drain: node %s not found", nodeID)
+		return
+	}
+
+	if node.Status == "draining" {
+		log.Printf("Drain: node %s already draining, skipping", nodeID)
 		return
 	}
 
