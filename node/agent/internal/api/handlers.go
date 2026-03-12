@@ -192,7 +192,11 @@ func (h *Handler) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.mgr.Start(name)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if strings.Contains(err.Error(), "is being migrated") {
+			http.Error(w, err.Error(), http.StatusConflict)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	writeJSON(w, resp)
