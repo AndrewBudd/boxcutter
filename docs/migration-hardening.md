@@ -717,21 +717,41 @@ When the daemon is SIGKILL'd during an OCI pull, `defer os.RemoveAll(stageDir)` 
 | Tests passed | 81 |
 | Tests partial (known limitations) | 2 |
 | Bugs found and fixed | 77 |
-| VMs migrated successfully | 170+ |
-| VMs rolled back successfully | 8+ |
-| Drain cycles completed | 28+ |
+| VMs migrated successfully | 200+ |
+| VMs rolled back successfully | 9+ |
+| Drain cycles completed | 34+ |
 | Maximum VMs in single drain | 11 |
-| Maximum consecutive migrations (same VM) | 8+ (ping-pong across 5 nodes) |
+| Maximum consecutive migrations (same VM) | 10+ (ping-pong across 7 nodes) |
 | Process survival verified | 7000+ entries, 95+ min |
-| Auto-scale triggers | 16+ |
-| Host daemon crashes survived | 8+ |
-| Node agent crashes survived | 4+ |
-| Rolling OCI upgrades completed | 4 |
-| Crash recovery tested | drain mid-flight, upgrade resume, SIGKILL |
+| Auto-scale triggers | 20+ |
+| Host daemon crashes survived | 11+ |
+| Node agent crashes survived | 5+ |
+| Rolling OCI upgrades completed | 5 |
+| Crash recovery tested | drain mid-flight, upgrade resume, SIGKILL ×3 |
 | /dev/shm fallback tested | Yes — 2GB VM migrated with 94% full target tmpfs |
+
+### Additional Tests (Phase 13 continued)
+
+| # | Test | Result |
+|---|------|--------|
+| 90 | Double-drain rejection (409), nonexistent drain (404) | **PASS** |
+| 91 | Drain only node in cluster (no target) | **PASS** — aborts gracefully |
+| 92 | Full upgrade cycle via API (rolling node replacement) | **PASS** |
+| 93 | SIGKILL during upgrade reconciliation | **PASS** — resumes, finds nodes already match |
+| 94 | Source agent killed mid-migration (stale migration recovery) | **PASS** — split-brain check, safe resume |
+| 95 | VM functional after 8+ migrations | **PASS** — Firecracker running, API responsive |
+| 96 | Rapid ping-pong migration (same VM back and forth) | **PASS** |
+| 97 | Full chaos: create + drain + SIGKILL + recover (5 VMs) | **PASS** |
+
+### Additional Bugs Fixed
+
+**Bug #78: Double-drain accepted (no guard)**
+Drain endpoint accepted any request without checking if node exists or is already draining. Fix: return 404 for missing node, 409 for already-draining.
+
+**Bug #79: Drain of nonexistent node silently accepted**
+Same root cause as Bug #78. Fixed with the same validation.
 
 ## Phase 14: Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
-- [ ] Parallel migration (drain multiple VMs concurrently to same target)
-- [ ] Double-drain rejection (drain already-draining node)
-- [ ] Golden image race fix (prevent concurrent builds)
+- [ ] Golden image race fix (prevent concurrent builds on new nodes)
+- [ ] Parallel drain (migrate multiple VMs simultaneously from same source)
