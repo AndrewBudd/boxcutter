@@ -122,6 +122,32 @@ When both transfers write to /dev/shm (fast), they both push data through the SS
 - **Concurrent create + migrate**: No blocking, import-snapshot completes in ~120ms
 - **Disk fallback penalty**: ~36s for 2GB VM (vs 5s with tmpfs). Acceptable for exhaustion scenarios.
 
+## Phase 2.8: Agent Restart & Network Resilience (complete)
+- [x] Orphaned SSH ControlMaster cleanup — killed on agent restart via `pkill` + socket removal
+- [x] Orphaned target directory cleanup — removed VM dirs without vm.json on agent restart
+- [x] SSH keepalive — ServerAliveInterval=10/CountMax=3 detects dead connections in ~30s
+- [x] Source agent restart during migration — stale marker recovery resumes paused VM
+- [x] Target agent restart during migration — source rollback + resume, target cleaned on restart
+- [x] Network partition during mem transfer — SSH keepalive detects, rollback in ~39s (was: indefinite)
+- [x] /dev/shm full on target — adaptive disk fallback, 1.594s downtime
+- [x] Migration under heavy guest I/O — succeeds, snapshot time proportional to dirty pages
+- [x] Double migration (immediate re-migrate) — both legs succeed
+- [x] 5-way simultaneous cross-migration — all 5 VMs arrive correctly
+
+### Bugs Found and Fixed
+10. **Orphaned SSH ControlMaster** — `ssh -fN` ControlMaster processes survive agent restart (KillMode=process only kills main Go process). Accumulate indefinitely, holding open SSH connections. Fixed: `pkill -f ssh.*ControlPath=/tmp/bc-migrate-` on startup + socket file cleanup.
+11. **Orphaned target directories** — interrupted migrations leave partial VM directories on target (rootfs.ext4 from pre-sync, no vm.json). Waste disk space and confuse subsequent operations. Fixed: `cleanupMigrationArtifacts` removes dirs without vm.json on agent restart.
+12. **No transfer timeout (network partition)** — if network drops during mem transfer, SSH blocks indefinitely waiting for TCP keepalive (~15min). VM stays paused the entire time. Fixed: added `ServerAliveInterval=10 ServerAliveCountMax=3` to migration SSH options, detecting dead connections in ~30s.
+
+### Stress Test Results (5-way simultaneous)
+| VM | RAM | Direction | Downtime | Notes |
+|----|-----|-----------|----------|-------|
+| test-a | 512MB | node-5→node-4 | 6.3s | First to complete |
+| test-d | 512MB | node-5→node-4 | 36.5s | I/O contention |
+| test-f | 512MB | node-5→node-4 | 37.4s | I/O contention |
+| test-g | 2048MB | node-5→node-4 | 42.1s | Large VM + contention |
+| shiny-egret | 512MB | node-4→node-5 | 1m15s | Sending node busy receiving 4 VMs |
+
 ## Phase 3: Fix Orchestrator Migration (TODO)
 - [x] Switch to ephemeral Tailscale keys — separate keys for orchestrator and nodes
 - [x] Fixed `provision.sh` to include ALL authorized SSH keys
@@ -136,7 +162,9 @@ When both transfers write to /dev/shm (fast), they both push data through the SS
 - [ ] Add idempotent recovery (re-run should always converge)
 
 ## Phase 5: Stress Testing (TODO)
-- [x] 5+ VMs concurrent migration — tested: 4 VMs simultaneously, all completed
+- [x] 5+ VMs concurrent migration — tested: 5 VMs simultaneously, all completed
 - [ ] Rolling node upgrade with live VMs
 - [x] Failure injection (kill source/target mid-migration) — tested both, correct recovery
 - [x] /dev/shm exhaustion (VM too large for tmpfs) — graceful fallback to disk
+- [x] Network partition during migration — rollback in ~39s (was: indefinite)
+- [x] Source/target agent restart during migration — correct recovery in all cases
