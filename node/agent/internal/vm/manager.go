@@ -1714,9 +1714,36 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	}
 	log.Printf("Migrating %s: VM paused in %s", name, time.Since(downtimeStart).Round(time.Millisecond))
 
-	// From here on, any error must resume the source VM
+	// From here on, any error must resume the source VM — but only after
+	// verifying the target doesn't have a running copy (prevents split-brain
+	// when import succeeds but the HTTP response is lost due to partition).
 	rollback := func(reason string) {
-		log.Printf("Migrating %s: ROLLBACK — %s, resuming source VM", name, reason)
+		log.Printf("Migrating %s: ROLLBACK — %s", name, reason)
+
+		// Check if target actually has a running copy (split-brain prevention)
+		splitBrainCheck := &http.Client{Timeout: 5 * time.Second}
+		checkResp, checkErr := splitBrainCheck.Get(fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name))
+		if checkErr == nil {
+			var detail map[string]interface{}
+			json.NewDecoder(checkResp.Body).Decode(&detail)
+			checkResp.Body.Close()
+			if s, _ := detail["status"].(string); s == "running" {
+				// Target has a running copy — do NOT resume source (would cause split-brain).
+				// Instead, commit to the target: stop source, clean up.
+				log.Printf("Migrating %s: SPLIT-BRAIN PREVENTED — target has running copy, committing to target", name)
+				if m.vmid != nil {
+					m.vmid.Deregister(name)
+				}
+				m.stopVM(name)
+				CleanupSnapshot(vmDir)
+				os.RemoveAll(vmDir)
+				os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
+				os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))
+				return
+			}
+		}
+
+		log.Printf("Migrating %s: resuming source VM", name)
 		if err := fcResume(vmDir); err != nil {
 			log.Printf("Migrating %s: WARNING — failed to resume source: %v", name, err)
 		}
