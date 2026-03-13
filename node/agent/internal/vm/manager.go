@@ -1820,6 +1820,12 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		}
 		cleanTarget()
 		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean source /dev/shm snapshot files
+		// Clean up disk-based snapshot files from vmDir (Bug #106).
+		// When fcSnapshot falls back to disk, it writes vm.snap and vm.mem
+		// into vmDir. These must be removed after rollback or they leak disk
+		// space and interfere with future migrations.
+		os.Remove(filepath.Join(vmDir, "vm.snap"))
+		os.Remove(filepath.Join(vmDir, "vm.mem"))
 	}
 
 	// Note: KVM dirty page tracking setup is slow (~25s for 512MB) on the first
