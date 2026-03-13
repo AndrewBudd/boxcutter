@@ -1121,21 +1121,35 @@ Import snapshot failed for bold-yak: cow image not found
 | 207 | Batched drain with transient failure | **PARTIAL** | 3/4 migrated, 1 failed (socket timeout → Bug #91) |
 | 208 | Migration during heavy disk I/O | **PASS** | 18.6s downtime (10x slower but no failure) |
 
+## Phase 25: Failure Injection + Edge Cases (tests #209-#217)
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 209 | Kill source Firecracker during migration | **PASS** | FC killed, pause failed (connection refused), VM stopped, restartable |
+| 210 | Network partition during snapshot transfer | **PASS** | Transfer completed before partition took effect (4.6s), 5.7s downtime |
+| 211 | Network partition during pre-sync | **PASS** | SSH exit 255, rollback clean |
+| 212 | Create duplicate VM on target during migration | **PASS** | Target rejected: "VM already exists" |
+| 213 | Full round-trip drain (4→5 VMs, 2 drains) | **PASS** | Phase 1: 220s, Phase 2: 271s, all healthy |
+| 214 | Migrate nonexistent VM | **PASS** | 404 response |
+| 215 | Self-migration | **PASS** | 400 "cannot migrate VM to the same node" |
+| 216 | Double migration | **PASS** | 409 "already migrating" |
+| 217 | Simultaneous drain BOTH nodes (8 VMs) | **PASS** | 508s, VMs ping-ponged then settled on one node |
+
 ## Cumulative Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 208 |
+| Total tests | 217 |
 | Total bugs found | 91 |
-| VMs migrated | 550+ |
-| Drain cycles completed | 100+ |
+| VMs migrated | 600+ |
+| Drain cycles completed | 110+ |
 | Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition, simultaneous drain, batched |
 | Host daemon crashes survived | 22+ |
 | Node agent crashes survived | 30+ |
-| Network partitions survived | 3 (pre-sync, post-pause, and mem-transfer) |
-| Successive migrations per VM | 20+ (bold-yak: 6x ping-pong + drain cycles across 10+ nodes) |
+| Network partitions survived | 4 (pre-sync, post-pause, mem-transfer, and during-pre-sync) |
+| Successive migrations per VM | 20+ (VMs survived 3+ successive drains across nodes 87-90) |
 | Resource leaks detected | 0 after all tests |
-| Nodes auto-scaled during testing | 10+ (77-88 range) |
+| Nodes auto-scaled during testing | 14+ (77-90 range) |
 | Disk-full scenarios tested | 3 (/dev/shm only, disk only, both) |
 
 ## Remaining (TODO)
