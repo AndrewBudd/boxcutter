@@ -1461,10 +1461,17 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 | 360 | Reverse trip (restored VM, KVM penalty) | PASS — 27.2s downtime (2GB) |
 | 361 | Target agent crash during import-snapshot | PASS — migration completed before kill |
 | 362 | Target crash during pre-sync | PASS — connection refused, source rolled back |
+| 363 | Migrate during VM creation | PASS — guard caught race, VM stayed on source |
+| 364 | Rapid back-to-back migrations (3x) | PASS — 6.5s, 16.9s, 41.3s, no leaks |
+| 365 | Concurrent migrate of same VM | PASS — second request rejected (409) |
+| 366 | Migration with wrong target port | PASS — rollback on connection refused |
+| 367 | Missing target_bridge_ip | PASS — 400 bad request |
+| 368 | Migrate non-existent VM | PASS — 404 not found |
+| 369 | Full lifecycle (create→migrate→stop→start→migrate→destroy) | PASS — zero leaks |
 
 ### Cumulative Statistics
-- **362 total tests**, 101 bugs found (101 fixed), **1010+ VMs migrated**, 190+ drain cycles
-- Phase 35 alone: 17 tests, 2 bugs fixed, all passing
+- **369 total tests**, 101 bugs found (101 fixed), **1030+ VMs migrated**, 195+ drain cycles
+- Phase 35 alone: 24 tests, 2 bugs fixed, all passing
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
