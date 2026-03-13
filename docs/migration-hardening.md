@@ -1245,6 +1245,33 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 
 **Create during drain**: Creating VMs on the target while migrations are arriving works cleanly. No lock contention, no naming collisions, no resource conflicts.
 
+## Phase 30: Drain Sort + Edge Cases + Concurrent /dev/shm Exhaustion (tests #241–#250)
+
+**Bug #95: Drain sort optimization** — Added `sort.Slice` to order VMs by RAM ascending before batching. Small VMs migrate in early batches, freeing /dev/shm space for larger VMs in later batches. Committed as `d2afa2c`.
+
+| Test | Scenario | Result | Details |
+|------|----------|--------|---------|
+| 241 | Drain sort: 6 VMs (4GB+2GB+4×512MB) | **PASS** | Batch 1: 3×512MB (1m46s), Batch 2: 512+2048+4096 (5m21s). Sort correct. |
+| 242 | Self-migration guard | **PASS** | Correctly rejected with "cannot migrate VM to the same node" |
+| 243 | Concurrent migration of same VM | **PASS** | First accepted (migrating), second rejected 409 "already migrating" |
+| 244 | Target node crash during migration | **PASS** | SSH transfer got exit 255, ROLLBACK, source VM resumed |
+| 245 | Target agent stopped during migration | **PASS** | Import-snapshot got "connection refused", ROLLBACK, source VM resumed |
+| 246 | Migrate stopped VM | **PASS** | "Relocate" path — file copy only (3.5s), arrived as stopped, started OK |
+| 247 | Rapid create-migrate-destroy (10x) | **9/10** | rapid-9 failed: test timing race (15s wait < 11.3s snapshot under I/O) |
+| 248 | Migrate fresh VM (never restored) | **PASS** | 1.6s downtime — best ever! No prefault needed, 310ms snapshot |
+| 249 | Migrate under heavy guest disk I/O | **PASS** | 1.5s downtime — dd writing 500MB inside VM had zero effect |
+| 250 | 4 concurrent migrations (exhausting /dev/shm) | **2/4** | fresh-vm + big-4g PASS; sim-1 + sim-2 ROLLBACK (disk snapshot timed out under I/O contention) |
+
+### Key Findings
+
+**Fresh VMs migrate fastest**: No prior vm.mem mmap → no COW overhead → 310ms snapshot, 1.6s total downtime.
+
+**/dev/shm ENOSPC fallback works**: When 4 VMs simultaneously snapshot and /dev/shm runs out, fcSnapshot's fallback to disk triggers cleanly. Firecracker returns error 28 (ENOSPC), partial /dev/shm files are cleaned, disk retry begins.
+
+**Concurrent disk snapshots cause timeout**: When 3+ VMs fall back to disk simultaneously, I/O contention can push snapshot time past the 5m timeout. This is the main remaining reliability gap for high-concurrency scenarios.
+
+**Cumulative statistics**: 250 total tests, 95 bugs found, 740+ VMs migrated, 130+ drain cycles.
+
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
 - [x] ~~Add timeout to Firecracker pause API call~~ — already 2-minute timeout in `fcClient()` (fcapi.go:27)
@@ -1258,3 +1285,4 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 - [x] ~~Drain aborts on transient failure~~ — retry once before aborting (Bug #91)
 - [x] ~~Target /dev/shm threshold too conservative~~ — reduced from 2.2x to 1.2x (Bug #92)
 - [x] ~~Auto-scaler drains migration target~~ — re-check VMs before scale-down (Bug #93)
+- [x] ~~Drain VM ordering~~ — sort by RAM ascending (Bug #95)
