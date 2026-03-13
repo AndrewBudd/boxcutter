@@ -1523,9 +1523,14 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 - Root cause: `drainNode()` early-returns for 0-VM nodes without cleaning up TAP, QCOW2, ISO, console log.
 - Fix: empty-node drain now cleans up all artifacts before returning.
 
+| 395 | Migrate then destroy on target | PASS — clean on both nodes |
+| 396 | Create on target, migrate to source | PASS — fresh VM migrated cleanly |
+| 397 | 4-hop rapid migration (A→B→A→B) | PASS — 10s, 41s, 15s, 24s, zero leaks |
+| 398 | Full drain via host API (5 VMs) | PASS — batched (3+2), all migrated, node stopped + cleaned |
+
 ### Cumulative Statistics
-- **394 total tests**, 105 bugs found (104 fixed, 1 known behavior), **1080+ VMs migrated**, 205+ drain cycles
-- Phase 36: 25 tests, 4 bugs fixed, all passing
+- **398 total tests**, 105 bugs found (104 fixed, 1 known behavior), **1095+ VMs migrated**, 210+ drain cycles
+- Phase 36: 29 tests, 4 bugs fixed, all passing
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
