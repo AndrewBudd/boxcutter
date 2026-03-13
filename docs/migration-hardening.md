@@ -1143,31 +1143,80 @@ Import snapshot failed for bold-yak: cow image not found
 | 219 | Rapid lifecycle stress (3 rounds create→migrate→destroy) | **PASS** | All 3 rounds completed, no orphans |
 | 220 | Drain with injected failure + retry (Bug #91 validation) | **PASS** | All 4 initial migrations failed (iptables block), unblocked, all 4 retries succeeded (293s) |
 
+## Phase 27: 4GB VM + /dev/shm Optimization + Prefault Fix (tests #221-#231)
+
+### Bugs Found and Fixed
+
+**Bug #92: Target /dev/shm threshold too conservative (2.2x memory)**
+Import-side /dev/shm check reserved 2.2x VM memory (2x for import + future export headroom + 20% margin). This forced 4GB VMs to always fall back to disk on import even when /dev/shm had enough space. Fix: reduced to 1.2x — fcSnapshot handles export fallback independently.
+- Before fix: import-snapshot 5.6s (disk), total downtime 3m36s
+- After fix: import-snapshot 130ms (tmpfs), total downtime 12.3s
+
+**Bug #93: Auto-scaler drains migration target node**
+Auto-scaler saw node-91 with 0 VMs (destroyed manually) and drained/killed it while a 4GB VM was actively migrating TO it. Migration failed with "No route to host", rolled back correctly. Fix: re-query candidate's VM count immediately before draining for scale-down.
+
+**Bug #94: Prefault only faults first vm.mem mapping segment**
+Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for a 4GB VM). `fcPrefaultMemory()` had `break` after the first `vm.mem` match — only 768MB of 4096MB was pre-faulted. Fix: collect ALL vm.mem ranges and fault them all.
+- Before fix: "pre-faulted 768MB" for 4GB VM
+- After fix: "pre-faulted 4096MB across 2 segments"
+- Disk snapshot improvement: 2m10s → 1m11s for 4GB VM
+
+### 4GB VM Migration Performance
+
+| Test | Source→Target | Source snapshot | Transfer | Import | Downtime |
+|------|-------------|----------------|----------|--------|----------|
+| #221 (baseline) | Disk→Disk | 2m22s | 1m8s | 5.6s | **3m36s** |
+| #222 (Bug #92 fix) | tmpfs→Disk | 3.7s | 8.4s | 130ms | **12.3s** |
+| #224 (clean target) | Disk→tmpfs | 1m44s | 9.1s | 130ms | **1m58s** |
+| #225 (Bug #94 fix) | Disk→tmpfs | **1m11s** | 9.1s | 130ms | **1m21s** |
+
+**Key insight**: 4GB VM downtime is dominated by disk-based source snapshots (1-2 min) because /dev/shm (5.9GB per QEMU VM) can't simultaneously hold the 4GB mmap AND the 4.9GB snapshot. The only fix is larger QEMU VMs (more RAM = more tmpfs). Not a code issue.
+
+### Test Results
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 221 | 4GB VM migration (baseline, no fix) | **PASS** | 3m36s downtime — both disk |
+| 222 | 4GB VM with Bug #92 fix | **PASS** | 12.3s downtime — tmpfs source, disk target |
+| 223 | 4GB VM — disk source, tmpfs target | **PASS** | 1m58s — source limited by other VM mmap |
+| 224 | 4GB VM — clean /dev/shm target | **PASS** | 1m58s — Bug #92 fix confirmed |
+| 225 | Prefault validation (4GB VM roundtrip) | **PASS** | 4096MB faulted across 2 segments, disk snapshot 1m11s |
+| 226 | Drain mixed sizes (4GB + 2x2GB) | **PASS** | 3m50s, all 3 migrated in single batch |
+| 227 | Drain 10.2GB (4GB + 3x2GB) to target | **PASS** | 8m30s, 2 failed first batch → retries succeeded |
+| 228 | Resource leak check | **PASS** | 4 TAPs, 4 procs, 0 stale — clean |
+| 229 | Migration to near-full target (102% overcommit) | **PASS** | Succeeded — import bypasses RAM check |
+| 230 | SIGKILL source during 4GB disk snapshot | **PASS** | Stale marker, split-brain check, resumed locally |
+| 231 | Drain 3 VMs (8.2GB incl 4GB) | **PASS** | 5m23s, no failures, no retries |
+
 ## Cumulative Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 220 |
-| Total bugs found | 91 |
-| VMs migrated | 620+ |
-| Drain cycles completed | 112+ |
+| Total tests | 231 |
+| Total bugs found | 94 |
+| VMs migrated | 650+ |
+| Drain cycles completed | 116+ |
 | Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition, simultaneous drain, batched |
 | Host daemon crashes survived | 22+ |
-| Node agent crashes survived | 30+ |
+| Node agent crashes survived | 32+ |
 | Network partitions survived | 5 (pre-sync, post-pause, mem-transfer, during-pre-sync, injected-drain-failure) |
-| Successive migrations per VM | 20+ (VMs survived 3+ successive drains across nodes 87-90) |
+| Successive migrations per VM | 20+ |
 | Resource leaks detected | 0 after all tests |
-| Nodes auto-scaled during testing | 15+ (77-91 range) |
+| Nodes auto-scaled during testing | 18+ (77-94 range) |
 | Disk-full scenarios tested | 3 (/dev/shm only, disk only, both) |
+| Largest single VM migrated | 4096MB (4GB) |
+| Max VMs on single node | 6 (14.3GB, 119% overcommit) |
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
 - [x] ~~Add timeout to Firecracker pause API call~~ — already 2-minute timeout in `fcClient()` (fcapi.go:27)
 - [x] ~~Add timeout to import-snapshot HTTP call~~ — already 2-minute timeout in `targetClient` (manager.go:1841)
 - [x] ~~Snapshot timeout too short for disk-based large VMs~~ — extended to 5-minute dedicated client (Bug #87)
-- [ ] Consider pre-faulting optimization before snapshot to reduce KVM lazy page fault penalty
+- [x] ~~Pre-faulting optimization~~ — fault ALL vm.mem segments, not just first (Bug #94)
 - [x] ~~Orphaned golden builds on agent restart~~ — agent kills orphans on startup (Bug #85)
 - [x] ~~Pre-sync cleanup race~~ — skip recent dirs in cleanup (Bug #88)
 - [x] ~~Stale /dev/shm from interrupted migration~~ — clean before transfers (Bug #89)
 - [x] ~~Concurrent migration I/O contention~~ — batch to max 3 concurrent (Bug #90)
 - [x] ~~Drain aborts on transient failure~~ — retry once before aborting (Bug #91)
+- [x] ~~Target /dev/shm threshold too conservative~~ — reduced from 2.2x to 1.2x (Bug #92)
+- [x] ~~Auto-scaler drains migration target~~ — re-check VMs before scale-down (Bug #93)
