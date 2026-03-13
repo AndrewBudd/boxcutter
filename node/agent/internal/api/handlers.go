@@ -361,15 +361,39 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pre-flight: reject if target already has a VM with this name
+	// Pre-flight: reject if target already has a VM with this name.
+	// If the target's copy has status "migrating" (being cleaned up after
+	// migrating OUT), wait briefly for cleanup to complete before proceeding.
+	// This prevents false rejections during rapid ping-pong migrations. (Bug #99)
 	preflightClient := &http.Client{Timeout: 10 * time.Second}
-	preflightResp, err := preflightClient.Get(fmt.Sprintf("http://%s/api/vms/%s", req.TargetAddr, name))
-	if err == nil {
-		preflightResp.Body.Close()
-		if preflightResp.StatusCode == http.StatusOK {
-			http.Error(w, fmt.Sprintf("target already has VM '%s'", name), http.StatusConflict)
-			return
+	targetClear := false
+	for attempt := 0; attempt < 15; attempt++ {
+		preflightResp, err := preflightClient.Get(fmt.Sprintf("http://%s/api/vms/%s", req.TargetAddr, name))
+		if err != nil {
+			targetClear = true
+			break // Target unreachable or error — will fail later in migration
 		}
+		if preflightResp.StatusCode != http.StatusOK {
+			preflightResp.Body.Close()
+			targetClear = true
+			break // VM doesn't exist on target
+		}
+		var detail map[string]interface{}
+		json.NewDecoder(preflightResp.Body).Decode(&detail)
+		preflightResp.Body.Close()
+		tgtStatus, _ := detail["status"].(string)
+		if tgtStatus != "migrating" {
+			break // VM exists and isn't leaving — reject below
+		}
+		// VM is migrating out, wait for cleanup
+		if attempt == 0 {
+			log.Printf("Migrate %s: target has migrating copy, waiting for cleanup...", name)
+		}
+		time.Sleep(time.Second)
+	}
+	if !targetClear {
+		http.Error(w, fmt.Sprintf("target already has VM '%s'", name), http.StatusConflict)
+		return
 	}
 
 	// Atomically check and set migration marker (prevents race with concurrent requests)
