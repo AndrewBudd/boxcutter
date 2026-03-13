@@ -1418,10 +1418,14 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 | 335 | 5 concurrent migrations | PASS — all 5 clean, no orphans |
 | 336 | Same-named VM on both nodes → migrate | PASS — 409 duplicate rejection |
 | 337 | 4GB migration with full leak audit | PASS — SIGKILL 2 iter, clean source |
+| 338 | Disk-based snapshot fallback (SHM full) | PASS — 66s snapshot (vs 1s on SHM), 71s downtime |
+| 339 | Migration to non-routable IP | PASS — fast fail, VM resumed |
+| 340 | Full drain via host daemon (3 VMs + anchor) | PASS — all migrated, node stopped |
+| 341 | Full lifecycle across new cluster | PASS — create, A→B, B→A, stop, start, destroy |
 
 ### Cumulative Statistics
-- **337 total tests**, 99 bugs found (99 fixed), **950+ VMs migrated**, 175+ drain cycles
-- Phase 34 alone: 21 tests, 2 bugs fixed, all passing
+- **341 total tests**, 99 bugs found (99 fixed), **970+ VMs migrated**, 180+ drain cycles
+- Phase 34 alone: 25 tests, 2 bugs fixed, all passing
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
