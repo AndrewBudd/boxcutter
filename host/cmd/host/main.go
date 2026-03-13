@@ -15,6 +15,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1529,6 +1530,14 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 	migrateClient := &http.Client{Timeout: 30 * time.Second}
 	pollClient := &http.Client{Timeout: 5 * time.Second}
+
+	// Sort VMs by RAM size (smallest first) so small VMs migrate first in
+	// early batches, freeing /dev/shm space for larger VMs in later batches.
+	sort.Slice(vms, func(i, j int) bool {
+		ri, _ := vms[i]["ram_mib"].(float64)
+		rj, _ := vms[j]["ram_mib"].(float64)
+		return ri < rj
+	})
 
 	// Build list of VMs to migrate (skip already-migrated ones)
 	var toMigrate []string
