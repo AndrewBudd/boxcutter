@@ -607,6 +607,10 @@ func cleanupMigrationArtifacts() {
 	// Clean up orphaned VM directories from interrupted inbound migrations.
 	// These have a rootfs.ext4 from pre-sync but no vm.json (import-snapshot
 	// never completed). Safe to remove because the source VM was resumed.
+	//
+	// Guard: skip directories modified within the last 10 minutes — they may
+	// belong to an active pre-sync from a remote source (Bug #88: agent restart
+	// during drain deleted pre-synced files before import-snapshot arrived).
 	vmBase := "/var/lib/boxcutter/vms"
 	entries, _ := os.ReadDir(vmBase)
 	for _, e := range entries {
@@ -617,7 +621,14 @@ func cleanupMigrationArtifacts() {
 		if _, err := os.Stat(filepath.Join(dir, "vm.json")); err == nil {
 			continue // has state file — legitimate VM
 		}
-		// No vm.json — this is an orphan from an interrupted migration
+		// Check if directory was recently modified (active pre-sync protection)
+		info, err := e.Info()
+		if err == nil && time.Since(info.ModTime()) < 10*time.Minute {
+			log.Printf("Skipping recent migration directory (age=%s): %s",
+				time.Since(info.ModTime()).Round(time.Second), dir)
+			continue
+		}
+		// No vm.json and old enough — this is an orphan from an interrupted migration
 		log.Printf("Removing orphaned migration directory: %s", dir)
 		os.RemoveAll(dir)
 	}
@@ -1671,10 +1682,16 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		}
 	}
 
-	mkdirCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
-		"sudo", "mkdir", "-p", dstVMDir)...)
-	if out, err := mkdirCmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
+	// Clean stale /dev/shm snapshot files from any previous migration of this VM
+	// (Bug #89: partial vm.mem from an interrupted migration was picked up by
+	// ImportSnapshot, which checks /dev/shm before vmDir). Also clean stale
+	// vm.snap/vm.mem from vmDir to avoid the same issue in reverse.
+	prepCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
+		"sudo", "rm", "-rf", fmt.Sprintf("/dev/shm/bc-%s", name), fmt.Sprintf("/dev/shm/bc-%s-mig", name),
+		"&&", "sudo", "mkdir", "-p", dstVMDir,
+		"&&", "sudo", "rm", "-f", dstVMDir+"vm.snap", dstVMDir+"vm.mem")...)
+	if out, err := prepCmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("prep target: %s: %w", string(out), err)
 	}
 
 	// Pre-sync disk using tar --sparse. This uses SEEK_DATA/SEEK_HOLE to read
