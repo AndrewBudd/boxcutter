@@ -1543,127 +1543,142 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	if len(toMigrate) == 0 {
 		log.Printf("Drain: all VMs already migrated from %s", nodeID)
 	} else {
-		log.Printf("Drain: migrating %d VMs concurrently from %s to %s", len(toMigrate), nodeID, targetNode.ID)
+		log.Printf("Drain: migrating %d VMs from %s to %s (max 3 concurrent)", len(toMigrate), nodeID, targetNode.ID)
 	}
 
-	// Fire all migrations
-	for _, vmName := range toMigrate {
-		migrateReq := map[string]string{
-			"target_addr":      fmt.Sprintf("%s:8800", targetNode.BridgeIP),
-			"target_bridge_ip": targetNode.BridgeIP,
-		}
-		data, _ := json.Marshal(migrateReq)
-		migrateResp, err := migrateClient.Post(
-			fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
-			"application/json",
-			jsonReader(data),
-		)
-		if err != nil {
-			log.Printf("Drain: failed to start migration of %s: %v", vmName, err)
-			continue
-		}
-		migrateResp.Body.Close()
-		if migrateResp.StatusCode == 409 {
-			log.Printf("Drain: %s already migrating — will poll", vmName)
-		} else if migrateResp.StatusCode >= 300 {
-			log.Printf("Drain: migrate %s returned %d", vmName, migrateResp.StatusCode)
-		} else {
-			log.Printf("Drain: started migration of %s", vmName)
-		}
-	}
-
-	// Poll all migrations concurrently
+	// Fire migrations in batches of 3 to avoid I/O contention.
+	// When all VMs fire at once, concurrent pre-syncs + snapshots compete for
+	// disk I/O, causing 2-3 minute downtimes instead of 2-6 seconds (Bug #90).
+	const maxConcurrentMigrations = 3
 	type drainResult struct {
 		name     string
 		migrated bool
 	}
-	results := make(chan drainResult, len(toMigrate))
+	failedMigrations := 0
 
-	for _, vmName := range toMigrate {
-		go func(name string) {
-			const inactivityTimeout = 2 * time.Minute
-			lastActivity := time.Now()
-			migrated := false
+	for batchStart := 0; batchStart < len(toMigrate); batchStart += maxConcurrentMigrations {
+		batchEnd := batchStart + maxConcurrentMigrations
+		if batchEnd > len(toMigrate) {
+			batchEnd = len(toMigrate)
+		}
+		batch := toMigrate[batchStart:batchEnd]
+		if batchStart > 0 {
+			log.Printf("Drain: starting batch %d-%d of %d VMs", batchStart+1, batchEnd, len(toMigrate))
+		}
 
-			for {
-				time.Sleep(3 * time.Second)
+		// Fire migrations for this batch
+		for _, vmName := range batch {
+			migrateReq := map[string]string{
+				"target_addr":      fmt.Sprintf("%s:8800", targetNode.BridgeIP),
+				"target_bridge_ip": targetNode.BridgeIP,
+			}
+			data, _ := json.Marshal(migrateReq)
+			migrateResp, err := migrateClient.Post(
+				fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
+				"application/json",
+				jsonReader(data),
+			)
+			if err != nil {
+				log.Printf("Drain: failed to start migration of %s: %v", vmName, err)
+				continue
+			}
+			migrateResp.Body.Close()
+			if migrateResp.StatusCode == 409 {
+				log.Printf("Drain: %s already migrating — will poll", vmName)
+			} else if migrateResp.StatusCode >= 300 {
+				log.Printf("Drain: migrate %s returned %d", vmName, migrateResp.StatusCode)
+			} else {
+				log.Printf("Drain: started migration of %s", vmName)
+			}
+		}
 
-				srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, name))
-				if err != nil {
-					if time.Since(lastActivity) > inactivityTimeout {
-						log.Printf("Drain: %s source unreachable for %v, verifying at target...", name, inactivityTimeout)
+		// Poll this batch concurrently
+		results := make(chan drainResult, len(batch))
+		for _, vmName := range batch {
+			go func(name string) {
+				const inactivityTimeout = 2 * time.Minute
+				lastActivity := time.Now()
+				migrated := false
+
+				for {
+					time.Sleep(3 * time.Second)
+
+					srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, name))
+					if err != nil {
+						if time.Since(lastActivity) > inactivityTimeout {
+							log.Printf("Drain: %s source unreachable for %v, verifying at target...", name, inactivityTimeout)
+							migrated = true
+							break
+						}
+						continue
+					}
+
+					if srcResp.StatusCode == 404 {
+						srcResp.Body.Close()
+						log.Printf("Drain: %s removed from source", name)
 						migrated = true
 						break
 					}
-					continue
-				}
 
-				if srcResp.StatusCode == 404 {
+					if srcResp.StatusCode != 200 {
+						srcResp.Body.Close()
+						lastActivity = time.Now()
+						continue
+					}
+
+					var srcDetail map[string]interface{}
+					json.NewDecoder(srcResp.Body).Decode(&srcDetail)
 					srcResp.Body.Close()
-					log.Printf("Drain: %s removed from source", name)
-					migrated = true
-					break
-				}
 
-				if srcResp.StatusCode != 200 {
-					srcResp.Body.Close()
+					srcStatus, _ := srcDetail["status"].(string)
+
+					if srcStatus == "migrating" {
+						lastActivity = time.Now()
+						continue
+					}
+					if srcStatus == "stopped" {
+						lastActivity = time.Now()
+						continue
+					}
+					if srcStatus == "running" {
+						log.Printf("Drain: %s migration failed (source status: running)", name)
+						break
+					}
 					lastActivity = time.Now()
-					continue
 				}
 
-				var srcDetail map[string]interface{}
-				json.NewDecoder(srcResp.Body).Decode(&srcDetail)
-				srcResp.Body.Close()
-
-				srcStatus, _ := srcDetail["status"].(string)
-
-				if srcStatus == "migrating" {
-					lastActivity = time.Now()
-					continue
-				}
-				if srcStatus == "stopped" {
-					lastActivity = time.Now()
-					continue
-				}
-				if srcStatus == "running" {
-					log.Printf("Drain: %s migration failed (source status: running)", name)
-					break
-				}
-				lastActivity = time.Now()
-			}
-
-			// Verify at target
-			if migrated {
-				verifyResp, err := pollClient.Get(
-					fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, name))
-				if err != nil {
-					log.Printf("Drain: WARNING: %s gone from source but target %s unreachable: %v", name, targetNode.ID, err)
-					migrated = false
-				} else {
-					var targetDetail map[string]interface{}
-					json.NewDecoder(verifyResp.Body).Decode(&targetDetail)
-					verifyResp.Body.Close()
-					targetStatus, _ := targetDetail["status"].(string)
-					if targetStatus == "" {
-						log.Printf("Drain: WARNING: %s not found on target %s after migration", name, targetNode.ID)
+				// Verify at target
+				if migrated {
+					verifyResp, err := pollClient.Get(
+						fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, name))
+					if err != nil {
+						log.Printf("Drain: WARNING: %s gone from source but target %s unreachable: %v", name, targetNode.ID, err)
 						migrated = false
 					} else {
-						log.Printf("Drain: %s verified on target %s (status: %s)", name, targetNode.ID, targetStatus)
+						var targetDetail map[string]interface{}
+						json.NewDecoder(verifyResp.Body).Decode(&targetDetail)
+						verifyResp.Body.Close()
+						targetStatus, _ := targetDetail["status"].(string)
+						if targetStatus == "" {
+							log.Printf("Drain: WARNING: %s not found on target %s after migration", name, targetNode.ID)
+							migrated = false
+						} else {
+							log.Printf("Drain: %s verified on target %s (status: %s)", name, targetNode.ID, targetStatus)
+						}
 					}
 				}
+
+				results <- drainResult{name: name, migrated: migrated}
+			}(vmName)
+		}
+
+		// Wait for this batch to complete before starting the next
+		for range batch {
+			r := <-results
+			if !r.migrated {
+				log.Printf("Drain: %s migration did not complete", r.name)
+				failedMigrations++
 			}
-
-			results <- drainResult{name: name, migrated: migrated}
-		}(vmName)
-	}
-
-	// Collect results
-	failedMigrations := 0
-	for range toMigrate {
-		r := <-results
-		if !r.migrated {
-			log.Printf("Drain: %s migration did not complete", r.name)
-			failedMigrations++
 		}
 	}
 
