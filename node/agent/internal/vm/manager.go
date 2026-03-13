@@ -1808,42 +1808,13 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean source /dev/shm snapshot files
 	}
 
-	// After snapshot restore, the first snapshot creation is extremely slow (~7-16s
-	// for 512MB) due to KVM needing to set up dirty page tracking. Running a
-	// disposable "warm-up" snapshot primes KVM so the real snapshot is fast (~300ms).
-	// The warm-up cost is paid once; the real snapshot benefits. Net effect: downtime
-	// is similar for the first migration but much better for subsequent ones. (Bug #96)
-	//
-	// Only runs when: (1) VM was restored from snapshot (/dev/shm vm.mem exists),
-	// AND (2) /dev/shm has enough space for the warm-up snapshot. For large VMs
-	// where /dev/shm can't hold both the import mmap and the warm-up, the snapshot
-	// will fall back to disk regardless — the warm-up provides no benefit there
-	// (disk I/O dominates, not KVM setup cost) and would double the downtime.
-	if memStat, err := os.Stat(filepath.Join("/dev/shm", "bc-"+name, "vm.mem")); err == nil {
-		doWarmup := false
-		needed := memStat.Size() + memStat.Size()/5 // need 120% of VM RAM for warm-up snapshot
-		var shmStat syscall.Statfs_t
-		if syscall.Statfs("/dev/shm", &shmStat) == nil {
-			avail := int64(shmStat.Bavail) * int64(shmStat.Bsize)
-			doWarmup = avail >= needed
-			if !doWarmup {
-				log.Printf("Migrating %s: skipping KVM warm-up (/dev/shm %dMB free, need %dMB)",
-					name, avail/1024/1024, needed/1024/1024)
-			}
-		}
-		if doWarmup {
-			warmStart := time.Now()
-			warmSnap, warmMem, warmErr := fcSnapshot(vmDir)
-			if warmErr == nil {
-				os.Remove(warmSnap)
-				os.Remove(warmMem)
-				os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
-				log.Printf("Migrating %s: KVM warm-up snapshot in %s", name, time.Since(warmStart).Round(time.Millisecond))
-			} else {
-				log.Printf("Migrating %s: KVM warm-up failed (proceeding): %v", name, warmErr)
-			}
-		}
-	}
+	// Note: KVM dirty page tracking setup is slow (~25s for 512MB) on the first
+	// snapshot after snapshot restore. A warm-up snapshot was tried (Bug #96) but
+	// removed (Bug #100): the warm-up pays the same 25s cost, then the real snapshot
+	// is fast (~700ms), making total ~25.7s vs ~25s without warm-up. Net effect for
+	// single migrations (the common case) is +0.7s overhead. The warm-up only helps
+	// if the same paused session takes multiple snapshots (e.g., failed retry), which
+	// is rare because rollback resumes the VM, resetting KVM tracking.
 
 	// Snapshot to regular files (Firecracker requires truncatable mem file, not FIFO)
 	snapStart := time.Now()

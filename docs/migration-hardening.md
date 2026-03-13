@@ -1422,10 +1422,49 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 | 339 | Migration to non-routable IP | PASS — fast fail, VM resumed |
 | 340 | Full drain via host daemon (3 VMs + anchor) | PASS — all migrated, node stopped |
 | 341 | Full lifecycle across new cluster | PASS — create, A→B, B→A, stop, start, destroy |
+| 342 | Target /dev/shm full → disk import | PASS — 50s downtime (vs 6s on SHM) |
+| 343 | Crashed migrating VM + agent restart | PASS — fresh start, no split-brain |
+| 344 | Destroy/Stop during active migration | PASS — 409 rejection for both |
+| 345 | Cross-migrate same-named VMs | PASS — both rejected (409 duplicate) |
+
+### Phase 35: Warm-up Removal + Auto-Scaler Guard
+
+**Bug #100: KVM warm-up snapshot adds unnecessary downtime during migration**
+- Symptom: restored VM migrations take ~26s downtime (512MB) due to warm-up + real snapshot
+- Root cause: warm-up snapshot (from Bug #96) pays the full KVM dirty tracking setup cost (~25s), then the real snapshot is fast (~700ms). Total with warm-up: ~25.7s. Without: ~16-22s. The warm-up adds overhead with no benefit for single-migration scenarios.
+- Fix: removed warm-up snapshot entirely. For 512MB VMs, downtime went from 26.9s → 17.6s (9.3s improvement). For 2GB VMs, 27s → 22s (5s improvement).
+- Note: the first snapshot after restore is inherently slow (KVM dirty page tracking setup). This cost scales with VM RAM and is unavoidable without KVM-level changes.
+
+**Bug #101: Auto-scaler triggers premature drain during node recovery**
+- Symptom: after killing node agent with SIGKILL (which kills all cgroup processes including Firecracker), the auto-scaler sees 0 VMs and triggers drain before RestartAll finishes restarting them.
+- Root cause: pre-drain re-check only validated `vms_running > 0`, missing the case where VMs exist on disk but haven't been restarted yet.
+- Fix: added `vms_total` check — if node has VMs on disk but 0 running, it's probably restarting. Scale-down is aborted.
+
+### Tests #346-#362
+
+| Test | Scenario | Result |
+|------|----------|--------|
+| 346 | Triple hop A→B→A→B (512MB) | PASS — all 3 hops clean, no leaks |
+| 347 | Bug #100 fix verify (non-restored VM) | PASS — 205ms snapshot, 1.6s downtime |
+| 348 | First migration of restored VM (no warm-up) | PASS — 16.3s snapshot, 17.6s downtime |
+| 349 | Reverse trip consistency | PASS — 203ms snapshot (VM ran 31s after restore) |
+| 350 | Source agent crash during migration | PASS — migration completed before kill |
+| 351 | Source agent crash during pre-sync (SIGKILL) | PASS — auto-scaler drain raced with RestartAll → led to Bug #101 |
+| 352 | 4 concurrent migrations | PASS — all 4 migrated in 36s, zero leaks |
+| 353 | Migration during heavy disk I/O | PASS — 15.9s downtime, pre-synced data valid |
+| 354 | Bug #101 fix verification | PASS — auto-scaler aborted drain, VMs recovered |
+| 355 | 4GB VM migration (fresh) | PASS — 6s snapshot, 15s downtime, 9s transfer |
+| 356 | 4GB VM reverse (restored, disk fallback) | PASS — 100s snapshot (disk), 1m50s downtime |
+| 357 | Golden version mismatch migration | PASS — file-based rootfs, golden not needed |
+| 358 | Full drain via host daemon API | PASS — 3 VMs migrated, node stopped |
+| 359 | Migration to freshly provisioned node | PASS — 5.4s downtime (2GB) |
+| 360 | Reverse trip (restored VM, KVM penalty) | PASS — 27.2s downtime (2GB) |
+| 361 | Target agent crash during import-snapshot | PASS — migration completed before kill |
+| 362 | Target crash during pre-sync | PASS — connection refused, source rolled back |
 
 ### Cumulative Statistics
-- **341 total tests**, 99 bugs found (99 fixed), **970+ VMs migrated**, 180+ drain cycles
-- Phase 34 alone: 25 tests, 2 bugs fixed, all passing
+- **362 total tests**, 101 bugs found (101 fixed), **1010+ VMs migrated**, 190+ drain cycles
+- Phase 35 alone: 17 tests, 2 bugs fixed, all passing
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
@@ -1445,3 +1484,5 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 - [x] ~~Source cleanup race~~ — wait for process exit before RemoveAll (Bug #97)
 - [x] ~~Orphaned Firecracker processes~~ — skip CtrlAltDel for paused VMs, syscall.Kill + fallback (Bug #98)
 - [x] ~~Pre-flight ping-pong rejection~~ — wait for migrating copy cleanup (Bug #99)
+- [x] ~~KVM warm-up overhead~~ — removed warm-up snapshot, 9s improvement for 512MB (Bug #100)
+- [x] ~~Premature drain during recovery~~ — check vms_total before scale-down (Bug #101)

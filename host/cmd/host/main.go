@@ -955,12 +955,18 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 				}
 			}
 			// Re-check candidate before draining: VMs may have arrived via
-			// in-flight migrations since the poll (Bug #93).
+			// in-flight migrations since the poll (Bug #93). Also check
+			// vms_total to catch nodes still restarting — RestartAll hasn't
+			// finished so vms_running=0 but VMs exist on disk (Bug #101).
 			if candidateBridgeIP != "" {
 				fresh := queryNodeHealth(candidateBridgeIP)
 				if fresh != nil {
 					if vms, _ := fresh["vms_running"].(float64); vms > 0 {
-						log.Printf("Scale-down aborted: %s now has %.0f VMs (inbound migrations?)", candidateID, vms)
+						log.Printf("Scale-down aborted: %s now has %.0f running VMs (inbound migrations?)", candidateID, vms)
+						continue
+					}
+					if total, _ := fresh["vms_total"].(float64); total > 0 {
+						log.Printf("Scale-down aborted: %s has %.0f VMs on disk but 0 running (node restarting?)", candidateID, total)
 						continue
 					}
 				}
