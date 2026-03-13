@@ -971,6 +971,30 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 					}
 				}
 			}
+			// Check if any VMs on other nodes are mid-migration. We can't
+			// tell which node is the target, so any in-flight migration
+			// blocks scale-down to avoid killing a migration target (Bug #104).
+			migratingFound := false
+			for _, nc := range nodes {
+				if nc.nodeID == candidateID {
+					continue
+				}
+				vmList := queryNodeVMs(nc.bridgeIP)
+				for _, vm := range vmList {
+					if s, _ := vm["status"].(string); s == "migrating" {
+						vmName, _ := vm["name"].(string)
+						log.Printf("Scale-down aborted: %s on %s is mid-migration (target might be %s)", vmName, nc.nodeID, candidateID)
+						migratingFound = true
+						break
+					}
+				}
+				if migratingFound {
+					break
+				}
+			}
+			if migratingFound {
+				continue
+			}
 			drainNode(cfg, state, candidateID)
 			lastScaleEvent = time.Now()
 		}
@@ -986,6 +1010,18 @@ func queryNodeHealth(bridgeIP string) map[string]interface{} {
 	defer resp.Body.Close()
 
 	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+func queryNodeVMs(bridgeIP string) []map[string]interface{} {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/vms", bridgeIP))
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var result []map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 	return result
 }

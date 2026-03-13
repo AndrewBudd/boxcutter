@@ -317,6 +317,10 @@ func (h *Handler) handleImportSnapshot(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.mgr.ImportSnapshot(&st)
 	if err != nil {
 		log.Printf("Import snapshot failed for %s: %v", name, err)
+		if vm.IsCapacityError(err) {
+			http.Error(w, err.Error(), http.StatusInsufficientStorage)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

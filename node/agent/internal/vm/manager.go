@@ -1715,6 +1715,20 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	phase1Start := time.Now()
 	log.Printf("Migrating %s to %s: pre-staging (VM still running)", name, targetAddr)
 
+	// Pre-flight: check target has enough RAM before doing any work (Bug #102)
+	preflightClient := &http.Client{Timeout: 10 * time.Second}
+	healthURL := fmt.Sprintf("http://%s/api/health", targetAddr)
+	if hResp, err := preflightClient.Get(healthURL); err == nil {
+		var health map[string]interface{}
+		json.NewDecoder(hResp.Body).Decode(&health)
+		hResp.Body.Close()
+		if freeMiB, ok := health["ram_free_mib"].(float64); ok {
+			if int(freeMiB) < st.RAMMIB {
+				return nil, fmt.Errorf("target has %dMiB free but VM needs %dMiB", int(freeMiB), st.RAMMIB)
+			}
+		}
+	}
+
 	// dm-snapshot VMs need the golden image on the target
 	if !fileRootfs && st.GoldenVer != "" && st.GoldenVer != "unversioned" {
 		if err := m.ensureTargetHasGolden(st.GoldenVer, targetAddr, targetBridgeIP); err != nil {
@@ -2081,6 +2095,15 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 
 	vmDir := VMDir(st.Name)
 	shmDir := filepath.Join("/dev/shm", "bc-"+st.Name)
+
+	// Check capacity: reject if this VM would overcommit the node (Bug #102)
+	sysRAM := m.getSystemRAMMiB()
+	if sysRAM > 0 {
+		allocatedRAM := m.getAllocatedRAMMiB()
+		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
+			return nil, &CapacityError{msg: "node is full (import rejected)"}
+		}
+	}
 
 	// Check if a VM with this name already exists (running or stopped)
 	if _, err := LoadVMState(vmDir); err == nil {
