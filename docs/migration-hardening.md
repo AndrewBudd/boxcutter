@@ -1270,7 +1270,31 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 
 **Concurrent disk snapshots cause timeout**: When 3+ VMs fall back to disk simultaneously, I/O contention can push snapshot time past the 5m timeout. This is the main remaining reliability gap for high-concurrency scenarios.
 
-**Cumulative statistics**: 250 total tests, 95 bugs found, 740+ VMs migrated, 130+ drain cycles.
+## Phase 31: Edge Cases + Host Daemon Crash Recovery (tests #251–#261)
+
+| Test | Scenario | Result | Details |
+|------|----------|--------|---------|
+| 251 | 2GB VM ping-pong (3 rounds, 6 hops) | **PASS** | 11-29s per hop, no degradation |
+| 252 | Source agent SIGKILL during migration | **PASS** | Stale marker recovery: checked target, resumed locally |
+| 253 | Split-brain detection (completed migration) | **PASS** | Clean — source already cleaned up before verify |
+| 254 | Disk full on target during pre-sync | **PASS** | "No space left on device" in pre-sync, no downtime |
+| 255 | Double drain of same node | **PASS** | Mutex serializes, second drain is no-op after removal |
+| 256 | Duplicate VM name creation | **PASS** | "VM already exists" error |
+| 257 | Migration name collision on target | **PASS** | Pre-flight "target already has VM" rejection |
+| 258 | Back-to-back migration (immediate reverse) | **PASS** | Second rejected with "already migrating" |
+| 259 | Resource leak check | **PASS** | FC procs = VMs, TAPs match, no stale markers |
+| 260 | Drain with mixed states (running + stopped) | **PASS** | Stopped VM relocated (file copy), running VM snapshot-migrated |
+| 261 | Host daemon SIGKILL during drain | **PASS** | Systemd restart, detected draining node, resumed drain |
+
+### Key Findings
+
+**Host daemon crash recovery**: When killed during a drain, the restarted daemon detects the draining node from cluster.json state and resumes. Already-migrated VMs are skipped, in-progress migrations are polled, remaining VMs get fresh migration requests.
+
+**Stale migration marker recovery**: Source agent restart correctly checks target for split-brain. If target doesn't have a running copy, source resumes VM locally. Orphaned SSH ControlMaster sockets are cleaned up.
+
+**Pre-sync failure is zero-downtime**: Disk full during pre-sync aborts before VM is paused. The VM never experiences any interruption.
+
+**Cumulative statistics**: 261 total tests, 95 bugs found, 800+ VMs migrated, 140+ drain cycles.
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
