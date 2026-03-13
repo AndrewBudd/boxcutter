@@ -1135,21 +1135,29 @@ Import snapshot failed for bold-yak: cow image not found
 | 216 | Double migration | **PASS** | 409 "already migrating" |
 | 217 | Simultaneous drain BOTH nodes (8 VMs) | **PASS** | 508s, VMs ping-ponged then settled on one node |
 
+## Phase 26: Lifecycle Stress + Retry Validation (tests #218-#220)
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 218 | Resource leak check (post-drain) | **PASS** | 8 TAPs, 8 FC procs, 0 loop devices, 0 stale /dev/shm — clean |
+| 219 | Rapid lifecycle stress (3 rounds create→migrate→destroy) | **PASS** | All 3 rounds completed, no orphans |
+| 220 | Drain with injected failure + retry (Bug #91 validation) | **PASS** | All 4 initial migrations failed (iptables block), unblocked, all 4 retries succeeded (293s) |
+
 ## Cumulative Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 217 |
+| Total tests | 220 |
 | Total bugs found | 91 |
-| VMs migrated | 600+ |
-| Drain cycles completed | 110+ |
+| VMs migrated | 620+ |
+| Drain cycles completed | 112+ |
 | Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition, simultaneous drain, batched |
 | Host daemon crashes survived | 22+ |
 | Node agent crashes survived | 30+ |
-| Network partitions survived | 4 (pre-sync, post-pause, mem-transfer, and during-pre-sync) |
+| Network partitions survived | 5 (pre-sync, post-pause, mem-transfer, during-pre-sync, injected-drain-failure) |
 | Successive migrations per VM | 20+ (VMs survived 3+ successive drains across nodes 87-90) |
 | Resource leaks detected | 0 after all tests |
-| Nodes auto-scaled during testing | 14+ (77-90 range) |
+| Nodes auto-scaled during testing | 15+ (77-91 range) |
 | Disk-full scenarios tested | 3 (/dev/shm only, disk only, both) |
 
 ## Remaining (TODO)
