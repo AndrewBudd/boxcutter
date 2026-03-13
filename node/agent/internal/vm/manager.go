@@ -464,44 +464,74 @@ func (m *Manager) stopVM(name string) error {
 	}
 
 	var pid int
-	fmt.Sscanf(string(pidData), "%d", &pid)
-
-	// Graceful shutdown via Firecracker API
-	apiSock := filepath.Join(vmDir, "api.sock")
-	if _, err := os.Stat(apiSock); err == nil {
-		run("curl", "-s", "--unix-socket", apiSock,
-			"-X", "PUT", "http://localhost/actions",
-			"-H", "Content-Type: application/json",
-			"-d", `{"action_type":"SendCtrlAltDel"}`)
-
-		for i := 0; i < 10; i++ {
-			p, _ := os.FindProcess(pid)
-			if p.Signal(nil) != nil {
-				break
-			}
-			time.Sleep(time.Second)
-		}
+	fmt.Sscanf(strings.TrimSpace(string(pidData)), "%d", &pid)
+	if pid == 0 {
+		log.Printf("stopVM %s: invalid PID in %s", name, pidFile)
+		return nil
 	}
 
-	// Force kill if still running and wait for it to exit
-	if p, _ := os.FindProcess(pid); p != nil {
-		if p.Signal(nil) == nil { // Still alive
-			p.Kill()
-			// Wait for process to fully exit so file handles and mmaps are released.
-			// Without this, RemoveAll on vmDir or /dev/shm can silently fail because
-			// the kernel still holds references to open files. (Bug #97)
-			for i := 0; i < 50; i++ { // up to 5 seconds
-				if p.Signal(nil) != nil {
-					break // Process exited
+	// Check if process is alive at all
+	if err := syscall.Kill(pid, 0); err != nil {
+		log.Printf("stopVM %s: PID %d already dead (%v)", name, pid, err)
+		goto cleanup
+	}
+
+	// Graceful shutdown via Firecracker API — skip for migrating VMs since they're
+	// paused and can't process CtrlAltDel (saves 10s of wasted waiting).
+	if !IsMigrating(vmDir) {
+		apiSock := filepath.Join(vmDir, "api.sock")
+		if _, err := os.Stat(apiSock); err == nil {
+			run("curl", "-s", "--unix-socket", apiSock,
+				"-X", "PUT", "http://localhost/actions",
+				"-H", "Content-Type: application/json",
+				"-d", `{"action_type":"SendCtrlAltDel"}`)
+
+			for i := 0; i < 10; i++ {
+				if err := syscall.Kill(pid, 0); err != nil {
+					log.Printf("stopVM %s: PID %d exited after CtrlAltDel", name, pid)
+					goto cleanup
 				}
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(time.Second)
 			}
 		}
 	}
 
-	// Cleanup
+	// Force kill if still running.
+	if err := syscall.Kill(pid, 0); err == nil {
+		log.Printf("stopVM %s: sending SIGKILL to PID %d", name, pid)
+		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+			log.Printf("stopVM %s: syscall.Kill SIGKILL returned error: %v", name, err)
+		}
+		// Wait for process to fully exit so file handles and mmaps are released.
+		for i := 0; i < 50; i++ { // up to 5 seconds
+			if err := syscall.Kill(pid, 0); err != nil {
+				log.Printf("stopVM %s: PID %d exited after SIGKILL (%d iterations)", name, pid, i+1)
+				goto cleanup
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Process survived SIGKILL via syscall — try kill command as fallback
+		log.Printf("stopVM %s: PID %d survived syscall SIGKILL, trying kill -9 command", name, pid)
+		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
+		for i := 0; i < 20; i++ { // up to 2 more seconds
+			if err := syscall.Kill(pid, 0); err != nil {
+				log.Printf("stopVM %s: PID %d exited after kill -9", name, pid)
+				goto cleanup
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Last resort: check /proc to understand what state it's in
+		if procStatus, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid)); readErr == nil {
+			log.Printf("stopVM %s: CRITICAL — PID %d unkillable. /proc status:\n%s", name, pid, string(procStatus))
+		} else {
+			// /proc file gone means process actually exited despite kill(pid,0) succeeding
+			log.Printf("stopVM %s: PID %d /proc gone (race with exit), treating as dead", name, pid)
+		}
+	}
+
+cleanup:
 	os.Remove(pidFile)
-	os.Remove(apiSock)
+	os.Remove(filepath.Join(vmDir, "api.sock"))
 
 	if st.Mark != 0 {
 		TeardownTAP(st.TAP, st.Mark)
