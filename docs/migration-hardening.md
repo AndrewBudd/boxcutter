@@ -1214,21 +1214,36 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 236 |
+| Total tests | 240 |
 | Total bugs found | 94 |
-| VMs migrated | 680+ |
-| Drain cycles completed | 120+ |
+| VMs migrated | 700+ |
+| Drain cycles completed | 124+ |
 | Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition, simultaneous drain, batched |
 | Host daemon crashes survived | 24+ |
 | Node agent crashes survived | 34+ |
 | Network partitions survived | 5 |
 | Agent upgrades during migration | 2 (source + target, both safe) |
-| Successive migrations per VM | 25+ (big-4g survived 8+ consecutive 4GB migrations) |
+| Successive migrations per VM | 25+ (big-4g survived 10+ consecutive 4GB migrations) |
 | Resource leaks detected | 0 after all tests |
-| Nodes auto-scaled during testing | 20+ (77-96 range) |
+| Nodes auto-scaled during testing | 22+ (77-98 range) |
 | Disk-full scenarios tested | 3 (/dev/shm only, disk only, both) |
 | Largest single VM migrated | 4096MB (4GB) |
 | Max VMs on single node | 6 (14.3GB, 119% overcommit) |
+
+## Phase 29: Final Chaos + Dual 4GB Drain (tests #237-#240)
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 237 | Drain 2x4GB + 1x2GB (10.2GB) | **PASS** | big-4g-2 in 54s (tmpfs!), big-4g 5m45s (disk), stress-1 3m18s. No failures |
+| 238 | Resource leak check | **PASS** | 3 TAPs, 3 procs, 0 stale — clean |
+| 239 | Create VM on target during active drain | **PASS** | VM created mid-drain, no interference, 6 VMs all healthy |
+| 240 | Comprehensive chaos (5 VMs + create-during-drain) | **PASS** | 2 batches, 5m total, 6 VMs on target, 0 stale markers |
+
+### Key Findings
+
+**Dual 4GB drain**: Two 4GB VMs drained concurrently. One was fresh (tmpfs snapshot, 54s), one was imported (disk snapshot, 5m45s). The /dev/shm competition is the dominant factor.
+
+**Create during drain**: Creating VMs on the target while migrations are arriving works cleanly. No lock contention, no naming collisions, no resource conflicts.
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
