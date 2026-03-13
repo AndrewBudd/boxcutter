@@ -1294,7 +1294,49 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 
 **Pre-sync failure is zero-downtime**: Disk full during pre-sync aborts before VM is paused. The VM never experiences any interruption.
 
-**Cumulative statistics**: 261 total tests, 95 bugs found, 800+ VMs migrated, 140+ drain cycles.
+**Cumulative statistics**: 284 total tests, 96 bugs found, 850+ VMs migrated, 150+ drain cycles.
+
+## Phase 32: Post-Restore Snapshot Slowdown + Continued Hardening (tests #266-#284)
+
+### Bug #96: Post-restore snapshot slowdown (KVM dirty page tracking)
+After snapshot restore, the first snapshot creation was extremely slow due to KVM needing to set up dirty page tracking infrastructure:
+- Fresh VM: 291ms snapshot, 1.6s downtime
+- 1x restored: 7.0s snapshot, 8.2s downtime
+- 2x restored: 16.2s snapshot, 18.9s downtime
+
+Progressive slowdown made chain migrations (ping-pong, multi-hop drain) increasingly painful.
+
+**Fix**: Before the real migration snapshot, run a disposable "warm-up" snapshot while the VM is paused. The warm-up primes KVM so the real snapshot is consistently ~200ms:
+- 1x restored after fix: 1.7s warm-up + **197ms** real snapshot
+- 2x restored after fix: 11.8s warm-up + **194ms** real snapshot
+
+Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/shm has enough space. Large VMs where disk I/O dominates skip the warm-up (would double downtime with no benefit).
+
+**Test #265 false alarm**: Destroy-during-migration race condition was investigated extensively. The migration to a bogus target failed quickly ("No route to host"), `EndMigration` cleared the flag, and destroy succeeded legitimately post-failure. The guard works correctly — verified with HTTP status code tracking (409 when migrating, 204 after migration completes).
+
+### Test Results (#266-#284)
+| # | Test | Result |
+|---|------|--------|
+| 266 | Destroy during active migration (careful repro) | PASS — 409 correctly blocked |
+| 266b | Destroy at migration failure boundary | PASS — destroy after EndMigration is legitimate |
+| 267 | Basic migration node-103→node-104 | PASS — 7s |
+| 268 | Chain migration (2 hops) with leak check | PASS — clean |
+| 269 | Migration completion tracking | PASS |
+| 270 | Kill target agent mid-migration | PASS — rollback, source resumed |
+| 271 | SIGKILL source agent during migration | PASS — recovery on restart |
+| 272 | 3 concurrent migrations from same source | PASS — all 3 arrived, no leaks |
+| 273 | Drain node-104 (3 VMs) | PASS |
+| 274 | Drain heavily loaded node (9 VMs, 11.7GB) | PASS — 3 batches, sorted by RAM |
+| 275 | Migrate 4GB VM (solo) | PASS — 30s |
+| 276 | 3-hop bounce migration | PARTIAL — third hop timing issue |
+| 277 | Migrate during VM boot | PASS — migration accepted, completed |
+| 278 | Snapshot timing comparison (3 hops) | DATA — confirmed progressive slowdown |
+| 279 | enable_diff_snapshots test | FAIL — didn't fix slowdown |
+| 280 | Goroutine warm-up test | FAIL — conflicted with migration |
+| 281 | Inline warm-up snapshot test | PASS — 197ms/194ms real snapshots |
+| 282 | 4GB VM with warm-up | INVESTIGATED — warm-up correctly skipped |
+| 283 | 4GB migration with /dev/shm guard | TARGET DRAINED — auto-scaler interference |
+| 284 | 512MB 3-hop definitive test | PASS — warm-up fix verified |
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
@@ -1310,3 +1352,4 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 - [x] ~~Target /dev/shm threshold too conservative~~ — reduced from 2.2x to 1.2x (Bug #92)
 - [x] ~~Auto-scaler drains migration target~~ — re-check VMs before scale-down (Bug #93)
 - [x] ~~Drain VM ordering~~ — sort by RAM ascending (Bug #95)
+- [x] ~~Post-restore snapshot slowdown~~ — KVM warm-up snapshot primes dirty tracking (Bug #96)
