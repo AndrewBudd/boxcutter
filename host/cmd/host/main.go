@@ -1683,7 +1683,85 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	}
 
 	if failedMigrations > 0 {
-		log.Printf("Drain: %d migration(s) failed — aborting drain, node %s NOT stopped", failedMigrations, nodeID)
+		// Retry failed VMs once before giving up (Bug #91: transient failures
+		// like Firecracker socket timeout shouldn't abort the entire drain).
+		var retryList []string
+		for _, vm := range toMigrate {
+			// Check if VM is still on source (migration failed, it's still running)
+			checkResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vm))
+			if err != nil {
+				continue
+			}
+			var detail map[string]interface{}
+			json.NewDecoder(checkResp.Body).Decode(&detail)
+			checkResp.Body.Close()
+			if status, _ := detail["status"].(string); status == "running" {
+				retryList = append(retryList, vm)
+			}
+		}
+
+		if len(retryList) > 0 {
+			log.Printf("Drain: retrying %d failed migration(s): %v", len(retryList), retryList)
+			retryFailed := 0
+			for _, vmName := range retryList {
+				migrateReq := map[string]string{
+					"target_addr":      fmt.Sprintf("%s:8800", targetNode.BridgeIP),
+					"target_bridge_ip": targetNode.BridgeIP,
+				}
+				data, _ := json.Marshal(migrateReq)
+				migrateResp, err := migrateClient.Post(
+					fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
+					"application/json",
+					jsonReader(data),
+				)
+				if err != nil {
+					log.Printf("Drain: retry failed to start migration of %s: %v", vmName, err)
+					retryFailed++
+					continue
+				}
+				migrateResp.Body.Close()
+				log.Printf("Drain: retry started migration of %s", vmName)
+
+				// Poll this single retry
+				const retryTimeout = 3 * time.Minute
+				deadline := time.Now().Add(retryTimeout)
+				migrated := false
+				for time.Now().Before(deadline) {
+					time.Sleep(3 * time.Second)
+					srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
+					if err != nil {
+						continue
+					}
+					if srcResp.StatusCode == 404 {
+						srcResp.Body.Close()
+						migrated = true
+						break
+					}
+					var srcDetail map[string]interface{}
+					json.NewDecoder(srcResp.Body).Decode(&srcDetail)
+					srcResp.Body.Close()
+					if s, _ := srcDetail["status"].(string); s == "running" {
+						break // failed again
+					}
+				}
+				if migrated {
+					log.Printf("Drain: retry %s succeeded", vmName)
+				} else {
+					log.Printf("Drain: retry %s failed", vmName)
+					retryFailed++
+				}
+			}
+			if retryFailed == 0 {
+				log.Printf("Drain: all retries succeeded")
+				failedMigrations = 0
+			} else {
+				failedMigrations = retryFailed
+			}
+		}
+	}
+
+	if failedMigrations > 0 {
+		log.Printf("Drain: %d migration(s) failed after retry — aborting drain, node %s NOT stopped", failedMigrations, nodeID)
 		state.SetNodeStatus(nodeID, "active") // revert so health monitor manages it
 		state.Save()
 		return
