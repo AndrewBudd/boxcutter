@@ -1294,7 +1294,7 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 
 **Pre-sync failure is zero-downtime**: Disk full during pre-sync aborts before VM is paused. The VM never experiences any interruption.
 
-**Cumulative statistics**: 284 total tests, 96 bugs found, 850+ VMs migrated, 150+ drain cycles.
+**Cumulative statistics**: 308 total tests, 97 bugs found, 900+ VMs migrated, 160+ drain cycles.
 
 ## Phase 32: Post-Restore Snapshot Slowdown + Continued Hardening (tests #266-#284)
 
@@ -1337,6 +1337,40 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 | 282 | 4GB VM with warm-up | INVESTIGATED — warm-up correctly skipped |
 | 283 | 4GB migration with /dev/shm guard | TARGET DRAINED — auto-scaler interference |
 | 284 | 512MB 3-hop definitive test | PASS — warm-up fix verified |
+| 285 | Rapid create-migrate-destroy (5x) | PASS — 5/5 |
+| 286 | Migration with I/O load | PASS — 6s |
+| 287 | Concurrent migration + create on target | PASS |
+| 288 | Migrate stopped VM (relocate path) | PASS — 4s |
+| 289 | Drain with mixed running + stopped VMs | PASS |
+| 290 | Host daemon SIGKILL during drain | PASS — auto-recovery |
+| 291 | Network partition (SSH kill mid-transfer) | PASS — source resumed |
+| 292 | Kill SSH during 2GB mem transfer | PASS — clean rollback |
+| 293 | Kill target agent during import | PASS — import already done, VMs survived |
+| 294 | Kill target agent during file transfer | PASS — rollback, source resumed |
+| 295 | 3 concurrent migrations to same target | PASS — all 3 arrived |
+| 296 | Bidirectional concurrent migration (6 total) | PASS — VMs swapped nodes |
+| 297 | SIGKILL source agent during migration | PASS — stale recovery resumed |
+| 298 | Split-brain prevention (artificial) | PASS — target copy preserved |
+| 299 | Pre-flight duplicate name rejection | PASS — 409 returned |
+| 300 | Drain with diverse sizes (512M-4GB) | PASS — RAM-ascending sort |
+| 301 | Bug #97 fix verification (512MB) | PASS — clean cleanup |
+| 302 | Bug #97 fix verification (1GB) | PASS — clean cleanup |
+| 303 | Bug #97 fix verification (2GB) | PASS — clean cleanup |
+| 304 | 4GB migration + cleanup | PASS — 2m48s downtime, clean |
+| 305 | Double migration attempt | PASS — second rejected 409 |
+| 306 | Rapid 10x create-migrate-destroy stress | PASS — 10/10, no leaks |
+| 307 | Target RAM exhaustion (overcommit) | PASS — migration succeeds (Linux overcommit) |
+| 308 | RestartAll with mixed VM states | PASS — all states handled |
+
+## Phase 33: Source Cleanup Race (Bug #97)
+
+**Bug #97**: After successful migration, source `stopVM()` sends SIGKILL but doesn't wait for the Firecracker process to exit. Subsequent `os.RemoveAll()` on vmDir and /dev/shm can silently fail because the kernel still holds file handles and mmaps. Results in leaked rootfs (50GB sparse) on disk and vm.mem (RAM-sized) on tmpfs.
+
+**Root cause**: `stopVM()` calls `p.Kill()` and returns immediately. On paused VMs (which is always the case during migration cleanup — the VM was paused for snapshot), the graceful CtrlAltDel does nothing (vCPUs frozen), so the 10s wait loop exits, then Kill fires but the caller doesn't wait for process exit.
+
+**Fix**: After SIGKILL, poll `p.Signal(nil)` every 100ms for up to 5s until the process is fully reaped. Also added warning logs for RemoveAll failures in migration cleanup so future leaks are visible.
+
+**Verified**: Tests #301-304 confirmed clean cleanup for 512MB, 1GB, 2GB, and 4GB VMs after migration.
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
@@ -1353,3 +1387,4 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 - [x] ~~Auto-scaler drains migration target~~ — re-check VMs before scale-down (Bug #93)
 - [x] ~~Drain VM ordering~~ — sort by RAM ascending (Bug #95)
 - [x] ~~Post-restore snapshot slowdown~~ — KVM warm-up snapshot primes dirty tracking (Bug #96)
+- [x] ~~Source cleanup race~~ — wait for process exit before RemoveAll (Bug #97)
