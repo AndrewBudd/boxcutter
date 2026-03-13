@@ -1294,7 +1294,7 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 
 **Pre-sync failure is zero-downtime**: Disk full during pre-sync aborts before VM is paused. The VM never experiences any interruption.
 
-**Cumulative statistics**: 308 total tests, 97 bugs found, 900+ VMs migrated, 160+ drain cycles.
+**Cumulative statistics**: 314 total tests, 97 bugs found, 920+ VMs migrated, 165+ drain cycles.
 
 ## Phase 32: Post-Restore Snapshot Slowdown + Continued Hardening (tests #266-#284)
 
@@ -1361,6 +1361,12 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 | 306 | Rapid 10x create-migrate-destroy stress | PASS — 10/10, no leaks |
 | 307 | Target RAM exhaustion (overcommit) | PASS — migration succeeds (Linux overcommit) |
 | 308 | RestartAll with mixed VM states | PASS — all states handled |
+| 309 | Migration to unreachable target | PASS — fast fail, no downtime |
+| 310 | Migration with corrupted vm.json | PASS — 404 pre-flight rejection |
+| 311 | Round-trip migration (A→B→A) | PASS — clean cleanup both ways |
+| 312 | Destroy during active migration | PASS — 409 rejection for both destroy and stop |
+| 313 | Ping-pong (5 round trips) | PASS — no leaks, warm-up consistently fast |
+| 314 | Host daemon SIGKILL during drain | PASS — resume detected in-progress migrations |
 
 ## Phase 33: Source Cleanup Race (Bug #97)
 
