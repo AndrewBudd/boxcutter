@@ -1555,3 +1555,65 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 - [x] ~~Import-snapshot accepts VMs beyond capacity~~ — capacity check + pre-flight (Bug #102)
 - [x] ~~Auto-scaler kills migration target~~ — check in-flight migrations before scale-down (Bug #104)
 - [x] ~~Stale QCOW2 reuse on auto-scale~~ — empty-node drain now cleans up disk artifacts (Bug #105)
+- [x] ~~Rollback leaks disk-based snapshot files~~ — clean vm.snap/vm.mem from vmDir on rollback (Bug #106)
+
+## Phase 37: Stress Testing (Tests #399-#408)
+
+### Test #399: Migrate 3 VMs then reverse-drain
+- Forward: 2/3 migrated (test-9 rolled back — /dev/shm race, Bug #103 known behavior)
+- Reverse: 2/2 back to source successfully
+- **PASS** (with expected rollback)
+
+### Test #400: Migrate to node with golden build in progress
+- Node-117 had golden_ready: false during migration
+- Import-snapshot doesn't require golden_ready (uses pre-synced rootfs)
+- **PASS** — downtime 62s, transfer 5s
+
+### Test #401: probe-1 stability on target
+- probe-1 migrated to node-117, survived 100s+ of polling
+- **PASS**
+
+### Test #402: Full bidirectional drain cycle (6 mixed-size VMs)
+- Forward drain: 5 VMs (4608MB) → all succeeded, ~65s total
+- Reverse drain: 6 VMs (5608MB) → all 6 succeeded
+- ENOSPC→disk fallback worked for 4 VMs that raced on /dev/shm
+- Disk-based snapshots took ~3.5-4 min (vs seconds on tmpfs)
+- **PASS**
+
+### Test #403: Agent SIGTERM during 6-VM concurrent drain
+- SIGTERM sent 20s into drain (during pre-sync phase)
+- All 6 VMs detected stale migration markers on restart
+- All 6 checked target (no running copies), resumed locally
+- **PASS** — split-brain detection worked perfectly
+
+### Test #404: Agent SIGKILL during active migration
+- SIGKILL sent during drain-c migration (snapshot phase)
+- 5 VMs "already running", drain-c "resumed after interrupted migration"
+- All 6 recovered. KillMode=process kept Firecracker alive.
+- **PASS**
+
+### Test #405: Target agent SIGKILL post-import
+- probe-1 migration completed before SIGKILL (512MB too fast)
+- Post-kill recovery: probe-1 "already running", stale pre-sync dirs skipped (Bug #88 protection)
+- **PARTIAL** (timing issue, but recovery verified)
+
+### Test #407: Bug #106 verification (rollback cleanup)
+- drain-b migration rejected by 507 capacity check, rolled back
+- vm.snap/vm.mem files in vmDir properly cleaned after rollback
+- /dev/shm migration directory also cleaned
+- **PASS**
+
+### Test #408: 6 concurrent migrations with disk fallback + capacity rejection
+- big-3: ENOSPC fallback for source snapshot (71s), disk transfer (1m51s)
+- drain-a: rollback after 507 capacity rejection, no leaked files
+- 5/6 VMs migrated, 1 rolled back cleanly
+- **PASS**
+
+### Bug #106: Rollback leaks disk-based snapshot files
+- **Symptom**: fcSnapshot falls back to disk (ENOSPC), writes vm.snap + vm.mem to vmDir. On rollback, only /dev/shm cleanup runs; disk files leak.
+- **Impact**: Leaked disk space on repeated failed migrations.
+- **Fix**: Added `os.Remove(vmDir/vm.snap)` and `os.Remove(vmDir/vm.mem)` to rollback function.
+
+### Cumulative Stats
+- **408 total tests**, **106 bugs found** (105 fixed, 1 known behavior)
+- **1115+ VMs migrated**, **220+ drain cycles**
