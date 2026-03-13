@@ -1553,9 +1553,26 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 	if len(vms) == 0 {
 		log.Printf("Drain: %s has no VMs, stopping", nodeID)
-		qemu.Stop(nodeID, node.PID)
+		// Remove from state BEFORE stop to prevent health monitor auto-restart
 		state.RemoveNode(nodeID)
 		state.Save()
+		qemu.Stop(nodeID, node.PID)
+		// Clean up TAP + disk artifacts (Bug #105: stale QCOW2 with old VM data
+		// gets reused if a new node with the same number is auto-scaled)
+		if node.TAP != "" {
+			bridge.DeleteTAP(node.TAP)
+		}
+		if node.Disk != "" {
+			os.Remove(node.Disk)
+		}
+		if node.ISO != "" {
+			os.Remove(node.ISO)
+		}
+		consoleLog := strings.TrimSuffix(node.Disk, ".qcow2") + "-console.log"
+		os.Remove(consoleLog)
+		pidFile := strings.TrimSuffix(node.Disk, ".qcow2") + ".pid"
+		os.Remove(pidFile)
+		log.Printf("Drain: %s complete (empty node)", nodeID)
 		return
 	}
 

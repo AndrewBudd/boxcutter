@@ -1508,9 +1508,24 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 | 384 | Scale-down blocked during active migration | PARTIAL PASS — migration too fast to trigger race, fix verified by code |
 | 385 | Full lifecycle after infrastructure churn | PASS — create→stop→start→destroy on fresh node |
 
+| 386 | Stop during active migration | PASS — 409 rejection |
+| 387 | Destroy during active migration | PASS — 409 rejection |
+| 388 | Migrate to self | PASS — 400 rejection |
+| 389 | Migrate stopped VM | PASS — relocated to target (stays stopped) |
+| 390 | Start migrated stopped VM on target | PASS — started successfully |
+| 391 | Concurrent create + migrate on same target | PASS — both succeeded |
+| 392 | Migrate under disk I/O stress on target | PASS — completed normally |
+| 393 | Data integrity after migration | INCONCLUSIVE — fwmark routing prevents host-side SSH verification |
+| 394 | Scale-down after auto-scale reuses stale QCOW2 | BUG #105 — old VM dirs from previous node reused → split-brain |
+
+**Bug #105: Auto-scaler empty-node drain skips disk cleanup**
+- Symptom: after draining an empty node, the QCOW2 is not deleted. When the same node number is re-allocated by auto-scale, it reuses the old QCOW2 with stale VM data. RestartAll finds old VM directories and starts duplicate copies → split-brain.
+- Root cause: `drainNode()` early-returns for 0-VM nodes without cleaning up TAP, QCOW2, ISO, console log.
+- Fix: empty-node drain now cleans up all artifacts before returning.
+
 ### Cumulative Statistics
-- **385 total tests**, 104 bugs found (103 fixed, 1 known behavior), **1060+ VMs migrated**, 200+ drain cycles
-- Phase 36: 16 tests, 3 bugs fixed, all passing
+- **394 total tests**, 105 bugs found (104 fixed, 1 known behavior), **1080+ VMs migrated**, 205+ drain cycles
+- Phase 36: 25 tests, 4 bugs fixed, all passing
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
@@ -1534,3 +1549,4 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 - [x] ~~Premature drain during recovery~~ — check vms_total before scale-down (Bug #101)
 - [x] ~~Import-snapshot accepts VMs beyond capacity~~ — capacity check + pre-flight (Bug #102)
 - [x] ~~Auto-scaler kills migration target~~ — check in-flight migrations before scale-down (Bug #104)
+- [x] ~~Stale QCOW2 reuse on auto-scale~~ — empty-node drain now cleans up disk artifacts (Bug #105)
