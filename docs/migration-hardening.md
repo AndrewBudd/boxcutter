@@ -1085,20 +1085,30 @@ Import snapshot failed for bold-yak: cow image not found
 | 190 | Full drain 5 VMs (5.0GB + 1 existing = 6 VMs, 7.0GB) | **PASS** | 115s drain, all healthy |
 | 191 | Resource leak check | **PASS** | 4 TAPs, 4 FC procs, 4 dirs, 3 /dev/shm, 0 loop devices — clean |
 
+## Phase 23: Final Stress Tests (tests #192-#195)
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 192 | Migration during golden rebuild | **PASS** | 6s migration, no interference from golden build |
+| 193 | Drain 3 VMs (4.6GB) to target | **PASS** | 75s, all healthy |
+| 194 | Simultaneous drain BOTH nodes | **PASS** | No deadlock; VMs ping-ponged then settled on one node |
+| 195 | Comprehensive drain stress | **PASS** | 4 VMs (5.1GB), 185s, all healthy on target |
+
 ## Cumulative Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 191 |
+| Total tests | 195 |
 | Total bugs found | 89 |
-| VMs migrated | 480+ |
-| Drain cycles completed | 80+ |
-| Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition |
+| VMs migrated | 500+ |
+| Drain cycles completed | 90+ |
+| Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition, simultaneous drain |
 | Host daemon crashes survived | 22+ |
 | Node agent crashes survived | 30+ |
 | Network partitions survived | 3 (pre-sync, post-pause, and mem-transfer) |
-| Successive migrations per VM | 20+ (bold-yak: 6x ping-pong + drain cycles across 8+ nodes) |
+| Successive migrations per VM | 20+ (bold-yak: 6x ping-pong + drain cycles across 10+ nodes) |
 | Resource leaks detected | 0 after all tests |
+| Nodes auto-scaled during testing | 10+ (77-87 range) |
 
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
