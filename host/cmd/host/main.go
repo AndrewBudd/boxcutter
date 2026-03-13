@@ -944,11 +944,24 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 			}
 		} else if candidateID := scaleDownCandidate(nodes, totalRAM, usedRAM, cfg.ScaleDownThresholdPct, cfg.ScaleUpThresholdPct); candidateID != "" {
 			// Find the candidate's info for logging
+			var candidateBridgeIP string
 			for _, nc := range nodes {
 				if nc.nodeID == candidateID {
 					log.Printf("Capacity below %d%% with %d nodes, scaling down: draining %s (%d MiB used, %d VMs)",
 						cfg.ScaleDownThresholdPct, len(nodes), nc.nodeID, nc.usedRAM, nc.vmsRunning)
+					candidateBridgeIP = nc.bridgeIP
 					break
+				}
+			}
+			// Re-check candidate before draining: VMs may have arrived via
+			// in-flight migrations since the poll (Bug #93).
+			if candidateBridgeIP != "" {
+				fresh := queryNodeHealth(candidateBridgeIP)
+				if fresh != nil {
+					if vms, _ := fresh["vms_running"].(float64); vms > 0 {
+						log.Printf("Scale-down aborted: %s now has %.0f VMs (inbound migrations?)", candidateID, vms)
+						continue
+					}
 				}
 			}
 			drainNode(cfg, state, candidateID)

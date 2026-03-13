@@ -175,20 +175,28 @@ func fcPrefaultMemory(pid int, vmName string) {
 		return
 	}
 
-	// Find the vm.mem mapping — it's the large MAP_PRIVATE file mapping
-	var startAddr, endAddr uint64
+	// Collect ALL vm.mem mappings — Firecracker splits guest memory into
+	// multiple segments (e.g., 768MB + 3328MB for a 4GB VM). Without
+	// faulting all segments, snapshot creation stays slow (Bug #94).
+	type memRange struct {
+		start, end uint64
+	}
+	var ranges []memRange
 	for _, line := range strings.Split(string(mapsData), "\n") {
 		if strings.Contains(line, "vm.mem") {
 			parts := strings.SplitN(line, " ", 2)
 			addrs := strings.Split(parts[0], "-")
 			if len(addrs) == 2 {
-				fmt.Sscanf(addrs[0], "%x", &startAddr)
-				fmt.Sscanf(addrs[1], "%x", &endAddr)
+				var s, e uint64
+				fmt.Sscanf(addrs[0], "%x", &s)
+				fmt.Sscanf(addrs[1], "%x", &e)
+				if s > 0 && e > s {
+					ranges = append(ranges, memRange{s, e})
+				}
 			}
-			break
 		}
 	}
-	if startAddr == 0 || endAddr == 0 {
+	if len(ranges) == 0 {
 		return // No vm.mem mapping found — fresh VM, not restored
 	}
 
@@ -200,19 +208,23 @@ func fcPrefaultMemory(pid int, vmName string) {
 	}
 	defer f.Close()
 
-	size := endAddr - startAddr
+	var totalSize uint64
 	buf := make([]byte, 4*1024*1024) // 4MB chunks
-	offset := int64(startAddr)
-	end := int64(endAddr)
-	for offset < end {
-		n := int64(len(buf))
-		if offset+n > end {
-			n = end - offset
+	for _, r := range ranges {
+		offset := int64(r.start)
+		end := int64(r.end)
+		for offset < end {
+			n := int64(len(buf))
+			if offset+n > end {
+				n = end - offset
+			}
+			f.ReadAt(buf[:n], offset)
+			offset += n
 		}
-		f.ReadAt(buf[:n], offset)
-		offset += n
+		totalSize += r.end - r.start
 	}
-	log.Printf("prefault %s: pre-faulted %dMB guest memory (PID %d)", vmName, size/1024/1024, pid)
+	log.Printf("prefault %s: pre-faulted %dMB guest memory across %d segments (PID %d)",
+		vmName, totalSize/1024/1024, len(ranges), pid)
 }
 
 func fcPut(vmDir, path string, body interface{}) error {
