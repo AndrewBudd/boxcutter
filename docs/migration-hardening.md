@@ -1034,6 +1034,60 @@ Focus: Kill agents during active migrations, test recovery. Fix snapshot timeout
 | Network partitions survived | 2 (pre-sync and post-pause) |
 | Successive migrations per VM | 12+ (bold-yak, dark-igloo endurance tested across ping-pong drains) |
 
+## Phase 20: Bug #88 + #89 Fix (tests #174-#180)
+
+### Bug #88: Pre-sync cleanup race condition
+**Root cause**: Target agent restarted while pre-syncs were in flight. `cleanupMigrationArtifacts()` deleted directories without `vm.json`, but pre-sync only transfers `rootfs.ext4` — no `vm.json` exists until import-snapshot runs.
+
+**Fix**: Skip directories modified within the last 10 minutes in `cleanupMigrationArtifacts()`.
+
+**Evidence**: Target agent logs showed:
+```
+Removing orphaned migration directory: /var/lib/boxcutter/vms/bold-yak  ← pre-synced, not orphaned!
+...2 minutes later...
+Import snapshot failed for bold-yak: cow image not found
+```
+
+### Bug #89: Stale /dev/shm snapshot files from interrupted migration
+**Root cause**: After interrupted migration, partial `vm.mem` (718MB instead of 2048MB) left in `/dev/shm/bc-big-vm/`. ImportSnapshot checks `/dev/shm` first, found the truncated file, and Firecracker rejected it: "file offset greater than file length".
+
+**Fix**: Migration prep step now cleans stale `/dev/shm/bc-<name>/` and stale `vmDir/vm.{snap,mem}` before starting transfers.
+
+### Tests
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 174 | Agent restart during pre-sync | **PASS** | Dirs survived cleanup, 2/4 VMs migrated (slow ones), 2 rolled back |
+| 175 | Triple consecutive drain | **PASS** | 3 rounds: node-77→78, 78→79, 79→80, all 4 VMs each |
+| 176 | Kill source during snapshot | **PASS** | 4 VMs paused, killed, all recovered via stale migration recovery |
+| 177 | Kill source after import succeeds | **PASS** | sunny-marmot committed to target, 3 others rolled back |
+| 178 | Drain recovered VMs | PARTIAL | 3/4 migrated, big-vm failed (Bug #89: stale vm.mem) |
+| 179 | Migrate 2GB VM after Bug #89 fix | **PASS** | 5.3s downtime, prep cleaned stale /dev/shm |
+| 180 | Full drain 4 VMs (5.1GB) | **PASS** | 65s total, all healthy |
+
+## Phase 21: Advanced Stress Tests (tests #181-#185)
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 181 | iptables network partition mid-transfer | **PASS** | Detected in ~40s (ServerAlive), rollback, no orphans |
+| 182 | Create VMs during drain | **PASS** | 4 migrated + 3 created concurrently = 7 VMs, no conflicts |
+| 183 | Simultaneous cross-migration A↔B | **PASS** | bold-yak 81→82 + cross-test 82→81, no deadlock |
+| 184 | Double-migrate same VM | **PASS** | Second request correctly rejected with HTTP 409 |
+| 185 | Drain 4 VMs (4.6GB) to loaded target | **PASS** | 55s, 6 VMs (7.2GB) all running on target |
+
+## Cumulative Statistics
+
+| Metric | Value |
+|--------|-------|
+| Total tests | 185 |
+| Total bugs found | 89 |
+| VMs migrated | 450+ |
+| Drain cycles completed | 75+ |
+| Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition |
+| Host daemon crashes survived | 22+ |
+| Node agent crashes survived | 25+ |
+| Network partitions survived | 3 (pre-sync, post-pause, and mem-transfer) |
+| Successive migrations per VM | 15+ (bold-yak migrated across 7+ nodes in triple drain tests) |
+
 ## Remaining (TODO)
 - [ ] Orchestrator upgrade with state migration
 - [x] ~~Add timeout to Firecracker pause API call~~ — already 2-minute timeout in `fcClient()` (fcapi.go:27)
@@ -1041,3 +1095,5 @@ Focus: Kill agents during active migrations, test recovery. Fix snapshot timeout
 - [x] ~~Snapshot timeout too short for disk-based large VMs~~ — extended to 5-minute dedicated client (Bug #87)
 - [ ] Consider pre-faulting optimization before snapshot to reduce KVM lazy page fault penalty
 - [x] ~~Orphaned golden builds on agent restart~~ — agent kills orphans on startup (Bug #85)
+- [x] ~~Pre-sync cleanup race~~ — skip recent dirs in cleanup (Bug #88)
+- [x] ~~Stale /dev/shm from interrupted migration~~ — clean before transfers (Bug #89)
