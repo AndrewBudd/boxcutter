@@ -483,10 +483,20 @@ func (m *Manager) stopVM(name string) error {
 		}
 	}
 
-	// Force kill if still running
+	// Force kill if still running and wait for it to exit
 	if p, _ := os.FindProcess(pid); p != nil {
-		p.Signal(nil) // Check if alive
-		p.Kill()
+		if p.Signal(nil) == nil { // Still alive
+			p.Kill()
+			// Wait for process to fully exit so file handles and mmaps are released.
+			// Without this, RemoveAll on vmDir or /dev/shm can silently fail because
+			// the kernel still holds references to open files. (Bug #97)
+			for i := 0; i < 50; i++ { // up to 5 seconds
+				if p.Signal(nil) != nil {
+					break // Process exited
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
 	}
 
 	// Cleanup
@@ -1954,10 +1964,16 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		m.vmid.Deregister(name)
 	}
 	m.stopVM(name)
-	CleanupSnapshot(vmDir)                                      // release loop devices / dm-snapshot before removing files
-	os.RemoveAll(vmDir)
-	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")) // clean up tmpfs snapshot files
-	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))        // clean up tmpfs import files (mmapped by FC, safe after stop)
+	CleanupSnapshot(vmDir) // release loop devices / dm-snapshot before removing files
+	if err := os.RemoveAll(vmDir); err != nil {
+		log.Printf("Migrating %s: WARNING — failed to remove vmDir: %v", name, err)
+	}
+	if err := os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig")); err != nil {
+		log.Printf("Migrating %s: WARNING — failed to remove /dev/shm export dir: %v", name, err)
+	}
+	if err := os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name)); err != nil {
+		log.Printf("Migrating %s: WARNING — failed to remove /dev/shm import dir: %v", name, err)
+	}
 
 	return &MigrateResponse{
 		Name:        importResp.Name,
