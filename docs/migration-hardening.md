@@ -1188,21 +1188,44 @@ Firecracker splits guest memory into multiple segments (e.g., 768MB + 3328MB for
 | 230 | SIGKILL source during 4GB disk snapshot | **PASS** | Stale marker, split-brain check, resumed locally |
 | 231 | Drain 3 VMs (8.2GB incl 4GB) | **PASS** | 5m23s, no failures, no retries |
 
+## Phase 28: Agent Upgrade Safety + Simultaneous Drain (tests #232-#236)
+
+### Test Results
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 232 | Rapid 4GB ping-pong (3 rounds) | **PASS** | Rounds: 2m5s, 3m6s (disk target), 2m6s. VM survived all |
+| 233 | SIGKILL host daemon during 4GB drain | **PASS** | Recovery: retry logic migrated big-4g on second attempt |
+| 234 | Source agent upgrade during migration | **PASS** | Stale marker → split-brain check → resumed locally (9s paused) |
+| 235 | Target agent upgrade during migration | **PASS** | import-snapshot connection refused → ROLLBACK → source resumed |
+| 236 | Simultaneous drain BOTH nodes (6GB + 4GB) | **PASS** | First drain succeeded (4m18s), second correctly aborted (no target) |
+
+### Key Findings
+
+**Agent upgrades are safe during migration**: Both source and target agent restarts during active migrations result in clean rollback. The stale migration recovery handles interrupted migrations automatically.
+
+**Source agent upgrade**: Kill happens during snapshot or transfer → new agent finds stale marker → checks target for running copy → resumes VM locally. Downtime limited to systemd restart time (~5-10s).
+
+**Target agent upgrade**: import-snapshot call gets "connection refused" → ROLLBACK → source VM resumed. Target's cleanup routine handles orphaned files on next startup.
+
+**4GB VM /dev/shm dynamics**: After importing to /dev/shm, the 4GB mmap persists until VM exits. On re-migration, the source has only ~1.9GB free /dev/shm — snapshot must go to disk (1-2 min). Target with clean /dev/shm can import via tmpfs (130ms). The /dev/shm alternation pattern: fast→slow→fast across consecutive migrations.
+
 ## Cumulative Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 231 |
+| Total tests | 236 |
 | Total bugs found | 94 |
-| VMs migrated | 650+ |
-| Drain cycles completed | 116+ |
+| VMs migrated | 680+ |
+| Drain cycles completed | 120+ |
 | Concurrent migrations tested | 3-way, bidirectional, crossing, parallel, opposing, during partition, simultaneous drain, batched |
-| Host daemon crashes survived | 22+ |
-| Node agent crashes survived | 32+ |
-| Network partitions survived | 5 (pre-sync, post-pause, mem-transfer, during-pre-sync, injected-drain-failure) |
-| Successive migrations per VM | 20+ |
+| Host daemon crashes survived | 24+ |
+| Node agent crashes survived | 34+ |
+| Network partitions survived | 5 |
+| Agent upgrades during migration | 2 (source + target, both safe) |
+| Successive migrations per VM | 25+ (big-4g survived 8+ consecutive 4GB migrations) |
 | Resource leaks detected | 0 after all tests |
-| Nodes auto-scaled during testing | 18+ (77-94 range) |
+| Nodes auto-scaled during testing | 20+ (77-96 range) |
 | Disk-full scenarios tested | 3 (/dev/shm only, disk only, both) |
 | Largest single VM migrated | 4096MB (4GB) |
 | Max VMs on single node | 6 (14.3GB, 119% overcommit) |
