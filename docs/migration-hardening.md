@@ -1678,6 +1678,12 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 - **Impact**: Orchestrator DB showed stale migration status, potentially misleading scheduling decisions.
 - **Fix**: Only health-check active nodes. Down nodes re-register via their agent startup flow.
 
+| 442 | Sustained load: 18 migrations in 7.5 min | **PASS** | Zero failures, VM survived 18 consecutive bounces |
+| 443 | Create VM with same name during migration | **PASS** | Both source and target reject with "already exists" |
+| 444 | Migrate VM with very long name | **PASS** | Long names handled correctly |
+| 445 | Migrate during golden image rebuild | **PASS** | No interference |
+| 446 | Destroy on target after migration | **PASS** | Expected behavior, not a race |
+
 ### Cumulative Stats
-- **441 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1250+ VMs migrated**, **250+ drain cycles**
+- **446 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1280+ VMs migrated**, **250+ drain cycles**
