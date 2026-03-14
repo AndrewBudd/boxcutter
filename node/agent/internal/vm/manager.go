@@ -1911,7 +1911,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// Memory file — use dd with 4M blocks for throughput
 	memStart := time.Now()
 	memCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"dd if=%s bs=4M 2>/dev/null | %s ubuntu@%s 'sudo dd of=%s/vm.mem bs=4M 2>/dev/null'",
+		"dd if=%s bs=4M 2>/dev/null | %s ubuntu@%s 'sudo dd of=%s/vm.mem bs=4M'",
 		memPath, sshOpts, targetBridgeIP, dstSnapDir))
 	if out, err := memCmd.CombinedOutput(); err != nil {
 		rollback("mem transfer failed: " + string(out) + ": " + err.Error())
