@@ -1644,7 +1644,27 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 | 427 | Name collision guard (target has same-named VM) | **PASS** | 409 returned |
 | 428 | Create-migrate-destroy pipeline (5 VMs) | **PASS** | 5 VMs created, migrated, destroyed cleanly |
 
+### Tests #429–#434 (continued)
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 429 | Heavy disk I/O during migration | **PASS** | 1GB VM migrated mid-dd, 9s downtime (dirty pages), VM functional after |
+| 430 | /dev/shm contention with disk fallback | **PASS** | 2GB VM migrated via disk path when /dev/shm exhausted |
+| 431 | Bidirectional 2GB swap | **PASS** | a-7 went 116→117, a-6 went 117→116 simultaneously |
+| 432 | Ping-pong (5 rapid bounces) | **PASS** | 3 successful bounces, 2 skipped (VM in transit) |
+| 433 | Source disk 100% + /dev/shm 93% full | **PASS** | Disk fallback with 542MB free, 29s downtime |
+| 434 | SIGKILL during 3 concurrent migrations | **PASS** | All 3 recovered via split-brain check, zero data loss |
+
 ### Bug #107: Stale node QCOW2/ISO files leak on boot recovery
 - **Symptom**: When boxcutter-host daemon restarts and finds stale nodes (status=draining/upgrading, dead QEMU PID), it removes them from cluster state but does NOT delete the QCOW2, cloud-init ISO, console log, or PID files. Over multiple upgrade/scale cycles, stale files accumulate — 10-20GB per dead node.
 - **Impact**: Root filesystem filled to 100% (130GB of stale QCOW2 files from nodes 91, 104, 113, 114).
 - **Fix**: `bootRecover()` now cleans up disk, ISO, console log, PID file, and TAP device when removing stale nodes. Also added PID file cleanup to the drain "with VMs" path for consistency.
+
+### Bug #108: Remote dd stderr suppressed on mem transfer failure
+- **Symptom**: Migration failure logged as "mem transfer failed: exit status 1" with no detail about the actual error (e.g., "No space left on device").
+- **Impact**: Difficult to diagnose /dev/shm contention failures.
+- **Fix**: Removed `2>/dev/null` from remote dd command so stderr propagates to CombinedOutput().
+
+### Cumulative Stats
+- **434 total tests**, **108 bugs found** (107 fixed, 1 known behavior)
+- **1200+ VMs migrated**, **240+ drain cycles**
