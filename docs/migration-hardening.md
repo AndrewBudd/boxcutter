@@ -1665,6 +1665,12 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 - **Impact**: Difficult to diagnose /dev/shm contention failures.
 - **Fix**: Removed `2>/dev/null` from remote dd command so stderr propagates to CombinedOutput().
 
+### Bug #109: Health monitor stalls on down nodes, delaying VM sync
+- **Symptom**: Orchestrator showed stale "migrating" status for VMs that had already completed migration. VM inventory sync took 224s per cycle.
+- **Root cause**: Health monitor iterated all 114 nodes (112 down + 2 active). Each down node timed out at 2s, totaling 224s per cycle. The 30s ticker couldn't keep up.
+- **Impact**: Orchestrator DB showed stale migration status, potentially misleading scheduling decisions.
+- **Fix**: Only health-check active nodes. Down nodes re-register via their agent startup flow.
+
 ### Cumulative Stats
-- **434 total tests**, **108 bugs found** (107 fixed, 1 known behavior)
-- **1200+ VMs migrated**, **240+ drain cycles**
+- **438 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1220+ VMs migrated**, **240+ drain cycles**
