@@ -537,12 +537,17 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 	}
 
 	// Clean up stale draining/upgrading nodes with dead QEMU processes.
-	var cleanNodes []string
+	type staleNode struct {
+		id   string
+		node *cluster.VMEntry
+	}
+	var cleanNodes []staleNode
 	var resumeDrainNodes []string
-	for _, node := range state.Nodes {
+	for i := range state.Nodes {
+		node := &state.Nodes[i]
 		if !node.IsActive() && !qemu.IsRunning(node.PID) {
 			log.Printf("  %s status=%s with dead QEMU (PID %d) — removing from cluster state", node.ID, node.Status, node.PID)
-			cleanNodes = append(cleanNodes, node.ID)
+			cleanNodes = append(cleanNodes, staleNode{id: node.ID, node: node})
 		} else if node.Status == "draining" && qemu.IsRunning(node.PID) {
 			// Drain was interrupted by host daemon crash. The QEMU VM is still
 			// running with some VMs remaining. Resume the drain in background.
@@ -550,8 +555,25 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 			resumeDrainNodes = append(resumeDrainNodes, node.ID)
 		}
 	}
-	for _, id := range cleanNodes {
-		state.RemoveNode(id)
+	for _, sn := range cleanNodes {
+		// Clean up disk artifacts before removing from state (Bug #107:
+		// stale QCOW2/ISO/console files leaked 10-20GB per dead node).
+		if sn.node.TAP != "" {
+			bridge.DeleteTAP(sn.node.TAP)
+		}
+		if sn.node.Disk != "" {
+			if err := os.Remove(sn.node.Disk); err == nil {
+				log.Printf("  %s: removed disk %s", sn.id, sn.node.Disk)
+			}
+			consoleLog := strings.TrimSuffix(sn.node.Disk, ".qcow2") + "-console.log"
+			os.Remove(consoleLog)
+			pidFile := strings.TrimSuffix(sn.node.Disk, ".qcow2") + ".pid"
+			os.Remove(pidFile)
+		}
+		if sn.node.ISO != "" {
+			os.Remove(sn.node.ISO)
+		}
+		state.RemoveNode(sn.id)
 	}
 
 	// Launch nodes (skip those being drained/upgraded)
@@ -1872,9 +1894,11 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	if node.ISO != "" {
 		os.Remove(node.ISO)
 	}
-	// Also remove console log
+	// Also remove console log + PID file
 	consoleLog := strings.TrimSuffix(node.Disk, ".qcow2") + "-console.log"
 	os.Remove(consoleLog)
+	pidFile := strings.TrimSuffix(node.Disk, ".qcow2") + ".pid"
+	os.Remove(pidFile)
 
 	log.Printf("Drain: %s complete", nodeID)
 }

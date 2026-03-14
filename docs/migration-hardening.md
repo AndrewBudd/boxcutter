@@ -1615,5 +1615,39 @@ Guard: warm-up only runs when (1) VM was restored from snapshot, AND (2) /dev/sh
 - **Fix**: Added `os.Remove(vmDir/vm.snap)` and `os.Remove(vmDir/vm.mem)` to rollback function.
 
 ### Cumulative Stats
-- **408 total tests**, **106 bugs found** (105 fixed, 1 known behavior)
-- **1115+ VMs migrated**, **220+ drain cycles**
+- **428 total tests**, **107 bugs found** (106 fixed, 1 known behavior)
+- **1175+ VMs migrated**, **230+ drain cycles**
+
+## Phase 38: Exhaustive Edge Case Testing (tests #409–#428)
+
+Systematic exploration of migration edge cases: rapid drain cycles, cross-traffic, agent crashes, network partitions, capacity guards, stopped VM migration, name collision detection, and create-migrate-destroy pipelines.
+
+### Test Results
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| 409 | Rapid drain-redrain 3 rounds (18 migrations) | **PASS** | R1: 4 VMs <30s. R2: 6 VMs ~90s. R3: 6 VMs ~3min (disk fallback I/O contention) |
+| 410 | Immediate re-migration of freshly restored VM | **PASS** | 1.6s downtime, 244ms snapshot (pre-faulted pages) |
+| 411 | Create VM during active inbound migration | **PASS** | No interference between create and import |
+| 412 | Destroy on source during concurrent migration | **PASS** | Concurrent destroy + migrate from same source node |
+| 413 | Double-migrate race (same VM) | **PASS** | 409 "already migrating" returned correctly |
+| 414 | Destroy on target during inbound migration | **PASS** | No interference with in-flight import |
+| 415 | Cross-traffic (inbound + outbound same node) | **PASS** | Bidirectional concurrent migrations |
+| 416 | Source agent SIGTERM during migration | **PASS** | KillMode=process keeps VM alive, split-brain check works |
+| 417 | Target agent SIGTERM during pre-sync | **PASS** | Migration completes after target agent restarts |
+| 418 | Target agent SIGKILL timing test | **PASS** | Migration completed before kill landed; VMs recovered on restart |
+| 419 | Capacity rejection + rollback | **PASS** | 507 from target → rollback → source VM resumed |
+| 420 | Network partition during snapshot transfer | **PASS** | SSH keepalive detected dead connection → rollback. Found Bug #107 |
+| 421 | Stop/destroy during migration | **PASS** | Both rejected with 409 |
+| 422 | Migrate stopped VM | **PASS** | Stopped state preserved, VM functional after start |
+| 423 | Self-migration guard | **PASS** | 400 "cannot migrate to same node" |
+| 424 | Migrate non-existent VM | **PASS** | 404 returned |
+| 425 | Migrate to unreachable target | **PASS** | SSH fails, migration aborts without pausing VM |
+| 426 | Migrate to reachable host with stopped agent | **PASS** | SSH pre-sync succeeds, import-snapshot connection refused → rollback |
+| 427 | Name collision guard (target has same-named VM) | **PASS** | 409 returned |
+| 428 | Create-migrate-destroy pipeline (5 VMs) | **PASS** | 5 VMs created, migrated, destroyed cleanly |
+
+### Bug #107: Stale node QCOW2/ISO files leak on boot recovery
+- **Symptom**: When boxcutter-host daemon restarts and finds stale nodes (status=draining/upgrading, dead QEMU PID), it removes them from cluster state but does NOT delete the QCOW2, cloud-init ISO, console log, or PID files. Over multiple upgrade/scale cycles, stale files accumulate — 10-20GB per dead node.
+- **Impact**: Root filesystem filled to 100% (130GB of stale QCOW2 files from nodes 91, 104, 113, 114).
+- **Fix**: `bootRecover()` now cleans up disk, ISO, console log, PID file, and TAP device when removing stale nodes. Also added PID file cleanup to the drain "with VMs" path for consistency.
