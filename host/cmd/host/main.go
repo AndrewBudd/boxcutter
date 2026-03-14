@@ -3569,7 +3569,8 @@ func runBootstrap() {
 	}
 
 	if imageTag == "" && !fromSource && version != "dev" {
-		imageTag = version // default: match host binary version
+		// Binary version is "0.3.0" but OCI images are tagged "v0.3.0"
+		imageTag = "v" + version
 	}
 	if imageTag == "" {
 		imageTag = "latest"
@@ -3579,6 +3580,31 @@ func runBootstrap() {
 		log.Printf("boxcutter-host bootstrap (from source: %s)", cfg.RepoDir)
 	} else {
 		log.Printf("boxcutter-host bootstrap (images: %s)", imageTag)
+	}
+
+	// Pre-flight: validate secrets bundle exists
+	bundleDir := cfg.BundleDir
+	requiredFiles := []string{
+		filepath.Join(bundleDir, "boxcutter.yaml"),
+		filepath.Join(bundleDir, "secrets", "authorized-keys"),
+		filepath.Join(bundleDir, "secrets", "cluster-ssh.key"),
+	}
+	var missing []string
+	for _, f := range requiredFiles {
+		if _, err := os.Stat(f); err != nil {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) > 0 {
+		log.Println("ERROR: Missing required configuration files:")
+		for _, f := range missing {
+			log.Printf("  - %s", f)
+		}
+		log.Println("")
+		log.Println("Set up your secrets bundle before running bootstrap:")
+		log.Println("  mkdir -p ~/.boxcutter/secrets")
+		log.Println("  # See README for required files")
+		log.Fatalf("Bootstrap aborted: missing configuration")
 	}
 
 	// Phase 1: Bridge
