@@ -1687,6 +1687,9 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 | 447 | Host-triggered drain with disk cleanup | **PASS** | All VMs drained, QCOW2/ISO/PID cleaned up, auto-scale reprovisions |
 | 448 | Migrate to freshly provisioned node | **PASS** | VMs migrate to base-image node before golden ready |
 
+| 449 | Migrate to target with orphaned directory | **PASS** | Pre-sync overwrites orphan, import succeeds |
+| 450 | Full bidirectional swap (6 VMs, max concurrency) | **PASS** | All 6 VMs crossed nodes simultaneously |
+
 ### Cumulative Stats
-- **448 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1300+ VMs migrated**, **260+ drain cycles**
+- **450 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1320+ VMs migrated**, **260+ drain cycles**
