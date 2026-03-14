@@ -1693,6 +1693,8 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 | 451 | Snapshot failure: both /dev/shm and disk full | **PASS** | ENOSPC → ROLLBACK → VM resumed on source |
 | 452 | Host daemon restart during active drain | **PASS** | Detected draining node, resumed drain after 30s warmup |
 
+| 453 | Migrate to auto-scaled fresh node | **PASS** | VMs migrate to brand new node-118 after auto-scale |
+
 ### Cumulative Stats
-- **452 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1340+ VMs migrated**, **265+ drain cycles**
+- **453 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1360+ VMs migrated**, **270+ drain cycles**
