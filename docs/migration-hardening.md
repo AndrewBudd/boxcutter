@@ -1697,6 +1697,8 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 
 | 454 | Data integrity verification after migration | **PASS** | md5sum match, file content identical, process state preserved |
 
+| 455 | Cumulative integrity: write, migrate 4x, verify | **PASS** | md5sum identical after 4 bounces |
+
 ### Cumulative Stats
-- **454 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1370+ VMs migrated**, **270+ drain cycles**
+- **455 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1380+ VMs migrated**, **275+ drain cycles**
