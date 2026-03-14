@@ -86,7 +86,7 @@ func (h *Handler) healthMonitorLoop() {
 			continue
 		}
 		for _, n := range nodes {
-			if n.Status == "retired" || n.Status == "draining" || n.Status == "provisioning" {
+			if n.Status != "active" {
 				continue
 			}
 			fc := node.NewFastClient(n.APIAddr)
