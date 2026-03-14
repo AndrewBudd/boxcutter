@@ -10,9 +10,6 @@ Battle-harden the VM migration process. Make it fast, reliable, and resilient to
 4. **Upgrade reconciler gets confused** — state file drift after failed upgrades (TODO)
 5. ~~**VMs experience minutes of downtime**~~ → **1.5-7.6s downtime**
 
-## Tailscale Keys (ephemeral)
-- Orchestrator: `REDACTED_TAILSCALE_KEY_ORCHESTRATOR`
-- Nodes: `REDACTED_TAILSCALE_KEY_NODES`
 
 ## Phase 1: Diagnose Transfer Speed (complete)
 - [x] Benchmark raw network throughput between nodes — SSH ~400MB/s on local bridge
