@@ -129,7 +129,8 @@ Create the following files:
 
 | File | What it is | How to get it |
 |------|-----------|---------------|
-| `~/.boxcutter/secrets/tailscale-node-authkey` | Tailscale auth key for orchestrator + node VMs | [Tailscale admin](https://login.tailscale.com/admin/settings/keys) -- reusable key |
+| `~/.boxcutter/secrets/tailscale-orch-authkey` | Tailscale auth key for the orchestrator VM | [Tailscale admin](https://login.tailscale.com/admin/settings/keys) -- reusable key |
+| `~/.boxcutter/secrets/tailscale-node-authkey` | Tailscale auth key for node VMs | Same -- reusable key |
 | `~/.boxcutter/secrets/tailscale-vm-authkey` | Tailscale auth key for Firecracker microVMs | Same -- reusable + ephemeral key |
 | `~/.boxcutter/secrets/cluster-ssh.key` | SSH key for inter-node communication | `ssh-keygen -t ed25519 -f ~/.boxcutter/secrets/cluster-ssh.key -N ""` |
 | `~/.boxcutter/secrets/authorized-keys` | SSH public keys for the boxcutter control interface | Your `~/.ssh/id_rsa.pub` or `id_ed25519.pub` |
@@ -164,11 +165,12 @@ The `PLACEHOLDER` values are templated automatically per-VM during provisioning.
 **Option A: Install from deb (recommended for production)**
 
 ```bash
-# Download latest stable release from GitHub Releases
-sudo boxcutter-host self-update --version v0.2.0
-# Or manually: wget + dpkg -i (see "Installation via Deb Package" above)
+# Download the latest release from GitHub
+wget https://github.com/AndrewBudd/boxcutter/releases/latest/download/boxcutter-host_amd64.deb
+sudo dpkg -i boxcutter-host_amd64.deb
 
-sudo boxcutter-host bootstrap --version v0.2.0
+# Bootstrap pulls OCI images, creates VMs, builds golden image (~5 min)
+sudo boxcutter-host bootstrap
 ```
 
 **Option B: Build from source (for development)**
