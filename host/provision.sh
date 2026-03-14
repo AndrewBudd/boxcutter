@@ -631,6 +631,10 @@ done)
       # Set hostname
       hostnamectl set-hostname ${NAME}
 
+      # Stop services that auto-started from the base image (before cloud-init).
+      # They'll be restarted after config is applied. Prevents stale golden builds.
+      systemctl stop boxcutter-node 2>/dev/null || true
+
       # Configure boxcutter.yaml with real values
       sed -i "s|hostname:.*HOSTNAME_PLACEHOLDER|hostname: ${NAME}|" /etc/boxcutter/boxcutter.yaml
       sed -i "s|bridge_ip:.*|bridge_ip: ${THIS_NODE_IP}|" /etc/boxcutter/boxcutter.yaml
