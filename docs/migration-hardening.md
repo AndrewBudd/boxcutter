@@ -1695,6 +1695,8 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 
 | 453 | Migrate to auto-scaled fresh node | **PASS** | VMs migrate to brand new node-118 after auto-scale |
 
+| 454 | Data integrity verification after migration | **PASS** | md5sum match, file content identical, process state preserved |
+
 ### Cumulative Stats
-- **453 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1360+ VMs migrated**, **270+ drain cycles**
+- **454 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1370+ VMs migrated**, **270+ drain cycles**
