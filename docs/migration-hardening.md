@@ -1654,6 +1654,13 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 | 432 | Ping-pong (5 rapid bounces) | **PASS** | 3 successful bounces, 2 skipped (VM in transit) |
 | 433 | Source disk 100% + /dev/shm 93% full | **PASS** | Disk fallback with 542MB free, 29s downtime |
 | 434 | SIGKILL during 3 concurrent migrations | **PASS** | All 3 recovered via split-brain check, zero data loss |
+| 435 | Kill Firecracker process after snapshot | **PASS** | Migration completes, stopVM handles dead PID gracefully |
+| 436 | Kill Firecracker during pre-sync | **PASS** | Pause fails, migration aborts cleanly, VM restartable |
+| 437 | Kill target FC after migration commit | **PASS** | VM shows "stopped", restartable via start API |
+| 438 | Orchestrator sync during/after migration | **BUG** | Found Bug #109: sync stalled on 112 down nodes |
+| 439 | Double agent restart during recovery | **PASS** | Second restart re-detects stale marker, resumes VM |
+| 440 | Bidirectional concurrent with shared SSH | **PASS** | ControlMasters don't interfere between directions |
+| 441 | Full drain + reverse drain (12 migrations) | **PASS** | All 7 VMs survived bidirectional full cluster drain |
 
 ### Bug #107: Stale node QCOW2/ISO files leak on boot recovery
 - **Symptom**: When boxcutter-host daemon restarts and finds stale nodes (status=draining/upgrading, dead QEMU PID), it removes them from cluster state but does NOT delete the QCOW2, cloud-init ISO, console log, or PID files. Over multiple upgrade/scale cycles, stale files accumulate — 10-20GB per dead node.
@@ -1672,5 +1679,5 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 - **Fix**: Only health-check active nodes. Down nodes re-register via their agent startup flow.
 
 ### Cumulative Stats
-- **438 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1220+ VMs migrated**, **240+ drain cycles**
+- **441 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1250+ VMs migrated**, **250+ drain cycles**
