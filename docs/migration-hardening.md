@@ -1684,6 +1684,9 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 | 445 | Migrate during golden image rebuild | **PASS** | No interference |
 | 446 | Destroy on target after migration | **PASS** | Expected behavior, not a race |
 
+| 447 | Host-triggered drain with disk cleanup | **PASS** | All VMs drained, QCOW2/ISO/PID cleaned up, auto-scale reprovisions |
+| 448 | Migrate to freshly provisioned node | **PASS** | VMs migrate to base-image node before golden ready |
+
 ### Cumulative Stats
-- **446 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1280+ VMs migrated**, **250+ drain cycles**
+- **448 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1300+ VMs migrated**, **260+ drain cycles**
