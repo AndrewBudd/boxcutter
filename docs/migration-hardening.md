@@ -1690,6 +1690,9 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 | 449 | Migrate to target with orphaned directory | **PASS** | Pre-sync overwrites orphan, import succeeds |
 | 450 | Full bidirectional swap (6 VMs, max concurrency) | **PASS** | All 6 VMs crossed nodes simultaneously |
 
+| 451 | Snapshot failure: both /dev/shm and disk full | **PASS** | ENOSPC → ROLLBACK → VM resumed on source |
+| 452 | Host daemon restart during active drain | **PASS** | Detected draining node, resumed drain after 30s warmup |
+
 ### Cumulative Stats
-- **450 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1320+ VMs migrated**, **260+ drain cycles**
+- **452 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
+- **1340+ VMs migrated**, **265+ drain cycles**
