@@ -2679,13 +2679,25 @@ func bootstrapGolden(cfg HostConfig, state *cluster.State) {
 		return
 	}
 
-	// First check if golden image exists in OCI
+	// Set golden head on orchestrator — retry a few times since the orchestrator
+	// API may still be starting up right after bootstrap health check passes.
 	orchAddr := fmt.Sprintf("http://%s:8801", state.Orchestrator.BridgeIP)
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	setHeadReq := map[string]string{"version": "latest"}
 	data, _ := json.Marshal(setHeadReq)
-	resp, err := client.Post(orchAddr+"/api/golden/head", "application/json", bytes.NewReader(data))
+	var resp *http.Response
+	var err error
+	for attempt := 1; attempt <= 6; attempt++ {
+		resp, err = client.Post(orchAddr+"/api/golden/head", "application/json", bytes.NewReader(data))
+		if err == nil {
+			break
+		}
+		if attempt < 6 {
+			log.Printf("  Orchestrator API not ready, retrying in 5s (attempt %d/6)...", attempt)
+			time.Sleep(5 * time.Second)
+		}
+	}
 	if err != nil {
 		log.Printf("  Could not set golden head on orchestrator: %v", err)
 		log.Println("  Golden image will need to be set up manually:")
