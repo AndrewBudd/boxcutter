@@ -168,14 +168,17 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 	chroot("update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null")
 	chroot("update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null")
 
-	// Install kmod (for modprobe — Docker needs kernel modules loaded)
-	chroot("apt-get install -y -qq kmod 2>/dev/null")
-
 	// Create /etc/modules-load.d to auto-load Docker-required modules on boot
+	// kmod is installed in the golden image (Dockerfile)
 	modulesDir := filepath.Join(mountPoint, "etc", "modules-load.d")
 	os.MkdirAll(modulesDir, 0755)
 	os.WriteFile(filepath.Join(modulesDir, "docker.conf"),
-		[]byte("overlay\nbridge\nbr_netfilter\nveth\nip_tables\nip6_tables\niptable_filter\nip6table_filter\niptable_nat\nip6table_nat\nxt_conntrack\n"), 0644)
+		[]byte("overlay\nbridge\nbr_netfilter\nveth\n"+
+			"ip_tables\nip6_tables\n"+
+			"iptable_filter\nip6table_filter\n"+
+			"iptable_nat\nip6table_nat\n"+
+			"xt_conntrack\nxt_addrtype\nxt_MASQUERADE\n"+
+			"nf_nat\nnf_conntrack\n"), 0644)
 
 	// Configure Tailscale for kernel networking (Firecracker uses userspace)
 	tailscaleDefaults := filepath.Join(mountPoint, "etc", "default", "tailscaled")

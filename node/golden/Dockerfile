@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 iputils-ping \
     ca-certificates locales \
     gcc libc6-dev \
+    kmod \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Serial console ---
