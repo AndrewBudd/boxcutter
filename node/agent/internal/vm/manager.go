@@ -1176,7 +1176,8 @@ func (m *Manager) cloneRepos(st *VMState) error {
 		}
 	}
 
-	// Set up credential helper once if we have a token
+	// Set up credential helper that fetches fresh tokens from metadata service.
+	// This ensures tokens are refreshed when repo policy changes (repos add).
 	if ghToken != "" {
 		setupCmd := fmt.Sprintf(`mkdir -p ~/.config/gh
 cat > ~/.config/gh/hosts.yml <<GHEOF
@@ -1185,7 +1186,7 @@ github.com:
     user: x-access-token
     git_protocol: https
 GHEOF
-git config --global credential.helper '!f() { echo username=x-access-token; echo password=%s; }; f'`,
+git config --global credential.helper '!f() { token=$(curl -sf http://169.254.169.254/token/github 2>/dev/null | grep -o "\"token\":\"[^\"]*\"" | cut -d\" -f4); [ -n "$token" ] && { echo username=x-access-token; echo password=$token; } || { echo username=x-access-token; echo password=%s; }; }; f'`,
 			ghToken, ghToken)
 		VMSSH(st.TAP, sshKey, setupCmd)
 	}
@@ -1407,6 +1408,19 @@ func (m *Manager) AddRepo(name, repo string) ([]string, error) {
 	if m.vmid != nil {
 		m.vmid.AddRepo(name, repo)
 	}
+
+	// Refresh the GitHub token inside the VM so git picks up the new repo scope.
+	// The credential helper fetches from the metadata service, which now includes
+	// the new repo in its token scope.
+	sshKey := m.cfg.SSH.PrivateKeyPath
+	if sshKey == "" {
+		sshKey = "/etc/boxcutter/secrets/cluster-ssh.key"
+	}
+	go func() {
+		if IsRunning(vmDir) {
+			VMSSH(st.TAP, sshKey, "/usr/local/bin/gh-token-refresh 2>/dev/null || true")
+		}
+	}()
 
 	return repos, nil
 }
