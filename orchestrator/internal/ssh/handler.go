@@ -128,6 +128,11 @@ func (h *Handler) cmdNew(args []string) int {
 				body["ram_mib"] = n
 				i++
 			}
+		case "--type":
+			if i+1 < len(args) {
+				body["type"] = args[i+1]
+				i++
+			}
 		case "--mode":
 			if i+1 < len(args) {
 				body["mode"] = args[i+1]
@@ -599,6 +604,7 @@ func (h *Handler) printHelp() {
 Commands:
   new [options]           Create and start a new VM
     --clone <repo>          Clone repo on creation (repeatable)
+    --type <type>           VM type: firecracker (default) or qemu
     --vcpu <N>              CPU cores (default: 2)
     --ram <MiB>             RAM in MiB (default: 2048)
     --disk <size>           Disk size (default: 50G)

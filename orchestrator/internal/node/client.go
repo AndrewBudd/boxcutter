@@ -26,6 +26,7 @@ func NewClient(apiAddr string) *Client {
 
 type CreateRequest struct {
 	Name           string   `json:"name"`
+	Type           string   `json:"type,omitempty"` // "firecracker" (default) or "qemu"
 	VCPU           int      `json:"vcpu,omitempty"`
 	RAMMIB         int      `json:"ram_mib,omitempty"`
 	Disk           string   `json:"disk,omitempty"`

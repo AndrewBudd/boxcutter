@@ -264,6 +264,7 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 
 type vmCreateRequest struct {
 	Name      string   `json:"name"`
+	Type      string   `json:"type,omitempty"` // "firecracker" (default) or "qemu"
 	VCPU      int      `json:"vcpu,omitempty"`
 	RAMMIB    int      `json:"ram_mib,omitempty"`
 	Disk      string   `json:"disk,omitempty"`
@@ -379,6 +380,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		client := node.NewClient(candidate.APIAddr)
 		resp, err := client.CreateStreaming(&node.CreateRequest{
 			Name:           req.Name,
+			Type:           req.Type,
 			VCPU:           req.VCPU,
 			RAMMIB:         req.RAMMIB,
 			Disk:           req.Disk,

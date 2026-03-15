@@ -162,22 +162,24 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 	}
 
 	// Configure iptables to use legacy backend (not nftables)
-	// Docker needs this inside Firecracker/QEMU VMs
 	chroot := func(cmd string) {
 		exec.Command("chroot", mountPoint, "bash", "-c", cmd).Run()
 	}
 	chroot("update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null")
 	chroot("update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null")
 
+	// Install kmod (for modprobe — Docker needs kernel modules loaded)
+	chroot("apt-get install -y -qq kmod 2>/dev/null")
+
+	// Create /etc/modules-load.d to auto-load Docker-required modules on boot
+	modulesDir := filepath.Join(mountPoint, "etc", "modules-load.d")
+	os.MkdirAll(modulesDir, 0755)
+	os.WriteFile(filepath.Join(modulesDir, "docker.conf"),
+		[]byte("overlay\nbridge\nbr_netfilter\nveth\nip_tables\nip6_tables\niptable_filter\nip6table_filter\niptable_nat\nip6table_nat\nxt_conntrack\n"), 0644)
+
 	// Configure Tailscale for kernel networking (Firecracker uses userspace)
 	tailscaleDefaults := filepath.Join(mountPoint, "etc", "default", "tailscaled")
 	os.WriteFile(tailscaleDefaults, []byte("PORT=0\nFLAGS=\n"), 0644)
-
-	// Install Docker daemon config to disable iptables (raw table not available in nested KVM)
-	dockerDir := filepath.Join(mountPoint, "etc", "docker")
-	os.MkdirAll(dockerDir, 0755)
-	os.WriteFile(filepath.Join(dockerDir, "daemon.json"),
-		[]byte(`{"iptables": false}`+"\n"), 0644)
 
 	log.Printf("QEMU VM %s: rootfs prepared (modules, iptables-legacy, docker config)", st.Name)
 }
