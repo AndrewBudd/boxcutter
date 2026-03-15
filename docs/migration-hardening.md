@@ -1699,6 +1699,48 @@ Systematic exploration of migration edge cases: rapid drain cycles, cross-traffi
 
 | 455 | Cumulative integrity: write, migrate 4x, verify | **PASS** | md5sum identical after 4 bounces |
 
+## Phase 39: QEMU VM Backend Testing (tests Q-1 through Q-28)
+
+Added QEMU VM support as an alternative to Firecracker for workloads requiring full kernel support (Docker, nftables). QEMU VMs use direct kernel boot with the node's Ubuntu kernel and initrd.
+
+### QEMU Test Results
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| Q-1 | Basic create on both nodes | **PASS** | 4 QEMU VMs created |
+| Q-2 | Stop and Start | **PASS** | SIGTERM → ACPI shutdown |
+| Q-3 | Destroy | **PASS** | |
+| Q-4 | Agent restart — VMs survive | **PASS** | KillMode=process works for QEMU |
+| Q-5 | Agent SIGKILL — VMs survive | **PASS** | QEMU -daemonize survives |
+| Q-6 | Large VM (2GB) + rapid stop/start 3x | **PASS** | |
+| Q-7 | Capacity guard (reject when full) | **PASS** | 90% RAM threshold |
+| Q-8 | Live migration guard | **PASS** | "not supported for QEMU VMs" |
+| Q-9 | Stopped VM migration between nodes | **PASS** | File transfer works |
+| Q-10 | Concurrent create + destroy | **PASS** | |
+| Q-11 | Mixed FC + QEMU on same node | **PASS** | Both types coexist |
+| Q-12 | Agent restart with mixed types | **PASS** | Both types recovered |
+| Q-13 | Guards: self-migration, name collision, not-found | **PASS** | |
+| Q-14 | Stop during migration attempt | **PASS** | Migration fails fast for QEMU |
+| Q-15 | Kill QEMU process → recover | **PASS** | Status=stopped, restartable |
+| Q-16 | Data integrity across stop/start | **PASS** | md5sum match after sync+stop+start |
+| Q-17 | Rapid create/destroy 5 cycles | **PASS** | |
+| Q-18 | Double stop/start idempotency | **PASS** | |
+| Q-20 | Agent SIGKILL during VM creation | **PASS** | VMs survive, agent recovers all |
+| Q-21 | Destroy all VMs concurrently | **PASS** | 6 concurrent destroys |
+| Q-22 | Bulk stop/start 5 VMs | **PASS** | 5 concurrent stops + 5 concurrent starts |
+| Q-23 | Docker hello-world end-to-end | **PASS** | Full Docker with overlay2 |
+| Q-24 | Host daemon restart with QEMU VMs | **PASS** | 7/7 survived |
+| Q-25 | Full lifecycle via orchestrator SSH | **PASS** | `new --type qemu` → destroy |
+| Q-26 | Sustained load: 10 create/destroy cycles | **PASS** | 10/10 in 202s |
+| Q-27 | Stopped VM migration + restart on target | **PASS** | |
+| Q-28 | Data integrity across migration | **PASS** | md5sum match after stop→migrate→start |
+
+### Bugs Found
+
+- **Bug #114**: Golden image missing `kmod` package — Docker can't load kernel modules (overlay, bridge, xt_addrtype). Fixed: added `kmod` to Dockerfile.
+- **Bug #115**: `prepareRootfsForQEMU` tried chroot `apt-get` (no network in chroot). Fixed: rely on golden image having kmod.
+- **Bug #116**: Missing Docker-required modules in modules-load.d (xt_addrtype, xt_MASQUERADE, nf_nat). Fixed: added to config.
+
 ### Cumulative Stats
-- **455 total tests**, **109 bugs found** (108 fixed, 1 known behavior)
-- **1380+ VMs migrated**, **275+ drain cycles**
+- **483 total tests**, **116 bugs found** (115 fixed, 1 known behavior)
+- **1420+ VMs created/migrated**, **280+ drain cycles**
