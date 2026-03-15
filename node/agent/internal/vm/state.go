@@ -12,6 +12,7 @@ import (
 // VMState is the persistent state for a VM, stored as vm.json.
 type VMState struct {
 	Name        string   `json:"name"`
+	Type        string   `json:"type,omitempty"` // "firecracker" (default/empty) or "qemu"
 	VCPU        int      `json:"vcpu"`
 	RAMMIB      int      `json:"ram_mib"`
 	Mark        int      `json:"mark"`
@@ -194,16 +195,46 @@ func ListVMs() ([]*VMState, error) {
 	return vms, nil
 }
 
-// IsRunning checks if the Firecracker process is alive.
+// IsRunning checks if the VM process is alive (Firecracker or QEMU).
 func IsRunning(vmDir string) bool {
-	data, err := os.ReadFile(filepath.Join(vmDir, "firecracker.pid"))
+	pid := ReadPID(vmDir)
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
+// ReadPID returns the VM process PID, checking both QEMU and Firecracker PID files.
+func ReadPID(vmDir string) int {
+	for _, pidFile := range []string{"qemu.pid", "firecracker.pid"} {
+		data, err := os.ReadFile(filepath.Join(vmDir, pidFile))
+		if err != nil {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid); err != nil || pid <= 0 {
+			continue
+		}
+		if syscall.Kill(pid, 0) == nil {
+			return pid
+		}
+	}
+	return 0
+}
+
+// IsQEMU returns true if this VM directory contains a QEMU VM.
+func IsQEMU(vmDir string) bool {
+	st, err := LoadVMState(vmDir)
 	if err != nil {
 		return false
 	}
-	var pid int
-	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil || pid <= 0 {
-		return false
+	return st.Type == "qemu"
+}
+
+// PIDFile returns the PID file name for the given VM type.
+func PIDFile(vmType string) string {
+	if vmType == "qemu" {
+		return "qemu.pid"
 	}
-	// Signal 0 tests if process exists
-	return syscall.Kill(pid, 0) == nil
+	return "firecracker.pid"
 }

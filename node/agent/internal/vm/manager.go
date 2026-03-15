@@ -85,6 +85,7 @@ type ProgressFunc func(phase, message string)
 // CreateRequest is the API input for creating a VM.
 type CreateRequest struct {
 	Name           string   `json:"name"`
+	Type           string   `json:"type,omitempty"` // "firecracker" (default) or "qemu"
 	VCPU           int      `json:"vcpu,omitempty"`
 	RAMMIB         int      `json:"ram_mib,omitempty"`
 	Disk           string   `json:"disk,omitempty"`
@@ -210,6 +211,7 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 
 		st = &VMState{
 			Name:        req.Name,
+			Type:        req.Type,
 			VCPU:        req.VCPU,
 			RAMMIB:      req.RAMMIB,
 			Mark:        mark,
@@ -242,10 +244,16 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 		return nil, fmt.Errorf("creating rootfs: %w", err)
 	}
 
-	if err := writeFirecrackerConfig(vmDir, st); err != nil {
-		CleanupSnapshot(vmDir)
-		os.RemoveAll(vmDir)
-		return nil, err
+	if st.Type == "qemu" {
+		// QEMU VMs: prepare rootfs with kernel modules for Docker support,
+		// and configure Tailscale for kernel networking (not userspace).
+		m.prepareRootfsForQEMU(st)
+	} else {
+		if err := writeFirecrackerConfig(vmDir, st); err != nil {
+			CleanupSnapshot(vmDir)
+			os.RemoveAll(vmDir)
+			return nil, err
+		}
 	}
 
 	m.prepareRootfs(st, req.AuthorizedKeys)
@@ -332,30 +340,37 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 	os.Remove(filepath.Join(vmDir, "api.sock"))
 	os.Remove(filepath.Join(vmDir, "vsock.sock"))
 
-	emit("starting", "Starting Firecracker VM...")
-	// Launch Firecracker
-	logFile, _ := os.Create(filepath.Join(vmDir, "firecracker.log"))
-	cmd := exec.Command("firecracker",
-		"--api-sock", filepath.Join(vmDir, "api.sock"),
-		"--config-file", filepath.Join(vmDir, "fc-config.json"),
-	)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	if err := cmd.Start(); err != nil {
+	var pid int
+	if st.Type == "qemu" {
+		emit("starting", "Starting QEMU VM...")
+		launchedPID, err := launchQEMU(vmDir, st)
+		if err != nil {
+			TeardownTAP(st.TAP, st.Mark)
+			return nil, fmt.Errorf("starting qemu: %w", err)
+		}
+		pid = launchedPID
+	} else {
+		emit("starting", "Starting Firecracker VM...")
+		logFile, _ := os.Create(filepath.Join(vmDir, "firecracker.log"))
+		cmd := exec.Command("firecracker",
+			"--api-sock", filepath.Join(vmDir, "api.sock"),
+			"--config-file", filepath.Join(vmDir, "fc-config.json"),
+		)
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+		if err := cmd.Start(); err != nil {
+			logFile.Close()
+			TeardownTAP(st.TAP, st.Mark)
+			return nil, fmt.Errorf("starting firecracker: %w", err)
+		}
 		logFile.Close()
-		TeardownTAP(st.TAP, st.Mark)
-		return nil, fmt.Errorf("starting firecracker: %w", err)
+		pid = cmd.Process.Pid
+		os.WriteFile(filepath.Join(vmDir, "firecracker.pid"),
+			[]byte(fmt.Sprintf("%d", pid)), 0644)
+		go cmd.Wait()
 	}
-	logFile.Close()
 
-	// Save PID
-	os.WriteFile(filepath.Join(vmDir, "firecracker.pid"),
-		[]byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
-
-	// Don't wait for firecracker — it runs until stopped
-	go cmd.Wait()
-
-	log.Printf("VM %s started (PID %d, mark %d)", st.Name, cmd.Process.Pid, st.Mark)
+	log.Printf("VM %s started (type=%s, PID %d, mark %d)", st.Name, st.Type, pid, st.Mark)
 
 	return &CreateResponse{
 		Name:   st.Name,
@@ -457,16 +472,9 @@ func (m *Manager) stopVM(name string) error {
 		return fmt.Errorf("VM '%s' not found", name)
 	}
 
-	pidFile := filepath.Join(vmDir, "firecracker.pid")
-	pidData, err := os.ReadFile(pidFile)
-	if err != nil {
-		return nil // Not running
-	}
-
-	var pid int
-	fmt.Sscanf(strings.TrimSpace(string(pidData)), "%d", &pid)
+	pid := ReadPID(vmDir)
 	if pid == 0 {
-		log.Printf("stopVM %s: invalid PID in %s", name, pidFile)
+		log.Printf("stopVM %s: no running process found", name)
 		return nil
 	}
 
@@ -476,22 +484,34 @@ func (m *Manager) stopVM(name string) error {
 		goto cleanup
 	}
 
-	// Graceful shutdown via Firecracker API — skip for migrating VMs since they're
-	// paused and can't process CtrlAltDel (saves 10s of wasted waiting).
+	// Graceful shutdown — skip for migrating VMs since they're paused.
 	if !IsMigrating(vmDir) {
-		apiSock := filepath.Join(vmDir, "api.sock")
-		if _, err := os.Stat(apiSock); err == nil {
-			run("curl", "-s", "--unix-socket", apiSock,
-				"-X", "PUT", "http://localhost/actions",
-				"-H", "Content-Type: application/json",
-				"-d", `{"action_type":"SendCtrlAltDel"}`)
-
+		if st.Type == "qemu" {
+			// QEMU: SIGTERM triggers ACPI shutdown
+			syscall.Kill(pid, syscall.SIGTERM)
 			for i := 0; i < 10; i++ {
 				if err := syscall.Kill(pid, 0); err != nil {
-					log.Printf("stopVM %s: PID %d exited after CtrlAltDel", name, pid)
+					log.Printf("stopVM %s: PID %d exited after SIGTERM", name, pid)
 					goto cleanup
 				}
 				time.Sleep(time.Second)
+			}
+		} else {
+			// Firecracker: CtrlAltDel via API
+			apiSock := filepath.Join(vmDir, "api.sock")
+			if _, err := os.Stat(apiSock); err == nil {
+				run("curl", "-s", "--unix-socket", apiSock,
+					"-X", "PUT", "http://localhost/actions",
+					"-H", "Content-Type: application/json",
+					"-d", `{"action_type":"SendCtrlAltDel"}`)
+
+				for i := 0; i < 10; i++ {
+					if err := syscall.Kill(pid, 0); err != nil {
+						log.Printf("stopVM %s: PID %d exited after CtrlAltDel", name, pid)
+						goto cleanup
+					}
+					time.Sleep(time.Second)
+				}
 			}
 		}
 	}
@@ -530,7 +550,7 @@ func (m *Manager) stopVM(name string) error {
 	}
 
 cleanup:
-	os.Remove(pidFile)
+	os.Remove(filepath.Join(vmDir, PIDFile(st.Type)))
 	os.Remove(filepath.Join(vmDir, "api.sock"))
 
 	if st.Mark != 0 {
@@ -606,8 +626,13 @@ func (m *Manager) List() ([]map[string]interface{}, error) {
 	var result []map[string]interface{}
 	for _, st := range vms {
 		status := DeriveStatus(VMDir(st.Name))
+		vmType := st.Type
+		if vmType == "" {
+			vmType = "firecracker"
+		}
 		result = append(result, map[string]interface{}{
 			"name":         st.Name,
+			"type":         vmType,
 			"tailscale_ip": st.TailscaleIP,
 			"mark":         st.Mark,
 			"mode":         st.Mode,
@@ -1666,6 +1691,12 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	st, err := LoadVMState(vmDir)
 	if err != nil {
 		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+
+	// QEMU VMs don't support snapshot-based live migration (yet).
+	// Stopped QEMU VMs can still be relocated via file transfer.
+	if st.Type == "qemu" && IsRunning(vmDir) {
+		return nil, fmt.Errorf("live migration is not supported for QEMU VMs (stop the VM first)")
 	}
 
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
