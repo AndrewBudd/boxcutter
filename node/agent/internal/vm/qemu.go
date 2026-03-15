@@ -70,9 +70,11 @@ func launchQEMU(vmDir string, st *VMState) (int, error) {
 		return 0, fmt.Errorf("no kernel found for QEMU VM (checked /var/lib/boxcutter/kernel/vmlinuz-qemu and /boot/vmlinuz-*)")
 	}
 
-	// Boot args: direct kernel boot with network config via kernel ip= parameter
+	// Boot args: direct kernel boot with network config via kernel ip= parameter.
+	// net.ifnames=0 biosdevname=0: force classic eth0 naming (Ubuntu uses predictable names).
 	bootArgs := fmt.Sprintf(
 		"console=ttyS0 root=/dev/vda rw init=/sbin/init "+
+			"net.ifnames=0 biosdevname=0 "+
 			"ip=10.0.0.2::10.0.0.1:255.255.255.252:%s:eth0:off:8.8.8.8",
 		st.Name)
 
@@ -87,7 +89,7 @@ func launchQEMU(vmDir string, st *VMState) (int, error) {
 		"-netdev", fmt.Sprintf("tap,id=net0,ifname=%s,script=no,downscript=no", st.TAP),
 		"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", st.MAC),
 		"-serial", fmt.Sprintf("file:%s", logPath),
-		"-nographic",
+		"-display", "none",
 		"-no-reboot",
 		"-pidfile", pidFile,
 		"-daemonize",
