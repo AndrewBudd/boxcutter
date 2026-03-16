@@ -184,6 +184,58 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 	tailscaleDefaults := filepath.Join(mountPoint, "etc", "default", "tailscaled")
 	os.WriteFile(tailscaleDefaults, []byte("PORT=0\nFLAGS=\n"), 0644)
 
+	// Add dev user to docker group (created when Docker is installed at first boot).
+	// Also create a firstboot script that installs Docker + adds the user.
+	firstbootDir := filepath.Join(mountPoint, "etc", "boxcutter")
+	os.MkdirAll(firstbootDir, 0755)
+	os.WriteFile(filepath.Join(firstbootDir, "qemu-firstboot.sh"), []byte(`#!/bin/bash
+# QEMU VM first-boot setup: install Docker, configure for dev user
+set -e
+MARKER=/etc/boxcutter/.qemu-firstboot-done
+[ -f "$MARKER" ] && exit 0
+
+# Install Docker if not present
+if ! command -v docker &>/dev/null; then
+    curl -fsSL https://get.docker.com | sh 2>/dev/null
+fi
+
+# Add dev user to docker group
+usermod -aG docker dev 2>/dev/null || true
+
+# Set iptables to legacy (Docker needs this in nested KVM)
+update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+
+# Enable + start Docker
+systemctl enable docker 2>/dev/null || true
+systemctl start docker 2>/dev/null || true
+
+touch "$MARKER"
+`), 0755)
+
+	// Create systemd service for firstboot
+	systemdDir := filepath.Join(mountPoint, "etc", "systemd", "system")
+	os.WriteFile(filepath.Join(systemdDir, "boxcutter-qemu-firstboot.service"), []byte(`[Unit]
+Description=Boxcutter QEMU first-boot setup (Docker install)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/etc/boxcutter/.qemu-firstboot-done
+
+[Service]
+Type=oneshot
+ExecStart=/etc/boxcutter/qemu-firstboot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+`), 0644)
+
+	// Enable the service
+	wantsDir := filepath.Join(systemdDir, "multi-user.target.wants")
+	os.MkdirAll(wantsDir, 0755)
+	os.Symlink("/etc/systemd/system/boxcutter-qemu-firstboot.service",
+		filepath.Join(wantsDir, "boxcutter-qemu-firstboot.service"))
+
 	log.Printf("QEMU VM %s: rootfs prepared (modules, iptables-legacy, docker config)", st.Name)
 }
 
