@@ -1028,6 +1028,15 @@ func (m *Manager) prepareRootfs(st *VMState, authorizedKeys []string) {
 	}
 	defer run("umount", mountDir)
 
+	// Write VM type so processes inside can identify the hypervisor
+	vmType := st.Type
+	if vmType == "" {
+		vmType = "firecracker"
+	}
+	bcDir := filepath.Join(mountDir, "etc", "boxcutter")
+	os.MkdirAll(bcDir, 0755)
+	os.WriteFile(filepath.Join(bcDir, "vm-type"), []byte(vmType+"\n"), 0644)
+
 	// CA cert
 	caCert := m.cfg.TLS.CACertPath
 	if _, err := os.Stat(caCert); err == nil {
