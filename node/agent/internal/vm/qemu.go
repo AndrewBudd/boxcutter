@@ -19,7 +19,8 @@ const (
 )
 
 // findQEMUKernel finds the best kernel to use for QEMU VMs.
-// Prefers a dedicated QEMU kernel if available, falls back to the node's kernel.
+// Uses the RUNNING kernel (uname -r) to ensure kernel and modules match.
+// A dedicated QEMU kernel at /var/lib/boxcutter/kernel/vmlinuz-qemu takes priority.
 func findQEMUKernel() (kernel string, initrd string) {
 	// Check for dedicated QEMU kernel
 	dedicated := "/var/lib/boxcutter/kernel/vmlinuz-qemu"
@@ -31,25 +32,19 @@ func findQEMUKernel() (kernel string, initrd string) {
 		return dedicated, ""
 	}
 
-	// Fall back to node VM's own kernel (symlink at /boot/vmlinuz)
-	if target, err := os.Readlink(defaultQEMUKernel); err == nil {
-		kernel = filepath.Join("/boot", target)
-	} else if _, err := os.Stat(defaultQEMUKernel); err == nil {
-		kernel = defaultQEMUKernel
-	} else {
-		// Search /boot for vmlinuz-*
-		entries, _ := filepath.Glob("/boot/vmlinuz-*")
-		if len(entries) > 0 {
-			kernel = entries[len(entries)-1] // latest version
-		}
-	}
-
-	if kernel == "" {
+	// Use the RUNNING kernel — not the /boot/vmlinuz symlink which may point
+	// to a newer installed-but-not-booted kernel. The modules we copy into
+	// the guest rootfs come from uname -r, so the kernel must match.
+	kver := kernelVersion()
+	if kver == "" {
 		return "", ""
 	}
 
-	// Find matching initrd
-	kver := strings.TrimPrefix(filepath.Base(kernel), "vmlinuz-")
+	kernel = fmt.Sprintf("/boot/vmlinuz-%s", kver)
+	if _, err := os.Stat(kernel); err != nil {
+		return "", ""
+	}
+
 	initrdPath := fmt.Sprintf("/boot/initrd.img-%s", kver)
 	if _, err := os.Stat(initrdPath); err == nil {
 		return kernel, initrdPath
