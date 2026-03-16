@@ -171,12 +171,14 @@ All commands go through the orchestrator SSH interface:
 
 ```bash
 ssh boxcutter new [options]        # Create a new VM
-  --clone <repo>                   #   Clone repo on creation
+  --type <type>                    #   firecracker (default) or qemu
+  --clone <repo>                   #   Clone repo on creation (repeatable)
   --vcpu <N>                       #   CPU cores (default: 2)
   --ram <MiB>                      #   RAM in MiB (default: 2048)
   --disk <size>                    #   Disk size (default: 50G)
   --mode normal|paranoid           #   Network mode (default: normal)
-ssh boxcutter list                 # List all VMs
+  --node <node-id>                 #   Pin to specific node
+ssh boxcutter list                 # List all VMs (shows type: fc/qemu)
 ssh boxcutter destroy <name>       # Destroy a VM
 ssh boxcutter stop <name>          # Stop a running VM
 ssh boxcutter start <name>         # Start a stopped VM
@@ -184,6 +186,47 @@ ssh boxcutter cp <name> [new-name] # Clone a VM's disk
 ssh boxcutter status               # Cluster capacity summary
 ssh boxcutter nodes                # List all nodes with health
 ssh boxcutter adduser <github>     # Add SSH keys from GitHub
+ssh boxcutter repos add <vm> <repo>  # Grant GitHub repo access to a VM
+ssh boxcutter repos list <vm>        # List repos a VM can access
+```
+
+## VM Types: Firecracker vs QEMU
+
+Boxcutter supports two VM backends:
+
+**Firecracker** (default) -- lightweight microVMs that boot in ~200ms. Best for most dev workloads. Limitations: no Docker support (minimal kernel lacks netfilter modules).
+
+**QEMU** (`--type qemu`) -- full VMs with a complete Linux kernel. Docker and docker-compose work out of the box. Boot time is ~5-10 seconds. Use this when your project needs Docker, docker-compose, or other workloads that require full kernel support.
+
+```bash
+# Firecracker VM (default, fast, lightweight)
+ssh boxcutter new
+
+# QEMU VM (Docker support, full kernel)
+ssh boxcutter new --type qemu --ram 4096
+
+# QEMU VM with a repo cloned
+ssh boxcutter new --type qemu --ram 4096 --clone github.com/org/repo
+```
+
+VMs can identify their type by reading `/etc/boxcutter/vm-type` (contains `firecracker` or `qemu`).
+
+The `list` command shows the type for each VM:
+
+```
+NAME          TAILSCALE IP    NODE              TYPE   VCPU  RAM   MODE    STATUS
+my-vm         100.64.1.42     boxcutter-node-1  fc     2     2G    normal  running
+docker-dev    100.64.1.43     boxcutter-node-1  qemu   2     4G    normal  running
+```
+
+### GitHub Repo Access
+
+When cloning private repos or using git submodules, grant access via `repos add`:
+
+```bash
+ssh boxcutter repos add my-vm org/main-repo
+ssh boxcutter repos add my-vm org/submodule-repo
+# Then inside the VM, git clone / submodule update will work
 ```
 
 ## After a Host Reboot
@@ -229,7 +272,9 @@ This scans `/proc` for running QEMU processes and rebuilds the state file. Nothi
 
 ## Migration
 
-Firecracker VMs are live-migrated between nodes during drain operations using snapshot/restore. The VM pauses, its memory is snapshotted, transferred to the target node, and resumed. Processes, memory, and Tailscale connections survive. Downtime is typically 1-10 seconds.
+**Firecracker VMs** are live-migrated between nodes during drain operations using snapshot/restore. The VM pauses, its memory is snapshotted, transferred to the target node, and resumed. Processes, memory, and Tailscale connections survive. Downtime is typically 1-10 seconds.
+
+**QEMU VMs** do not support live migration. They can be relocated when stopped (stop → transfer files → start on new node). During node drains, running QEMU VMs are skipped.
 
 ## Troubleshooting
 
