@@ -225,12 +225,13 @@ func (h *Handler) cmdList() int {
 	var vms []map[string]interface{}
 	json.Unmarshal(resp, &vms)
 
-	fmt.Printf("%-20s %-18s %-12s %-8s %-8s %-8s %-8s\n",
-		"NAME", "TAILSCALE IP", "NODE", "MODE", "VCPU", "RAM", "STATUS")
+	fmt.Printf("%-20s %-18s %-12s %-8s %-5s %-8s %-8s %-8s\n",
+		"NAME", "TAILSCALE IP", "NODE", "TYPE", "VCPU", "RAM", "MODE", "STATUS")
 	for _, v := range vms {
 		name, _ := v["name"].(string)
 		tsIP, _ := v["tailscale_ip"].(string)
 		nodeName, _ := v["node_name"].(string)
+		vmType, _ := v["type"].(string)
 		mode, _ := v["mode"].(string)
 		vcpu, _ := v["vcpu"].(float64)
 		ramMIB, _ := v["ram_mib"].(float64)
@@ -238,9 +239,12 @@ func (h *Handler) cmdList() int {
 		if tsIP == "" {
 			tsIP = "-"
 		}
+		if vmType == "" || vmType == "firecracker" {
+			vmType = "fc"
+		}
 
-		fmt.Printf("%-20s %-18s %-12s %-8s %-8.0f %-8s %-8s\n",
-			name, tsIP, nodeName, mode, vcpu, fmt.Sprintf("%.0fG", ramMIB/1024), status)
+		fmt.Printf("%-20s %-18s %-12s %-8s %-5.0f %-8s %-8s %-8s\n",
+			name, tsIP, nodeName, vmType, vcpu, fmt.Sprintf("%.0fG", ramMIB/1024), mode, status)
 	}
 	return 0
 }

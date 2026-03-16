@@ -42,6 +42,7 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 
 type registerRequest struct {
 	VMID        string            `json:"vm_id"`
+	VMType      string            `json:"vm_type,omitempty"`
 	IP          string            `json:"ip"`
 	Mark        int               `json:"mark"`
 	Mode        string            `json:"mode"`
@@ -66,6 +67,7 @@ func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	rec := &registry.VMRecord{
 		VMID:        req.VMID,
+		VMType:      req.VMType,
 		IP:          req.IP,
 		Mark:        req.Mark,
 		Mode:        req.Mode,

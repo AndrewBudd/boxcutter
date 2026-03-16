@@ -30,6 +30,7 @@ func NewClient(socketPath string) *Client {
 
 type RegisterRequest struct {
 	VMID        string   `json:"vm_id"`
+	VMType      string   `json:"vm_type,omitempty"` // "firecracker" or "qemu"
 	IP          string   `json:"ip"`
 	Mark        int      `json:"mark"`
 	Mode        string   `json:"mode"`

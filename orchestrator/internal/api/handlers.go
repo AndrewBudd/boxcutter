@@ -446,6 +446,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 // vmListEntry is the enriched VM info returned by the list endpoint.
 type vmListEntry struct {
 	Name        string `json:"name"`
+	Type        string `json:"type"`
 	NodeID      string `json:"node_id"`
 	NodeName    string `json:"node_name"`
 	TailscaleIP string `json:"tailscale_ip"`
@@ -519,6 +520,7 @@ func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
 		// Enrich with node detail if available
 		if nodeDetail, ok := detailsByNode[v.NodeID]; ok {
 			if detail, ok := nodeDetail[v.Name]; ok {
+				entry.Type = detail.Type
 				entry.TailscaleIP = detail.TailscaleIP
 				entry.Mode = detail.Mode
 				entry.VCPU = detail.VCPU

@@ -420,8 +420,13 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 
 	// Register with vmid
 	if m.vmid != nil {
+		vmType := st.Type
+		if vmType == "" {
+			vmType = "firecracker"
+		}
 		m.vmid.Register(&vmid.RegisterRequest{
 			VMID:        st.Name,
+			VMType:      vmType,
 			IP:          "10.0.0.2",
 			Mark:        st.Mark,
 			Mode:        st.Mode,
@@ -2321,8 +2326,13 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 
 	// Register with vmid
 	if m.vmid != nil {
+		vmType := st.Type
+		if vmType == "" {
+			vmType = "firecracker"
+		}
 		m.vmid.Register(&vmid.RegisterRequest{
 			VMID:        st.Name,
+			VMType:      vmType,
 			IP:          "10.0.0.2",
 			Mark:        st.Mark,
 			Mode:        st.Mode,

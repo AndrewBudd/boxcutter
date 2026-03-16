@@ -306,6 +306,7 @@ func (c *Client) CopyStreaming(srcName, dstName string, onProgress func(*Progres
 // VMDetail is the full VM info returned by the node agent.
 type VMDetail struct {
 	Name        string `json:"name"`
+	Type        string `json:"type"`
 	TailscaleIP string `json:"tailscale_ip"`
 	Mark        int    `json:"mark"`
 	Mode        string `json:"mode"`
