@@ -47,6 +47,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleAddRepo)
 	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleRemoveRepo)
 	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleListRepos)
+	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleLogs)
 	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
 	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
@@ -599,6 +600,85 @@ func (h *Handler) handleGoldenBuild(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Golden image build complete")
 	emit("ready", "Golden image ready")
+}
+
+func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+		name = strings.TrimSuffix(name, "/logs")
+	}
+
+	vmDir := vm.VMDir(name)
+	if _, err := vm.LoadVMState(vmDir); err != nil {
+		http.Error(w, fmt.Sprintf("VM '%s' not found", name), http.StatusNotFound)
+		return
+	}
+
+	// Try console.log (QEMU) first, then firecracker.log
+	var logPath string
+	for _, candidate := range []string{"console.log", "firecracker.log"} {
+		p := filepath.Join(vmDir, candidate)
+		if _, err := os.Stat(p); err == nil {
+			logPath = p
+			break
+		}
+	}
+	if logPath == "" {
+		http.Error(w, "no log file found", http.StatusNotFound)
+		return
+	}
+
+	// Return last N lines (default 100, configurable via ?lines=N)
+	lines := 100
+	if l := r.URL.Query().Get("lines"); l != "" {
+		fmt.Sscanf(l, "%d", &lines)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Strip ANSI escape codes for clean output
+	clean := stripANSI(string(data))
+
+	// Split and take last N lines
+	allLines := strings.Split(clean, "\n")
+	start := 0
+	if len(allLines) > lines {
+		start = len(allLines) - lines
+	}
+	output := strings.Join(allLines[start:], "\n")
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(output))
+}
+
+// stripANSI removes ANSI escape sequences and carriage returns from text.
+func stripANSI(s string) string {
+	// Remove ESC[...m (SGR), ESC[...K (erase), and other CSI sequences
+	result := make([]byte, 0, len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// Skip CSI sequence until final byte (letter)
+			i += 2
+			for i < len(s) && !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
+				i++
+			}
+			if i < len(s) {
+				i++ // skip final byte
+			}
+		} else if s[i] == '\r' || s[i] == '\x1b' {
+			i++
+		} else {
+			result = append(result, s[i])
+			i++
+		}
+	}
+	return string(result)
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {

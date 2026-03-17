@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -139,6 +140,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms", h.migrationGuard(h.handleVMCreate))
 	mux.HandleFunc("GET /api/vms", h.handleVMList)
 	mux.HandleFunc("GET /api/vms/{name}", h.handleVMGet)
+	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleVMLogs)
 	mux.HandleFunc("DELETE /api/vms/{name}", h.migrationGuard(h.handleVMDestroy))
 	mux.HandleFunc("POST /api/vms/{name}/stop", h.migrationGuard(h.handleVMStop))
 	mux.HandleFunc("POST /api/vms/{name}/start", h.migrationGuard(h.handleVMStart))
@@ -569,6 +571,45 @@ func (h *Handler) handleVMGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, result)
+}
+
+func (h *Handler) handleVMLogs(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+		name = strings.TrimSuffix(name, "/logs")
+	}
+
+	vm, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+
+	n, err := h.db.GetNode(vm.NodeID)
+	if err != nil || n == nil {
+		http.Error(w, "node not found", http.StatusNotFound)
+		return
+	}
+
+	// Proxy to the node agent's logs endpoint
+	lines := r.URL.Query().Get("lines")
+	url := fmt.Sprintf("http://%s/api/vms/%s/logs", n.APIAddr, name)
+	if lines != "" {
+		url += "?lines=" + lines
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		http.Error(w, "node unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func (h *Handler) handleVMDestroy(w http.ResponseWriter, r *http.Request) {

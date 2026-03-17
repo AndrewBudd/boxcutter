@@ -43,6 +43,12 @@ func (h *Handler) Run(args []string) int {
 			return 1
 		}
 		return h.cmdDestroy(target)
+	case "logs":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> logs <vm-name> [--lines N]")
+			return 1
+		}
+		return h.cmdLogs(target, args[2:])
 	case "stop":
 		if target == "" {
 			fmt.Println("Usage: ssh <host> stop <vm-name>")
@@ -246,6 +252,24 @@ func (h *Handler) cmdList() int {
 		fmt.Printf("%-20s %-18s %-12s %-8s %-5.0f %-8s %-8s %-8s\n",
 			name, tsIP, nodeName, vmType, vcpu, fmt.Sprintf("%.0fG", ramMIB/1024), mode, status)
 	}
+	return 0
+}
+
+func (h *Handler) cmdLogs(name string, args []string) int {
+	lines := "100"
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--lines" && i+1 < len(args) {
+			lines = args[i+1]
+			i++
+		}
+	}
+
+	resp, err := h.get(fmt.Sprintf("/api/vms/%s/logs?lines=%s", name, lines))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	fmt.Print(string(resp))
 	return 0
 }
 
@@ -615,6 +639,7 @@ Commands:
     --mode normal|paranoid  Network mode (default: normal)
     --node <node-id>        Pin to specific node
   list                    List all VMs
+  logs <name> [--lines N] Show VM console/system logs (default: last 100 lines)
   destroy <name>          Destroy a VM
   stop <name>             Stop a running VM
   start <name>            Start a stopped VM
