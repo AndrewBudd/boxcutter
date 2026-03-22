@@ -10,16 +10,19 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className="dark">
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+      </head>
       <body className="bg-gray-950 text-gray-100 min-h-screen">
-        <div className="flex min-h-screen">
-          <nav className="w-48 bg-gray-900 border-r border-gray-800 p-4 flex flex-col gap-1">
-            <Link href="/" className="text-lg font-bold text-white mb-4 block">Boxcutter</Link>
+        <nav className="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center gap-4 overflow-x-auto">
+          <Link href="/" className="text-lg font-bold text-white whitespace-nowrap">Boxcutter</Link>
+          <div className="flex gap-1">
             <NavLink href="/">Dashboard</NavLink>
             <NavLink href="/activity">Activity</NavLink>
             <NavLink href="/nodes">Nodes</NavLink>
-          </nav>
-          <main className="flex-1 p-6">{children}</main>
-        </div>
+          </div>
+        </nav>
+        <main className="p-4 md:p-6">{children}</main>
       </body>
     </html>
   )
@@ -29,7 +32,7 @@ function NavLink({ href, children }: { href: string; children: React.ReactNode }
   return (
     <Link
       href={href}
-      className="block px-3 py-2 rounded text-sm text-gray-300 hover:bg-gray-800 hover:text-white transition-colors"
+      className="px-3 py-1.5 rounded text-sm text-gray-300 hover:bg-gray-800 hover:text-white transition-colors whitespace-nowrap"
     >
       {children}
     </Link>

@@ -58,7 +58,7 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
         <p className="text-gray-400 mb-4">{vm.description}</p>
       )}
 
-      <div className="grid grid-cols-4 gap-4 mb-6">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 mb-6">
         <Info label="Type" value={String(vm?.type || 'fc')} />
         <Info label="Status" value={String(vm?.status || '...')} />
         <Info label="Tailscale IP" value={tsIP || '-'} />

@@ -1677,7 +1677,8 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		if run("mount", RootfsPath(dstDir), mountDir) == nil {
 			os.WriteFile(filepath.Join(mountDir, "etc/hostname"), []byte(dstName+"\n"), 0644)
 			os.RemoveAll(filepath.Join(mountDir, "var/lib/tailscale"))
-			// Also remove SSH host keys so the copy gets fresh ones
+			// Regenerate SSH host keys so the copy gets fresh ones.
+			// Delete existing keys then use ssh-keygen to create new ones.
 			exec.Command("rm", "-f",
 				filepath.Join(mountDir, "etc/ssh/ssh_host_rsa_key"),
 				filepath.Join(mountDir, "etc/ssh/ssh_host_rsa_key.pub"),
@@ -1686,6 +1687,12 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 				filepath.Join(mountDir, "etc/ssh/ssh_host_ed25519_key"),
 				filepath.Join(mountDir, "etc/ssh/ssh_host_ed25519_key.pub"),
 			).Run()
+			exec.Command("ssh-keygen", "-t", "ed25519", "-f",
+				filepath.Join(mountDir, "etc/ssh/ssh_host_ed25519_key"), "-N", "").Run()
+			exec.Command("ssh-keygen", "-t", "rsa", "-f",
+				filepath.Join(mountDir, "etc/ssh/ssh_host_rsa_key"), "-N", "").Run()
+			exec.Command("ssh-keygen", "-t", "ecdsa", "-f",
+				filepath.Join(mountDir, "etc/ssh/ssh_host_ecdsa_key"), "-N", "").Run()
 			log.Printf("CopyVM %s: hostname set, tailscale state wiped, SSH keys regenerated", dstName)
 			run("umount", mountDir)
 		} else {
