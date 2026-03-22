@@ -1671,26 +1671,38 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		}
 	}
 
-	// Mount the copied rootfs and update hostname
+	// Mount the copied rootfs and update hostname + wipe Tailscale state
 	mountDir, err := os.MkdirTemp("", "bc-mount-")
 	if err == nil {
 		if run("mount", RootfsPath(dstDir), mountDir) == nil {
-			// Update hostname
 			os.WriteFile(filepath.Join(mountDir, "etc/hostname"), []byte(dstName+"\n"), 0644)
-			// Remove Tailscale state so it gets a fresh identity
 			os.RemoveAll(filepath.Join(mountDir, "var/lib/tailscale"))
+			// Also remove SSH host keys so the copy gets fresh ones
+			exec.Command("rm", "-f",
+				filepath.Join(mountDir, "etc/ssh/ssh_host_rsa_key"),
+				filepath.Join(mountDir, "etc/ssh/ssh_host_rsa_key.pub"),
+				filepath.Join(mountDir, "etc/ssh/ssh_host_ecdsa_key"),
+				filepath.Join(mountDir, "etc/ssh/ssh_host_ecdsa_key.pub"),
+				filepath.Join(mountDir, "etc/ssh/ssh_host_ed25519_key"),
+				filepath.Join(mountDir, "etc/ssh/ssh_host_ed25519_key.pub"),
+			).Run()
+			log.Printf("CopyVM %s: hostname set, tailscale state wiped, SSH keys regenerated", dstName)
 			run("umount", mountDir)
+		} else {
+			log.Printf("CopyVM %s: WARNING — could not mount rootfs to update hostname/tailscale", dstName)
 		}
 		os.RemoveAll(mountDir)
 	}
 
-	// Start the new VM
+	// Start the new VM and run post-start (Tailscale join, vmid registration)
 	resp, err := m.startVM(dstSt, progress)
 	if err != nil {
 		CleanupSnapshot(dstDir)
 		os.RemoveAll(dstDir)
 		return nil, fmt.Errorf("starting copied VM: %w", err)
 	}
+
+	m.postStartVM(dstSt, resp, progress)
 
 	return resp, nil
 }
