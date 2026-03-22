@@ -678,13 +678,22 @@ func (h *Handler) handleLogs(w http.ResponseWriter, r *http.Request) {
 	// Strip ANSI escape codes for clean output
 	clean := stripANSI(string(data))
 
-	// Split and take last N lines
-	allLines := strings.Split(clean, "\n")
-	start := 0
-	if len(allLines) > lines {
-		start = len(allLines) - lines
+	// Filter out ttyS0 timeout spam — this is normal on every Firecracker
+	// boot and resolves after 90s, but pollutes logs and confuses agents.
+	var filtered []string
+	for _, line := range strings.Split(clean, "\n") {
+		if strings.Contains(line, "Job dev-ttyS0.device/start running") {
+			continue
+		}
+		filtered = append(filtered, line)
 	}
-	output := strings.Join(allLines[start:], "\n")
+
+	// Take last N lines
+	start := 0
+	if len(filtered) > lines {
+		start = len(filtered) - lines
+	}
+	output := strings.Join(filtered[start:], "\n")
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(output))

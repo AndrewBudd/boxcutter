@@ -163,6 +163,13 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 	chroot("update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null")
 	chroot("update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null")
 
+	// Mask serial-getty on ttyS0 — QEMU serial is redirected to a log file,
+	// so there's no real tty device. Without this, systemd waits 90s for
+	// dev-ttyS0.device to appear, spamming the console log.
+	sysDir := filepath.Join(mountPoint, "etc", "systemd", "system")
+	os.MkdirAll(sysDir, 0755)
+	os.Symlink("/dev/null", filepath.Join(sysDir, "serial-getty@ttyS0.service"))
+
 	// Create /etc/modules-load.d to auto-load Docker-required modules on boot
 	// kmod is installed in the golden image (Dockerfile)
 	modulesDir := filepath.Join(mountPoint, "etc", "modules-load.d")
