@@ -1568,9 +1568,13 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		}
 	}
 
-	// Pause source VM if running (freezes vCPUs for consistent COW copy)
+	// Pause source VM if running (freezes vCPUs for consistent disk copy).
+	// Only Firecracker supports pause via API. QEMU VMs must be stopped first.
 	wasRunning := IsRunning(srcDir)
 	if wasRunning {
+		if srcSt.Type == "qemu" {
+			return nil, fmt.Errorf("QEMU VMs must be stopped before copying (use: ssh boxcutter stop %s)", srcName)
+		}
 		progress("copy", "Pausing source VM...")
 		if err := fcPause(srcDir); err != nil {
 			return nil, fmt.Errorf("pausing source VM: %w", err)
@@ -1642,25 +1646,29 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 	}
 
 	dstSt := &VMState{
-		Name:       dstName,
-		VCPU:       srcSt.VCPU,
-		RAMMIB:     srcSt.RAMMIB,
-		Mark:       mark,
-		Mode:       srcSt.Mode,
-		MAC:        fixedMAC,
-		Disk:       srcSt.Disk,
-		TAP:        tap,
-		Created:    time.Now().Format(time.RFC3339),
-		GoldenVer:  srcSt.GoldenVer,
+		Name:        dstName,
+		Type:        srcSt.Type,
+		Description: srcSt.Description,
+		VCPU:        srcSt.VCPU,
+		RAMMIB:      srcSt.RAMMIB,
+		Mark:        mark,
+		Mode:        srcSt.Mode,
+		MAC:         fixedMAC,
+		Disk:        srcSt.Disk,
+		TAP:         tap,
+		Created:     time.Now().Format(time.RFC3339),
+		GoldenVer:   srcSt.GoldenVer,
 	}
 	if err := SaveVMState(dstDir, dstSt); err != nil {
 		os.RemoveAll(dstDir)
 		return nil, err
 	}
 
-	if err := writeFirecrackerConfig(dstDir, dstSt); err != nil {
-		os.RemoveAll(dstDir)
-		return nil, err
+	if dstSt.Type != "qemu" {
+		if err := writeFirecrackerConfig(dstDir, dstSt); err != nil {
+			os.RemoveAll(dstDir)
+			return nil, err
+		}
 	}
 
 	// Mount the copied rootfs and update hostname
