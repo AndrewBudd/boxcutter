@@ -33,9 +33,10 @@ export default function TerminalView({ vmName, tailscaleIP }: { vmName: string; 
 
     terminal.writeln(`Connecting to ${vmName} (${tailscaleIP})...`)
 
-    // Connect WebSocket to terminal server
-    const wsHost = window.location.hostname
-    const ws = new WebSocket(`ws://${wsHost}:3001/ws?vm=${vmName}&ip=${tailscaleIP}`)
+    // Connect WebSocket through nginx (wss on 443, or ws on 3001 for dev)
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const wsHost = window.location.host // includes port if non-standard
+    const ws = new WebSocket(`${proto}://${wsHost}/ws?vm=${vmName}&ip=${tailscaleIP}`)
 
     ws.onopen = () => {
       terminal.writeln('Connected.\r\n')
