@@ -39,3 +39,5 @@ host/host
 # OS
 .DS_Store
 .release/
+web/node_modules/
+web/.next/
