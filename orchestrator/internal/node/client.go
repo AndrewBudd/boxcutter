@@ -26,7 +26,8 @@ func NewClient(apiAddr string) *Client {
 
 type CreateRequest struct {
 	Name           string   `json:"name"`
-	Type           string   `json:"type,omitempty"` // "firecracker" (default) or "qemu"
+	Type           string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
+	Description    string   `json:"description,omitempty"` // user-provided description
 	VCPU           int      `json:"vcpu,omitempty"`
 	RAMMIB         int      `json:"ram_mib,omitempty"`
 	Disk           string   `json:"disk,omitempty"`
@@ -307,6 +308,7 @@ func (c *Client) CopyStreaming(srcName, dstName string, onProgress func(*Progres
 type VMDetail struct {
 	Name        string `json:"name"`
 	Type        string `json:"type"`
+	Description string `json:"description"`
 	TailscaleIP string `json:"tailscale_ip"`
 	Mark        int    `json:"mark"`
 	Mode        string `json:"mode"`

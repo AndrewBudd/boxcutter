@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -141,6 +142,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/vms", h.handleVMList)
 	mux.HandleFunc("GET /api/vms/{name}", h.handleVMGet)
 	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleVMLogs)
+	mux.HandleFunc("PATCH /api/vms/{name}", h.handleVMUpdate)
 	mux.HandleFunc("DELETE /api/vms/{name}", h.migrationGuard(h.handleVMDestroy))
 	mux.HandleFunc("POST /api/vms/{name}/stop", h.migrationGuard(h.handleVMStop))
 	mux.HandleFunc("POST /api/vms/{name}/start", h.migrationGuard(h.handleVMStart))
@@ -265,15 +267,16 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 // --- VM handlers ---
 
 type vmCreateRequest struct {
-	Name      string   `json:"name"`
-	Type      string   `json:"type,omitempty"` // "firecracker" (default) or "qemu"
-	VCPU      int      `json:"vcpu,omitempty"`
-	RAMMIB    int      `json:"ram_mib,omitempty"`
-	Disk      string   `json:"disk,omitempty"`
-	CloneURL  string   `json:"clone_url,omitempty"`
-	CloneURLs []string `json:"clone_urls,omitempty"`
-	Mode      string   `json:"mode,omitempty"`
-	NodeID    string   `json:"node_id,omitempty"` // optional: pin to specific node
+	Name        string   `json:"name"`
+	Type        string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
+	Description string   `json:"description,omitempty"` // user-provided description
+	VCPU        int      `json:"vcpu,omitempty"`
+	RAMMIB      int      `json:"ram_mib,omitempty"`
+	Disk        string   `json:"disk,omitempty"`
+	CloneURL    string   `json:"clone_url,omitempty"`
+	CloneURLs   []string `json:"clone_urls,omitempty"`
+	Mode        string   `json:"mode,omitempty"`
+	NodeID      string   `json:"node_id,omitempty"` // optional: pin to specific node
 }
 
 func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
@@ -383,6 +386,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		resp, err := client.CreateStreaming(&node.CreateRequest{
 			Name:           req.Name,
 			Type:           req.Type,
+			Description:    req.Description,
 			VCPU:           req.VCPU,
 			RAMMIB:         req.RAMMIB,
 			Disk:           req.Disk,
@@ -449,6 +453,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 type vmListEntry struct {
 	Name        string `json:"name"`
 	Type        string `json:"type"`
+	Description string `json:"description,omitempty"`
 	NodeID      string `json:"node_id"`
 	NodeName    string `json:"node_name"`
 	TailscaleIP string `json:"tailscale_ip"`
@@ -523,6 +528,7 @@ func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
 		if nodeDetail, ok := detailsByNode[v.NodeID]; ok {
 			if detail, ok := nodeDetail[v.Name]; ok {
 				entry.Type = detail.Type
+				entry.Description = detail.Description
 				entry.TailscaleIP = detail.TailscaleIP
 				entry.Mode = detail.Mode
 				entry.VCPU = detail.VCPU
@@ -608,6 +614,43 @@ func (h *Handler) handleVMLogs(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+func (h *Handler) handleVMUpdate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+	}
+
+	vmRec, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+
+	n, err := h.db.GetNode(vmRec.NodeID)
+	if err != nil || n == nil {
+		http.Error(w, "node not found", http.StatusNotFound)
+		return
+	}
+
+	// Proxy PATCH to the node agent
+	body, _ := io.ReadAll(r.Body)
+	url := fmt.Sprintf("http://%s/api/vms/%s", n.APIAddr, name)
+	req, _ := http.NewRequest("PATCH", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "node unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }

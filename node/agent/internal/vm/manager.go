@@ -85,7 +85,8 @@ type ProgressFunc func(phase, message string)
 // CreateRequest is the API input for creating a VM.
 type CreateRequest struct {
 	Name           string   `json:"name"`
-	Type           string   `json:"type,omitempty"` // "firecracker" (default) or "qemu"
+	Type           string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
+	Description    string   `json:"description,omitempty"` // user-provided description
 	VCPU           int      `json:"vcpu,omitempty"`
 	RAMMIB         int      `json:"ram_mib,omitempty"`
 	Disk           string   `json:"disk,omitempty"`
@@ -212,6 +213,7 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 		st = &VMState{
 			Name:        req.Name,
 			Type:        req.Type,
+			Description: req.Description,
 			VCPU:        req.VCPU,
 			RAMMIB:      req.RAMMIB,
 			Mark:        mark,
@@ -638,6 +640,7 @@ func (m *Manager) List() ([]map[string]interface{}, error) {
 		result = append(result, map[string]interface{}{
 			"name":         st.Name,
 			"type":         vmType,
+			"description":  st.Description,
 			"tailscale_ip": st.TailscaleIP,
 			"mark":         st.Mark,
 			"mode":         st.Mode,

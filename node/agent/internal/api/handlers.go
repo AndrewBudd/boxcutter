@@ -48,6 +48,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleRemoveRepo)
 	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleListRepos)
 	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleLogs)
+	mux.HandleFunc("PATCH /api/vms/{name}", h.handleUpdate)
 	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
 	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
@@ -144,6 +145,39 @@ func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
 		"vm":     st,
 		"status": status,
 	})
+}
+
+func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+	}
+
+	var req struct {
+		Description *string `json:"description,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	vmDir := vm.VMDir(name)
+	st, err := vm.LoadVMState(vmDir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("VM '%s' not found", name), http.StatusNotFound)
+		return
+	}
+
+	if req.Description != nil {
+		st.Description = *req.Description
+	}
+
+	if err := vm.SaveVMState(vmDir, st); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{"status": "updated", "vm": st})
 }
 
 func (h *Handler) handleDestroy(w http.ResponseWriter, r *http.Request) {

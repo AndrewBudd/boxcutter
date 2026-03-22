@@ -12,7 +12,8 @@ import (
 // VMState is the persistent state for a VM, stored as vm.json.
 type VMState struct {
 	Name        string   `json:"name"`
-	Type        string   `json:"type,omitempty"` // "firecracker" (default/empty) or "qemu"
+	Type        string   `json:"type,omitempty"`        // "firecracker" (default/empty) or "qemu"
+	Description string   `json:"description,omitempty"` // user-provided description
 	VCPU        int      `json:"vcpu"`
 	RAMMIB      int      `json:"ram_mib"`
 	Mark        int      `json:"mark"`

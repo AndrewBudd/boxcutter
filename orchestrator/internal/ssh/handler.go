@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -61,6 +62,13 @@ func (h *Handler) Run(args []string) int {
 			return 1
 		}
 		return h.cmdStart(target)
+	case "describe":
+		if target == "" || len(args) < 3 {
+			fmt.Println("Usage: ssh <host> describe <vm-name> <description>")
+			return 1
+		}
+		desc := strings.Join(args[2:], " ")
+		return h.cmdDescribe(target, desc)
 	case "cp", "copy":
 		if target == "" {
 			fmt.Println("Usage: ssh <host> cp <source-vm> [new-name]")
@@ -154,6 +162,16 @@ func (h *Handler) cmdNew(args []string) int {
 				body["node_id"] = args[i+1]
 				i++
 			}
+		case "--name":
+			if i+1 < len(args) {
+				body["name"] = args[i+1]
+				i++
+			}
+		case "--desc", "--description":
+			if i+1 < len(args) {
+				body["description"] = args[i+1]
+				i++
+			}
 		}
 	}
 
@@ -238,6 +256,7 @@ func (h *Handler) cmdList() int {
 		tsIP, _ := v["tailscale_ip"].(string)
 		nodeName, _ := v["node_name"].(string)
 		vmType, _ := v["type"].(string)
+		desc, _ := v["description"].(string)
 		mode, _ := v["mode"].(string)
 		vcpu, _ := v["vcpu"].(float64)
 		ramMIB, _ := v["ram_mib"].(float64)
@@ -251,7 +270,22 @@ func (h *Handler) cmdList() int {
 
 		fmt.Printf("%-20s %-18s %-12s %-8s %-5.0f %-8s %-8s %-8s\n",
 			name, tsIP, nodeName, vmType, vcpu, fmt.Sprintf("%.0fG", ramMIB/1024), mode, status)
+		if desc != "" {
+			fmt.Printf("  %s\n", desc)
+		}
 	}
+	return 0
+}
+
+func (h *Handler) cmdDescribe(name, description string) int {
+	body := map[string]interface{}{"description": description}
+	data, _ := json.Marshal(body)
+	_, err := h.patch("/api/vms/"+name, data)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	fmt.Printf("VM '%s' description updated.\n", name)
 	return 0
 }
 
@@ -631,15 +665,18 @@ func (h *Handler) printHelp() {
 
 Commands:
   new [options]           Create and start a new VM
-    --clone <repo>          Clone repo on creation (repeatable)
+    --name <name>           Custom VM name (default: auto-generated)
     --type <type>           VM type: firecracker (default) or qemu
+    --desc <text>           Description of what this VM is for
+    --clone <repo>          Clone repo on creation (repeatable)
     --vcpu <N>              CPU cores (default: 2)
     --ram <MiB>             RAM in MiB (default: 2048)
     --disk <size>           Disk size (default: 50G)
     --mode normal|paranoid  Network mode (default: normal)
     --node <node-id>        Pin to specific node
-  list                    List all VMs
+  list                    List all VMs (shows type, description)
   logs <name> [--lines N] Show VM console/system logs (default: last 100 lines)
+  describe <name> <text>  Set or update a VM's description
   destroy <name>          Destroy a VM
   stop <name>             Stop a running VM
   start <name>            Start a stopped VM
@@ -744,6 +781,21 @@ func (h *Handler) post(path string, data interface{}) ([]byte, error) {
 
 func (h *Handler) delete(path string) ([]byte, error) {
 	req, _ := http.NewRequest("DELETE", h.apiBase+path, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func (h *Handler) patch(path string, data []byte) ([]byte, error) {
+	req, _ := http.NewRequest("PATCH", h.apiBase+path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
