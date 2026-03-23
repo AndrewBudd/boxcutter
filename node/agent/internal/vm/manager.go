@@ -1568,16 +1568,30 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		}
 	}
 
-	// Pause source VM if running (freezes vCPUs for consistent disk copy).
-	// Only Firecracker supports pause via API. QEMU VMs must be stopped first.
+	// Pause/sync source VM for consistent disk copy.
 	wasRunning := IsRunning(srcDir)
 	if wasRunning {
 		if srcSt.Type == "qemu" {
-			return nil, fmt.Errorf("QEMU VMs must be stopped before copying (use: ssh boxcutter stop %s)", srcName)
+			// QEMU: sync guest filesystem via SSH for crash-consistent copy.
+			// The VM stays running — copy is equivalent to a power-cycle snapshot.
+			progress("copy", "Syncing filesystem...")
+			sshKey := m.cfg.SSH.PrivateKeyPath
+			if sshKey == "" {
+				sshKey = "/etc/boxcutter/secrets/cluster-ssh.key"
+			}
+			VMSSH(srcSt.TAP, sshKey, "sudo sync")
+		} else {
+			progress("copy", "Pausing source VM...")
+			if err := fcPause(srcDir); err != nil {
+				return nil, fmt.Errorf("pausing source VM: %w", err)
+			}
 		}
-		progress("copy", "Pausing source VM...")
-		if err := fcPause(srcDir); err != nil {
-			return nil, fmt.Errorf("pausing source VM: %w", err)
+	}
+
+	// Helper to resume FC on error (QEMU doesn't need resume — it stays running)
+	unfreezeSource := func() {
+		if wasRunning && srcSt.Type != "qemu" {
+			fcResume(srcDir)
 		}
 	}
 
@@ -1591,9 +1605,7 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		srcRootfs := filepath.Join(srcDir, "rootfs.ext4")
 		dstRootfs := filepath.Join(dstDir, "rootfs.ext4")
 		if err := copyFile(srcRootfs, dstRootfs); err != nil {
-			if wasRunning {
-				fcResume(srcDir)
-			}
+			unfreezeSource()
 			os.RemoveAll(dstDir)
 			return nil, fmt.Errorf("copying rootfs: %w", err)
 		}
@@ -1601,23 +1613,19 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		// Legacy dm-snapshot: copy the COW overlay
 		srcCowPath := filepath.Join(srcDir, "cow.img")
 		if _, err := os.Stat(srcCowPath); err != nil {
-			if wasRunning {
-				fcResume(srcDir)
-			}
+			unfreezeSource()
 			return nil, fmt.Errorf("source COW image not found")
 		}
 		dstCowPath := filepath.Join(dstDir, "cow.img")
 		if err := copyFile(srcCowPath, dstCowPath); err != nil {
-			if wasRunning {
-				fcResume(srcDir)
-			}
+			unfreezeSource()
 			os.RemoveAll(dstDir)
 			return nil, fmt.Errorf("copying COW: %w", err)
 		}
 	}
 
-	// Resume source VM immediately after copy
-	if wasRunning {
+	// Resume source VM (Firecracker only — QEMU stays running during copy)
+	if wasRunning && srcSt.Type != "qemu" {
 		progress("copy", "Resuming source VM...")
 		if err := fcResume(srcDir); err != nil {
 			log.Printf("Warning: failed to resume source VM %s: %v", srcName, err)
