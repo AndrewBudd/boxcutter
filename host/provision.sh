@@ -276,7 +276,8 @@ write_files:
       fi
 
       # zstd (for golden image decompression) + mosquitto client tools (for debugging)
-      apt-get install -y -qq zstd mosquitto-clients 2>/dev/null || true
+      # qemu-system-x86 + qemu-utils (for QEMU VM support: launch, disk management, migration)
+      apt-get install -y -qq zstd mosquitto-clients qemu-system-x86 qemu-utils 2>/dev/null || true
 
       # Go + DERP
       if ! command -v go &>/dev/null; then

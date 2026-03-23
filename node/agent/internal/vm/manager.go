@@ -2165,10 +2165,12 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		rollback("import request failed: " + err.Error())
 		return nil, fmt.Errorf("import request: %w", err)
 	}
+	importBody2, _ := io.ReadAll(importResp.Body)
 	importResp.Body.Close()
 
 	if importResp.StatusCode >= 300 {
-		rollback(fmt.Sprintf("import returned %d", importResp.StatusCode))
+		errMsg := strings.TrimSpace(string(importBody2))
+		rollback(fmt.Sprintf("import returned %d: %s", importResp.StatusCode, errMsg))
 		return nil, fmt.Errorf("import failed: HTTP %d", importResp.StatusCode)
 	}
 	log.Printf("Migrating QEMU %s: import completed in %s", name, time.Since(importStart).Round(time.Millisecond))

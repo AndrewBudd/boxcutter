@@ -351,6 +351,7 @@ func (h *Handler) handleImportQEMUState(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := h.mgr.ImportQEMUState(name, req.StatePath)
 	if err != nil {
+		log.Printf("ImportQEMUState %s failed: %v", name, err)
 		if strings.Contains(err.Error(), "capacity") || strings.Contains(err.Error(), "full") {
 			http.Error(w, err.Error(), http.StatusInsufficientStorage)
 		} else {
