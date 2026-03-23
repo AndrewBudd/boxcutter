@@ -87,6 +87,7 @@ func launchQEMU(vmDir string, st *VMState) (int, error) {
 		"-display", "none",
 		"-no-reboot",
 		"-pidfile", pidFile,
+		"-qmp", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(vmDir, "qmp.sock")),
 		"-daemonize",
 	}
 

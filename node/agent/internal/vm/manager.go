@@ -1745,10 +1745,9 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return nil, fmt.Errorf("VM '%s' not found", name)
 	}
 
-	// QEMU VMs don't support snapshot-based live migration (yet).
-	// Stopped QEMU VMs can still be relocated via file transfer.
+	// QEMU VMs use QMP-based state save/restore for live migration.
 	if st.Type == "qemu" && IsRunning(vmDir) {
-		return nil, fmt.Errorf("live migration is not supported for QEMU VMs (stop the VM first)")
+		return m.migrateQEMUVM(name, st, targetAddr, targetBridgeIP)
 	}
 
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
@@ -2102,6 +2101,151 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	}, nil
 }
 
+// migrateQEMUVM performs a live migration of a running QEMU VM using QMP save/restore.
+// Flow: pre-sync disk → pause → save state → transfer state → restore on target → verify.
+func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBridgeIP string) (*MigrateResponse, error) {
+	vmDir := VMDir(name)
+	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
+	dstVMDir := fmt.Sprintf("/var/lib/boxcutter/vms/%s/", name)
+	diskName := "rootfs.ext4"
+	if _, err := os.Stat(filepath.Join(vmDir, "rootfs.qcow2")); err == nil {
+		diskName = "rootfs.qcow2"
+	}
+
+	// SSH setup (reuse existing pattern from Firecracker migration)
+	sshBase := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+		"-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10"}
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10", clusterKey)
+	sshArgs := append([]string{}, sshBase...)
+
+	// Clean target directory
+	cleanArgs := []string{"sudo", "rm", "-rf", dstVMDir,
+		fmt.Sprintf("/dev/shm/bc-%s", name), fmt.Sprintf("/dev/shm/bc-%s-mig", name)}
+	cleanCmd := exec.Command("ssh", append(append([]string{}, sshArgs...), append([]string{"ubuntu@" + targetBridgeIP}, cleanArgs...)...)...)
+	cleanCmd.Run()
+
+	// Pre-flight: ensure target has golden image + create vmDir
+	log.Printf("Migrating QEMU %s to %s: pre-staging", name, targetAddr)
+	prepCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
+		"sudo", "mkdir", "-p", dstVMDir)...)
+	if out, err := prepCmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("prep target: %s: %w", string(out), err)
+	}
+
+	// Phase 1: Pre-sync rootfs while VM is running (zero downtime)
+	log.Printf("Migrating QEMU %s: pre-syncing %s with tar --sparse", name, diskName)
+	preSyncStart := time.Now()
+	preSyncCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
+	if out, err := preSyncCmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("pre-sync disk: %s: %w", string(out), err)
+	}
+	log.Printf("Migrating QEMU %s: pre-sync completed in %s", name, time.Since(preSyncStart).Round(time.Millisecond))
+
+	// Phase 2: Pause + Save state (downtime starts)
+	log.Printf("Migrating QEMU %s: pausing VM (downtime starts)", name)
+	downtimeStart := time.Now()
+
+	if err := qmpStop(vmDir); err != nil {
+		return nil, fmt.Errorf("qmp stop: %w", err)
+	}
+	log.Printf("Migrating QEMU %s: VM paused in %s", name, time.Since(downtimeStart).Round(time.Millisecond))
+
+	// Rollback function
+	rollback := func(reason string) {
+		log.Printf("Migrating QEMU %s: ROLLBACK — %s", name, reason)
+		log.Printf("Migrating QEMU %s: resuming source VM", name)
+		if err := qmpCont(vmDir); err != nil {
+			log.Printf("Migrating QEMU %s: WARNING — failed to resume: %v", name, err)
+		}
+	}
+
+	// Save state
+	snapStart := time.Now()
+	statePath, err := qmpSaveState(vmDir)
+	if err != nil {
+		rollback("state save failed: " + err.Error())
+		return nil, fmt.Errorf("qmp save state: %w", err)
+	}
+	stateInfo, _ := os.Stat(statePath)
+	stateSize := int64(0)
+	if stateInfo != nil {
+		stateSize = stateInfo.Size()
+	}
+	log.Printf("Migrating QEMU %s: state saved in %s (%dMB)", name,
+		time.Since(snapStart).Round(time.Millisecond), stateSize/1024/1024)
+
+	// Transfer state file
+	xferStart := time.Now()
+	dstStatePath := filepath.Join(dstVMDir, "qemu-state.bin")
+	xferCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"dd if=%s bs=4M 2>/dev/null | %s ubuntu@%s 'sudo dd of=%s bs=4M'",
+		statePath, sshOpts, targetBridgeIP, dstStatePath))
+	if out, err := xferCmd.CombinedOutput(); err != nil {
+		rollback("state transfer failed: " + string(out) + ": " + err.Error())
+		return nil, fmt.Errorf("state transfer: %w", err)
+	}
+	log.Printf("Migrating QEMU %s: state transferred in %s", name, time.Since(xferStart).Round(time.Millisecond))
+
+	// Transfer vm.json
+	vmJsonCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"cat %s | %s ubuntu@%s 'sudo tee %s > /dev/null'",
+		filepath.Join(vmDir, "vm.json"), sshOpts, targetBridgeIP, filepath.Join(dstVMDir, "vm.json")))
+	vmJsonCmd.Run()
+
+	// Phase 3: Import on target
+	log.Printf("Migrating QEMU %s: restoring on target %s", name, targetAddr)
+	importStart := time.Now()
+
+	importBody := map[string]interface{}{
+		"state_path": dstStatePath,
+	}
+	importData, _ := json.Marshal(importBody)
+	importResp, err := http.Post(
+		fmt.Sprintf("http://%s/api/vms/%s/import-qemu-state", targetAddr, name),
+		"application/json",
+		bytes.NewReader(importData))
+	if err != nil {
+		rollback("import request failed: " + err.Error())
+		return nil, fmt.Errorf("import request: %w", err)
+	}
+	importResp.Body.Close()
+
+	if importResp.StatusCode >= 300 {
+		rollback(fmt.Sprintf("import returned %d", importResp.StatusCode))
+		return nil, fmt.Errorf("import failed: HTTP %d", importResp.StatusCode)
+	}
+	log.Printf("Migrating QEMU %s: import completed in %s", name, time.Since(importStart).Round(time.Millisecond))
+
+	// Verify target is healthy
+	verifyClient := &http.Client{Timeout: 5 * time.Second}
+	verifyResp, err := verifyClient.Get(fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name))
+	if err != nil {
+		rollback("verify failed: " + err.Error())
+		return nil, fmt.Errorf("verify: %w", err)
+	}
+	verifyResp.Body.Close()
+
+	downtime := time.Since(downtimeStart)
+	log.Printf("Migration complete: QEMU %s → %s | ram=%dMB | downtime=%s",
+		name, targetAddr, st.RAMMIB, downtime.Round(time.Millisecond))
+
+	// Commit: stop source
+	m.stopVM(name)
+
+	// Clean up state files
+	os.Remove(statePath)
+	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
+
+	return &MigrateResponse{
+		Name:       name,
+		TargetNode: targetAddr,
+		Status:     fmt.Sprintf("migrated (downtime: %s)", downtime.Round(time.Millisecond)),
+	}, nil
+}
+
 // relocateStoppedVM transfers a stopped VM's files to the target node.
 // No snapshot needed — just rsync vm.json + disk image + ensure golden image.
 func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey string) (*MigrateResponse, error) {
@@ -2192,6 +2336,81 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 // ImportSnapshot loads a VM from a Firecracker snapshot on this node.
 // The COW, vm.snap, and vm.mem files must already be in the VM directory.
 // This resumes the VM exactly where it was paused — no reboot.
+// ImportQEMUState imports a QEMU VM with a saved state file (from QMP migrate).
+// The rootfs and state file are already on disk. This function:
+// 1. Sets up TAP + fwmark networking
+// 2. Launches QEMU with -incoming defer
+// 3. Loads the state file via QMP
+// 4. Resumes the VM
+func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM state not found: %w", err)
+	}
+
+	// Capacity check
+	sysRAM := m.getSystemRAMMiB()
+	if sysRAM > 0 {
+		allocatedRAM := m.getAllocatedRAMMiB()
+		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
+			return nil, &CapacityError{msg: "node is full"}
+		}
+	}
+
+	// Set up networking
+	if err := SetupTAP(st.TAP, st.Mark); err != nil {
+		return nil, fmt.Errorf("setting up TAP: %w", err)
+	}
+
+	// Launch QEMU in incoming mode
+	pid, err := launchQEMUIncoming(vmDir, st)
+	if err != nil {
+		TeardownTAP(st.TAP, st.Mark)
+		return nil, fmt.Errorf("launching QEMU incoming: %w", err)
+	}
+
+	// Load saved state
+	if err := qmpLoadState(vmDir, statePath); err != nil {
+		// Kill the QEMU process
+		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
+		TeardownTAP(st.TAP, st.Mark)
+		return nil, fmt.Errorf("loading state: %w", err)
+	}
+
+	log.Printf("QEMU VM %s imported and resumed (PID %d)", name, pid)
+
+	// Clean up state file
+	os.Remove(statePath)
+
+	// Register with vmid
+	if m.vmid != nil {
+		vmType := st.Type
+		if vmType == "" {
+			vmType = "qemu"
+		}
+		m.vmid.Register(&vmid.RegisterRequest{
+			VMID:        st.Name,
+			VMType:      vmType,
+			IP:          "10.0.0.2",
+			Mark:        st.Mark,
+			Mode:        st.Mode,
+			GitHubRepo:  st.GitHubRepo,
+			GitHubRepos: st.AllGitHubRepos(),
+		})
+	}
+
+	return &CreateResponse{
+		Name:   name,
+		Mark:   st.Mark,
+		Mode:   st.Mode,
+		Status: "running",
+	}, nil
+}
+
 func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

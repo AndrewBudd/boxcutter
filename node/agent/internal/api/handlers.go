@@ -42,6 +42,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/export", h.handleExport)
 	mux.HandleFunc("POST /api/vms/{name}/import", h.handleImport)
 	mux.HandleFunc("POST /api/vms/{name}/import-snapshot", h.handleImportSnapshot)
+	mux.HandleFunc("POST /api/vms/{name}/import-qemu-state", h.handleImportQEMUState)
 	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleCopy)
 	mux.HandleFunc("POST /api/vms/{name}/migrate", h.handleMigrate)
 	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleAddRepo)
@@ -329,6 +330,32 @@ func (h *Handler) handleImport(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.mgr.ImportVM(&st)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+func (h *Handler) handleImportQEMUState(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+
+	var req struct {
+		StatePath string `json:"state_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp, err := h.mgr.ImportQEMUState(name, req.StatePath)
+	if err != nil {
+		if strings.Contains(err.Error(), "capacity") || strings.Contains(err.Error(), "full") {
+			http.Error(w, err.Error(), http.StatusInsufficientStorage)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	writeJSON(w, resp)
