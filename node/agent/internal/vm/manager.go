@@ -298,9 +298,9 @@ func (m *Manager) startSetup(name string) (*VMState, error) {
 		return nil, fmt.Errorf("ensuring snapshot: %w", err)
 	}
 
-	// Regenerate FC config (may be missing after relocation, or have stale paths)
-	if err := writeFirecrackerConfig(vmDir, st); err != nil {
-		return nil, fmt.Errorf("writing firecracker config: %w", err)
+	// Regenerate backend-specific config (FC config, or no-op for QEMU)
+	if err := BackendFor(st.Type).WriteConfig(vmDir, st); err != nil {
+		return nil, fmt.Errorf("writing config: %w", err)
 	}
 
 	return st, nil
@@ -1625,8 +1625,7 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		return nil, err
 	}
 
-	dstBackend := BackendFor(dstSt.Type)
-	dstBackend.PrepareDisk(m, dstSt)
+	BackendFor(dstSt.Type).WriteConfig(dstDir, dstSt)
 
 	// Mount the copied rootfs and update hostname + wipe Tailscale state
 	mountDir, err := os.MkdirTemp("", "bc-mount-")
@@ -2109,6 +2108,12 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		if err := qmpCont(vmDir); err != nil {
 			log.Printf("Migrating QEMU %s: WARNING — failed to resume: %v", name, err)
 		}
+		// Clean up pre-staged files on target
+		cleanupCmd := exec.Command("bash", "-c", fmt.Sprintf(
+			"%s ubuntu@%s 'sudo rm -rf %s'",
+			sshOpts, targetBridgeIP, dstVMDir))
+		cleanupCmd.Run()
+		log.Printf("Migrating QEMU %s: cleaned up target %s", name, dstVMDir)
 	}
 
 	// Save state

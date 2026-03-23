@@ -114,6 +114,9 @@ type SnapshotState struct {
 // IsFileRootfs returns true if the VM uses a standalone rootfs file
 // instead of dm-snapshot. Detected by the presence of rootfs.ext4.
 func IsFileRootfs(vmDir string) bool {
+	if _, err := os.Stat(filepath.Join(vmDir, "rootfs.qcow2")); err == nil {
+		return true
+	}
 	_, err := os.Stat(filepath.Join(vmDir, "rootfs.ext4"))
 	return err == nil
 }

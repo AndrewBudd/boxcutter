@@ -37,7 +37,12 @@ type VMBackend interface {
 
 	// PrepareDisk mounts the rootfs and injects backend-specific files
 	// (kernel modules, Docker config for QEMU; FC config for Firecracker).
+	// Called once at creation time.
 	PrepareDisk(mgr *Manager, st *VMState)
+
+	// WriteConfig regenerates any config needed before launch (called on every start).
+	// FC: regenerates fc-config.json. QEMU: no-op (config is in launch args).
+	WriteConfig(vmDir string, st *VMState) error
 
 	// DiskName returns the rootfs filename ("rootfs.ext4" or "rootfs.qcow2").
 	DiskName(vmDir string) string

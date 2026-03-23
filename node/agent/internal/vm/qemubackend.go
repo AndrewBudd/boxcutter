@@ -75,3 +75,8 @@ func (q *QEMUBackend) SyncBeforeCopy(st *VMState, sshKey string) (bool, error) {
 	VMSSH(st.TAP, sshKey, "sudo sync")
 	return false, nil // not paused, no Resume needed
 }
+
+func (q *QEMUBackend) WriteConfig(vmDir string, st *VMState) error {
+	// QEMU config is embedded in launch args, no config file needed
+	return nil
+}

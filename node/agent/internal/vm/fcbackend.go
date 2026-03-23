@@ -116,3 +116,7 @@ func (f *FirecrackerBackend) SyncBeforeCopy(st *VMState, sshKey string) (bool, e
 	}
 	return true, nil // paused, needs Resume after copy
 }
+
+func (f *FirecrackerBackend) WriteConfig(vmDir string, st *VMState) error {
+	return writeFirecrackerConfig(vmDir, st)
+}
