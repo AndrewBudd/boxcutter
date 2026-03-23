@@ -2166,10 +2166,11 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	cleanCmd := exec.Command("ssh", append(append([]string{}, sshArgs...), append([]string{"ubuntu@" + targetBridgeIP}, cleanArgs...)...)...)
 	cleanCmd.Run()
 
-	// Pre-flight: ensure target has golden image + create vmDir
+	// Pre-flight: ensure target has golden image (including QCOW2 version) + create vmDir
 	log.Printf("Migrating QEMU %s to %s: pre-staging", name, targetAddr)
-	prepCmd := exec.Command("ssh", append(sshArgs, "ubuntu@"+targetBridgeIP,
-		"sudo", "mkdir", "-p", dstVMDir)...)
+	prepCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"%s ubuntu@%s 'sudo mkdir -p %s && if [ ! -f /var/lib/boxcutter/golden/rootfs.qcow2 ] && [ -f /var/lib/boxcutter/golden/rootfs.ext4 ]; then sudo qemu-img convert -f raw -O qcow2 /var/lib/boxcutter/golden/rootfs.ext4 /var/lib/boxcutter/golden/rootfs.qcow2; fi'",
+		sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := prepCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("prep target: %s: %w", string(out), err)
 	}
@@ -2399,6 +2400,17 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		allocatedRAM := m.getAllocatedRAMMiB()
 		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
 			return nil, &CapacityError{msg: "node is full"}
+		}
+	}
+
+	// Ensure golden QCOW2 exists if this is a QCOW2-backed VM
+	if DiskFormat(vmDir) == "qcow2" {
+		goldenExt4 := m.cfg.Storage.GoldenLocalPath
+		goldenQCOW2 := GoldenQCOW2Path(goldenExt4)
+		if _, err := os.Stat(goldenQCOW2); err != nil {
+			if _, err := os.Stat(goldenExt4); err == nil {
+				run("qemu-img", "convert", "-f", "raw", "-O", "qcow2", goldenExt4, goldenQCOW2)
+			}
 		}
 	}
 
