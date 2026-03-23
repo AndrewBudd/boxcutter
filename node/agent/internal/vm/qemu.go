@@ -80,7 +80,7 @@ func launchQEMU(vmDir string, st *VMState) (int, error) {
 		"-m", fmt.Sprintf("%d", st.RAMMIB),
 		"-kernel", kernel,
 		"-append", bootArgs,
-		"-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,cache=writeback", rootfs),
+		"-drive", fmt.Sprintf("file=%s,format=%s,if=virtio,cache=writeback", rootfs, DiskFormat(vmDir)),
 		"-netdev", fmt.Sprintf("tap,id=net0,ifname=%s,script=no,downscript=no", st.TAP),
 		"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", st.MAC),
 		"-serial", fmt.Sprintf("file:%s", logPath),
@@ -132,16 +132,47 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 	vmDir := VMDir(st.Name)
 	rootfs := RootfsPath(vmDir)
 
-	// Mount rootfs temporarily to inject files
+	// Mount rootfs temporarily to inject files.
+	// QCOW2 requires qemu-nbd; raw ext4 uses loop mount.
 	mountPoint := filepath.Join(vmDir, "mnt")
 	os.MkdirAll(mountPoint, 0755)
 
-	if out, err := exec.Command("mount", "-o", "loop", rootfs, mountPoint).CombinedOutput(); err != nil {
-		log.Printf("Warning: could not mount rootfs for QEMU prep: %s: %v", string(out), err)
-		return
+	format := DiskFormat(vmDir)
+	var nbdDev string
+	if format == "qcow2" {
+		// Use qemu-nbd to expose QCOW2 as block device
+		exec.Command("modprobe", "nbd", "max_part=8").Run()
+		// Find a free nbd device
+		for i := 0; i < 16; i++ {
+			dev := fmt.Sprintf("/dev/nbd%d", i)
+			if out, err := exec.Command("qemu-nbd", "-c", dev, rootfs).CombinedOutput(); err == nil {
+				nbdDev = dev
+				break
+			} else {
+				_ = out // device busy, try next
+			}
+		}
+		if nbdDev == "" {
+			log.Printf("Warning: could not find free nbd device for QEMU prep")
+			return
+		}
+		time.Sleep(500 * time.Millisecond) // let kernel discover partition
+		if out, err := exec.Command("mount", nbdDev, mountPoint).CombinedOutput(); err != nil {
+			log.Printf("Warning: could not mount qcow2 via nbd for QEMU prep: %s: %v", string(out), err)
+			exec.Command("qemu-nbd", "-d", nbdDev).Run()
+			return
+		}
+	} else {
+		if out, err := exec.Command("mount", "-o", "loop", rootfs, mountPoint).CombinedOutput(); err != nil {
+			log.Printf("Warning: could not mount rootfs for QEMU prep: %s: %v", string(out), err)
+			return
+		}
 	}
 	defer func() {
 		exec.Command("umount", mountPoint).Run()
+		if nbdDev != "" {
+			exec.Command("qemu-nbd", "-d", nbdDev).Run()
+		}
 		os.Remove(mountPoint)
 	}()
 

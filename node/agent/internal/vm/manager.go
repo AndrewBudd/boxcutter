@@ -241,16 +241,20 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 	// Phase 2: I/O-heavy work — no lock needed (vmDir exists, mark allocated).
 	vmDir := VMDir(req.Name)
 	req.progress("snapshot", "Creating disk...")
-	if err := CreateRootfs(vmDir, goldenPath, req.Disk); err != nil {
-		os.RemoveAll(vmDir)
-		return nil, fmt.Errorf("creating rootfs: %w", err)
-	}
 
 	if st.Type == "qemu" {
-		// QEMU VMs: prepare rootfs with kernel modules for Docker support,
-		// and configure Tailscale for kernel networking (not userspace).
+		// QEMU VMs use QCOW2 backed by golden image (instant creation)
+		if err := CreateQCOW2Rootfs(vmDir, goldenPath, req.Disk); err != nil {
+			os.RemoveAll(vmDir)
+			return nil, fmt.Errorf("creating qcow2 rootfs: %w", err)
+		}
 		m.prepareRootfsForQEMU(st)
 	} else {
+		// Firecracker VMs use raw ext4
+		if err := CreateRootfs(vmDir, goldenPath, req.Disk); err != nil {
+			os.RemoveAll(vmDir)
+			return nil, fmt.Errorf("creating rootfs: %w", err)
+		}
 		if err := writeFirecrackerConfig(vmDir, st); err != nil {
 			CleanupSnapshot(vmDir)
 			os.RemoveAll(vmDir)
@@ -1018,6 +1022,43 @@ func writeFirecrackerConfig(vmDir string, st *VMState) error {
 }
 
 // prepareRootfs mounts the rootfs once and injects CA cert + SSH keys.
+// mountRootfs mounts a VM's rootfs (raw ext4 or QCOW2) to the given mount point.
+// Returns a cleanup function that unmounts and disconnects nbd.
+func mountRootfs(vmDir, mountPoint string) (func(), error) {
+	rootfs := RootfsPath(vmDir)
+	format := DiskFormat(vmDir)
+
+	if format == "qcow2" {
+		exec.Command("modprobe", "nbd", "max_part=8").Run()
+		var nbdDev string
+		for i := 0; i < 16; i++ {
+			dev := fmt.Sprintf("/dev/nbd%d", i)
+			if _, err := exec.Command("qemu-nbd", "-c", dev, rootfs).CombinedOutput(); err == nil {
+				nbdDev = dev
+				break
+			}
+		}
+		if nbdDev == "" {
+			return nil, fmt.Errorf("no free nbd device")
+		}
+		time.Sleep(500 * time.Millisecond)
+		if err := run("mount", nbdDev, mountPoint); err != nil {
+			exec.Command("qemu-nbd", "-d", nbdDev).Run()
+			return nil, fmt.Errorf("mount qcow2: %w", err)
+		}
+		return func() {
+			run("umount", mountPoint)
+			exec.Command("qemu-nbd", "-d", nbdDev).Run()
+		}, nil
+	}
+
+	// Raw ext4
+	if err := run("mount", rootfs, mountPoint); err != nil {
+		return nil, fmt.Errorf("mount ext4: %w", err)
+	}
+	return func() { run("umount", mountPoint) }, nil
+}
+
 func (m *Manager) prepareRootfs(st *VMState, authorizedKeys []string) {
 	vmDir := VMDir(st.Name)
 	mountDir, err := os.MkdirTemp("", "bc-mount-")
@@ -1026,10 +1067,11 @@ func (m *Manager) prepareRootfs(st *VMState, authorizedKeys []string) {
 	}
 	defer os.RemoveAll(mountDir)
 
-	if run("mount", RootfsPath(vmDir), mountDir) != nil {
+	cleanup, err := mountRootfs(vmDir, mountDir)
+	if err != nil {
 		return
 	}
-	defer run("umount", mountDir)
+	defer cleanup()
 
 	// Write VM type so processes inside can identify the hypervisor
 	vmType := st.Type
@@ -1682,11 +1724,10 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 	// Mount the copied rootfs and update hostname + wipe Tailscale state
 	mountDir, err := os.MkdirTemp("", "bc-mount-")
 	if err == nil {
-		if run("mount", RootfsPath(dstDir), mountDir) == nil {
+		cleanup, mountErr := mountRootfs(dstDir, mountDir)
+		if mountErr == nil {
 			os.WriteFile(filepath.Join(mountDir, "etc/hostname"), []byte(dstName+"\n"), 0644)
 			os.RemoveAll(filepath.Join(mountDir, "var/lib/tailscale"))
-			// Regenerate SSH host keys so the copy gets fresh ones.
-			// Delete existing keys then use ssh-keygen to create new ones.
 			exec.Command("rm", "-f",
 				filepath.Join(mountDir, "etc/ssh/ssh_host_rsa_key"),
 				filepath.Join(mountDir, "etc/ssh/ssh_host_rsa_key.pub"),
@@ -1702,9 +1743,9 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 			exec.Command("ssh-keygen", "-t", "ecdsa", "-f",
 				filepath.Join(mountDir, "etc/ssh/ssh_host_ecdsa_key"), "-N", "").Run()
 			log.Printf("CopyVM %s: hostname set, tailscale state wiped, SSH keys regenerated", dstName)
-			run("umount", mountDir)
+			cleanup()
 		} else {
-			log.Printf("CopyVM %s: WARNING — could not mount rootfs to update hostname/tailscale", dstName)
+			log.Printf("CopyVM %s: WARNING — could not mount rootfs: %v", dstName, mountErr)
 		}
 		os.RemoveAll(mountDir)
 	}

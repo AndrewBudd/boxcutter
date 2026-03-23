@@ -47,6 +47,41 @@ func CreateRootfs(vmDir, goldenPath, diskSize string) error {
 	return nil
 }
 
+// CreateQCOW2Rootfs creates a QCOW2 disk image backed by a golden QCOW2 image.
+// This is instant (metadata-only, no data copy). The golden ext4 image is
+// converted to QCOW2 if the QCOW2 version doesn't exist yet.
+func CreateQCOW2Rootfs(vmDir, goldenExt4Path, diskSize string) error {
+	// Convert golden ext4 to QCOW2 if needed (one-time, cached)
+	goldenQCOW2 := strings.TrimSuffix(goldenExt4Path, ".ext4") + ".qcow2"
+	if _, err := os.Stat(goldenQCOW2); err != nil {
+		// Convert: raw ext4 → QCOW2
+		if err := run("qemu-img", "convert", "-f", "raw", "-O", "qcow2", goldenExt4Path, goldenQCOW2); err != nil {
+			return fmt.Errorf("converting golden to qcow2: %w", err)
+		}
+	}
+
+	// Parse disk size
+	diskBytes, err := parseSize(diskSize)
+	if err != nil {
+		diskBytes = 50 * 1024 * 1024 * 1024 // default 50G
+	}
+
+	// Create QCOW2 with backing file — instant, no data copy
+	rootfsPath := filepath.Join(vmDir, "rootfs.qcow2")
+	if err := run("qemu-img", "create", "-f", "qcow2",
+		"-b", goldenQCOW2, "-F", "qcow2",
+		rootfsPath, fmt.Sprintf("%d", diskBytes)); err != nil {
+		return fmt.Errorf("creating qcow2 rootfs: %w", err)
+	}
+
+	return nil
+}
+
+// GoldenQCOW2Path returns the QCOW2 version of a golden ext4 image path.
+func GoldenQCOW2Path(ext4Path string) string {
+	return strings.TrimSuffix(ext4Path, ".ext4") + ".qcow2"
+}
+
 // CreateSnapshot creates a dm-snapshot COW overlay on the golden image.
 func CreateSnapshot(vmDir, goldenPath, diskSize string) (*SnapshotState, error) {
 	// Get golden image size

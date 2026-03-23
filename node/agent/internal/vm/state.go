@@ -119,11 +119,27 @@ func IsFileRootfs(vmDir string) bool {
 }
 
 // RootfsPath returns the block device or file path for this VM's rootfs.
+// Checks for QCOW2 first (QEMU VMs), then ext4, then dm-snapshot.
 func RootfsPath(vmDir string) string {
+	qcow2Path := filepath.Join(vmDir, "rootfs.qcow2")
+	if _, err := os.Stat(qcow2Path); err == nil {
+		return qcow2Path
+	}
 	if IsFileRootfs(vmDir) {
 		return filepath.Join(vmDir, "rootfs.ext4")
 	}
 	return "/dev/mapper/bc-" + filepath.Base(vmDir)
+}
+
+// DiskFormat returns "qcow2", "raw", or "dm" based on what rootfs exists.
+func DiskFormat(vmDir string) string {
+	if _, err := os.Stat(filepath.Join(vmDir, "rootfs.qcow2")); err == nil {
+		return "qcow2"
+	}
+	if IsFileRootfs(vmDir) {
+		return "raw"
+	}
+	return "dm"
 }
 
 func LoadVMState(vmDir string) (*VMState, error) {
