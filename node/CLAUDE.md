@@ -1,6 +1,6 @@
 # Node
 
-The fundamental system that manages Firecracker VMs as a resource. Turns bare compute into isolated, networked, identity-aware dev environments. Contains multiple sub-components that work together.
+The fundamental system that manages Firecracker and QEMU VMs as a resource. Turns bare compute into isolated, networked, identity-aware dev environments. Contains multiple sub-components that work together.
 
 ## Sub-Components
 
@@ -11,7 +11,7 @@ The node agent manages Firecracker VM lifecycle. Runs as `boxcutter-node` on `:8
 | Package | Responsibility |
 |---------|---------------|
 | `internal/api/` | HTTP handlers — VM CRUD, migration, golden image, health |
-| `internal/vm/` | Firecracker process management — create, destroy, start, stop, snapshot, restore |
+| `internal/vm/` | VM process management via VMBackend interface — create, destroy, start, stop, snapshot, restore, migration (FC + QEMU) |
 | `internal/golden/` | Golden image versioning — tracks available versions, active head |
 | `internal/network/` | TAP device and fwmark setup per VM |
 | `internal/mqtt/` | MQTT client — subscribes to golden image updates from orchestrator |
@@ -115,6 +115,5 @@ This component **owns**:
 This component **does not own**:
 - VM scheduling (which node a VM lands on — that's orchestrator)
 - SSH key management (that's orchestrator)
-- QEMU VM management (that's host)
 - MQTT broker (that's host; node is a client)
 - Golden image head version (that's orchestrator; node pulls what it's told)

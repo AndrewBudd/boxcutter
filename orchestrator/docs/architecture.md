@@ -21,6 +21,9 @@ ssh boxcutter new [options]        # Create a new VM
   --disk <size>                    #   Disk size (default: 50G)
   --mode normal|paranoid           #   Network mode (default: normal)
   --node <node-id>                 #   Pin to specific node
+  --type <type>                    #   VM type: firecracker or qemu
+  --name <name>                    #   Custom VM name
+  --desc <text>                    #   Description
 ssh boxcutter list                 # List all VMs
 ssh boxcutter destroy <name>       # Destroy a VM
 ssh boxcutter stop <name>          # Stop a running VM
@@ -29,6 +32,8 @@ ssh boxcutter cp <name> [new-name] # Clone a VM's disk
 ssh boxcutter status               # Cluster capacity summary
 ssh boxcutter nodes                # List all nodes with health
 ssh boxcutter images               # List golden images on nodes
+ssh boxcutter logs <name>          # Show VM logs
+ssh boxcutter describe <name>      # Show detailed VM info
 ssh boxcutter adduser <github>     # Add SSH keys from GitHub
 ssh boxcutter removeuser <github>  # Remove SSH keys
 ssh boxcutter keys                 # List configured SSH keys

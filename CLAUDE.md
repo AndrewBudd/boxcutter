@@ -14,7 +14,7 @@ Host Control Plane (host/)
   │     Distributed state & coordination: scheduling, SSH interface, key mgmt
   │
   └── Node (node/)
-        Manages Firecracker VMs as a resource: lifecycle, identity, networking, proxy
+        Manages Firecracker + QEMU VMs as a resource: lifecycle, identity, networking, proxy
         │
         └── Guest (node/golden/)
               The environment inside each Firecracker VM

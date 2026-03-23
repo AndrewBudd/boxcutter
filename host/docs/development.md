@@ -96,7 +96,7 @@ sudo boxcutter-host upgrade golden
 sudo boxcutter-host version
 ```
 
-Node upgrades use drain + migration: a new node is launched from the latest image, all Firecracker VMs are migrated off the old node via snapshot/restore, then the old node is stopped.
+Node upgrades use drain + migration: a new node is launched from the latest image, all VMs (Firecracker and QEMU) are migrated off the old node — Firecracker via snapshot/restore, QEMU via QMP state save/restore — then the old node is stopped.
 
 ## State Recovery
 

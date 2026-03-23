@@ -1,6 +1,6 @@
 # Boxcutter System Architecture
 
-Boxcutter provides ephemeral dev environment VMs using Firecracker microVMs. The system runs on a single physical host with three domains.
+Boxcutter provides ephemeral dev environment VMs using Firecracker microVMs and QEMU VMs. The system runs on a single physical host with three domains.
 
 ## Overview
 
@@ -30,7 +30,7 @@ Boxcutter provides ephemeral dev environment VMs using Firecracker microVMs. The
 │    │     vmid (:80) — fwmark-based VM identity + tokens          │
 │    │     boxcutter-proxy (:8080) — MITM proxy, sentinel tokens   │
 │    │     MQTT client — subscribes to golden image updates         │
-│    │     Firecracker microVMs (each 10.0.0.2, isolated TAPs)    │
+│    │     Firecracker + QEMU VMs (each 10.0.0.2, isolated TAPs)    │
 │    │                                                             │
 │    └── Node N (auto-scaled)                                      │
 │                                                                  │
@@ -58,7 +58,7 @@ Distributed state manager and coordinator. Tracks which VMs exist on which nodes
 
 ### Node (`node/`)
 
-The fundamental system that manages Firecracker VMs as a resource. Contains the agent (VM lifecycle), vmid (identity), proxy (credential brokering), golden image (guest environment), and shell scripts (networking, TLS).
+The fundamental system that manages Firecracker and QEMU VMs as a resource. Contains the agent (VM lifecycle), vmid (identity), proxy (credential brokering), golden image (guest environment), and shell scripts (networking, TLS).
 
 → [node/docs/architecture.md](../node/docs/architecture.md) for internals
 
@@ -143,8 +143,8 @@ VM base images are distributed as OCI artifacts via GitHub Container Registry:
 
 ```
 ghcr.io/andrewbudd/boxcutter/
-  ├── node:latest          (~1.1GB zstd-compressed QCOW2)
-  ├── orchestrator:latest  (~1.1GB zstd-compressed QCOW2)
+  ├── node:latest          (~1.6GB zstd-compressed QCOW2)
+  ├── orchestrator:latest  (~1.2GB zstd-compressed QCOW2)
   └── golden:latest        (~450MB zstd-compressed ext4)
 ```
 
@@ -154,7 +154,7 @@ Pull is anonymous (public packages). Push requires `gh auth login`.
 
 ## Migration
 
-Firecracker VMs migrate between nodes using snapshot/restore. The host coordinates *when* to drain a node; the node agent handles *how* to migrate each VM. Downtime is ~10 seconds for a 2GB RAM VM.
+Firecracker VMs migrate between nodes using snapshot/restore. QEMU VMs migrate using QMP state save/restore — the VM is paused, its full CPU/device/RAM state is saved to a file, transferred to the target, and restored. The host coordinates *when* to drain a node; the node agent handles *how* to migrate each VM. Downtime is ~2-10 seconds for Firecracker (depending on RAM) and ~10-12 seconds for QEMU VMs.
 
 → [node/docs/architecture.md](../node/docs/architecture.md) for migration details
 

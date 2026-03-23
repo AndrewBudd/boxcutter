@@ -44,13 +44,13 @@ Default thresholds (in `defaultConfig()`):
 - MaxNodes: 0 (no hard cap, limited by host resources)
 - Min free memory on host: 8GB
 - Min free disk on host: 20GB
-- Scale cooldown: 10 minutes between any scale events
+- Scale cooldown: 5 minutes between any scale events
 
 ## Drain and Migration Coordination
 
 When draining a node (for upgrade or removal):
 
-1. Host calls the source node's migrate API for each VM
+1. Both Firecracker and QEMU VMs are live-migrated during drain. Firecracker uses snapshot/restore; QEMU uses QMP state save/restore.
 2. Node agent handles the actual snapshot/restore transfer to the target
 3. Once all VMs are migrated off, host stops the QEMU process
 
@@ -61,8 +61,8 @@ The host coordinates *when* to drain; the node agent handles *how* to migrate.
 VM base images are OCI artifacts stored at `ghcr.io/andrewbudd/boxcutter/`:
 
 ```
-├── node:latest          (~1.1GB zstd-compressed QCOW2)
-├── orchestrator:latest  (~1.1GB zstd-compressed QCOW2)
+├── node:latest          (~1.6GB zstd-compressed QCOW2)
+├── orchestrator:latest  (~1.2GB zstd-compressed QCOW2)
 └── golden:latest        (~450MB zstd-compressed ext4)
 ```
 

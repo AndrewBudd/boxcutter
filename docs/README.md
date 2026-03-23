@@ -40,7 +40,7 @@ dev@bold-fox:~$
 |    |                   Scheduling, key management (:8801)      |
 |    |                                                          |
 |    +-- tap-node1 --- Node VM 1 (192.168.50.3)                 |
-|    |                   Firecracker agent (:8800)               |
+|    |                   VM agent (:8800)                        |
 |    |                   +------+ +------+ +------+             |
 |    |                   |fox   | |otter | |heron |  microVMs   |
 |    |                   |FC 2G | |FC 2G | |FC 2G |             |
@@ -172,6 +172,8 @@ All commands go through the orchestrator SSH interface:
 ```bash
 ssh boxcutter new [options]        # Create a new VM
   --type <type>                    #   firecracker (default) or qemu
+  --name <name>                    #   Custom VM name (default: random)
+  --desc <text>                    #   Description for the VM
   --clone <repo>                   #   Clone repo on creation (repeatable)
   --vcpu <N>                       #   CPU cores (default: 2)
   --ram <MiB>                      #   RAM in MiB (default: 2048)
@@ -183,6 +185,8 @@ ssh boxcutter destroy <name>       # Destroy a VM
 ssh boxcutter stop <name>          # Stop a running VM
 ssh boxcutter start <name>         # Start a stopped VM
 ssh boxcutter cp <name> [new-name] # Clone a VM's disk
+ssh boxcutter logs <name>          # View console logs for a VM
+ssh boxcutter describe <name>      # Show detailed VM info
 ssh boxcutter status               # Cluster capacity summary
 ssh boxcutter nodes                # List all nodes with health
 ssh boxcutter adduser <github>     # Add SSH keys from GitHub
@@ -274,7 +278,7 @@ This scans `/proc` for running QEMU processes and rebuilds the state file. Nothi
 
 **Firecracker VMs** are live-migrated between nodes during drain operations using snapshot/restore. The VM pauses, its memory is snapshotted, transferred to the target node, and resumed. Processes, memory, and Tailscale connections survive. Downtime is typically 1-10 seconds.
 
-**QEMU VMs** do not support live migration. They can be relocated when stopped (stop → transfer files → start on new node). During node drains, running QEMU VMs are skipped.
+**QEMU VMs** are live-migrated using QMP state save/restore. The VM is paused, its CPU/device/RAM state is saved to file, the state and disk are transferred to the target node, and the VM is restored. Downtime is ~10-12 seconds for a 4GB RAM VM. During node drains, both Firecracker and QEMU VMs are migrated.
 
 ## Troubleshooting
 

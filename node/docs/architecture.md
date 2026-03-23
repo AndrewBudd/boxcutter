@@ -1,6 +1,6 @@
 # Node Architecture
 
-The node is the fundamental system that manages Firecracker VMs as a resource. It turns bare compute into isolated, networked, identity-aware dev environments. A node contains multiple cooperating services that together provide VM lifecycle, identity, networking, and credential brokering.
+The node is the fundamental system that manages Firecracker and QEMU VMs as a resource. It turns bare compute into isolated, networked, identity-aware dev environments. A node contains multiple cooperating services that together provide VM lifecycle, identity, networking, and credential brokering.
 
 ## Services
 
@@ -18,19 +18,24 @@ Each VM gets a directory at `/var/lib/boxcutter/vms/{name}/`:
 
 ```
 /var/lib/boxcutter/vms/my-dev-vm/
-├── vm.json              — VM config + state
-├── rootfs.ext4          — Sparse ext4 disk (~50GB allocated on-demand)
-├── firecracker.json     — Firecracker VM config
-├── metadata.json        — Cloud-init style metadata
-├── firecracker.pid      — PID of running Firecracker process
-├── firecracker.sock     — Firecracker API Unix socket
+├── vm.json              — VM config + state (includes "type": "firecracker" or "qemu")
+├── rootfs.ext4          — Sparse ext4 disk (Firecracker VMs, or legacy QEMU)
+├── rootfs.qcow2         — QCOW2 disk with golden backing file (QEMU VMs)
+├── fc-config.json       — Firecracker VM config (FC only)
+├── firecracker.pid      — PID of running Firecracker process (FC only)
+├── api.sock             — Firecracker API Unix socket (FC only)
+├── vsock.sock           — Firecracker vsock socket (FC only)
+├── qemu.pid             — PID of running QEMU process (QEMU only)
+├── qmp.sock             — QMP (QEMU Monitor Protocol) socket (QEMU only)
+├── console.log          — Serial console output (QEMU only)
 └── migrating            — Marker file (present only during migration)
 ```
 
 **vm.json** contains all VM config:
 ```json
 {
-  "name": "my-dev-vm", "vcpu": 2, "ram_mib": 2048,
+  "name": "my-dev-vm", "type": "qemu", "description": "My project dev env",
+  "vcpu": 2, "ram_mib": 2048,
   "mark": 101, "mode": "normal", "mac": "AA:FC:00:00:00:65",
   "disk": "50G", "tap": "tap-my-dev-vm",
   "created": "2026-03-10T12:00:00Z",
@@ -39,11 +44,11 @@ Each VM gets a directory at `/var/lib/boxcutter/vms/{name}/`:
 }
 ```
 
-**Storage models:** New VMs use file-based rootfs (standalone sparse ext4 copied from golden image via `CreateRootfs()`). Legacy VMs may use dm-snapshot COW overlays (`cow.img` on shared golden). `IsFileRootfs(vmDir)` distinguishes between the two.
+**Storage models:** Firecracker VMs use file-based rootfs (standalone sparse ext4 copied from golden image via `CreateRootfs()`). QEMU VMs use QCOW2 disks with a golden backing file (instant creation via `CreateQCOW2Rootfs()`). Legacy VMs may use dm-snapshot COW overlays. `IsFileRootfs(vmDir)` distinguishes between file-based (ext4 or qcow2) and dm-snapshot VMs.
 
 ## Node Agent
 
-The node agent manages Firecracker VM lifecycle via an HTTP API on `:8800`.
+The node agent manages Firecracker and QEMU VM lifecycle via an HTTP API on `:8800`.
 
 **API endpoints:**
 
@@ -66,6 +71,11 @@ The node agent manages Firecracker VM lifecycle via an HTTP API on `:8800`.
 | `GET /api/golden/versions` | List golden image versions |
 | `GET /api/golden/{version}` | Golden image details |
 | `POST /api/golden/build` | Build golden image |
+| `POST /api/vms/{name}/import-qemu-state` | Import a QEMU VM with saved state (migration target) |
+| `GET /api/vms/{name}/logs` | VM console logs |
+| `PATCH /api/vms/{name}` | Update VM metadata (description) |
+| `GET /api/vms/{name}/activity` | Tapegun activity feed |
+| `POST /api/vms/{name}/inbox` | Post message to VM inbox |
 | `GET /api/health` | Health check |
 
 **Internal packages:**
@@ -73,7 +83,7 @@ The node agent manages Firecracker VM lifecycle via an HTTP API on `:8800`.
 | Package | Responsibility |
 |---------|---------------|
 | `internal/api/` | HTTP handlers |
-| `internal/vm/` | Firecracker process management — create, destroy, start, stop, snapshot, restore, per-TAP networking |
+| `internal/vm/` | VM process management via VMBackend interface — create, destroy, start, stop, snapshot, restore, migration, per-TAP networking. Supports both Firecracker and QEMU backends. |
 | `internal/golden/` | Golden image versioning — tracks available versions, active head |
 | `internal/network/` | TAP device and fwmark setup |
 | `internal/mqtt/` | MQTT client — subscribes to golden image updates |
@@ -170,6 +180,35 @@ Source Node                              Target Node
 What survives: all processes and memory, Tailscale identity and IP, network connections (after DERP re-establishment).
 
 Downtime: ~10 seconds for a 2GB RAM VM (dominated by memory file transfer over bridge network).
+
+**Tailscale networking:** Firecracker VMs use userspace Tailscale networking (no kernel TUN support), with vsock nudge triggering `tailscale netcheck` after migration. QEMU VMs use kernel-mode Tailscale networking (they have a full kernel with CONFIG_TUN support).
+
+### QEMU Migration
+
+QEMU VMs migrate using QMP (QEMU Monitor Protocol) state save/restore:
+
+```
+Source Node                              Target Node
+    │                                        │
+    ├─ Pre-sync rootfs via tar --sparse ────>│  (while VM runs, zero downtime)
+    │                                        │
+    ├─ QMP: stop (pause vCPUs)               │  (sub-millisecond)
+    ├─ QMP: migrate exec:cat > state.bin     │  (saves CPU + device + RAM state)
+    │                                        │
+    ├─ Transfer state file via SSH ─────────>│  (~3-4s for 4GB)
+    ├─ Transfer vm.json via SSH ────────────>│
+    │                                        │
+    │                                        ├─ Launch QEMU with -incoming defer
+    │                                        ├─ QMP: migrate-incoming exec:cat < state.bin
+    │                                        ├─ VM resumes with full state
+    │                                        │
+    ├─ Verify target healthy                 │
+    ├─ Stop source, cleanup                  │
+```
+
+What survives: all processes and memory, disk state. Tailscale reconnects automatically.
+
+Downtime: ~10-12 seconds for a 4GB RAM VM (dominated by state save + transfer).
 
 ## Normal vs Paranoid Mode
 
