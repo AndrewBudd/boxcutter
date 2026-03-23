@@ -110,20 +110,23 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
         </div>
       )}
 
-      <div className="mt-6 border-t border-gray-800 pt-4">
-        <h3 className="text-sm font-medium text-gray-400 mb-2">Send Message</h3>
-        <div className="flex gap-2">
-          <input type="text" value={message} onChange={e => setMessage(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && sendMessage()}
-            placeholder="Type a message..."
-            className="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
-          <label className="flex items-center gap-1 text-xs text-gray-400">
-            <input type="checkbox" checked={sendKeys} onChange={e => setSendKeys(e.target.checked)} /> send_keys
-          </label>
-          <button onClick={sendMessage} className="px-4 py-2 bg-blue-600 rounded text-sm hover:bg-blue-500">Send</button>
+      {/* Tapegun message (hidden on terminal tab) */}
+      {tab !== 'terminal' && (
+        <div className="mt-6 border-t border-gray-800 pt-4">
+          <h3 className="text-sm font-medium text-gray-400 mb-2">Send Tapegun Message</h3>
+          <div className="flex gap-2">
+            <input type="text" value={message} onChange={e => setMessage(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && sendMessage()}
+              placeholder="Type a message..."
+              className="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+            <label className="flex items-center gap-1 text-xs text-gray-400">
+              <input type="checkbox" checked={sendKeys} onChange={e => setSendKeys(e.target.checked)} /> send_keys
+            </label>
+            <button onClick={sendMessage} className="px-4 py-2 bg-blue-600 rounded text-sm hover:bg-blue-500">Send</button>
+          </div>
+          {msgStatus && <div className="text-xs text-gray-500 mt-1">{msgStatus}</div>}
         </div>
-        {msgStatus && <div className="text-xs text-gray-500 mt-1">{msgStatus}</div>}
-      </div>
+      )}
     </div>
   )
 }
