@@ -242,25 +242,12 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 	vmDir := VMDir(req.Name)
 	req.progress("snapshot", "Creating disk...")
 
-	if st.Type == "qemu" {
-		// QEMU VMs use QCOW2 backed by golden image (instant creation)
-		if err := CreateQCOW2Rootfs(vmDir, goldenPath, req.Disk); err != nil {
-			os.RemoveAll(vmDir)
-			return nil, fmt.Errorf("creating qcow2 rootfs: %w", err)
-		}
-		m.prepareRootfsForQEMU(st)
-	} else {
-		// Firecracker VMs use raw ext4
-		if err := CreateRootfs(vmDir, goldenPath, req.Disk); err != nil {
-			os.RemoveAll(vmDir)
-			return nil, fmt.Errorf("creating rootfs: %w", err)
-		}
-		if err := writeFirecrackerConfig(vmDir, st); err != nil {
-			CleanupSnapshot(vmDir)
-			os.RemoveAll(vmDir)
-			return nil, err
-		}
+	backend := BackendFor(st.Type)
+	if err := backend.CreateDisk(vmDir, goldenPath, req.Disk); err != nil {
+		os.RemoveAll(vmDir)
+		return nil, fmt.Errorf("creating disk: %w", err)
 	}
+	backend.PrepareDisk(m, st)
 
 	m.prepareRootfs(st, req.AuthorizedKeys)
 
@@ -345,38 +332,22 @@ func (m *Manager) startVM(st *VMState, progress ProgressFunc) (*CreateResponse, 
 	// Clean stale sockets
 	os.Remove(filepath.Join(vmDir, "api.sock"))
 	os.Remove(filepath.Join(vmDir, "vsock.sock"))
+	os.Remove(filepath.Join(vmDir, "qmp.sock"))
 
-	var pid int
-	if st.Type == "qemu" {
-		emit("starting", "Starting QEMU VM...")
-		launchedPID, err := launchQEMU(vmDir, st)
-		if err != nil {
-			TeardownTAP(st.TAP, st.Mark)
-			return nil, fmt.Errorf("starting qemu: %w", err)
-		}
-		pid = launchedPID
-	} else {
-		emit("starting", "Starting Firecracker VM...")
-		logFile, _ := os.Create(filepath.Join(vmDir, "firecracker.log"))
-		cmd := exec.Command("firecracker",
-			"--api-sock", filepath.Join(vmDir, "api.sock"),
-			"--config-file", filepath.Join(vmDir, "fc-config.json"),
-		)
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-		if err := cmd.Start(); err != nil {
-			logFile.Close()
-			TeardownTAP(st.TAP, st.Mark)
-			return nil, fmt.Errorf("starting firecracker: %w", err)
-		}
-		logFile.Close()
-		pid = cmd.Process.Pid
-		os.WriteFile(filepath.Join(vmDir, "firecracker.pid"),
-			[]byte(fmt.Sprintf("%d", pid)), 0644)
-		go cmd.Wait()
+	backend := BackendFor(st.Type)
+	vmType := st.Type
+	if vmType == "" {
+		vmType = "firecracker"
+	}
+	emit("starting", fmt.Sprintf("Starting %s VM...", vmType))
+
+	pid, err := backend.Launch(vmDir, st)
+	if err != nil {
+		TeardownTAP(st.TAP, st.Mark)
+		return nil, fmt.Errorf("starting VM: %w", err)
 	}
 
-	log.Printf("VM %s started (type=%s, PID %d, mark %d)", st.Name, st.Type, pid, st.Mark)
+	log.Printf("VM %s started (type=%s, PID %d, mark %d)", st.Name, vmType, pid, st.Mark)
 
 	return &CreateResponse{
 		Name:   st.Name,
@@ -495,74 +466,16 @@ func (m *Manager) stopVM(name string) error {
 		goto cleanup
 	}
 
-	// Graceful shutdown — skip for migrating VMs since they're paused.
-	if !IsMigrating(vmDir) {
-		if st.Type == "qemu" {
-			// QEMU: SIGTERM triggers ACPI shutdown
-			syscall.Kill(pid, syscall.SIGTERM)
-			for i := 0; i < 10; i++ {
-				if err := syscall.Kill(pid, 0); err != nil {
-					log.Printf("stopVM %s: PID %d exited after SIGTERM", name, pid)
-					goto cleanup
-				}
-				time.Sleep(time.Second)
-			}
-		} else {
-			// Firecracker: CtrlAltDel via API
-			apiSock := filepath.Join(vmDir, "api.sock")
-			if _, err := os.Stat(apiSock); err == nil {
-				run("curl", "-s", "--unix-socket", apiSock,
-					"-X", "PUT", "http://localhost/actions",
-					"-H", "Content-Type: application/json",
-					"-d", `{"action_type":"SendCtrlAltDel"}`)
-
-				for i := 0; i < 10; i++ {
-					if err := syscall.Kill(pid, 0); err != nil {
-						log.Printf("stopVM %s: PID %d exited after CtrlAltDel", name, pid)
-						goto cleanup
-					}
-					time.Sleep(time.Second)
-				}
-			}
-		}
-	}
-
-	// Force kill if still running.
-	if err := syscall.Kill(pid, 0); err == nil {
-		log.Printf("stopVM %s: sending SIGKILL to PID %d", name, pid)
-		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
-			log.Printf("stopVM %s: syscall.Kill SIGKILL returned error: %v", name, err)
-		}
-		// Wait for process to fully exit so file handles and mmaps are released.
-		for i := 0; i < 50; i++ { // up to 5 seconds
-			if err := syscall.Kill(pid, 0); err != nil {
-				log.Printf("stopVM %s: PID %d exited after SIGKILL (%d iterations)", name, pid, i+1)
-				goto cleanup
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		// Process survived SIGKILL via syscall — try kill command as fallback
-		log.Printf("stopVM %s: PID %d survived syscall SIGKILL, trying kill -9 command", name, pid)
-		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
-		for i := 0; i < 20; i++ { // up to 2 more seconds
-			if err := syscall.Kill(pid, 0); err != nil {
-				log.Printf("stopVM %s: PID %d exited after kill -9", name, pid)
-				goto cleanup
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		// Last resort: check /proc to understand what state it's in
-		if procStatus, readErr := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid)); readErr == nil {
-			log.Printf("stopVM %s: CRITICAL — PID %d unkillable. /proc status:\n%s", name, pid, string(procStatus))
-		} else {
-			// /proc file gone means process actually exited despite kill(pid,0) succeeding
-			log.Printf("stopVM %s: PID %d /proc gone (race with exit), treating as dead", name, pid)
-		}
+	// Graceful shutdown via backend
+	{
+		backend := BackendFor(st.Type)
+		backend.GracefulShutdown(vmDir, pid, 10*time.Second)
 	}
 
 cleanup:
 	os.Remove(filepath.Join(vmDir, PIDFile(st.Type)))
 	os.Remove(filepath.Join(vmDir, "api.sock"))
+	os.Remove(filepath.Join(vmDir, "qmp.sock"))
 
 	if st.Mark != 0 {
 		TeardownTAP(st.TAP, st.Mark)
@@ -1612,28 +1525,25 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 
 	// Pause/sync source VM for consistent disk copy.
 	wasRunning := IsRunning(srcDir)
+	backend := BackendFor(srcSt.Type)
+	wasPaused := false
 	if wasRunning {
-		if srcSt.Type == "qemu" {
-			// QEMU: sync guest filesystem via SSH for crash-consistent copy.
-			// The VM stays running — copy is equivalent to a power-cycle snapshot.
-			progress("copy", "Syncing filesystem...")
-			sshKey := m.cfg.SSH.PrivateKeyPath
-			if sshKey == "" {
-				sshKey = "/etc/boxcutter/secrets/cluster-ssh.key"
-			}
-			VMSSH(srcSt.TAP, sshKey, "sudo sync")
-		} else {
-			progress("copy", "Pausing source VM...")
-			if err := fcPause(srcDir); err != nil {
-				return nil, fmt.Errorf("pausing source VM: %w", err)
-			}
+		sshKey := m.cfg.SSH.PrivateKeyPath
+		if sshKey == "" {
+			sshKey = "/etc/boxcutter/secrets/cluster-ssh.key"
 		}
+		progress("copy", "Preparing source VM for copy...")
+		paused, err := backend.SyncBeforeCopy(srcSt, sshKey)
+		if err != nil {
+			return nil, fmt.Errorf("preparing source for copy: %w", err)
+		}
+		wasPaused = paused
 	}
 
-	// Helper to resume FC on error (QEMU doesn't need resume — it stays running)
+	// Helper to resume on error
 	unfreezeSource := func() {
-		if wasRunning && srcSt.Type != "qemu" {
-			fcResume(srcDir)
+		if wasPaused {
+			backend.Resume(VMDir(srcName))
 		}
 	}
 
@@ -1642,10 +1552,11 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 	progress("copy", "Copying disk image...")
 	os.MkdirAll(dstDir, 0755)
 
-	if fileRootfs {
-		// File-based rootfs: copy the standalone ext4 directly
-		srcRootfs := filepath.Join(srcDir, "rootfs.ext4")
-		dstRootfs := filepath.Join(dstDir, "rootfs.ext4")
+	if fileRootfs || DiskFormat(srcDir) == "qcow2" {
+		// File-based rootfs: copy the rootfs file (ext4 or QCOW2)
+		diskName := backend.DiskName(srcDir)
+		srcRootfs := filepath.Join(srcDir, diskName)
+		dstRootfs := filepath.Join(dstDir, diskName)
 		if err := copyFile(srcRootfs, dstRootfs); err != nil {
 			unfreezeSource()
 			os.RemoveAll(dstDir)
@@ -1666,10 +1577,10 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		}
 	}
 
-	// Resume source VM (Firecracker only — QEMU stays running during copy)
-	if wasRunning && srcSt.Type != "qemu" {
+	// Resume source VM if it was paused
+	if wasPaused {
 		progress("copy", "Resuming source VM...")
-		if err := fcResume(srcDir); err != nil {
+		if err := backend.Resume(srcDir); err != nil {
 			log.Printf("Warning: failed to resume source VM %s: %v", srcName, err)
 		}
 	}
@@ -1714,12 +1625,8 @@ func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*Cre
 		return nil, err
 	}
 
-	if dstSt.Type != "qemu" {
-		if err := writeFirecrackerConfig(dstDir, dstSt); err != nil {
-			os.RemoveAll(dstDir)
-			return nil, err
-		}
-	}
+	dstBackend := BackendFor(dstSt.Type)
+	dstBackend.PrepareDisk(m, dstSt)
 
 	// Mount the copied rootfs and update hostname + wipe Tailscale state
 	mountDir, err := os.MkdirTemp("", "bc-mount-")
