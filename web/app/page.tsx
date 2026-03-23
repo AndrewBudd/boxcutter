@@ -25,6 +25,9 @@ export default function Dashboard() {
   const [activity, setActivity] = useState<Record<string, Activity>>({})
   const [loaded, setLoaded] = useState(false)
   const [nodeCount, setNodeCount] = useState(0)
+  const [showCreate, setShowCreate] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [createForm, setCreateForm] = useState({ name: '', type: 'firecracker', ram: '2048', vcpu: '2', desc: '' })
 
   useEffect(() => {
     const poll = async () => {
@@ -52,7 +55,70 @@ export default function Dashboard() {
 
   return (
     <div>
-      <h1 className="text-xl md:text-2xl font-bold mb-4 md:mb-6">Dashboard</h1>
+      <div className="flex items-center justify-between mb-4 md:mb-6">
+        <h1 className="text-xl md:text-2xl font-bold">Dashboard</h1>
+        <button onClick={() => setShowCreate(!showCreate)}
+          className="px-4 py-2 bg-green-700 hover:bg-green-600 rounded text-sm font-medium">
+          + New VM
+        </button>
+      </div>
+
+      {showCreate && (
+        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
+          <h3 className="text-sm font-medium text-gray-300 mb-3">Create New VM</h3>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <input placeholder="Name (optional)" value={createForm.name}
+              onChange={e => setCreateForm({...createForm, name: e.target.value})}
+              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+            <select value={createForm.type}
+              onChange={e => setCreateForm({...createForm, type: e.target.value})}
+              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+              <option value="firecracker">Firecracker</option>
+              <option value="qemu">QEMU (Docker)</option>
+            </select>
+            <select value={createForm.ram}
+              onChange={e => setCreateForm({...createForm, ram: e.target.value})}
+              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+              <option value="1024">1 GB RAM</option>
+              <option value="2048">2 GB RAM</option>
+              <option value="4096">4 GB RAM</option>
+              <option value="8192">8 GB RAM</option>
+            </select>
+            <select value={createForm.vcpu}
+              onChange={e => setCreateForm({...createForm, vcpu: e.target.value})}
+              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+              <option value="1">1 vCPU</option>
+              <option value="2">2 vCPU</option>
+              <option value="4">4 vCPU</option>
+            </select>
+            <button disabled={creating} onClick={async () => {
+              setCreating(true)
+              try {
+                const body: Record<string, unknown> = {
+                  type: createForm.type,
+                  ram_mib: parseInt(createForm.ram),
+                  vcpu: parseInt(createForm.vcpu),
+                }
+                if (createForm.name) body.name = createForm.name
+                if (createForm.desc) body.description = createForm.desc
+                await fetch('/api/vms/create', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(body),
+                })
+                setShowCreate(false)
+                setCreateForm({ name: '', type: 'firecracker', ram: '2048', vcpu: '2', desc: '' })
+              } catch {}
+              setCreating(false)
+            }} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-medium disabled:opacity-50">
+              {creating ? 'Creating...' : 'Create'}
+            </button>
+          </div>
+          <input placeholder="Description (optional)" value={createForm.desc}
+            onChange={e => setCreateForm({...createForm, desc: e.target.value})}
+            className="mt-3 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+        </div>
+      )}
 
       <div className="grid grid-cols-3 gap-2 md:gap-4 mb-6 md:mb-8">
         <StatCard label="VMs" value={loaded ? String(vms.length) : '...'} />
