@@ -166,6 +166,13 @@ else
   cp "${REPO_DIR}/orchestrator/scripts/boxcutter-names" "${PD}/scripts/"
   cp "${REPO_DIR}/orchestrator/systemd/boxcutter-orchestrator.service" "${PD}/systemd/"
   cp "${REPO_DIR}/node/golden/nss_catchall.c" "${PD}/"
+
+  # Web UI
+  mkdir -p "${PD}/web"
+  rsync -a --exclude=node_modules --exclude=.next --exclude=.git "${REPO_DIR}/web/" "${PD}/web/"
+  cp "${REPO_DIR}/web/systemd/"*.service "${REPO_DIR}/web/systemd/"*.timer "${PD}/systemd/"
+  cp "${REPO_DIR}/web/scripts/boxcutter-tailscale-cert" "${PD}/scripts/"
+  cp "${REPO_DIR}/web/nginx.conf" "${PD}/config/" 2>/dev/null || true
 fi
 
 PAYLOAD_TAR="${BUILD_DIR}/payload.tar.gz"
@@ -216,6 +223,9 @@ if [ -f /usr/local/bin/boxcutter-node ]; then
   systemctl start vmid boxcutter-proxy boxcutter-node caddy 2>/dev/null || true
 else
   systemctl start boxcutter-orchestrator 2>/dev/null || true
+  # Start web services + rotate TLS cert
+  systemctl start nginx boxcutter-web boxcutter-terminal 2>/dev/null || true
+  /usr/local/bin/boxcutter-tailscale-cert 2>/dev/null || true
 fi
 
 rm -f "$CONFIG_TAR"
@@ -407,6 +417,8 @@ packages:
   - curl
   - openssh-server
   - ca-certificates
+  - nginx
+  - rsync
 
 write_files:
   - path: /opt/boxcutter-payload.tar.gz
@@ -425,10 +437,14 @@ write_files:
 
       install -m 755 "\$PD/bin/"* /usr/local/bin/
       for s in "\$PD/scripts/"*; do [ -f "\$s" ] && install -m 755 "\$s" /usr/local/bin/; done
-      cp "\$PD/systemd/"*.service /etc/systemd/system/
+      cp "\$PD/systemd/"*.service "\$PD/systemd/"*.timer /etc/systemd/system/ 2>/dev/null || true
       systemctl daemon-reload
 
-      mkdir -p /etc/boxcutter/secrets /var/lib/boxcutter
+      mkdir -p /etc/boxcutter/secrets /etc/boxcutter/certs /var/lib/boxcutter
+
+      # Node.js (LTS via NodeSource)
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
 
       # Tailscale
       if ! command -v tailscale &>/dev/null; then curl -fsSL https://tailscale.com/install.sh | sh; fi
@@ -473,6 +489,28 @@ write_files:
           AllowTcpForwarding no
           X11Forwarding no
       SSHEOF
+
+      # Web UI — install dependencies and build
+      if [ -d "\$PD/web" ]; then
+        cp -r "\$PD/web" /var/lib/boxcutter/web
+        cd /var/lib/boxcutter/web
+        npm ci --omit=dev 2>&1 | tail -3
+        npm run build 2>&1 | tail -5
+        echo "Web UI built"
+
+        # nginx config
+        rm -f /etc/nginx/sites-enabled/default
+        cp "\$PD/config/nginx.conf" /etc/nginx/sites-available/boxcutter
+        ln -sf /etc/nginx/sites-available/boxcutter /etc/nginx/sites-enabled/boxcutter
+
+        # Self-signed fallback cert (replaced by Tailscale cert at boot)
+        mkdir -p /etc/boxcutter/certs
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+          -keyout /etc/boxcutter/certs/tls.key -out /etc/boxcutter/certs/tls.crt \
+          -days 365 -nodes -subj "/CN=boxcutter" 2>/dev/null
+
+        systemctl enable nginx boxcutter-web boxcutter-terminal boxcutter-tailscale-cert.timer
+      fi
 
       # Enable orchestrator service (but don't start — no config yet)
       systemctl enable boxcutter-orchestrator

@@ -410,6 +410,13 @@ build_orchestrator() {
   # Include nss_catchall.c for SSH any-user support
   cp "${REPO_DIR}/node/golden/nss_catchall.c" "${PD}/"
 
+  # Web UI
+  mkdir -p "${PD}/web" "${PD}/config"
+  rsync -a --exclude=node_modules --exclude=.next --exclude=.git "${REPO_DIR}/web/" "${PD}/web/"
+  cp "${REPO_DIR}/web/systemd/"*.service "${REPO_DIR}/web/systemd/"*.timer "${PD}/systemd/"
+  cp "${REPO_DIR}/web/scripts/boxcutter-tailscale-cert" "${PD}/scripts/"
+  cp "${REPO_DIR}/web/nginx.conf" "${PD}/config/"
+
   # Bundle (orchestrator only needs tailscale key + authorized keys)
   cp "${BUNDLE_DIR}/boxcutter.yaml" "${PD}/bundle/"
   for secret in tailscale-node-authkey tailscale-orch-authkey authorized-keys; do
@@ -447,6 +454,8 @@ packages:
   - curl
   - openssh-server
   - ca-certificates
+  - nginx
+  - rsync
 
 write_files:
   - path: /opt/boxcutter-payload.tar.gz
@@ -465,11 +474,15 @@ write_files:
 
       install -m 755 "\$PD/bin/"* /usr/local/bin/
       for s in "\$PD/scripts/"*; do [ -f "\$s" ] && install -m 755 "\$s" /usr/local/bin/; done
-      cp "\$PD/systemd/"*.service /etc/systemd/system/
+      cp "\$PD/systemd/"*.service "\$PD/systemd/"*.timer /etc/systemd/system/ 2>/dev/null || true
       systemctl daemon-reload
 
+      # Node.js (LTS via NodeSource)
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
+
       # Bundle
-      mkdir -p /etc/boxcutter/secrets /var/lib/boxcutter
+      mkdir -p /etc/boxcutter/secrets /etc/boxcutter/certs /var/lib/boxcutter
       cp "\$PD/bundle/boxcutter.yaml" /etc/boxcutter/
       for f in "\$PD/bundle/secrets/"*; do [ -f "\$f" ] && cp "\$f" "/etc/boxcutter/secrets/\$(basename "\$f")"; done
       chmod 600 /etc/boxcutter/secrets/* 2>/dev/null || true
@@ -531,6 +544,32 @@ write_files:
           X11Forwarding no
       SSHEOF
       systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+
+      # Web UI — install dependencies and build
+      if [ -d "\$PD/web" ]; then
+        cp -r "\$PD/web" /var/lib/boxcutter/web
+        cd /var/lib/boxcutter/web
+        npm ci --omit=dev 2>&1 | tail -3
+        npm run build 2>&1 | tail -5
+        echo "Web UI built"
+
+        # nginx config
+        rm -f /etc/nginx/sites-enabled/default
+        cp "\$PD/config/nginx.conf" /etc/nginx/sites-available/boxcutter
+        ln -sf /etc/nginx/sites-available/boxcutter /etc/nginx/sites-enabled/boxcutter
+
+        # Self-signed fallback cert (replaced by Tailscale cert after join)
+        mkdir -p /etc/boxcutter/certs
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+          -keyout /etc/boxcutter/certs/tls.key -out /etc/boxcutter/certs/tls.crt \
+          -days 365 -nodes -subj "/CN=boxcutter" 2>/dev/null
+
+        systemctl enable nginx boxcutter-web boxcutter-terminal boxcutter-tailscale-cert.timer
+        systemctl start nginx boxcutter-web boxcutter-terminal
+      fi
+
+      # Rotate Tailscale cert now (if Tailscale is connected)
+      /usr/local/bin/boxcutter-tailscale-cert 2>/dev/null || true
 
       # Enable + start orchestrator
       systemctl enable boxcutter-orchestrator
@@ -773,6 +812,10 @@ done)
       fi
 
       systemctl restart boxcutter-orchestrator 2>/dev/null || true
+
+      # Start web services + rotate TLS cert (if image has web UI baked in)
+      systemctl start nginx boxcutter-web boxcutter-terminal 2>/dev/null || true
+      /usr/local/bin/boxcutter-tailscale-cert 2>/dev/null || true
 
 runcmd:
   - bash /opt/boxcutter-config.sh

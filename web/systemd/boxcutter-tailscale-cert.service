@@ -1,0 +1,6 @@
+[Unit]
+Description=Rotate Tailscale TLS certificate for nginx
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/boxcutter-tailscale-cert

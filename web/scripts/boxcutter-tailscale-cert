@@ -1,0 +1,32 @@
+#!/bin/bash
+# Fetch Tailscale TLS cert and install for nginx.
+# Runs as systemd oneshot (daily timer) and at boot.
+set -e
+
+CERT_DIR="/etc/boxcutter/certs"
+mkdir -p "$CERT_DIR"
+
+# Get the Tailscale FQDN
+FQDN=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName' | sed 's/\.$//')
+if [ -z "$FQDN" ] || [ "$FQDN" = "null" ]; then
+    echo "Tailscale not connected, skipping cert rotation"
+    exit 0
+fi
+
+# tailscale cert writes to current directory
+WORK=$(mktemp -d)
+cd "$WORK"
+
+if tailscale cert "$FQDN" 2>/dev/null; then
+    cp "${FQDN}.crt" "$CERT_DIR/tls.crt"
+    cp "${FQDN}.key" "$CERT_DIR/tls.key"
+    chmod 600 "$CERT_DIR/tls.key"
+    rm -rf "$WORK"
+    # Reload nginx if running
+    systemctl reload nginx 2>/dev/null || true
+    echo "TLS cert rotated for $FQDN"
+else
+    rm -rf "$WORK"
+    echo "tailscale cert failed (HTTPS may not be enabled on tailnet)"
+    exit 0
+fi

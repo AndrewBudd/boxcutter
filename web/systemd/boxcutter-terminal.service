@@ -1,0 +1,14 @@
+[Unit]
+Description=Boxcutter Terminal Server (WebSocket-SSH bridge)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/boxcutter/web
+ExecStart=/usr/bin/node /var/lib/boxcutter/web/terminal-server.js
+Environment=TERMINAL_PORT=3001
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
