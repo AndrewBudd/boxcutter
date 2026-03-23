@@ -14,6 +14,26 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
   const [message, setMessage] = useState('')
   const [sendKeys, setSendKeys] = useState(false)
   const [msgStatus, setMsgStatus] = useState('')
+  const [actionMsg, setActionMsg] = useState('')
+  const [copyName, setCopyName] = useState('')
+  const [showCopy, setShowCopy] = useState(false)
+  const [confirmDestroy, setConfirmDestroy] = useState(false)
+
+  const vmAction = async (action: string, body?: object) => {
+    setActionMsg(action + '...')
+    try {
+      const opts: RequestInit = { method: 'POST' }
+      if (body) {
+        opts.headers = { 'Content-Type': 'application/json' }
+        opts.body = JSON.stringify(body)
+      }
+      await fetch('/api/vms/' + name + '/' + action, opts)
+      setActionMsg(action + ' done')
+      setTimeout(() => setActionMsg(''), 3000)
+    } catch (e) {
+      setActionMsg('Error: ' + e)
+    }
+  }
 
   useEffect(() => {
     const poll = async () => {
@@ -53,7 +73,41 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
 
   return (
     <div>
-      <h1 className="text-2xl font-bold mb-2">{name}</h1>
+      <div className="flex items-center gap-4 mb-2 flex-wrap">
+        <h1 className="text-2xl font-bold">{name}</h1>
+        <div className="flex gap-2">
+          {vm?.status === 'running' ? (
+            <button onClick={() => vmAction('stop')}
+              className="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-xs font-medium">Stop</button>
+          ) : vm?.status === 'stopped' ? (
+            <button onClick={() => vmAction('start')}
+              className="px-3 py-1 bg-green-700 hover:bg-green-600 rounded text-xs font-medium">Start</button>
+          ) : null}
+          <button onClick={() => setShowCopy(!showCopy)}
+            className="px-3 py-1 bg-blue-700 hover:bg-blue-600 rounded text-xs font-medium">Copy</button>
+          {!confirmDestroy ? (
+            <button onClick={() => setConfirmDestroy(true)}
+              className="px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs font-medium">Destroy</button>
+          ) : (
+            <span className="flex gap-1">
+              <button onClick={() => { vmAction('destroy'); setConfirmDestroy(false) }}
+                className="px-3 py-1 bg-red-600 hover:bg-red-500 rounded text-xs font-medium">Confirm Destroy</button>
+              <button onClick={() => setConfirmDestroy(false)}
+                className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium">Cancel</button>
+            </span>
+          )}
+        </div>
+        {actionMsg && <span className="text-xs text-gray-400">{actionMsg}</span>}
+      </div>
+      {showCopy && (
+        <div className="flex gap-2 mb-4">
+          <input type="text" value={copyName} onChange={e => setCopyName(e.target.value)}
+            placeholder="New VM name..."
+            className="bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500 w-60" />
+          <button onClick={() => { if (copyName.trim()) { vmAction('copy', { name: copyName }); setShowCopy(false); setCopyName('') } }}
+            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-xs font-medium">Create Copy</button>
+        </div>
+      )}
       {typeof vm?.description === 'string' && vm.description && (
         <p className="text-gray-400 mb-4">{vm.description}</p>
       )}
