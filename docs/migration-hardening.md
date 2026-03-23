@@ -1767,3 +1767,32 @@ Added live copy support for QEMU VMs (sync+copy while running) and web UI action
 ### Cumulative Stats
 - **489 total tests**, **118 bugs found** (117 fixed, 1 known behavior)
 - **1450+ VMs created/migrated**, **285+ drain cycles**
+
+## Phase 41: QEMU Live Migration via QMP (test QM-1)
+
+Implemented QEMU live migration using QMP (QEMU Monitor Protocol) state save/restore.
+
+### Flow
+1. Pre-sync rootfs with tar --sparse (VM running, zero downtime)
+2. QMP stop (pause vCPUs) — 7ms
+3. QMP migrate to file (save CPU+devices+RAM state) — 3-4s for 512MB
+4. Transfer state file via SSH — 1.6s for 473MB
+5. Target: launch QEMU with -incoming defer, load state via QMP
+6. Target: QMP cont (resume vCPUs)
+7. Verify target healthy, stop source
+
+### Test Results
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| QM-1 | QEMU live migration 512MB VM | **PASS** | 7.5s downtime, data integrity verified |
+| QM-1b | Rollback on target failure | **PASS** | Source VM resumed after 500 error |
+
+### Performance
+
+| VM RAM | State Size | Pause | Save | Transfer | Import | Total Downtime |
+|--------|-----------|-------|------|----------|--------|---------------|
+| 512MB | 473MB | 7ms | 4.1s | 1.6s | 1.6s | **7.5s** |
+
+### Cumulative Stats
+- **491 total tests**, **118 bugs found** (117 fixed, 1 known behavior)
