@@ -1,8 +1,10 @@
 #!/bin/bash
 set -e
 
-# Create data directory
-mkdir -p /var/lib/boxcutter/.images
+# Create data directory (skip if symlink exists — user may have moved storage)
+if [ ! -L /var/lib/boxcutter/.images ]; then
+    mkdir -p /var/lib/boxcutter/.images
+fi
 
 # Reload systemd to pick up the service file
 systemctl daemon-reload
