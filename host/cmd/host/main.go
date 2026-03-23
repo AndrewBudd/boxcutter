@@ -1646,6 +1646,29 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	if len(toMigrate) == 0 {
 		log.Printf("Drain: all VMs already migrated from %s", nodeID)
 	} else {
+		// Stop QEMU VMs before migration — they don't support live migration.
+		// Stopped VMs can be relocated via file transfer.
+		for _, vmName := range toMigrate {
+			vmType := ""
+			for _, vm := range vms {
+				if n, _ := vm["name"].(string); n == vmName {
+					vmType, _ = vm["type"].(string)
+					break
+				}
+			}
+			if vmType == "qemu" {
+				log.Printf("Drain: stopping QEMU VM %s before migration", vmName)
+				stopResp, err := migrateClient.Post(
+					fmt.Sprintf("http://%s:8800/api/vms/%s/stop", node.BridgeIP, vmName),
+					"application/json", nil)
+				if err != nil {
+					log.Printf("Drain: failed to stop QEMU VM %s: %v", vmName, err)
+				} else {
+					stopResp.Body.Close()
+					log.Printf("Drain: QEMU VM %s stopped for migration", vmName)
+				}
+			}
+		}
 		log.Printf("Drain: migrating %d VMs from %s to %s (max 3 concurrent)", len(toMigrate), nodeID, targetNode.ID)
 	}
 
@@ -1868,6 +1891,29 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		state.SetNodeStatus(nodeID, "active") // revert so health monitor manages it
 		state.Save()
 		return
+	}
+
+	// Start QEMU VMs that were stopped for migration
+	for _, vmName := range toMigrate {
+		vmType := ""
+		for _, vm := range vms {
+			if n, _ := vm["name"].(string); n == vmName {
+				vmType, _ = vm["type"].(string)
+				break
+			}
+		}
+		if vmType == "qemu" {
+			log.Printf("Drain: starting QEMU VM %s on target %s", vmName, targetNode.ID)
+			startResp, err := migrateClient.Post(
+				fmt.Sprintf("http://%s:8800/api/vms/%s/start", targetNode.BridgeIP, vmName),
+				"application/json", nil)
+			if err != nil {
+				log.Printf("Drain: WARNING — failed to start QEMU VM %s on target: %v", vmName, err)
+			} else {
+				startResp.Body.Close()
+				log.Printf("Drain: QEMU VM %s started on %s", vmName, targetNode.ID)
+			}
+		}
 	}
 
 	// All VMs migrated and verified — stop the node
