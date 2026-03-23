@@ -29,21 +29,26 @@ wss.on('connection', (ws, req) => {
   // Spawn SSH with a PTY via script -qfc (gives us a real PTY on Linux)
   const ssh = spawn('script', [
     '-qfc',
-    `ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ${SSH_KEY} dev@${ip}`,
+    `ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o SendEnv=LANG -i ${SSH_KEY} dev@${ip}`,
     '/dev/null'
   ], {
-    env: { ...process.env, TERM: 'xterm-256color' },
+    env: {
+      ...process.env,
+      TERM: 'xterm-256color',
+      LANG: 'en_US.UTF-8',
+      LC_ALL: 'en_US.UTF-8',
+    },
   })
 
   ssh.stdout.on('data', (data) => {
     if (ws.readyState === 1) {
-      ws.send(data.toString('binary'))
+      ws.send(data.toString('utf8'))
     }
   })
 
   ssh.stderr.on('data', (data) => {
     if (ws.readyState === 1) {
-      ws.send(data.toString('binary'))
+      ws.send(data.toString('utf8'))
     }
   })
 
