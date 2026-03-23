@@ -1744,3 +1744,26 @@ Added QEMU VM support as an alternative to Firecracker for workloads requiring f
 ### Cumulative Stats
 - **483 total tests**, **116 bugs found** (115 fixed, 1 known behavior)
 - **1420+ VMs created/migrated**, **280+ drain cycles**
+## Phase 40: QEMU Live Copy + Web UI (tests QC-1 through QC-6)
+
+Added live copy support for QEMU VMs (sync+copy while running) and web UI action buttons.
+
+### QEMU Live Copy Test Results
+
+| # | Scenario | Result | Notes |
+|---|----------|--------|-------|
+| QC-1 | Live copy with data integrity | **PASS** | md5sum match, source stays running |
+| QC-2 | Multiple copies of same source | **PASS** | 3 copies from same source, all running |
+| QC-3 | Copy preserves metadata | **PASS** | Type and description preserved |
+| QC-4 | Lifecycle on copies (stop/start/destroy) | **PASS** | All operations work on copies |
+| QC-5 | Agent restart — copies survive | **PASS** | All 6 VMs recovered |
+| QC-6 | Copy of a copy (nested) | **PASS** | Second-generation copy works |
+
+### Web UI Updates
+- Stop/Start/Copy/Destroy buttons on VM detail page
+- Confirm step for destroy (must click twice)
+- Copy dialog with name input
+
+### Cumulative Stats
+- **489 total tests**, **118 bugs found** (117 fixed, 1 known behavior)
+- **1450+ VMs created/migrated**, **285+ drain cycles**
