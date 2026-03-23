@@ -24,7 +24,13 @@ mkdir -p /home/dev/.tapegun
 jq -n --arg msg "$message" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{last_response: $msg, timestamp: $ts}' > "$STATUS_FILE" 2>/dev/null
 
-# Post to metadata service (best-effort, don't block Claude)
+# Post to metadata service — both activity (for dashboard) and status (for detail)
+# Use activity endpoint so it shows up in tapegun activity view
+curl -sf -X POST "$METADATA/tapegun/activity" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg msg "$message" '{status: "claude-code", summary: $msg}')" \
+    --max-time 2 >/dev/null 2>&1 &
+
 curl -sf -X POST "$METADATA/tapegun/status" \
     -H "Content-Type: application/json" \
     -d "$(jq -n --arg msg "$message" '{status: $msg}')" \
