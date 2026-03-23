@@ -24,15 +24,18 @@ export default function Dashboard() {
   const [vms, setVMs] = useState<VM[]>([])
   const [activity, setActivity] = useState<Record<string, Activity>>({})
   const [loaded, setLoaded] = useState(false)
+  const [nodeCount, setNodeCount] = useState(0)
 
   useEffect(() => {
     const poll = async () => {
       try {
-        const [vmRes, actRes] = await Promise.all([
+        const [vmRes, actRes, nodeRes] = await Promise.all([
           fetch('/api/vms').then(r => r.json()),
           fetch('/api/tapegun/activity').then(r => r.json()).catch(() => []),
+          fetch('/api/nodes').then(r => r.json()).catch(() => []),
         ])
         if (Array.isArray(vmRes)) setVMs(vmRes)
+        if (Array.isArray(nodeRes)) setNodeCount(nodeRes.filter((n: {status: string}) => n.status === 'active').length)
         const map: Record<string, Activity> = {}
         if (Array.isArray(actRes)) for (const a of actRes) map[a.name] = a
         setActivity(map)
@@ -45,7 +48,7 @@ export default function Dashboard() {
   }, [])
 
   const running = vms.filter(v => v.status === 'running').length
-  const nodes = [...new Set(vms.map(v => v.node_name).filter(Boolean))].length
+  // nodeCount is fetched from /api/nodes (active nodes only)
 
   return (
     <div>
@@ -54,7 +57,7 @@ export default function Dashboard() {
       <div className="grid grid-cols-3 gap-2 md:gap-4 mb-6 md:mb-8">
         <StatCard label="VMs" value={loaded ? String(vms.length) : '...'} />
         <StatCard label="Running" value={loaded ? String(running) : '...'} />
-        <StatCard label="Nodes" value={loaded ? String(nodes) : '...'} />
+        <StatCard label="Nodes" value={loaded ? String(nodeCount) : '...'} />
       </div>
 
       {/* Desktop table */}
