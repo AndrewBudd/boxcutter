@@ -77,8 +77,12 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
         <h1 className="text-2xl font-bold">{name}</h1>
         <div className="flex gap-2">
           {vm?.status === 'running' ? (
-            <button onClick={() => vmAction('stop')}
-              className="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-xs font-medium">Stop</button>
+            <>
+              <button onClick={() => vmAction('stop')}
+                className="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-xs font-medium">Stop</button>
+              <button onClick={() => vmAction('restart')}
+                className="px-3 py-1 bg-orange-700 hover:bg-orange-600 rounded text-xs font-medium">Restart</button>
+            </>
           ) : vm?.status === 'stopped' ? (
             <button onClick={() => vmAction('start')}
               className="px-3 py-1 bg-green-700 hover:bg-green-600 rounded text-xs font-medium">Start</button>
