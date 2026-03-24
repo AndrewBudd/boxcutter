@@ -2370,6 +2370,32 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		})
 	}
 
+	// Rejoin Tailscale after migration — QEMU VMs don't have vsock for nudge,
+	// so we SSH in and re-run tailscale up with the auth key.
+	go func() {
+		sshKey := m.cfg.SSH.PrivateKeyPath
+		authkeyFile := m.cfg.Tailscale.VMAuthkeyFile
+		authkeyData, err := os.ReadFile(authkeyFile)
+		if err != nil {
+			log.Printf("QEMU VM %s: cannot read Tailscale authkey for post-migration rejoin: %v", name, err)
+			return
+		}
+		authkey := strings.TrimSpace(string(authkeyData))
+		// Wait for SSH to become available
+		time.Sleep(2 * time.Second)
+		if err := WaitForSSH(st.TAP, sshKey, 30*time.Second); err != nil {
+			log.Printf("QEMU VM %s: SSH not ready for Tailscale rejoin: %v", name, err)
+			return
+		}
+		out, err := VMSSH(st.TAP, sshKey,
+			fmt.Sprintf("sudo tailscale up --authkey='%s' --hostname='%s'", authkey, st.Name))
+		if err != nil {
+			log.Printf("QEMU VM %s: Tailscale rejoin failed: %s %v", name, out, err)
+		} else {
+			log.Printf("QEMU VM %s: Tailscale rejoined after migration", name)
+		}
+	}()
+
 	return &CreateResponse{
 		Name:   name,
 		Mark:   st.Mark,
