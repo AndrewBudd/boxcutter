@@ -9,11 +9,38 @@ const url = require('url')
 
 const PORT = process.env.TERMINAL_PORT || 3001
 const SSH_KEY = '/etc/boxcutter/secrets/cluster-ssh.key'
+const ORCH_API = process.env.ORCHESTRATOR_API || 'http://localhost:8801'
 
 const wss = new WebSocketServer({ port: PORT })
 console.log(`Terminal server listening on port ${PORT}`)
 
-wss.on('connection', (ws, req) => {
+// Look up the VM's node bridge IP and TAP name from the orchestrator/node APIs
+async function getVMRoute(vmName) {
+  try {
+    const vmResp = await fetch(`${ORCH_API}/api/vms/${vmName}`)
+    const vmData = await vmResp.json()
+    const nodeId = vmData.node_id
+    if (!nodeId) return null
+
+    const nodesResp = await fetch(`${ORCH_API}/api/nodes`)
+    const nodes = await nodesResp.json()
+    const node = nodes.find(n => n.id === nodeId)
+    if (!node || !node.bridge_ip) return null
+
+    // Get TAP name from node agent
+    const detailResp = await fetch(`http://${node.bridge_ip}:8800/api/vms/${vmName}`)
+    const detail = await detailResp.json()
+    const tap = detail.vm?.tap || detail.tap
+    if (!tap) return null
+
+    return { bridgeIP: node.bridge_ip, tap }
+  } catch (e) {
+    console.error(`Terminal: route lookup failed for ${vmName}:`, e.message)
+    return null
+  }
+}
+
+wss.on('connection', async (ws, req) => {
   const params = new URLSearchParams(url.parse(req.url).query)
   const vmName = params.get('vm')
   const ip = params.get('ip')
@@ -26,10 +53,30 @@ wss.on('connection', (ws, req) => {
 
   console.log(`Terminal: connecting to ${vmName} (${ip})`)
 
+  // Try direct Tailscale SSH first, fall back to bridge+socat
+  let sshCmd = `ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o SendEnv=LANG -i ${SSH_KEY} dev@${ip}`
+
+  // Check if we can reach the VM directly via Tailscale
+  const { execSync } = require('child_process')
+  let useBridge = false
+  try {
+    execSync(`ping -c 1 -W 2 ${ip} 2>/dev/null`, { stdio: 'ignore' })
+  } catch {
+    // Can't reach via Tailscale, try bridge route
+    const route = await getVMRoute(vmName)
+    if (route) {
+      console.log(`Terminal: using bridge route via ${route.bridgeIP} (${route.tap})`)
+      sshCmd = `ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o SendEnv=LANG -i ${SSH_KEY} -o "ProxyCommand=ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ${SSH_KEY} ubuntu@${route.bridgeIP} socat - TCP:10.0.0.2:22,so-bindtodevice=${route.tap}" dev@10.0.0.2`
+      useBridge = true
+    } else {
+      console.log(`Terminal: can't reach ${vmName} via Tailscale or bridge`)
+    }
+  }
+
   // Spawn SSH with a PTY via script -qfc (gives us a real PTY on Linux)
   const ssh = spawn('script', [
     '-qfc',
-    `ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o SendEnv=LANG -i ${SSH_KEY} dev@${ip}`,
+    sshCmd,
     '/dev/null'
   ], {
     env: {
