@@ -282,6 +282,8 @@ packages:
   - openssh-server
   - ca-certificates
   - gnupg
+  - qemu-system-x86
+  - qemu-utils
 
 write_files:
   - path: /opt/boxcutter-payload.tar.gz
