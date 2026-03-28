@@ -697,7 +697,7 @@ func (m *Manager) RestartAll() {
 			} else {
 				log.Printf("  %s: stale migration marker found (no target info), resuming paused VM", st.Name)
 			}
-			if err := fcResume(vmDir); err != nil {
+			if err := BackendFor(st.Type).Resume(vmDir); err != nil {
 				log.Printf("  %s: resume failed (will restart from scratch): %v", st.Name, err)
 			} else {
 				SetMigrating(vmDir, false)
@@ -728,7 +728,7 @@ func (m *Manager) RestartAll() {
 			continue
 		}
 
-		if err := writeFirecrackerConfig(vmDir, st); err != nil {
+		if err := BackendFor(st.Type).WriteConfig(vmDir, st); err != nil {
 			log.Printf("  %s: config failed: %v", st.Name, err)
 			continue
 		}
