@@ -372,6 +372,24 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 		return
 	}
 
+	// Register with vmid FIRST — the guest's boxcutter-metadata.service
+	// queries vmid at boot and blocks SSH if vmid doesn't know about the VM.
+	if m.vmid != nil {
+		vmType := st.Type
+		if vmType == "" {
+			vmType = "firecracker"
+		}
+		m.vmid.Register(&vmid.RegisterRequest{
+			VMID:        st.Name,
+			VMType:      vmType,
+			IP:          "10.0.0.2",
+			Mark:        st.Mark,
+			Mode:        st.Mode,
+			GitHubRepo:  st.GitHubRepo,
+			GitHubRepos: st.AllGitHubRepos(),
+		})
+	}
+
 	// Wait for SSH
 	emit("ssh", "Waiting for VM to boot...")
 	sshKey := m.cfg.SSH.PrivateKeyPath
@@ -388,29 +406,6 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 	// Join Tailscale
 	emit("tailscale", "Joining Tailscale network...")
 	tsIP := m.joinTailscale(st)
-
-	// Check again after Tailscale (another slow operation)
-	if !IsRunning(vmDir) {
-		log.Printf("VM %s no longer running after Tailscale join, aborting post-start", st.Name)
-		return
-	}
-
-	// Register with vmid
-	if m.vmid != nil {
-		vmType := st.Type
-		if vmType == "" {
-			vmType = "firecracker"
-		}
-		m.vmid.Register(&vmid.RegisterRequest{
-			VMID:        st.Name,
-			VMType:      vmType,
-			IP:          "10.0.0.2",
-			Mark:        st.Mark,
-			Mode:        st.Mode,
-			GitHubRepo:  st.GitHubRepo,
-			GitHubRepos: st.AllGitHubRepos(),
-		})
-	}
 
 	// Paranoid mode: inject proxy env
 	if st.Mode == "paranoid" {

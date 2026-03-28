@@ -32,9 +32,10 @@ case "${1:-up}" in
     [ -z "$UPLINK" ] && { echo "Warning: no default route found, VMs won't have internet"; }
 
     if [ -n "$UPLINK" ]; then
-      # Restore conntrack marks on return traffic (before per-TAP rules)
+      # Restore conntrack marks on return traffic (MUST be first rule in PREROUTING,
+      # before Tailscale's masked CONNMARK restore which only handles upper bits)
       iptables -t mangle -C PREROUTING -j CONNMARK --restore-mark 2>/dev/null || \
-      iptables -t mangle -A PREROUTING -j CONNMARK --restore-mark
+      iptables -t mangle -I PREROUTING 1 -j CONNMARK --restore-mark
 
       # Save marks to conntrack after per-TAP marking
       iptables -t mangle -C POSTROUTING -m mark ! --mark 0 -j CONNMARK --save-mark 2>/dev/null || \
