@@ -1092,18 +1092,11 @@ func canScaleUp(cfg HostConfig, currentNodeCount int) (bool, string) {
 			afterLaunchMB, availMB, nodeRAMMB, nodeRAMMB, cfg.MinFreeMemoryMB)
 	}
 
-	// Also enforce MaxNodes against memory-based ceiling.
-	// The rolling upgrade reserve is already enforced by the requiredMB check above
-	// (which ensures room for thisNode + upgradeNode + minFree), so we don't subtract
-	// an additional slot here.
-	memoryBasedMax := (availMB - cfg.MinFreeMemoryMB) / nodeRAMMB
-	effectiveMax := memoryBasedMax
-	if cfg.MaxNodes > 0 && cfg.MaxNodes < effectiveMax {
-		effectiveMax = cfg.MaxNodes
-	}
-	if currentNodeCount >= effectiveMax {
-		return false, fmt.Sprintf("at capacity: %d nodes running, effective max is %d (memory-based: %d, configured: %d, includes rolling upgrade reserve)",
-			currentNodeCount, effectiveMax, memoryBasedMax, cfg.MaxNodes)
+	// Also enforce MaxNodes. The requiredMB check above already verified we have
+	// enough memory for this node + upgrade reserve + minFree. This check enforces
+	// the configured hard cap.
+	if cfg.MaxNodes > 0 && currentNodeCount >= cfg.MaxNodes {
+		return false, fmt.Sprintf("at configured maximum of %d nodes", cfg.MaxNodes)
 	}
 
 	// Check host disk space
