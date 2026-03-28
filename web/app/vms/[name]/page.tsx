@@ -2,6 +2,7 @@
 
 import { useEffect, useState, use } from 'react'
 import dynamic from 'next/dynamic'
+import Link from 'next/link'
 
 const TerminalView = dynamic(() => import('@/components/terminal-view'), { ssr: false })
 
@@ -70,82 +71,105 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
   const actRaw = activity as Record<string, unknown> | null
   const actData = actRaw?.activity as Record<string, string> | undefined
   const tsIP = vm?.tailscale_ip as string || ''
+  const isRunning = vm?.status === 'running'
+  const isStopped = vm?.status === 'stopped'
+  const vmType = String(vm?.type || 'fc')
 
   return (
     <div>
-      <div className="flex items-center gap-4 mb-2 flex-wrap">
-        <h1 className="text-2xl font-bold">{name}</h1>
-        <div className="flex gap-2">
-          {vm?.status === 'running' ? (
-            <>
-              <button onClick={() => vmAction('stop')}
-                className="px-3 py-1 bg-yellow-700 hover:bg-yellow-600 rounded text-xs font-medium">Stop</button>
-              <button onClick={() => vmAction('restart')}
-                className="px-3 py-1 bg-orange-700 hover:bg-orange-600 rounded text-xs font-medium">Restart</button>
-            </>
-          ) : vm?.status === 'stopped' ? (
-            <button onClick={() => vmAction('start')}
-              className="px-3 py-1 bg-green-700 hover:bg-green-600 rounded text-xs font-medium">Start</button>
-          ) : null}
-          <button onClick={() => setShowCopy(!showCopy)}
-            className="px-3 py-1 bg-blue-700 hover:bg-blue-600 rounded text-xs font-medium">Copy</button>
-          {!confirmDestroy ? (
-            <button onClick={() => setConfirmDestroy(true)}
-              className="px-3 py-1 bg-red-900 hover:bg-red-800 rounded text-xs font-medium">Destroy</button>
-          ) : (
-            <span className="flex gap-1">
-              <button onClick={() => { vmAction('destroy'); setConfirmDestroy(false) }}
-                className="px-3 py-1 bg-red-600 hover:bg-red-500 rounded text-xs font-medium">Confirm Destroy</button>
-              <button onClick={() => setConfirmDestroy(false)}
-                className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-xs font-medium">Cancel</button>
+      {/* Breadcrumb */}
+      <div className="flex items-center gap-2 text-sm text-gray-500 mb-4">
+        <Link href="/" className="hover:text-gray-300 transition-colors">VMs</Link>
+        <span>/</span>
+        <span className="text-gray-300">{name}</span>
+      </div>
+
+      {/* Header */}
+      <div className="flex flex-col md:flex-row md:items-center gap-3 mb-6">
+        <div className="flex-1">
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-semibold">{name}</h1>
+            <span className={`badge ${vmType === 'qemu' ? 'bg-purple-500/15 text-purple-400 border border-purple-500/20' : 'bg-amber-500/15 text-amber-400 border border-amber-500/20'}`}>
+              {vmType === 'qemu' ? 'QEMU' : 'FC'}
             </span>
+            <span className="flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-emerald-400 shadow-sm shadow-emerald-400/50 animate-pulse' : 'bg-gray-500'}`} />
+              <span className={`text-sm ${isRunning ? 'text-emerald-400' : 'text-gray-500'}`}>{String(vm?.status || '...')}</span>
+            </span>
+          </div>
+          {typeof vm?.description === 'string' && vm.description && (
+            <p className="text-sm text-gray-500 mt-1">{vm.description}</p>
           )}
         </div>
-        {actionMsg && <span className="text-xs text-gray-400">{actionMsg}</span>}
+
+        {/* Action buttons */}
+        <div className="flex items-center gap-2 flex-wrap">
+          {isRunning && (
+            <>
+              <button onClick={() => vmAction('stop')} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-600 hover:bg-amber-500 text-white transition-all active:scale-95">Stop</button>
+              <button onClick={() => vmAction('restart')} className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all active:scale-95 bg-orange-600 hover:bg-orange-500 text-white shadow-sm shadow-orange-900/30">Restart</button>
+            </>
+          )}
+          {isStopped && <button onClick={() => vmAction('start')} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition-all active:scale-95">Start</button>}
+          <button onClick={() => setShowCopy(!showCopy)} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-all active:scale-95">Copy</button>
+          {!confirmDestroy ? (
+            <button onClick={() => setConfirmDestroy(true)} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-600 hover:bg-red-500 text-white transition-all active:scale-95">Destroy</button>
+          ) : (
+            <span className="flex gap-1">
+              <button onClick={() => { vmAction('destroy'); setConfirmDestroy(false) }} className="px-3 py-1.5 rounded-lg text-xs font-medium transition-all active:scale-95 bg-red-500 hover:bg-red-400 text-white">Confirm</button>
+              <button onClick={() => setConfirmDestroy(false)} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-800 hover:bg-gray-700 text-gray-300 transition-all active:scale-95">Cancel</button>
+            </span>
+          )}
+          {actionMsg && <span className="text-xs text-gray-500 animate-pulse">{actionMsg}</span>}
+        </div>
       </div>
+
+      {/* Copy form */}
       {showCopy && (
-        <div className="flex gap-2 mb-4">
+        <div className="bg-gray-900/80 border border-gray-800/80 rounded-xl p-4 mb-6 flex gap-2">
           <input type="text" value={copyName} onChange={e => setCopyName(e.target.value)}
             placeholder="New VM name..."
-            className="bg-gray-900 border border-gray-700 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500 w-60" />
+            className="bg-gray-800/50 border border-gray-700/50 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 placeholder:text-gray-600 transition-colors w-60" />
           <button onClick={() => { if (copyName.trim()) { vmAction('copy', { name: copyName }); setShowCopy(false); setCopyName('') } }}
-            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded text-xs font-medium">Create Copy</button>
+            className="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-all active:scale-95">Create Copy</button>
+          <button onClick={() => setShowCopy(false)} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-800 hover:bg-gray-700 text-gray-300 transition-all active:scale-95">Cancel</button>
         </div>
       )}
-      {typeof vm?.description === 'string' && vm.description && (
-        <p className="text-gray-400 mb-4">{vm.description}</p>
-      )}
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 mb-6">
-        <Info label="Type" value={String(vm?.type || 'fc')} />
-        <Info label="Status" value={String(vm?.status || '...')} />
-        <Info label="Tailscale IP" value={tsIP || '-'} />
-        <Info label="Node" value={String(vm?.node_name || '...')} />
-        <Info label="vCPU" value={String(vm?.vcpu || '-')} />
-        <Info label="RAM" value={vm?.ram_mib ? (Number(vm.ram_mib) / 1024) + 'G' : '-'} />
-        <Info label="Mode" value={String(vm?.mode || '-')} />
-        <Info label="Pending" value={String(actRaw?.pending_messages || 0)} />
+      {/* Info grid */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        <InfoCard label="Tailscale IP" value={tsIP || 'pending'} mono />
+        <InfoCard label="Node" value={String(vm?.node_name || '...').replace('boxcutter-', '')} />
+        <InfoCard label="Resources" value={`${vm?.vcpu || '-'} vCPU / ${vm?.ram_mib ? (Number(vm.ram_mib) / 1024) + 'G' : '-'} RAM`} />
+        <InfoCard label="Mode" value={String(vm?.mode || '-')} />
       </div>
 
-      <div className="flex gap-1 mb-4 border-b border-gray-800">
+      {/* Tabs */}
+      <div className="flex gap-1 mb-4 border-b border-white/5">
         {(['activity', 'logs', 'terminal'] as const).map(t => (
           <button key={t} onClick={() => setTab(t)}
-            className={'px-4 py-2 text-sm capitalize ' + (tab === t ? 'text-white border-b-2 border-blue-500' : 'text-gray-400 hover:text-white')}>
+            className={'px-4 py-2.5 text-sm capitalize transition-all duration-150 ' +
+              (tab === t
+                ? 'text-white border-b-2 border-blue-500 font-medium'
+                : 'text-gray-500 hover:text-gray-300 border-b-2 border-transparent')}>
             {t}
           </button>
         ))}
       </div>
 
+      {/* Tab content */}
       {tab === 'activity' && (
         <div>
           {actData && actData.status && (
-            <div className="mb-2 text-sm text-gray-400">
-              Status: <span className="text-white">{String(actData.status)}</span>
-              {actData?.timestamp ? <span className="ml-4 text-gray-600">{new Date(String(actData?.timestamp)).toLocaleTimeString()}</span> : null}
+            <div className="flex items-center gap-3 mb-3 text-sm">
+              <span className="text-gray-500">Status:</span>
+              <span className="text-white font-medium">{String(actData.status)}</span>
+              {actData?.timestamp && <span className="text-gray-600 text-xs">{new Date(String(actData.timestamp)).toLocaleTimeString()}</span>}
             </div>
           )}
-          <div className="bg-[#0d1117] border border-gray-800 rounded-lg p-4 font-mono text-xs whitespace-pre-wrap max-h-[500px] overflow-y-auto text-green-400">
-            {actData?.pane_content ? String(actData.pane_content) : 'No activity data. Tapegun daemon may not be running.'}
+          <div className="bg-[#0d1117] border border-gray-800/80 rounded-xl p-4 font-mono text-xs whitespace-pre-wrap max-h-[500px] overflow-y-auto text-green-400 leading-relaxed"
+               style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+            {actData?.pane_content ? String(actData.pane_content) : <span className="text-gray-600">No activity data. Tapegun daemon may not be running in this VM.</span>}
           </div>
         </div>
       )}
@@ -153,9 +177,10 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
       {tab === 'logs' && (
         <div>
           <button onClick={() => fetch('/api/vms/' + name + '/logs?lines=200').then(r => r.text()).then(setLogs)}
-            className="mb-2 px-3 py-1 text-xs bg-gray-800 rounded hover:bg-gray-700">Refresh</button>
-          <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 font-mono text-xs whitespace-pre-wrap max-h-[500px] overflow-y-auto text-gray-300">
-            {logs || 'Loading...'}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-800 hover:bg-gray-700 text-gray-300 transition-all active:scale-95 mb-3">Refresh Logs</button>
+          <div className="bg-[#0d1117] border border-gray-800/80 rounded-xl p-4 font-mono text-xs whitespace-pre-wrap max-h-[500px] overflow-y-auto text-gray-400 leading-relaxed"
+               style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+            {logs || <span className="text-gray-600">Loading...</span>}
           </div>
         </div>
       )}
@@ -163,37 +188,38 @@ export default function VMDetail({ params }: { params: Promise<{ name: string }>
       {tab === 'terminal' && (
         <div>
           {tsIP ? <TerminalView vmName={name} tailscaleIP={tsIP} /> : (
-            <div className="text-gray-400 py-8 text-center">No Tailscale IP — terminal requires connectivity</div>
+            <div className="bg-gray-900/80 border border-gray-800/80 rounded-xl py-12 text-center text-gray-500">No Tailscale IP yet. Terminal requires network connectivity.</div>
           )}
         </div>
       )}
 
-      {/* Tapegun message (hidden on terminal tab) */}
+      {/* Tapegun message */}
       {tab !== 'terminal' && (
-        <div className="mt-6 border-t border-gray-800 pt-4">
-          <h3 className="text-sm font-medium text-gray-400 mb-2">Send Tapegun Message</h3>
+        <div className="mt-8 pt-6 border-t border-white/5">
+          <h3 className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-3">Send Message</h3>
           <div className="flex gap-2">
             <input type="text" value={message} onChange={e => setMessage(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && sendMessage()}
-              placeholder="Type a message..."
-              className="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
-            <label className="flex items-center gap-1 text-xs text-gray-400">
-              <input type="checkbox" checked={sendKeys} onChange={e => setSendKeys(e.target.checked)} /> send_keys
+              placeholder="Type a message to send to this VM..."
+              className="bg-gray-800/50 border border-gray-700/50 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 placeholder:text-gray-600 transition-colors flex-1" />
+            <label className="flex items-center gap-1.5 text-xs text-gray-500 select-none cursor-pointer">
+              <input type="checkbox" checked={sendKeys} onChange={e => setSendKeys(e.target.checked)}
+                className="rounded border-gray-600" /> keys
             </label>
-            <button onClick={sendMessage} className="px-4 py-2 bg-blue-600 rounded text-sm hover:bg-blue-500">Send</button>
+            <button onClick={sendMessage} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-all active:scale-95 px-5">Send</button>
           </div>
-          {msgStatus && <div className="text-xs text-gray-500 mt-1">{msgStatus}</div>}
+          {msgStatus && <div className="text-xs text-emerald-500 mt-2">{msgStatus}</div>}
         </div>
       )}
     </div>
   )
 }
 
-function Info({ label, value }: { label: string; value: string }) {
+function InfoCard({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded p-3">
-      <div className="text-xs text-gray-500">{label}</div>
-      <div className="text-sm font-medium mt-0.5">{value}</div>
+    <div className="bg-gray-900/80 border border-gray-800/80 rounded-xl p-3.5">
+      <div className="text-[10px] text-gray-600 uppercase tracking-wider font-medium">{label}</div>
+      <div className={`text-sm font-medium mt-1 ${mono ? 'font-mono text-gray-300' : 'text-gray-200'}`}>{value}</div>
     </div>
   )
 }

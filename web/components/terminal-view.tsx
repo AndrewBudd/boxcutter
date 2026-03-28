@@ -22,12 +22,28 @@ export default function TerminalView({ vmName, tailscaleIP }: { vmName: string; 
     const terminal = new Terminal({
       cursorBlink: true,
       fontSize: 13,
-      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
+      fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
       theme: {
         background: '#0d1117',
-        foreground: '#c9d1d9',
+        foreground: '#e6edf3',
         cursor: '#58a6ff',
         selectionBackground: '#264f78',
+        black: '#0d1117',
+        red: '#ff7b72',
+        green: '#7ee787',
+        yellow: '#d29922',
+        blue: '#58a6ff',
+        magenta: '#bc8cff',
+        cyan: '#76e3ea',
+        white: '#e6edf3',
+        brightBlack: '#484f58',
+        brightRed: '#ffa198',
+        brightGreen: '#56d364',
+        brightYellow: '#e3b341',
+        brightBlue: '#79c0ff',
+        brightMagenta: '#d2a8ff',
+        brightCyan: '#b3f0ff',
+        brightWhite: '#f0f6fc',
       },
       rows: 24,
       cols: 100,
@@ -37,7 +53,7 @@ export default function TerminalView({ vmName, tailscaleIP }: { vmName: string; 
     terminal.open(termRef.current)
     fitAddon.fit()
 
-    terminal.writeln(`Connecting to ${vmName} (${tailscaleIP})...`)
+    terminal.writeln(`\x1b[2m Connecting to ${vmName}...\x1b[0m`)
 
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
     const wsHost = window.location.host
@@ -45,7 +61,7 @@ export default function TerminalView({ vmName, tailscaleIP }: { vmName: string; 
     wsRef.current = ws
 
     ws.onopen = () => {
-      terminal.writeln('Connected.\r\n')
+      terminal.writeln(`\x1b[32m Connected.\x1b[0m\r\n`)
       setConnected(true)
       ws.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }))
     }
@@ -53,12 +69,12 @@ export default function TerminalView({ vmName, tailscaleIP }: { vmName: string; 
     ws.onmessage = (event) => terminal.write(event.data)
 
     ws.onerror = () => {
-      terminal.writeln('\r\n\x1b[31mWebSocket error\x1b[0m')
+      terminal.writeln('\r\n\x1b[31m Connection error.\x1b[0m')
       setConnected(false)
     }
 
     ws.onclose = () => {
-      terminal.writeln('\r\n\x1b[33mDisconnected.\x1b[0m')
+      terminal.writeln('\r\n\x1b[33m Session ended.\x1b[0m')
       setConnected(false)
     }
 
@@ -84,44 +100,29 @@ export default function TerminalView({ vmName, tailscaleIP }: { vmName: string; 
 
   return (
     <div>
-      {/* Control buttons */}
-      <div className="flex flex-wrap gap-2 mb-2">
-        <button onClick={() => sendText('tmux attach\n')}
-          className="px-3 py-1.5 bg-green-800 hover:bg-green-700 rounded text-xs text-white font-medium">
-          tmux attach
-        </button>
-        <button onClick={() => sendText('\x02d')}
-          className="px-3 py-1.5 bg-yellow-800 hover:bg-yellow-700 rounded text-xs text-white font-medium">
-          tmux detach
-        </button>
-        <div className="border-l border-gray-700 mx-1" />
-        <button onClick={() => sendText('\x1b[A')} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-xs">
-          ↑
-        </button>
-        <button onClick={() => sendText('\x1b[B')} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-xs">
-          ↓
-        </button>
-        <button onClick={() => sendText('\x1b[D')} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-xs">
-          ←
-        </button>
-        <button onClick={() => sendText('\x1b[C')} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-xs">
-          →
-        </button>
-        <div className="border-l border-gray-700 mx-1" />
-        <button onClick={() => sendText('\x03')} className="px-3 py-1.5 bg-red-900 hover:bg-red-800 rounded text-xs">
-          Ctrl+C
-        </button>
-        <button onClick={() => sendText('\n')} className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded text-xs">
-          Enter
-        </button>
+      {/* Toolbar */}
+      <div className="flex flex-wrap items-center gap-1.5 mb-2">
+        <div className="flex gap-1">
+          <button onClick={() => sendText('tmux attach\n')} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition-all active:scale-95 text-[11px]">tmux attach</button>
+          <button onClick={() => sendText('\x02d')} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-600 hover:bg-amber-500 text-white transition-all active:scale-95 text-[11px]">tmux detach</button>
+        </div>
+        <div className="w-px h-5 bg-white/10 mx-1" />
+        <div className="flex gap-1">
+          {[['↑', '\x1b[A'], ['↓', '\x1b[B'], ['←', '\x1b[D'], ['→', '\x1b[C']].map(([label, code]) => (
+            <button key={label} onClick={() => sendText(code)} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-800 hover:bg-gray-700 text-gray-300 transition-all active:scale-95 w-8 text-center text-[11px]">{label}</button>
+          ))}
+        </div>
+        <div className="w-px h-5 bg-white/10 mx-1" />
+        <button onClick={() => sendText('\x03')} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-red-600 hover:bg-red-500 text-white transition-all active:scale-95 text-[11px]">Ctrl+C</button>
+        <button onClick={() => sendText('\n')} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-800 hover:bg-gray-700 text-gray-300 transition-all active:scale-95 text-[11px]">Enter</button>
         <div className="flex-1" />
-        <span className={'text-xs px-2 py-1.5 rounded ' + (connected ? 'text-green-400' : 'text-red-400')}>
+        <span className={`text-[11px] px-2 py-1 rounded-md ${connected ? 'text-emerald-400 bg-emerald-500/10' : 'text-red-400 bg-red-500/10'}`}>
           {connected ? 'connected' : 'disconnected'}
         </span>
       </div>
 
       {/* Terminal */}
-      <div className="bg-[#0d1117] rounded-lg border border-gray-800 p-1">
+      <div className="bg-[#0d1117] rounded-xl border border-white/5 p-1.5 shadow-2xl shadow-black/50">
         <div ref={termRef} />
       </div>
     </div>

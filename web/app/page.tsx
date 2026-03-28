@@ -51,34 +51,38 @@ export default function Dashboard() {
   }, [])
 
   const running = vms.filter(v => v.status === 'running').length
-  // nodeCount is fetched from /api/nodes (active nodes only)
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4 md:mb-6">
-        <h1 className="text-xl md:text-2xl font-bold">Dashboard</h1>
+      {/* Header */}
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-semibold">Virtual Machines</h1>
+          <p className="text-sm text-gray-500 mt-0.5">Manage your ephemeral dev environments</p>
+        </div>
         <button onClick={() => setShowCreate(!showCreate)}
-          className="px-4 py-2 bg-green-700 hover:bg-green-600 rounded text-sm font-medium">
+          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-600 hover:bg-emerald-500 text-white transition-all active:scale-95 px-4 py-2 text-sm">
           + New VM
         </button>
       </div>
 
+      {/* Create Form */}
       {showCreate && (
-        <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 mb-6">
-          <h3 className="text-sm font-medium text-gray-300 mb-3">Create New VM</h3>
+        <div className="bg-gray-900/80 border border-gray-800/80 rounded-xl p-5 mb-6 animate-in">
+          <h3 className="text-sm font-medium text-gray-300 mb-4">Create New VM</h3>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
             <input placeholder="Name (optional)" value={createForm.name}
               onChange={e => setCreateForm({...createForm, name: e.target.value})}
-              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+              className="bg-gray-800/50 border border-gray-700/50 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 placeholder:text-gray-600 transition-colors" />
             <select value={createForm.type}
               onChange={e => setCreateForm({...createForm, type: e.target.value})}
-              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+              className="bg-gray-800/50 border border-gray-700/50 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 placeholder:text-gray-600 transition-colors">
               <option value="firecracker">Firecracker</option>
               <option value="qemu">QEMU (Docker)</option>
             </select>
             <select value={createForm.ram}
               onChange={e => setCreateForm({...createForm, ram: e.target.value})}
-              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+              className="bg-gray-800/50 border border-gray-700/50 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 placeholder:text-gray-600 transition-colors">
               <option value="1024">1 GB RAM</option>
               <option value="2048">2 GB RAM</option>
               <option value="4096">4 GB RAM</option>
@@ -86,7 +90,7 @@ export default function Dashboard() {
             </select>
             <select value={createForm.vcpu}
               onChange={e => setCreateForm({...createForm, vcpu: e.target.value})}
-              className="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+              className="bg-gray-800/50 border border-gray-700/50 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 placeholder:text-gray-600 transition-colors">
               <option value="1">1 vCPU</option>
               <option value="2">2 vCPU</option>
               <option value="4">4 vCPU</option>
@@ -110,83 +114,81 @@ export default function Dashboard() {
                 setCreateForm({ name: '', type: 'firecracker', ram: '2048', vcpu: '2', desc: '' })
               } catch {}
               setCreating(false)
-            }} className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-medium disabled:opacity-50">
+            }} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-500 text-white transition-all active:scale-95 py-2 text-sm disabled:opacity-50">
               {creating ? 'Creating...' : 'Create'}
             </button>
           </div>
           <input placeholder="Description (optional)" value={createForm.desc}
             onChange={e => setCreateForm({...createForm, desc: e.target.value})}
-            className="mt-3 w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:border-blue-500" />
+            className="bg-gray-800/50 border border-gray-700/50 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20 placeholder:text-gray-600 transition-colors mt-3 w-full" />
         </div>
       )}
 
-      <div className="grid grid-cols-3 gap-2 md:gap-4 mb-6 md:mb-8">
-        <StatCard label="VMs" value={loaded ? String(vms.length) : '...'} />
-        <StatCard label="Running" value={loaded ? String(running) : '...'} />
-        <StatCard label="Nodes" value={loaded ? String(nodeCount) : '...'} />
+      {/* Stats */}
+      <div className="grid grid-cols-3 gap-3 md:gap-4 mb-8">
+        <StatCard label="Total VMs" value={loaded ? String(vms.length) : '-'} color="blue" />
+        <StatCard label="Running" value={loaded ? String(running) : '-'} color="emerald" />
+        <StatCard label="Nodes" value={loaded ? String(nodeCount) : '-'} color="purple" />
       </div>
 
       {/* Desktop table */}
-      <div className="hidden md:block bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
+      <div className="hidden md:block card overflow-hidden">
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-gray-800 text-gray-400 text-left">
-              <th className="px-4 py-3">Name</th>
-              <th className="px-4 py-3">Type</th>
-              <th className="px-4 py-3">IP</th>
-              <th className="px-4 py-3">Node</th>
-              <th className="px-4 py-3">CPU</th>
-              <th className="px-4 py-3">RAM</th>
-              <th className="px-4 py-3">Status</th>
-              <th className="px-4 py-3">Activity</th>
+            <tr className="border-b border-white/5 text-gray-500 text-left text-xs uppercase tracking-wider">
+              <th className="px-5 py-3 font-medium">Name</th>
+              <th className="px-5 py-3 font-medium">Type</th>
+              <th className="px-5 py-3 font-medium">IP Address</th>
+              <th className="px-5 py-3 font-medium">Node</th>
+              <th className="px-5 py-3 font-medium">Resources</th>
+              <th className="px-5 py-3 font-medium">Status</th>
+              <th className="px-5 py-3 font-medium">Activity</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className="divide-y divide-white/[0.03]">
             {vms.map(vm => {
               const act = activity[vm.name]
               return (
-                <tr key={vm.name} className="border-b border-gray-800/50 hover:bg-gray-800/50">
-                  <td className="px-4 py-3">
-                    <Link href={'/vms/' + vm.name} className="text-blue-400 hover:underline font-medium">{vm.name}</Link>
-                    {vm.description && <div className="text-xs text-gray-500 mt-0.5">{vm.description}</div>}
+                <tr key={vm.name} className="hover:bg-white/[0.02] transition-colors">
+                  <td className="px-5 py-3.5">
+                    <Link href={'/vms/' + vm.name} className="text-blue-400 hover:text-blue-300 font-medium transition-colors">{vm.name}</Link>
+                    {vm.description && <div className="text-xs text-gray-600 mt-0.5 max-w-[200px] truncate">{vm.description}</div>}
                   </td>
-                  <td className="px-4 py-3"><TypeBadge type={vm.type} /></td>
-                  <td className="px-4 py-3 text-gray-400 font-mono text-xs">{vm.tailscale_ip || '-'}</td>
-                  <td className="px-4 py-3 text-gray-400 text-xs">{vm.node_name}</td>
-                  <td className="px-4 py-3 text-gray-400">{vm.vcpu || '-'}</td>
-                  <td className="px-4 py-3 text-gray-400">{vm.ram_mib ? (vm.ram_mib / 1024).toFixed(0) + 'G' : '-'}</td>
-                  <td className="px-4 py-3"><StatusDot status={vm.status} /></td>
-                  <td className="px-4 py-3 text-xs text-gray-400 max-w-[200px] truncate">{act?.activity?.status || '-'}</td>
+                  <td className="px-5 py-3.5"><TypeBadge type={vm.type} /></td>
+                  <td className="px-5 py-3.5 font-mono text-xs text-gray-400">{vm.tailscale_ip || <span className="text-gray-600">pending</span>}</td>
+                  <td className="px-5 py-3.5 text-gray-500 text-xs">{vm.node_name?.replace('boxcutter-', '')}</td>
+                  <td className="px-5 py-3.5 text-gray-500 text-xs">{vm.vcpu}c / {vm.ram_mib ? (vm.ram_mib / 1024).toFixed(0) : '-'}G</td>
+                  <td className="px-5 py-3.5"><StatusPill status={vm.status} /></td>
+                  <td className="px-5 py-3.5 text-xs text-gray-600 max-w-[180px] truncate">{act?.activity?.status || ''}</td>
                 </tr>
               )
             })}
           </tbody>
         </table>
-        {!loaded && <div className="text-center py-8 text-gray-500">Loading...</div>}
-        {loaded && vms.length === 0 && <div className="text-center py-8 text-gray-500">No VMs found</div>}
+        {!loaded && <div className="text-center py-12 text-gray-600">Loading...</div>}
+        {loaded && vms.length === 0 && <div className="text-center py-12 text-gray-600">No VMs. Click <span className="text-emerald-400">+ New VM</span> to create one.</div>}
       </div>
 
       {/* Mobile cards */}
       <div className="md:hidden flex flex-col gap-3">
-        {!loaded && <div className="text-center py-8 text-gray-500">Loading...</div>}
+        {!loaded && <div className="text-center py-12 text-gray-600">Loading...</div>}
         {vms.map(vm => {
           const act = activity[vm.name]
           return (
-            <Link key={vm.name} href={'/vms/' + vm.name}
-              className="block bg-gray-900 border border-gray-800 rounded-lg p-4 active:bg-gray-800">
+            <Link key={vm.name} href={'/vms/' + vm.name} className="bg-gray-900/80 border border-gray-800/80 rounded-xl transition-all duration-200 hover:border-gray-700 hover:bg-gray-900 p-4 block">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-blue-400 font-medium">{vm.name}</span>
                 <div className="flex items-center gap-2">
                   <TypeBadge type={vm.type} />
-                  <StatusDot status={vm.status} />
+                  <StatusPill status={vm.status} />
                 </div>
               </div>
-              {vm.description && <div className="text-xs text-gray-500 mb-2">{vm.description}</div>}
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-400">
-                <div>IP: <span className="font-mono">{vm.tailscale_ip || '-'}</span></div>
-                <div>Node: {vm.node_name?.replace('boxcutter-', '')}</div>
-                <div>CPU: {vm.vcpu || '-'} / RAM: {vm.ram_mib ? (vm.ram_mib / 1024).toFixed(0) + 'G' : '-'}</div>
-                <div className="truncate">Act: {act?.activity?.status || '-'}</div>
+              {vm.description && <div className="text-xs text-gray-600 mb-2">{vm.description}</div>}
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-500">
+                <div>IP: <span className="font-mono text-gray-400">{vm.tailscale_ip || '-'}</span></div>
+                <div>{vm.node_name?.replace('boxcutter-', '')}</div>
+                <div>{vm.vcpu}c / {vm.ram_mib ? (vm.ram_mib / 1024).toFixed(0) + 'G' : '-'}</div>
+                <div className="truncate">{act?.activity?.status || ''}</div>
               </div>
             </Link>
           )
@@ -196,28 +198,40 @@ export default function Dashboard() {
   )
 }
 
-function StatCard({ label, value }: { label: string; value: string }) {
+function StatCard({ label, value, color }: { label: string; value: string; color: string }) {
+  const gradients: Record<string, string> = {
+    blue: 'from-blue-500/10 to-blue-500/5 border-blue-500/10',
+    emerald: 'from-emerald-500/10 to-emerald-500/5 border-emerald-500/10',
+    purple: 'from-purple-500/10 to-purple-500/5 border-purple-500/10',
+  }
+  const textColors: Record<string, string> = {
+    blue: 'text-blue-400',
+    emerald: 'text-emerald-400',
+    purple: 'text-purple-400',
+  }
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-lg p-3 md:p-4">
-      <div className="text-gray-400 text-xs md:text-sm">{label}</div>
-      <div className="text-2xl md:text-3xl font-bold mt-1">{value}</div>
+    <div className={`rounded-xl border bg-gradient-to-br p-4 md:p-5 ${gradients[color]}`}>
+      <div className="text-xs text-gray-500 font-medium uppercase tracking-wider">{label}</div>
+      <div className={`text-3xl md:text-4xl font-bold mt-1 ${textColors[color]}`}>{value}</div>
     </div>
   )
 }
 
 function TypeBadge({ type }: { type: string }) {
+  const isQemu = type === 'qemu'
   return (
-    <span className={'px-2 py-0.5 rounded text-xs ' + (type === 'qemu' ? 'bg-purple-900/50 text-purple-300' : 'bg-orange-900/50 text-orange-300')}>
-      {type || 'fc'}
+    <span className={`badge ${isQemu ? 'bg-purple-500/15 text-purple-400 border border-purple-500/20' : 'bg-amber-500/15 text-amber-400 border border-amber-500/20'}`}>
+      {isQemu ? 'qemu' : 'fc'}
     </span>
   )
 }
 
-function StatusDot({ status }: { status: string }) {
+function StatusPill({ status }: { status: string }) {
+  const isRunning = status === 'running'
   return (
     <span className="flex items-center gap-1.5">
-      <span className={'w-2 h-2 rounded-full ' + (status === 'running' ? 'bg-green-500' : 'bg-gray-500')} />
-      <span className="text-xs text-gray-300">{status}</span>
+      <span className={`w-1.5 h-1.5 rounded-full ${isRunning ? 'bg-emerald-400 shadow-sm shadow-emerald-400/50' : 'bg-gray-500'}`} />
+      <span className={`text-xs ${isRunning ? 'text-emerald-400' : 'text-gray-500'}`}>{status}</span>
     </span>
   )
 }
