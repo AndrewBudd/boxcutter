@@ -55,6 +55,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 
+	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleExec)
+
 	// Tapegun endpoints
 	mux.HandleFunc("GET /api/vms/{name}/activity", h.handleGetActivity)
 	mux.HandleFunc("POST /api/vms/{name}/inbox", h.handlePostInbox)
@@ -815,4 +817,25 @@ func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, activity)
+}
+
+func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req struct {
+		Command string `json:"command"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Command == "" {
+		http.Error(w, "command is required", http.StatusBadRequest)
+		return
+	}
+	output, err := h.mgr.Exec(name, req.Command)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"output": output})
 }

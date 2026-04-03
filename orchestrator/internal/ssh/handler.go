@@ -109,6 +109,12 @@ func (h *Handler) Run(args []string) int {
 		return h.cmdRepos(args[1:])
 	case "tapegun":
 		return h.cmdTapegun(args[1:])
+	case "authorize":
+		if target == "" {
+			fmt.Println("Usage: ssh <host> authorize <vm-name>")
+			return 1
+		}
+		return h.cmdAuthorize(target)
 	case "help":
 		h.printHelp()
 		return 0
@@ -660,6 +666,46 @@ func (h *Handler) cmdRepos(args []string) int {
 	}
 }
 
+func (h *Handler) cmdAuthorize(name string) int {
+	// Tell the VM to fetch its SSH key from the metadata service and configure SSH.
+	setupScript := `set -e
+METADATA="http://169.254.169.254"
+mkdir -p /home/dev/.ssh
+curl -sf "$METADATA/metadata/boxcutter-ssh-key" > /home/dev/.ssh/boxcutter-vm.key
+chmod 600 /home/dev/.ssh/boxcutter-vm.key
+printf '%s\n' \
+  'Host orchestrator' \
+  '  HostName 192.168.50.2' \
+  '  User boxcutter' \
+  '  IdentityFile ~/.ssh/boxcutter-vm.key' \
+  '  StrictHostKeyChecking no' \
+  '  UserKnownHostsFile /dev/null' \
+  '  LogLevel ERROR' \
+  > /home/dev/.ssh/config
+chown -R 1000:1000 /home/dev/.ssh
+chmod 700 /home/dev/.ssh
+chmod 600 /home/dev/.ssh/config
+if [ ! -f /usr/local/bin/boxcutter ]; then
+  printf '#!/bin/bash\nexec ssh -o ConnectTimeout=5 orchestrator "$@"\n' > /usr/local/bin/boxcutter
+  chmod 755 /usr/local/bin/boxcutter
+fi
+echo "ok"`
+
+	resp, err := h.post("/api/vms/"+name+"/exec", map[string]string{"command": setupScript})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var result map[string]string
+	json.Unmarshal(resp, &result)
+	if strings.TrimSpace(result["output"]) == "ok" {
+		fmt.Printf("VM '%s' authorized. Inside the VM, run: boxcutter list\n", name)
+	} else {
+		fmt.Printf("Output: %s\n", result["output"])
+	}
+	return 0
+}
+
 func (h *Handler) printHelp() {
 	fmt.Print(`Boxcutter — ephemeral dev environments
 
@@ -681,6 +727,7 @@ Commands:
   stop <name>             Stop a running VM
   start <name>            Start a stopped VM
   cp <name> [new-name]    Copy a VM (clone its disk)
+  authorize <name>        Grant a VM access to boxcutter commands
   repos list <name>       List GitHub repos for a VM
   repos add <name> <repo> Add a repo to VM's GitHub policy
   repos remove <name> <repo>

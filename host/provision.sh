@@ -417,9 +417,9 @@ build_orchestrator() {
   cp "${REPO_DIR}/web/scripts/boxcutter-tailscale-cert" "${PD}/scripts/"
   cp "${REPO_DIR}/web/nginx.conf" "${PD}/config/"
 
-  # Bundle (orchestrator only needs tailscale key + authorized keys)
+  # Bundle (orchestrator only needs tailscale key + authorized keys + vm-ssh pubkey)
   cp "${BUNDLE_DIR}/boxcutter.yaml" "${PD}/bundle/"
-  for secret in tailscale-node-authkey tailscale-orch-authkey authorized-keys; do
+  for secret in tailscale-node-authkey tailscale-orch-authkey authorized-keys vm-ssh.key.pub; do
     [ -f "${BUNDLE_DIR}/secrets/${secret}" ] && cp "${BUNDLE_DIR}/secrets/${secret}" "${PD}/bundle/secrets/"
   done
 
@@ -508,6 +508,10 @@ write_files:
       [ -f /etc/boxcutter/secrets/authorized-keys ] && \
         cp /etc/boxcutter/secrets/authorized-keys /home/boxcutter/.ssh/authorized_keys
       touch /home/boxcutter/.ssh/authorized_keys
+      # Add VM SSH key (allows VMs to use boxcutter commands)
+      if [ -f /etc/boxcutter/secrets/vm-ssh.key.pub ]; then
+        cat /etc/boxcutter/secrets/vm-ssh.key.pub >> /home/boxcutter/.ssh/authorized_keys
+      fi
       chmod 700 /home/boxcutter/.ssh
       chmod 600 /home/boxcutter/.ssh/authorized_keys
       chown -R boxcutter:boxcutter /home/boxcutter/.ssh
@@ -786,6 +790,11 @@ done)
       if id boxcutter &>/dev/null && [ -f /etc/boxcutter/secrets/authorized-keys ]; then
         mkdir -p /home/boxcutter/.ssh
         cp /etc/boxcutter/secrets/authorized-keys /home/boxcutter/.ssh/authorized_keys
+        # Add VM SSH key with restricted role
+        if [ -f /etc/boxcutter/secrets/vm-ssh.key.pub ]; then
+          VM_PUBKEY=\$(cat /etc/boxcutter/secrets/vm-ssh.key.pub)
+          printf 'command="BOXCUTTER_ROLE=vm exec /usr/local/bin/boxcutter-ssh-orchestrator" %s\n' "\$VM_PUBKEY" >> /home/boxcutter/.ssh/authorized_keys
+        fi
         chown -R boxcutter:boxcutter /home/boxcutter/.ssh
         chmod 700 /home/boxcutter/.ssh
         chmod 600 /home/boxcutter/.ssh/authorized_keys

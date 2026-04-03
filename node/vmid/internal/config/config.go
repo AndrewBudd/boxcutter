@@ -26,6 +26,7 @@ type ListenConfig struct {
 type MetadataFilesConfig struct {
 	SSHAuthorizedKeys []string `yaml:"ssh_authorized_keys"`
 	CACertPath        string   `yaml:"ca_cert_path"`
+	VMSSHKeyPath      string   `yaml:"vm_ssh_key_path"`
 }
 
 type JWTConfig struct {
@@ -120,7 +121,8 @@ func Load(path string) (*Config, error) {
 				"/etc/boxcutter/secrets/cluster-ssh.key.pub",
 				"/etc/boxcutter/secrets/authorized-keys",
 			},
-			CACertPath: "/etc/boxcutter/secrets/ca.crt",
+			CACertPath:   "/etc/boxcutter/secrets/ca.crt",
+			VMSSHKeyPath: "/etc/boxcutter/secrets/vm-ssh.key",
 		},
 		JWT: JWTConfig{
 			TTL: 10 * time.Minute,

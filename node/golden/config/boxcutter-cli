@@ -1,0 +1,8 @@
+#!/bin/bash
+# Convenience wrapper for boxcutter orchestrator commands from inside a VM.
+# Usage: boxcutter <command> [args]
+# Examples:
+#   boxcutter list
+#   boxcutter tapegun activity
+#   boxcutter tapegun send <vm-name> <message>
+exec ssh -o ConnectTimeout=5 orchestrator "$@"

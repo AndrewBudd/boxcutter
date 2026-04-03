@@ -30,6 +30,7 @@ func (h *MetadataHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /.well-known/jwks.json", h.handleJWKS)
 	mux.HandleFunc("GET /metadata/ssh-keys", h.handleSSHKeys)
 	mux.HandleFunc("GET /metadata/ca-cert", h.handleCACert)
+	mux.HandleFunc("GET /metadata/boxcutter-ssh-key", h.handleVMSSHKey)
 	// Metadata-style root
 	mux.HandleFunc("GET /", h.handleRoot)
 }
@@ -49,12 +50,13 @@ func (h *MetadataHandler) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"ip":     rec.IP,
 		"labels": rec.Labels,
 		"endpoints": map[string]string{
-			"identity": "/identity",
-			"token":    "/token",
-			"github":   "/token/github",
-			"jwks":     "/.well-known/jwks.json",
-			"ssh_keys": "/metadata/ssh-keys",
-			"ca_cert":  "/metadata/ca-cert",
+			"identity":         "/identity",
+			"token":            "/token",
+			"github":           "/token/github",
+			"jwks":             "/.well-known/jwks.json",
+			"ssh_keys":         "/metadata/ssh-keys",
+			"ca_cert":          "/metadata/ca-cert",
+			"boxcutter_ssh_key": "/metadata/boxcutter-ssh-key",
 		},
 	})
 }
@@ -156,6 +158,27 @@ func (h *MetadataHandler) handleSSHKeys(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(strings.Join(keys, "\n") + "\n"))
+}
+
+// HandleVMSSHKey is the exported version for use outside the identity middleware.
+func (h *MetadataHandler) HandleVMSSHKey(w http.ResponseWriter, r *http.Request) {
+	h.handleVMSSHKey(w, r)
+}
+
+// handleVMSSHKey returns the VM SSH private key for orchestrator access.
+// This is NOT behind identity middleware — VMs fetch this at boot.
+func (h *MetadataHandler) handleVMSSHKey(w http.ResponseWriter, r *http.Request) {
+	if h.metadata.VMSSHKeyPath == "" {
+		http.Error(w, "VM SSH key not configured", http.StatusNotFound)
+		return
+	}
+	data, err := os.ReadFile(h.metadata.VMSSHKeyPath)
+	if err != nil {
+		http.Error(w, "VM SSH key not available", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write(data)
 }
 
 // handleCACert returns the internal CA certificate.

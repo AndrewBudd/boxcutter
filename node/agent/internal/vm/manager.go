@@ -536,6 +536,19 @@ func (m *Manager) Get(name string) (*VMState, string, error) {
 	return st, DeriveStatus(vmDir), nil
 }
 
+// Exec runs a command inside a VM via SSH and returns the output.
+func (m *Manager) Exec(name string, command string) (string, error) {
+	st, status, err := m.Get(name)
+	if err != nil {
+		return "", err
+	}
+	if status != "running" {
+		return "", fmt.Errorf("VM '%s' is %s, not running", name, status)
+	}
+	sshKey := m.cfg.SSH.PrivateKeyPath
+	return VMSSH(st.TAP, sshKey, "bash", "-c", command)
+}
+
 // List returns all VMs with their status.
 func (m *Manager) List() ([]map[string]interface{}, error) {
 	vms, err := ListVMs()

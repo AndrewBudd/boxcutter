@@ -33,3 +33,26 @@ if curl -sf "${METADATA}/metadata/ca-cert" > /tmp/boxcutter-ca.crt 2>/dev/null; 
 else
   echo "metadata: no CA cert available (skipping)"
 fi
+
+# Fetch VM SSH key (for orchestrator access)
+if curl -sf "${METADATA}/metadata/boxcutter-ssh-key" > /tmp/boxcutter-vm-ssh.key 2>/dev/null; then
+  mkdir -p /home/dev/.ssh
+  mv /tmp/boxcutter-vm-ssh.key /home/dev/.ssh/boxcutter-vm.key
+  chmod 600 /home/dev/.ssh/boxcutter-vm.key
+  # SSH config for orchestrator access
+  printf '%s\n' \
+    'Host orchestrator' \
+    '  HostName 192.168.50.2' \
+    '  User boxcutter' \
+    '  IdentityFile ~/.ssh/boxcutter-vm.key' \
+    '  StrictHostKeyChecking no' \
+    '  UserKnownHostsFile /dev/null' \
+    '  LogLevel ERROR' \
+    > /home/dev/.ssh/config
+  chown -R 1000:1000 /home/dev/.ssh
+  chmod 700 /home/dev/.ssh
+  chmod 600 /home/dev/.ssh/config
+  echo "metadata: VM SSH key installed (orchestrator access enabled)"
+else
+  echo "metadata: VM SSH key not available (skipping)"
+fi

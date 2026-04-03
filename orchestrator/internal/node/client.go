@@ -144,6 +144,25 @@ func (c *Client) Destroy(name string) error {
 	return nil
 }
 
+// ExecInVM runs a command inside a VM via the node agent.
+func (c *Client) ExecInVM(name, command string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"command": command})
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+name+"/exec", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("node exec: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("node exec: %s", string(respBody))
+	}
+	var result struct {
+		Output string `json:"output"`
+	}
+	json.Unmarshal(respBody, &result)
+	return result.Output, nil
+}
+
 func (c *Client) Stop(name string) error {
 	resp, err := c.http.Post(c.baseURL+"/api/vms/"+name+"/stop", "", nil)
 	if err != nil {

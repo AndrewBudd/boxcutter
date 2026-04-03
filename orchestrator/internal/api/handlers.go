@@ -178,6 +178,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tapegun/activity/{name}", h.handleTapegunVMActivity)
 	mux.HandleFunc("POST /api/tapegun/message/{name}", h.handleTapegunMessage)
 	mux.HandleFunc("POST /api/tapegun/broadcast", h.handleTapegunBroadcast)
+
+	// VM exec
+	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleVMExec)
 }
 
 // --- Node handlers ---
@@ -1490,4 +1493,40 @@ func (h *Handler) handleTapegunBroadcast(w http.ResponseWriter, r *http.Request)
 		"sent":   sent,
 		"failed": failed,
 	})
+}
+
+func (h *Handler) handleVMExec(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req struct {
+		Command string `json:"command"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Command == "" {
+		http.Error(w, "command is required", http.StatusBadRequest)
+		return
+	}
+
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+
+	n, err := h.db.GetNode(v.NodeID)
+	if err != nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	nc := node.NewClient(n.APIAddr)
+	output, err := nc.ExecInVM(name, req.Command)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]string{"output": output})
 }

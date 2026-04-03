@@ -112,6 +112,7 @@ func main() {
 	publicMux.HandleFunc("GET /.well-known/jwks.json", metaHandler.HandleJWKS)
 	publicMux.HandleFunc("GET /metadata/ssh-keys", metaHandler.HandleSSHKeys)
 	publicMux.HandleFunc("GET /metadata/ca-cert", metaHandler.HandleCACert)
+	publicMux.HandleFunc("GET /metadata/boxcutter-ssh-key", metaHandler.HandleVMSSHKey)
 	publicMux.Handle("/", identityMiddleware(vmMux))
 
 	// Listen with mark-aware listener on metadata address
