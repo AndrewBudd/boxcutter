@@ -395,10 +395,14 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 		})
 	}
 
-	// Wait for SSH
+	// Wait for SSH (QEMU VMs boot slower, especially in nested virt)
 	emit("ssh", "Waiting for VM to boot...")
 	sshKey := m.cfg.SSH.PrivateKeyPath
-	if err := WaitForSSH(st.TAP, sshKey, 30*time.Second); err != nil {
+	sshTimeout := 30 * time.Second
+	if st.Type == "qemu" {
+		sshTimeout = 90 * time.Second
+	}
+	if err := WaitForSSH(st.TAP, sshKey, sshTimeout); err != nil {
 		log.Printf("Warning: SSH not ready for %s: %v", st.Name, err)
 	}
 
@@ -2519,9 +2523,9 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 			}
 			authkey = strings.TrimSpace(string(authkeyData))
 		}
-		// Wait for SSH to become available
+		// Wait for SSH to become available (longer timeout for nested virt)
 		time.Sleep(2 * time.Second)
-		if err := WaitForSSH(st.TAP, sshKey, 30*time.Second); err != nil {
+		if err := WaitForSSH(st.TAP, sshKey, 90*time.Second); err != nil {
 			log.Printf("QEMU VM %s: SSH not ready for Tailscale rejoin: %v", name, err)
 			return
 		}
