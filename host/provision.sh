@@ -215,6 +215,9 @@ packages:
   - openssh-server
   - ca-certificates
   - gnupg
+  - rsync
+  - squashfs-tools
+  - kmod
 
 write_files:
   - path: /opt/boxcutter-payload.tar.gz
