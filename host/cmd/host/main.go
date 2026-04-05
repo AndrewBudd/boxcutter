@@ -1734,8 +1734,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 						lastActivity = time.Now()
 						continue
 					}
-					if srcStatus == "stopped" {
-						// Migration completed — source VM was stopped by the migration process
+					if srcStatus == "migrated" {
 						log.Printf("Drain: %s removed from source", name)
 						migrated = true
 						break
@@ -1743,6 +1742,11 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 					if srcStatus == "running" {
 						log.Printf("Drain: %s migration failed (source status: running)", name)
 						break
+					}
+					if srcStatus == "stopped" {
+						// Could be user-stopped or migration cleanup in progress
+						lastActivity = time.Now()
+						continue
 					}
 					lastActivity = time.Now()
 				}

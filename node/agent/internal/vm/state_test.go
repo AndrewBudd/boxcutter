@@ -107,6 +107,39 @@ func TestIsMigrating(t *testing.T) {
 	}
 }
 
+func TestIsMigrated(t *testing.T) {
+	dir := t.TempDir()
+
+	if IsMigrated(dir) {
+		t.Error("IsMigrated should be false without marker")
+	}
+
+	SetMigrated(dir, true)
+	if !IsMigrated(dir) {
+		t.Error("IsMigrated should be true after SetMigrated(true)")
+	}
+
+	// DeriveStatus should return "migrated"
+	if status := DeriveStatus(dir); status != "migrated" {
+		t.Errorf("DeriveStatus = %q, want migrated", status)
+	}
+
+	SetMigrated(dir, false)
+	if IsMigrated(dir) {
+		t.Error("IsMigrated should be false after SetMigrated(false)")
+	}
+}
+
+func TestDeriveStatus_MigratedBeforeStopped(t *testing.T) {
+	// When both migrated marker and no running process, "migrated" should win
+	dir := t.TempDir()
+	SetMigrated(dir, true)
+	// No PID file, no process — would be "stopped" without the marker
+	if status := DeriveStatus(dir); status != "migrated" {
+		t.Errorf("DeriveStatus = %q, want migrated (marker present, VM not running)", status)
+	}
+}
+
 func TestMigrationTarget(t *testing.T) {
 	dir := t.TempDir()
 

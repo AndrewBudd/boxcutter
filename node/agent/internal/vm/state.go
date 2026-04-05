@@ -94,15 +94,34 @@ func MigrationTarget(vmDir string) string {
 }
 
 // DeriveStatus computes VM status from reality, never from stored state.
-// Source of truth: process existence + migration marker.
+// Source of truth: process existence + migration/migrated markers.
 func DeriveStatus(vmDir string) string {
 	if IsMigrating(vmDir) {
 		return "migrating"
+	}
+	if IsMigrated(vmDir) {
+		return "migrated"
 	}
 	if IsRunning(vmDir) {
 		return "running"
 	}
 	return "stopped"
+}
+
+// IsMigrated checks if the VM has completed migration (source copy).
+func IsMigrated(vmDir string) bool {
+	_, err := os.Stat(filepath.Join(vmDir, "migrated"))
+	return err == nil
+}
+
+// SetMigrated creates or removes the migrated marker on the source VM.
+func SetMigrated(vmDir string, migrated bool) {
+	marker := filepath.Join(vmDir, "migrated")
+	if migrated {
+		os.WriteFile(marker, []byte("1"), 0644)
+	} else {
+		os.Remove(marker)
+	}
 }
 
 // SnapshotState tracks dm-snapshot loop devices.

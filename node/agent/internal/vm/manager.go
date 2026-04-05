@@ -1977,6 +1977,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 				if m.vmid != nil {
 					m.vmid.Deregister(name)
 				}
+				SetMigrated(vmDir, true)
 				m.stopVM(name)
 				CleanupSnapshot(vmDir)
 				os.RemoveAll(vmDir)
@@ -2156,6 +2157,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
 	}
+	SetMigrated(vmDir, true) // mark before cleanup so status is "migrated" not "stopped"
 	m.stopVM(name)
 	CleanupSnapshot(vmDir) // release loop devices / dm-snapshot before removing files
 	if err := os.RemoveAll(vmDir); err != nil {
@@ -2318,12 +2320,12 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	log.Printf("Migration complete: QEMU %s → %s | ram=%dMB | downtime=%s",
 		name, targetAddr, st.RAMMIB, downtime.Round(time.Millisecond))
 
-	// Commit: stop source
+	// Commit: mark migrated, stop source, cleanup
+	SetMigrated(vmDir, true)
 	m.stopVM(name)
-
-	// Clean up state files
 	os.Remove(statePath)
 	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
+	os.RemoveAll(vmDir) // clean up source files
 
 	return &MigrateResponse{
 		Name:       name,
@@ -2409,6 +2411,7 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
 	}
+	SetMigrated(vmDir, true)
 	CleanupSnapshot(vmDir) // clean up dm-snapshot loop devices before removing files
 	os.RemoveAll(vmDir)
 	log.Printf("Relocated stopped VM %s to %s", name, targetAddr)
