@@ -23,10 +23,16 @@ done
 
 echo "tapegun: daemon started (poll every ${POLL_INTERVAL}s)"
 
+# If running as root, tmux sessions belong to dev user
+TMUX_CMD="tmux"
+if [ "$(id -u)" = "0" ] && id dev >/dev/null 2>&1; then
+    TMUX_CMD="sudo -u dev tmux"
+fi
+
 while true; do
     # --- Post activity ---
-    if tmux has-session 2>/dev/null; then
-        PANE_CONTENT=$(tmux capture-pane -p -t 0 2>/dev/null | tail -50)
+    if $TMUX_CMD has-session 2>/dev/null; then
+        PANE_CONTENT=$($TMUX_CMD capture-pane -p -t 0 2>/dev/null | tail -50)
         if [ -n "$PANE_CONTENT" ]; then
             STATUS="active"
         else
@@ -68,10 +74,10 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
         chown 1000:1000 "$INBOX_FILE"
 
         # Inject send_keys messages into tmux
-        if command -v jq >/dev/null 2>&1 && tmux has-session 2>/dev/null; then
+        if command -v jq >/dev/null 2>&1 && $TMUX_CMD has-session 2>/dev/null; then
             echo "$MSGS" | jq -r '.[] | select(.send_keys == true or .priority == "urgent") | .body' | while IFS= read -r line; do
                 if [ -n "$line" ]; then
-                    tmux send-keys -t 0 "$line" Enter
+                    $TMUX_CMD send-keys -t 0 "$line" Enter
                 fi
             done
         fi
