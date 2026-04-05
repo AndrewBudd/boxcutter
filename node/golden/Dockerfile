@@ -40,6 +40,11 @@ RUN echo "boxcutter-vm" > /etc/hostname.boxcutter && \
 # --- fstab ---
 RUN echo "/dev/vda / ext4 defaults 0 1" > /etc/fstab
 
+# --- Auto-grow root filesystem to fill disk on first boot ---
+COPY config/boxcutter-growfs.service /etc/systemd/system/boxcutter-growfs.service
+RUN ln -sf /etc/systemd/system/boxcutter-growfs.service \
+      /etc/systemd/system/local-fs.target.wants/boxcutter-growfs.service
+
 # --- Set hostname from kernel ip= parameter at boot ---
 COPY config/set-hostname.service /etc/systemd/system/set-hostname.service
 RUN ln -sf /etc/systemd/system/set-hostname.service \

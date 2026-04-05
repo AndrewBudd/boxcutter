@@ -227,6 +227,10 @@ write_files:
     content: |
       #!/bin/bash
       set -e
+
+      # Grow root filesystem to fill disk (QEMU VMs may have larger virtual disk)
+      resize2fs /dev/vda1 2>/dev/null || resize2fs /dev/vda 2>/dev/null || true
+
       PD="/opt/boxcutter-payload"
       mkdir -p "\$PD"
       tar xzf /opt/boxcutter-payload.tar.gz -C "\$PD"
@@ -486,6 +490,10 @@ write_files:
     content: |
       #!/bin/bash
       set -e
+
+      # Grow root filesystem to fill disk
+      resize2fs /dev/vda1 2>/dev/null || resize2fs /dev/vda 2>/dev/null || true
+
       PD="/opt/boxcutter-payload"
       mkdir -p "\$PD"
       tar xzf /opt/boxcutter-payload.tar.gz -C "\$PD"

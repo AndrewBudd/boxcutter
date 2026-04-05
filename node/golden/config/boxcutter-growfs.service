@@ -1,0 +1,13 @@
+[Unit]
+Description=Grow root filesystem to fill disk
+DefaultDependencies=no
+Before=local-fs.target
+After=-.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'resize2fs /dev/vda 2>/dev/null || true'
+
+[Install]
+WantedBy=local-fs.target
