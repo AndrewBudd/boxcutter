@@ -104,6 +104,8 @@ func main() {
 	metaHandler.Register(vmMux)
 	tapegunHandler := api.NewTapegunHandler(reg)
 	tapegunHandler.Register(vmMux)
+	messagingHandler := api.NewMessagingHandler(reg, cfg.Metadata.NodeAgentURL)
+	messagingHandler.Register(vmMux)
 
 	identityMiddleware := middleware.Identity(reg)
 

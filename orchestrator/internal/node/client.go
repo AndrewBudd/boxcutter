@@ -164,6 +164,21 @@ func (c *Client) ExecInVM(name, command string) (string, error) {
 	return result.Output, nil
 }
 
+// PushMailbox delivers a message to a VM's mailbox on this node.
+func (c *Client) PushMailbox(vmName string, msg interface{}) error {
+	body, _ := json.Marshal(msg)
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+vmName+"/mailbox", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("node push mailbox: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("node push mailbox: %s", string(respBody))
+	}
+	return nil
+}
+
 func (c *Client) Stop(name string) error {
 	resp, err := c.http.Post(c.baseURL+"/api/vms/"+name+"/stop", "", nil)
 	if err != nil {

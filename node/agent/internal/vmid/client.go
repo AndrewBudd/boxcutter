@@ -143,6 +143,46 @@ func (c *Client) GHCRToken() (string, error) {
 	return tok.Token, nil
 }
 
+// MailboxMessage mirrors the registry type for JSON encoding/decoding.
+type MailboxMessage struct {
+	ID        string  `json:"id"`
+	From      string  `json:"from"`
+	To        string  `json:"to"`
+	Subject   string  `json:"subject,omitempty"`
+	Body      string  `json:"body"`
+	CreatedAt string  `json:"created_at"`
+	InFlight  *string `json:"in_flight,omitempty"`
+}
+
+// PushMailbox delivers a message to a VM's mailbox via the admin socket.
+func (c *Client) PushMailbox(vmID string, msg *MailboxMessage) error {
+	body, _ := json.Marshal(msg)
+	resp, err := c.http.Post("http://localhost/internal/vms/"+vmID+"/mailbox", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("vmid push mailbox: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("vmid push mailbox: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// ExportMailbox returns all messages in a VM's mailbox (for migration).
+func (c *Client) ExportMailbox(vmID string) ([]*MailboxMessage, error) {
+	resp, err := c.http.Get("http://localhost/internal/vms/" + vmID + "/mailbox")
+	if err != nil {
+		return nil, fmt.Errorf("vmid export mailbox: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vmid export mailbox: status %d", resp.StatusCode)
+	}
+	var msgs []*MailboxMessage
+	json.NewDecoder(resp.Body).Decode(&msgs)
+	return msgs, nil
+}
+
 // ActivityReport mirrors the registry type for JSON decoding.
 type ActivityReport struct {
 	Timestamp   string `json:"timestamp"`

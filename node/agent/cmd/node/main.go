@@ -60,6 +60,8 @@ func main() {
 	// HTTP API
 	mux := http.NewServeMux()
 	handler := api.NewHandler(mgr)
+	handler.SetVMIDClient(vmidClient)
+	handler.SetOrchestratorURL(cfg.Orchestrator.URL)
 	handler.Register(mux)
 
 	// Health check (separate from VM health)

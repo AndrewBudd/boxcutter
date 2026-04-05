@@ -38,6 +38,10 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/vms/{id}/inbox", h.handlePostInbox)
 	mux.HandleFunc("GET /internal/vms/{id}/inbox", h.handleGetInbox)
 	mux.HandleFunc("GET /internal/tapegun/activity", h.handleAllActivity)
+
+	// VM-to-VM mailbox (used by node agent for relay + migration)
+	mux.HandleFunc("POST /internal/vms/{id}/mailbox", h.handlePushMailbox)
+	mux.HandleFunc("GET /internal/vms/{id}/mailbox", h.handleExportMailbox)
 }
 
 type registerRequest struct {
@@ -272,6 +276,39 @@ func (h *AdminHandler) handleGetInbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *AdminHandler) handleAllActivity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, h.reg.AllActivity())
+}
+
+func (h *AdminHandler) handlePushMailbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	var msg registry.MailboxMessage
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !h.reg.PushMailbox(id, &msg) {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (h *AdminHandler) handleExportMailbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	msgs, ok := h.reg.ExportMailbox(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	if msgs == nil {
+		msgs = []*registry.MailboxMessage{}
+	}
+	writeJSON(w, msgs)
 }
 
 func extractPathID(path, prefix string) string {

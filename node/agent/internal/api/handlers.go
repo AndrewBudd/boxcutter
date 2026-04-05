@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,12 +20,24 @@ import (
 )
 
 type Handler struct {
-	mgr      *vm.Manager
-	goldenMgr *golden.Manager
+	mgr            *vm.Manager
+	goldenMgr      *golden.Manager
+	vmidClient     *vmid.Client
+	orchestratorURL string
 }
 
 func NewHandler(mgr *vm.Manager) *Handler {
 	return &Handler{mgr: mgr}
+}
+
+// SetVMIDClient sets the vmid admin socket client for mailbox operations.
+func (h *Handler) SetVMIDClient(c *vmid.Client) {
+	h.vmidClient = c
+}
+
+// SetOrchestratorURL sets the orchestrator URL for cross-node message relay.
+func (h *Handler) SetOrchestratorURL(url string) {
+	h.orchestratorURL = url
 }
 
 // SetGoldenManager sets the golden image manager for OCI-based golden image management.
@@ -56,6 +69,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleExec)
+	mux.HandleFunc("POST /api/messages/relay", h.handleMessageRelay)
+	mux.HandleFunc("POST /api/vms/{name}/mailbox", h.handlePushMailbox)
 
 	// Tapegun endpoints
 	mux.HandleFunc("GET /api/vms/{name}/activity", h.handleGetActivity)
@@ -838,4 +853,62 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"output": output})
+}
+
+// handlePushMailbox pushes a message into a local VM's mailbox via vmid admin socket.
+func (h *Handler) handlePushMailbox(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if h.vmidClient == nil {
+		http.Error(w, "vmid client not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var msg vmid.MailboxMessage
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.vmidClient.PushMailbox(name, &msg); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// handleMessageRelay receives a message from vmid and routes it.
+// If the target VM is local, delivers via vmid admin socket.
+// If remote, forwards to the orchestrator for routing.
+func (h *Handler) handleMessageRelay(w http.ResponseWriter, r *http.Request) {
+	var msg vmid.MailboxMessage
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Try local delivery via vmid
+	if h.vmidClient != nil {
+		if err := h.vmidClient.PushMailbox(msg.To, &msg); err == nil {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+	}
+
+	// Not local — relay to orchestrator
+	if h.orchestratorURL == "" {
+		http.Error(w, "target VM not found", http.StatusNotFound)
+		return
+	}
+
+	body, _ := json.Marshal(msg)
+	resp, err := http.Post(h.orchestratorURL+"/api/messages/relay", "application/json", bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "orchestrator relay failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		http.Error(w, string(respBody), resp.StatusCode)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
 }

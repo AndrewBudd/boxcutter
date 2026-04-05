@@ -27,6 +27,7 @@ type MetadataFilesConfig struct {
 	SSHAuthorizedKeys []string `yaml:"ssh_authorized_keys"`
 	CACertPath        string   `yaml:"ca_cert_path"`
 	VMSSHKeyPath      string   `yaml:"vm_ssh_key_path"`
+	NodeAgentURL      string   `yaml:"node_agent_url"`
 }
 
 type JWTConfig struct {
@@ -123,6 +124,7 @@ func Load(path string) (*Config, error) {
 			},
 			CACertPath:   "/etc/boxcutter/secrets/ca.crt",
 			VMSSHKeyPath: "/etc/boxcutter/secrets/vm-ssh.key",
+			NodeAgentURL: "http://localhost:8800",
 		},
 		JWT: JWTConfig{
 			TTL: 10 * time.Minute,

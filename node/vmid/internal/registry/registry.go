@@ -20,6 +20,20 @@ type StatusReport struct {
 	Status    string    `json:"status"` // last assistant message or summary
 }
 
+// MailboxMessage is a VM-to-VM message stored in the recipient's mailbox.
+type MailboxMessage struct {
+	ID        string     `json:"id"`
+	From      string     `json:"from"`
+	To        string     `json:"to"`
+	Subject   string     `json:"subject,omitempty"`
+	Body      string     `json:"body"`
+	CreatedAt time.Time  `json:"created_at"`
+	InFlight  *time.Time `json:"in_flight,omitempty"` // when consumed; nil = pending
+}
+
+// InFlightTimeout is how long a consumed message stays invisible before redelivery.
+const InFlightTimeout = 30 * time.Second
+
 // Message is a directive sent to a VM by an external tapegun agent.
 type Message struct {
 	ID        string     `json:"id"`
@@ -49,9 +63,10 @@ type VMRecord struct {
 	GitHubRepo  string            `json:"github_repo,omitempty"`  // backwards compat
 	GitHubRepos []string          `json:"github_repos,omitempty"` // all repos
 
-	LastActivity *ActivityReport `json:"last_activity,omitempty"`
-	LastStatus   *StatusReport   `json:"last_status,omitempty"`
-	Inbox        []*Message      `json:"inbox,omitempty"`
+	LastActivity *ActivityReport   `json:"last_activity,omitempty"`
+	LastStatus   *StatusReport    `json:"last_status,omitempty"`
+	Inbox        []*Message       `json:"inbox,omitempty"`
+	Mailbox      []*MailboxMessage `json:"mailbox,omitempty"`
 }
 
 // AllGitHubRepos returns the list of repos, falling back to single GitHubRepo.
@@ -130,6 +145,57 @@ func (r *VMRecord) AckMessages(ids []string) {
 			m.ReadAt = &now
 		}
 	}
+}
+
+// PushMailbox appends a message to the VM's mailbox.
+func (r *VMRecord) PushMailbox(msg *MailboxMessage) {
+	r.Mailbox = append(r.Mailbox, msg)
+}
+
+// ConsumeMailbox returns pending messages and marks them as in-flight.
+// Messages whose in-flight timeout has expired are returned to pending first.
+func (r *VMRecord) ConsumeMailbox() []*MailboxMessage {
+	now := time.Now()
+	// Reset expired in-flight messages to pending
+	for _, m := range r.Mailbox {
+		if m.InFlight != nil && now.Sub(*m.InFlight) > InFlightTimeout {
+			m.InFlight = nil
+		}
+	}
+	// Collect and mark pending messages as in-flight
+	var result []*MailboxMessage
+	for _, m := range r.Mailbox {
+		if m.InFlight == nil {
+			m.InFlight = &now
+			result = append(result, m)
+		}
+	}
+	return result
+}
+
+// AckMailbox permanently deletes a message from the mailbox.
+func (r *VMRecord) AckMailbox(msgID string) bool {
+	for i, m := range r.Mailbox {
+		if m.ID == msgID {
+			r.Mailbox = append(r.Mailbox[:i], r.Mailbox[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// ExportMailbox returns a copy of all mailbox messages (for migration).
+func (r *VMRecord) ExportMailbox() []*MailboxMessage {
+	if len(r.Mailbox) == 0 {
+		return nil
+	}
+	msgs := make([]*MailboxMessage, len(r.Mailbox))
+	for i, m := range r.Mailbox {
+		cp := *m
+		cp.InFlight = nil // reset in-flight on export
+		msgs[i] = &cp
+	}
+	return msgs
 }
 
 // PendingCount returns the number of unread messages.
@@ -311,6 +377,65 @@ func (r *Registry) AllActivity() []VMActivitySummary {
 		})
 	}
 	return summaries
+}
+
+// PushMailbox adds a message to a VM's mailbox under lock.
+func (r *Registry) PushMailbox(vmID string, msg *MailboxMessage) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.PushMailbox(msg)
+	return true
+}
+
+// ConsumeMailbox returns and marks pending messages as in-flight.
+func (r *Registry) ConsumeMailbox(vmID string) ([]*MailboxMessage, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	return rec.ConsumeMailbox(), true
+}
+
+// AckMailbox deletes a message from a VM's mailbox.
+func (r *Registry) AckMailbox(vmID string, msgID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	return rec.AckMailbox(msgID)
+}
+
+// ExportMailbox returns a copy of a VM's mailbox for migration.
+func (r *Registry) ExportMailbox(vmID string) ([]*MailboxMessage, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	return rec.ExportMailbox(), true
+}
+
+// ImportMailbox loads messages into a VM's mailbox (after migration).
+func (r *Registry) ImportMailbox(vmID string, msgs []*MailboxMessage) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	for _, m := range msgs {
+		rec.PushMailbox(m)
+	}
+	return true
 }
 
 func (r *Registry) MarshalJSON() ([]byte, error) {

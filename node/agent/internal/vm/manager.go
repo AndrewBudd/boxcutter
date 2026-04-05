@@ -1130,6 +1130,43 @@ func (m *Manager) injectSSHKeys(st *VMState) {
 	run("chown", "-R", "1000:1000", sshDir)
 }
 
+// exportMailboxToFile saves a VM's mailbox to vmDir/mailbox.json for migration.
+func (m *Manager) exportMailboxToFile(name, vmDir string) {
+	if m.vmid == nil {
+		return
+	}
+	msgs, err := m.vmid.ExportMailbox(name)
+	if err != nil || len(msgs) == 0 {
+		os.Remove(filepath.Join(vmDir, "mailbox.json"))
+		return
+	}
+	data, _ := json.MarshalIndent(msgs, "", "  ")
+	os.WriteFile(filepath.Join(vmDir, "mailbox.json"), data, 0644)
+	log.Printf("VM %s: exported %d mailbox messages for migration", name, len(msgs))
+}
+
+// importMailboxFromFile loads mailbox.json from vmDir and pushes to vmid.
+func (m *Manager) importMailboxFromFile(name, vmDir string) {
+	if m.vmid == nil {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(vmDir, "mailbox.json"))
+	if err != nil {
+		return
+	}
+	var msgs []*vmid.MailboxMessage
+	if err := json.Unmarshal(data, &msgs); err != nil {
+		return
+	}
+	for _, msg := range msgs {
+		m.vmid.PushMailbox(name, msg)
+	}
+	os.Remove(filepath.Join(vmDir, "mailbox.json"))
+	if len(msgs) > 0 {
+		log.Printf("VM %s: imported %d mailbox messages after migration", name, len(msgs))
+	}
+}
+
 func (m *Manager) joinTailscale(st *VMState) string {
 	sshKey := m.cfg.SSH.PrivateKeyPath
 	authkey := st.TailscaleAuthkey
@@ -1708,6 +1745,9 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return nil, fmt.Errorf("VM '%s' not found", name)
 	}
 
+	// Export mailbox before migration so it travels with the VM files
+	m.exportMailboxToFile(name, vmDir)
+
 	// QEMU VMs use QMP-based state save/restore for live migration.
 	if st.Type == "qemu" && IsRunning(vmDir) {
 		return m.migrateQEMUVM(name, st, targetAddr, targetBridgeIP)
@@ -2068,6 +2108,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 // Flow: pre-sync disk → pause → save state → transfer state → restore on target → verify.
 func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBridgeIP string) (*MigrateResponse, error) {
 	vmDir := VMDir(name)
+	m.exportMailboxToFile(name, vmDir)
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
 	dstVMDir := fmt.Sprintf("/var/lib/boxcutter/vms/%s/", name)
 	diskName := "rootfs.ext4"
@@ -2221,6 +2262,7 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 // relocateStoppedVM transfers a stopped VM's files to the target node.
 // No snapshot needed — just rsync vm.json + disk image + ensure golden image.
 func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey string) (*MigrateResponse, error) {
+	m.exportMailboxToFile(name, vmDir)
 	log.Printf("Relocating stopped VM %s to %s", name, targetAddr)
 	fileRootfs := IsFileRootfs(vmDir)
 
@@ -2384,6 +2426,8 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 			GitHubRepo:  st.GitHubRepo,
 			GitHubRepos: st.AllGitHubRepos(),
 		})
+		// Import mailbox after registration
+		m.importMailboxFromFile(st.Name, VMDir(st.Name))
 	}
 
 	// Rejoin Tailscale after migration — QEMU VMs don't have vsock for nudge,
@@ -2616,6 +2660,8 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 			GitHubRepo:  st.GitHubRepo,
 			GitHubRepos: st.AllGitHubRepos(),
 		})
+		// Import mailbox after registration
+		m.importMailboxFromFile(st.Name, VMDir(st.Name))
 	}
 
 	// Pre-fault guest memory pages so the next snapshot creation is fast (~260ms
