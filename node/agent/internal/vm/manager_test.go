@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -191,6 +192,39 @@ func TestCreateRequest_TailscaleAuthkey(t *testing.T) {
 	}
 	if decoded.TailscaleAuthkey != "tskey-auth-test-123" {
 		t.Errorf("TailscaleAuthkey = %q, want tskey-auth-test-123", decoded.TailscaleAuthkey)
+	}
+}
+
+func TestExecResult_JSONRoundTrip(t *testing.T) {
+	r := ExecResult{Output: "hello world\n", ExitCode: 0}
+	data, _ := json.Marshal(r)
+	var decoded ExecResult
+	json.Unmarshal(data, &decoded)
+	if decoded.Output != "hello world\n" {
+		t.Errorf("Output = %q, want 'hello world\\n'", decoded.Output)
+	}
+	if decoded.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0", decoded.ExitCode)
+	}
+}
+
+func TestExecResult_NonZeroExitCode(t *testing.T) {
+	r := ExecResult{Output: "error: not found\n", ExitCode: 127}
+	data, _ := json.Marshal(r)
+	var decoded ExecResult
+	json.Unmarshal(data, &decoded)
+	if decoded.ExitCode != 127 {
+		t.Errorf("ExitCode = %d, want 127", decoded.ExitCode)
+	}
+}
+
+func TestExecResult_ExitCodePreservedInJSON(t *testing.T) {
+	// Verify exit_code field name is correct in JSON
+	r := ExecResult{Output: "", ExitCode: 42}
+	data, _ := json.Marshal(r)
+	s := string(data)
+	if !strings.Contains(s, `"exit_code":42`) {
+		t.Errorf("JSON should contain exit_code:42, got %s", s)
 	}
 }
 

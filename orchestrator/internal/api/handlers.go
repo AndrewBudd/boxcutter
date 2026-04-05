@@ -1531,13 +1531,13 @@ func (h *Handler) handleVMExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nc := node.NewClient(n.APIAddr)
-	output, err := nc.ExecInVM(name, req.Command)
+	result, err := nc.ExecInVM(name, req.Command)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	writeJSON(w, map[string]string{"output": output})
+	writeJSON(w, result)
 }
 
 func (h *Handler) handleVMLocation(w http.ResponseWriter, r *http.Request) {

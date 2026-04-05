@@ -849,12 +849,12 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "command is required", http.StatusBadRequest)
 		return
 	}
-	output, err := h.mgr.Exec(name, req.Command)
+	result, err := h.mgr.Exec(name, req.Command)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"output": output})
+	writeJSON(w, result)
 }
 
 // handlePushMailbox pushes a message into a local VM's mailbox via vmid admin socket.

@@ -145,23 +145,27 @@ func (c *Client) Destroy(name string) error {
 	return nil
 }
 
+// ExecResult holds the output and exit code from a VM exec.
+type ExecResult struct {
+	Output   string `json:"output"`
+	ExitCode int    `json:"exit_code"`
+}
+
 // ExecInVM runs a command inside a VM via the node agent.
-func (c *Client) ExecInVM(name, command string) (string, error) {
+func (c *Client) ExecInVM(name, command string) (*ExecResult, error) {
 	body, _ := json.Marshal(map[string]string{"command": command})
 	resp, err := c.http.Post(c.baseURL+"/api/vms/"+name+"/exec", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("node exec: %w", err)
+		return nil, fmt.Errorf("node exec: %w", err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("node exec: %s", string(respBody))
+		return nil, fmt.Errorf("node exec: %s", string(respBody))
 	}
-	var result struct {
-		Output string `json:"output"`
-	}
+	var result ExecResult
 	json.Unmarshal(respBody, &result)
-	return result.Output, nil
+	return &result, nil
 }
 
 // PushMailbox delivers a message to a VM's mailbox on this node.

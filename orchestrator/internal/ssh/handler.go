@@ -115,6 +115,13 @@ func (h *Handler) Run(args []string) int {
 			return 1
 		}
 		return h.cmdAuthorize(target)
+	case "exec":
+		if target == "" || len(args) < 3 {
+			fmt.Println("Usage: ssh <host> exec <vm-name> <command...>")
+			return 1
+		}
+		cmd := strings.Join(args[2:], " ")
+		return h.cmdExec(target, cmd)
 	case "help":
 		h.printHelp()
 		return 0
@@ -671,6 +678,21 @@ func (h *Handler) cmdRepos(args []string) int {
 	}
 }
 
+func (h *Handler) cmdExec(name, command string) int {
+	resp, err := h.post("/api/vms/"+name+"/exec", map[string]string{"command": command})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	var result struct {
+		Output   string `json:"output"`
+		ExitCode int    `json:"exit_code"`
+	}
+	json.Unmarshal(resp, &result)
+	fmt.Print(result.Output)
+	return result.ExitCode
+}
+
 func (h *Handler) cmdAuthorize(name string) int {
 	// Tell the VM to fetch its SSH key from the metadata service and configure SSH.
 	setupScript := `set -e
@@ -732,6 +754,7 @@ Commands:
   stop <name>             Stop a running VM
   start <name>            Start a stopped VM
   cp <name> [new-name]    Copy a VM (clone its disk)
+  exec <name> <command>   Run a command on a VM and return output
   authorize <name>        Grant a VM access to boxcutter commands
   repos list <name>       List GitHub repos for a VM
   repos add <name> <repo> Add a repo to VM's GitHub policy

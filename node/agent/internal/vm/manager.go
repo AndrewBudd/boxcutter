@@ -541,16 +541,31 @@ func (m *Manager) Get(name string) (*VMState, string, error) {
 }
 
 // Exec runs a command inside a VM via SSH and returns the output.
-func (m *Manager) Exec(name string, command string) (string, error) {
+// ExecResult holds the output and exit code of a command.
+type ExecResult struct {
+	Output   string `json:"output"`
+	ExitCode int    `json:"exit_code"`
+}
+
+func (m *Manager) Exec(name string, command string) (*ExecResult, error) {
 	st, status, err := m.Get(name)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if status != "running" {
-		return "", fmt.Errorf("VM '%s' is %s, not running", name, status)
+		return nil, fmt.Errorf("VM '%s' is %s, not running", name, status)
 	}
 	sshKey := m.cfg.SSH.PrivateKeyPath
-	return VMSSH(st.TAP, sshKey, command)
+	output, err := VMSSH(st.TAP, sshKey, command)
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			return nil, err // connection error, not command error
+		}
+	}
+	return &ExecResult{Output: output, ExitCode: exitCode}, nil
 }
 
 // List returns all VMs with their status.
