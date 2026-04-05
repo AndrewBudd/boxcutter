@@ -191,6 +191,27 @@ func defaultConfig() HostConfig {
 		clusterPrefix = "boxcutter"
 	}
 
+	nodeVCPU := 6
+	if v := os.Getenv("NODE_VCPU"); v != "" {
+		fmt.Sscanf(v, "%d", &nodeVCPU)
+	}
+	nodeRAM := "12G"
+	if v := os.Getenv("NODE_RAM"); v != "" {
+		nodeRAM = v
+	}
+	nodeDisk := "150G"
+	if v := os.Getenv("NODE_DISK"); v != "" {
+		nodeDisk = v
+	}
+	orchRAM := "4G"
+	if v := os.Getenv("ORCH_RAM"); v != "" {
+		orchRAM = v
+	}
+	orchVCPU := 2
+	if v := os.Getenv("ORCH_VCPU"); v != "" {
+		fmt.Sscanf(v, "%d", &orchVCPU)
+	}
+
 	return HostConfig{
 		ClusterPrefix:      clusterPrefix,
 		RepoDir:            repoDir,
@@ -203,12 +224,12 @@ func defaultConfig() HostConfig {
 		OrchestratorIP:     "192.168.50.2",
 		OrchestratorMAC:    "52:54:00:00:00:02",
 		OrchestratorTAP:    "tap-orch",
-		OrchestratorVCPU:   2,
-		OrchestratorRAM:    "4G",
+		OrchestratorVCPU:   orchVCPU,
+		OrchestratorRAM:    orchRAM,
 		OrchestratorDisk:   "20G",
-		NodeVCPU:           6,
-		NodeRAM:            "12G",
-		NodeDisk:           "150G",
+		NodeVCPU:           nodeVCPU,
+		NodeRAM:            nodeRAM,
+		NodeDisk:           nodeDisk,
 		NodeSubnet:         "192.168.50",
 		NodeIPOffset:       2,
 		StatePath:          "/var/lib/boxcutter/cluster.json",
