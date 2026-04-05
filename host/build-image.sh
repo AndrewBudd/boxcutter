@@ -749,6 +749,25 @@ for attempt in 1 2 3; do
 done
 echo "  QCOW2: ${OUTPUT_QCOW2} ($(du -h "$OUTPUT_QCOW2" | cut -f1))"
 
+# --- Post-conversion cleanup: remove stale netplan from flattened image ---
+# The in-VM cleanup may fail silently (SSH disconnect, cloud-init regeneration).
+# Belt-and-suspenders: mount the final image and clean it directly.
+echo "--- Post-conversion cleanup ---"
+sudo modprobe nbd max_part=8 2>/dev/null || true
+if sudo qemu-nbd --connect=/dev/nbd1 "$OUTPUT_QCOW2" 2>/dev/null; then
+  sleep 1
+  CLEAN_MNT=$(mktemp -d)
+  if sudo mount /dev/nbd1p1 "$CLEAN_MNT" 2>/dev/null || sudo mount /dev/nbd1 "$CLEAN_MNT" 2>/dev/null; then
+    sudo rm -f "$CLEAN_MNT/etc/netplan/50-cloud-init.yaml"
+    sudo rm -rf "$CLEAN_MNT/var/lib/cloud/"
+    sudo truncate -s 0 "$CLEAN_MNT/etc/machine-id" 2>/dev/null
+    sudo umount "$CLEAN_MNT"
+    echo "  Cleaned stale netplan + cloud-init state"
+  fi
+  sudo qemu-nbd --disconnect /dev/nbd1 2>/dev/null
+  rmdir "$CLEAN_MNT" 2>/dev/null
+fi
+
 # --- Compress with zstd ---
 echo "--- Compressing with zstd ---"
 OUTPUT_ZST="${OUTPUT_QCOW2}.zst"
