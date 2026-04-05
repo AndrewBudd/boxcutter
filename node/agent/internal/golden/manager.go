@@ -97,14 +97,7 @@ func (m *Manager) SetHead(version string) error {
 		// Read the version that was just built
 		version = m.readCurrentVersion()
 		if version == "" {
-			// Build script exited 0 but didn't produce an image (flock race).
-			// Wait briefly and retry once — the other process may finish.
-			log.Printf("golden: build exited without producing image, waiting 60s for concurrent build...")
-			time.Sleep(60 * time.Second)
-			version = m.readCurrentVersion()
-			if version == "" {
-				return fmt.Errorf("golden image not found after build (concurrent build may have failed)")
-			}
+			return fmt.Errorf("golden image not found after build")
 		}
 	} else {
 		// Check if we already have this version

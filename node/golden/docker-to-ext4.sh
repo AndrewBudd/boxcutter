@@ -16,12 +16,19 @@ OUTPUT="${GOLDEN_DIR}/rootfs.ext4"
 SIZE="${1:-4G}"
 IMAGE_NAME="boxcutter-golden"
 
-# Prevent concurrent builds (Bug #77: boot-time + MQTT-triggered builds race)
+# Prevent concurrent builds. Block (wait) if another build is running,
+# then check if the result already exists — skip if so.
 LOCKFILE="/var/lock/boxcutter-golden-build.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
-  echo "Another golden image build is already running, exiting."
-  exit 0
+  echo "Another golden image build is running, waiting for it to finish..."
+  flock 9  # block until the lock is released
+  # Check if the other build produced a result
+  if [ -L "${OUTPUT}" ] && [ -s "$(readlink -f "${OUTPUT}" 2>/dev/null)" ]; then
+    echo "Build completed by another process."
+    exit 0
+  fi
+  echo "Previous build did not produce a result, continuing..."
 fi
 
 echo "=== Building golden image from Dockerfile ==="
