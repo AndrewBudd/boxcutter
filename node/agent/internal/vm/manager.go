@@ -719,6 +719,7 @@ func (m *Manager) RestartAll() {
 			} else {
 				SetMigrating(vmDir, false)
 				os.RemoveAll(filepath.Join("/dev/shm", "bc-"+st.Name+"-mig"))
+				m.registerWithVMID(st)
 				log.Printf("  %s: resumed after interrupted migration", st.Name)
 				continue
 			}
@@ -726,7 +727,8 @@ func (m *Manager) RestartAll() {
 		SetMigrating(vmDir, false) // clear stale marker regardless
 
 		if IsRunning(vmDir) {
-			log.Printf("  %s: already running, skipping", st.Name)
+			log.Printf("  %s: already running, re-registering with vmid", st.Name)
+			m.registerWithVMID(st)
 			continue
 		}
 
@@ -1128,6 +1130,26 @@ func (m *Manager) injectSSHKeys(st *VMState) {
 	os.WriteFile(existingKeysPath, []byte(strings.Join(merged, "\n")+"\n"), 0600)
 
 	run("chown", "-R", "1000:1000", sshDir)
+}
+
+// registerWithVMID registers a VM with vmid (fire-and-forget, for RestartAll).
+func (m *Manager) registerWithVMID(st *VMState) {
+	if m.vmid == nil {
+		return
+	}
+	vmType := st.Type
+	if vmType == "" {
+		vmType = "firecracker"
+	}
+	m.vmid.Register(&vmid.RegisterRequest{
+		VMID:        st.Name,
+		VMType:      vmType,
+		IP:          "10.0.0.2",
+		Mark:        st.Mark,
+		Mode:        st.Mode,
+		GitHubRepo:  st.GitHubRepo,
+		GitHubRepos: st.AllGitHubRepos(),
+	})
 }
 
 // EnsureVMIDRegistered makes sure a VM is registered with vmid.
