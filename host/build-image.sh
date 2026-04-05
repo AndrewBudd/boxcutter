@@ -641,6 +641,10 @@ sudo bash -c '
   # Remove cloud-init state so it re-runs on next boot
   cloud-init clean --logs 2>/dev/null || rm -rf /var/lib/cloud/
 
+  # Remove stale netplan config (cloud-init clean doesn't remove it, and
+  # the MAC-based match prevents networking on VMs with different MACs)
+  rm -f /etc/netplan/50-cloud-init.yaml
+
   # Remove machine-id (regenerated on boot)
   truncate -s 0 /etc/machine-id
   rm -f /var/lib/dbus/machine-id
