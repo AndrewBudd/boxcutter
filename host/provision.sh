@@ -371,7 +371,7 @@ write_files:
       echo "============================================"
 
 runcmd:
-  - bash /opt/boxcutter-bootstrap.sh
+  - bash /opt/boxcutter-bootstrap.sh || { echo "Bootstrap failed, retrying..."; sleep 5; bash /opt/boxcutter-bootstrap.sh; }
 USERDATA
 
   cat > "${CIDATA}/meta-data" <<META
@@ -622,7 +622,7 @@ write_files:
       echo "============================================"
 
 runcmd:
-  - bash /opt/boxcutter-bootstrap.sh
+  - bash /opt/boxcutter-bootstrap.sh || { echo "Bootstrap failed, retrying..."; sleep 5; bash /opt/boxcutter-bootstrap.sh; }
 USERDATA
 
   cat > "${CIDATA}/meta-data" <<META
