@@ -169,3 +169,47 @@ func TestVMDir(t *testing.T) {
 		t.Errorf("VMDir base = %q, want test-vm", filepath.Base(dir))
 	}
 }
+
+func TestCreateRequest_TailscaleAuthkey(t *testing.T) {
+	// Verify CreateRequest JSON marshals/unmarshals the authkey field
+	req := CreateRequest{
+		Name:             "ts-vm",
+		VCPU:             2,
+		RAMMIB:           2048,
+		Mode:             "normal",
+		TailscaleAuthkey: "tskey-auth-test-123",
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded CreateRequest
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.TailscaleAuthkey != "tskey-auth-test-123" {
+		t.Errorf("TailscaleAuthkey = %q, want tskey-auth-test-123", decoded.TailscaleAuthkey)
+	}
+}
+
+func TestCreateRequest_TailscaleAuthkey_OmittedWhenEmpty(t *testing.T) {
+	req := CreateRequest{
+		Name:   "no-ts",
+		VCPU:   2,
+		RAMMIB: 2048,
+		Mode:   "normal",
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]interface{}
+	json.Unmarshal(data, &raw)
+	if _, exists := raw["tailscale_authkey"]; exists {
+		t.Error("tailscale_authkey should be omitted from JSON when empty")
+	}
+}

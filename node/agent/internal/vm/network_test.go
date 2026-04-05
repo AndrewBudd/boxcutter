@@ -73,6 +73,65 @@ func TestAllocateMark_CollisionAvoidance(t *testing.T) {
 	}
 }
 
+// --- CONNMARK fix tests ---
+// These test the detection logic for the Tailscale CONNMARK conflict.
+// Tailscale adds "CONNMARK --restore-mark" at the end of mangle PREROUTING
+// which overwrites VM fwmarks (set by our TAP rules) with 0 for new connections.
+// This broke VM networking on stop/start (cold boot) in v0.9.0.
+
+func TestNeedsCONNMARKFix_UnconditionalRestore(t *testing.T) {
+	// Tailscale's problematic rule: unconditional CONNMARK restore at the end
+	iptablesS := `-P PREROUTING ACCEPT
+-A PREROUTING -m conntrack --ctstate RELATED,ESTABLISHED -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000
+-A PREROUTING -i tap-silky-eagle -j MARK --set-xmark 0xa34e/0xffffffff
+-A PREROUTING -i tap-lotj-golden -j MARK --set-xmark 0x8d34/0xffffffff
+-A PREROUTING -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff`
+
+	if !needsCONNMARKFix(iptablesS) {
+		t.Error("should detect unconditional CONNMARK restore as needing fix")
+	}
+}
+
+func TestNeedsCONNMARKFix_AlreadyConditional(t *testing.T) {
+	// Already fixed: conditional restore (only when mark is 0)
+	iptablesS := `-P PREROUTING ACCEPT
+-A PREROUTING -m conntrack --ctstate RELATED,ESTABLISHED -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000
+-A PREROUTING -i tap-silky-eagle -j MARK --set-xmark 0xa34e/0xffffffff
+-A PREROUTING -i tap-lotj-golden -j MARK --set-xmark 0x8d34/0xffffffff
+-A PREROUTING -m mark --mark 0x0 -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff`
+
+	if needsCONNMARKFix(iptablesS) {
+		t.Error("should NOT flag already-conditional CONNMARK restore")
+	}
+}
+
+func TestNeedsCONNMARKFix_NoTailscale(t *testing.T) {
+	// No Tailscale rules at all
+	iptablesS := `-P PREROUTING ACCEPT
+-A PREROUTING -i tap-test-vm -j MARK --set-xmark 0x1234/0xffffffff`
+
+	if needsCONNMARKFix(iptablesS) {
+		t.Error("should NOT flag when no CONNMARK rule present")
+	}
+}
+
+func TestNeedsCONNMARKFix_Empty(t *testing.T) {
+	if needsCONNMARKFix("") {
+		t.Error("should NOT flag empty iptables output")
+	}
+}
+
+func TestNeedsCONNMARKFix_CONNMARKNotLast(t *testing.T) {
+	// CONNMARK restore exists but is NOT the last rule — a VM TAP rule is last
+	iptablesS := `-P PREROUTING ACCEPT
+-A PREROUTING -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff
+-A PREROUTING -i tap-new-vm -j MARK --set-xmark 0x5678/0xffffffff`
+
+	if needsCONNMARKFix(iptablesS) {
+		t.Error("should NOT flag CONNMARK that isn't the last rule")
+	}
+}
+
 func TestCRC32Mark_Range(t *testing.T) {
 	// Test many names to ensure range is always [1, 65535]
 	names := []string{

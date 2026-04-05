@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -145,6 +146,78 @@ func TestReadPID_DeadProcess(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "qemu.pid"), []byte("999999999"), 0644)
 	if pid := ReadPID(dir); pid != 0 {
 		t.Errorf("ReadPID for dead PID = %d, want 0", pid)
+	}
+}
+
+func TestVMState_TailscaleAuthkey_Persistence(t *testing.T) {
+	dir := t.TempDir()
+	st := &VMState{
+		Name:             "ts-test",
+		VCPU:             2,
+		RAMMIB:           2048,
+		Mark:             999,
+		Mode:             "normal",
+		TailscaleAuthkey: "tskey-auth-fake-key-12345",
+	}
+	if err := SaveVMState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadVMState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.TailscaleAuthkey != "tskey-auth-fake-key-12345" {
+		t.Errorf("TailscaleAuthkey = %q, want tskey-auth-fake-key-12345", loaded.TailscaleAuthkey)
+	}
+}
+
+func TestVMState_TailscaleAuthkey_OmittedWhenEmpty(t *testing.T) {
+	dir := t.TempDir()
+	st := &VMState{
+		Name:   "no-ts-key",
+		VCPU:   2,
+		RAMMIB: 2048,
+		Mark:   888,
+		Mode:   "normal",
+	}
+	if err := SaveVMState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the JSON doesn't include the key when empty
+	data, _ := os.ReadFile(filepath.Join(dir, "vm.json"))
+	var raw map[string]interface{}
+	json.Unmarshal(data, &raw)
+	if _, exists := raw["tailscale_authkey"]; exists {
+		t.Error("tailscale_authkey should be omitted from JSON when empty")
+	}
+
+	// Verify it loads back as empty
+	loaded, err := LoadVMState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.TailscaleAuthkey != "" {
+		t.Errorf("TailscaleAuthkey = %q, want empty", loaded.TailscaleAuthkey)
+	}
+}
+
+func TestVMState_BackwardsCompat_NoAuthkey(t *testing.T) {
+	// Simulate loading a vm.json from before the authkey field existed
+	dir := t.TempDir()
+	oldJSON := `{"name":"old-vm","vcpu":2,"ram_mib":2048,"mark":777,"mode":"normal","tailscale_ip":"100.1.2.3"}`
+	os.WriteFile(filepath.Join(dir, "vm.json"), []byte(oldJSON), 0644)
+
+	loaded, err := LoadVMState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.TailscaleAuthkey != "" {
+		t.Errorf("Old vm.json should have empty TailscaleAuthkey, got %q", loaded.TailscaleAuthkey)
+	}
+	if loaded.TailscaleIP != "100.1.2.3" {
+		t.Errorf("TailscaleIP = %q, want 100.1.2.3", loaded.TailscaleIP)
 	}
 }
 

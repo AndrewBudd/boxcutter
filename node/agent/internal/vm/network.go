@@ -80,18 +80,22 @@ func fixTailscaleCONNMARK() {
 	if err != nil {
 		return
 	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) == 0 {
-		return
-	}
-	last := lines[len(lines)-1]
-	// Match: "-A PREROUTING -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
-	// (unconditional restore with no -m mark condition)
-	if strings.Contains(last, "CONNMARK --restore-mark") && !strings.Contains(last, "-m mark") {
-		// Delete the unconditional rule and add a conditional one
+	if needsCONNMARKFix(string(out)) {
 		run("iptables", "-t", "mangle", "-D", "PREROUTING", "-j", "CONNMARK", "--restore-mark")
 		run("iptables", "-t", "mangle", "-A", "PREROUTING", "-m", "mark", "--mark", "0x0", "-j", "CONNMARK", "--restore-mark")
 	}
+}
+
+// needsCONNMARKFix returns true if the last rule in mangle PREROUTING is an
+// unconditional CONNMARK --restore-mark (no -m mark condition). Tailscale adds
+// this rule which clobbers VM fwmarks for new connections.
+func needsCONNMARKFix(iptablesSOutput string) bool {
+	lines := strings.Split(strings.TrimSpace(iptablesSOutput), "\n")
+	if len(lines) == 0 {
+		return false
+	}
+	last := lines[len(lines)-1]
+	return strings.Contains(last, "CONNMARK --restore-mark") && !strings.Contains(last, "-m mark")
 }
 
 // TeardownTAP removes TAP device and all associated rules.
