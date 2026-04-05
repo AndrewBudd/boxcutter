@@ -88,6 +88,20 @@ if [ -z "$SSH_PUBKEY" ]; then
 fi
 [ -z "$SSH_PUBKEY" ] && { echo "Error: no SSH public key found"; exit 1; }
 
+# Ensure the current user's SSH key is in authorized-keys (for dev clusters)
+for keyfile in \
+    "${REAL_HOME}/.ssh/id_ed25519.pub" "${REAL_HOME}/.ssh/id_rsa.pub" \
+    ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
+  if [ -f "$keyfile" ]; then
+    USER_KEY=$(head -1 "$keyfile")
+    if ! echo "$SSH_KEYS_YAML" | grep -qF "$USER_KEY"; then
+      SSH_KEYS_YAML="${SSH_KEYS_YAML}      - ${USER_KEY}
+"
+    fi
+    break
+  fi
+done
+
 # --- Shared: download Ubuntu base image ---
 UBUNTU_IMG="${IMAGES_DIR}/ubuntu-noble-cloudimg-amd64.img"
 ensure_ubuntu_img() {
