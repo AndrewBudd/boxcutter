@@ -178,6 +178,11 @@ func (h *Handler) cmdNew(args []string) int {
 				body["description"] = args[i+1]
 				i++
 			}
+		case "--ts-authkey":
+			if i+1 < len(args) {
+				body["tailscale_authkey"] = args[i+1]
+				i++
+			}
 		}
 	}
 
@@ -720,6 +725,7 @@ Commands:
     --disk <size>           Disk size (default: 50G)
     --mode normal|paranoid  Network mode (default: normal)
     --node <node-id>        Pin to specific node
+    --ts-authkey <key>      Tailscale auth key (default: node's shared key)
   list                    List all VMs (shows type, description)
   logs <name> [--lines N] Show VM console/system logs (default: last 100 lines)
   describe <name> <text>  Set or update a VM's description

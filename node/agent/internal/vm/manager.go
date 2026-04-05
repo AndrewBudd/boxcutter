@@ -84,16 +84,17 @@ type ProgressFunc func(phase, message string)
 
 // CreateRequest is the API input for creating a VM.
 type CreateRequest struct {
-	Name           string   `json:"name"`
-	Type           string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
-	Description    string   `json:"description,omitempty"` // user-provided description
-	VCPU           int      `json:"vcpu,omitempty"`
-	RAMMIB         int      `json:"ram_mib,omitempty"`
-	Disk           string   `json:"disk,omitempty"`
-	CloneURL       string   `json:"clone_url,omitempty"`
-	CloneURLs      []string `json:"clone_urls,omitempty"`
-	Mode           string   `json:"mode,omitempty"`
-	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
+	Name             string   `json:"name"`
+	Type             string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
+	Description      string   `json:"description,omitempty"` // user-provided description
+	VCPU             int      `json:"vcpu,omitempty"`
+	RAMMIB           int      `json:"ram_mib,omitempty"`
+	Disk             string   `json:"disk,omitempty"`
+	CloneURL         string   `json:"clone_url,omitempty"`
+	CloneURLs        []string `json:"clone_urls,omitempty"`
+	Mode             string   `json:"mode,omitempty"`
+	AuthorizedKeys   []string `json:"authorized_keys,omitempty"`
+	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
 
 	progressFn ProgressFunc `json:"-"`
 }
@@ -211,22 +212,23 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 		}
 
 		st = &VMState{
-			Name:        req.Name,
-			Type:        req.Type,
-			Description: req.Description,
-			VCPU:        req.VCPU,
-			RAMMIB:      req.RAMMIB,
-			Mark:        mark,
-			Mode:        req.Mode,
-			MAC:         fixedMAC,
-			Disk:        req.Disk,
-			TAP:         tap,
-			Created:     time.Now().Format(time.RFC3339),
-			CloneURL:    req.CloneURL,
-			CloneURLs:   cloneURLs,
-			GitHubRepo:  firstOrEmpty(githubRepos),
-			GitHubRepos: githubRepos,
-			GoldenVer:   goldenVer,
+			Name:             req.Name,
+			Type:             req.Type,
+			Description:      req.Description,
+			VCPU:             req.VCPU,
+			RAMMIB:           req.RAMMIB,
+			Mark:             mark,
+			Mode:             req.Mode,
+			MAC:              fixedMAC,
+			Disk:             req.Disk,
+			TAP:              tap,
+			Created:          time.Now().Format(time.RFC3339),
+			CloneURL:         req.CloneURL,
+			CloneURLs:        cloneURLs,
+			GitHubRepo:       firstOrEmpty(githubRepos),
+			GitHubRepos:      githubRepos,
+			GoldenVer:        goldenVer,
+			TailscaleAuthkey: req.TailscaleAuthkey,
 		}
 		if err := SaveVMState(vmDir, st); err != nil {
 			os.RemoveAll(vmDir)
@@ -1128,10 +1130,14 @@ func (m *Manager) injectSSHKeys(st *VMState) {
 
 func (m *Manager) joinTailscale(st *VMState) string {
 	sshKey := m.cfg.SSH.PrivateKeyPath
-	authkey, err := config.ReadSecret(m.cfg.Tailscale.VMAuthkeyFile)
-	if err != nil || authkey == "" {
-		log.Printf("Warning: no Tailscale VM auth key")
-		return ""
+	authkey := st.TailscaleAuthkey
+	if authkey == "" {
+		var err error
+		authkey, err = config.ReadSecret(m.cfg.Tailscale.VMAuthkeyFile)
+		if err != nil || authkey == "" {
+			log.Printf("Warning: no Tailscale VM auth key")
+			return ""
+		}
 	}
 
 	VMSSH(st.TAP, sshKey,
@@ -2382,13 +2388,15 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 	// so we SSH in and re-run tailscale up with the auth key.
 	go func() {
 		sshKey := m.cfg.SSH.PrivateKeyPath
-		authkeyFile := m.cfg.Tailscale.VMAuthkeyFile
-		authkeyData, err := os.ReadFile(authkeyFile)
-		if err != nil {
-			log.Printf("QEMU VM %s: cannot read Tailscale authkey for post-migration rejoin: %v", name, err)
-			return
+		authkey := st.TailscaleAuthkey
+		if authkey == "" {
+			authkeyData, err := os.ReadFile(m.cfg.Tailscale.VMAuthkeyFile)
+			if err != nil {
+				log.Printf("QEMU VM %s: cannot read Tailscale authkey for post-migration rejoin: %v", name, err)
+				return
+			}
+			authkey = strings.TrimSpace(string(authkeyData))
 		}
-		authkey := strings.TrimSpace(string(authkeyData))
 		// Wait for SSH to become available
 		time.Sleep(2 * time.Second)
 		if err := WaitForSSH(st.TAP, sshKey, 30*time.Second); err != nil {

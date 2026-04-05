@@ -26,8 +26,9 @@ type VMState struct {
 	CloneURLs   []string `json:"clone_urls,omitempty"`   // all clone URLs
 	GitHubRepo  string   `json:"github_repo,omitempty"`  // backwards compat — single repo
 	GitHubRepos []string `json:"github_repos,omitempty"` // all GitHub repos (owner/repo)
-	TailscaleIP string   `json:"tailscale_ip,omitempty"`
-	GoldenVer   string   `json:"golden_version,omitempty"`
+	TailscaleIP      string `json:"tailscale_ip,omitempty"`
+	TailscaleAuthkey string `json:"tailscale_authkey,omitempty"`
+	GoldenVer        string `json:"golden_version,omitempty"`
 }
 
 // AllGitHubRepos returns the list of GitHub repos, falling back to the single

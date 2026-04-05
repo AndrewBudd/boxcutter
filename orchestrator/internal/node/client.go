@@ -25,16 +25,17 @@ func NewClient(apiAddr string) *Client {
 }
 
 type CreateRequest struct {
-	Name           string   `json:"name"`
-	Type           string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
-	Description    string   `json:"description,omitempty"` // user-provided description
-	VCPU           int      `json:"vcpu,omitempty"`
-	RAMMIB         int      `json:"ram_mib,omitempty"`
-	Disk           string   `json:"disk,omitempty"`
-	CloneURL       string   `json:"clone_url,omitempty"`
-	CloneURLs      []string `json:"clone_urls,omitempty"`
-	Mode           string   `json:"mode,omitempty"`
-	AuthorizedKeys []string `json:"authorized_keys,omitempty"`
+	Name             string   `json:"name"`
+	Type             string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
+	Description      string   `json:"description,omitempty"` // user-provided description
+	VCPU             int      `json:"vcpu,omitempty"`
+	RAMMIB           int      `json:"ram_mib,omitempty"`
+	Disk             string   `json:"disk,omitempty"`
+	CloneURL         string   `json:"clone_url,omitempty"`
+	CloneURLs        []string `json:"clone_urls,omitempty"`
+	Mode             string   `json:"mode,omitempty"`
+	AuthorizedKeys   []string `json:"authorized_keys,omitempty"`
+	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
 }
 
 type CreateResponse struct {

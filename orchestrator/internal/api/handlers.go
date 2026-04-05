@@ -271,16 +271,17 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 // --- VM handlers ---
 
 type vmCreateRequest struct {
-	Name        string   `json:"name"`
-	Type        string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
-	Description string   `json:"description,omitempty"` // user-provided description
-	VCPU        int      `json:"vcpu,omitempty"`
-	RAMMIB      int      `json:"ram_mib,omitempty"`
-	Disk        string   `json:"disk,omitempty"`
-	CloneURL    string   `json:"clone_url,omitempty"`
-	CloneURLs   []string `json:"clone_urls,omitempty"`
-	Mode        string   `json:"mode,omitempty"`
-	NodeID      string   `json:"node_id,omitempty"` // optional: pin to specific node
+	Name             string   `json:"name"`
+	Type             string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
+	Description      string   `json:"description,omitempty"` // user-provided description
+	VCPU             int      `json:"vcpu,omitempty"`
+	RAMMIB           int      `json:"ram_mib,omitempty"`
+	Disk             string   `json:"disk,omitempty"`
+	CloneURL         string   `json:"clone_url,omitempty"`
+	CloneURLs        []string `json:"clone_urls,omitempty"`
+	Mode             string   `json:"mode,omitempty"`
+	NodeID           string   `json:"node_id,omitempty"` // optional: pin to specific node
+	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
 }
 
 func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
@@ -388,16 +389,17 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 
 		client := node.NewClient(candidate.APIAddr)
 		resp, err := client.CreateStreaming(&node.CreateRequest{
-			Name:           req.Name,
-			Type:           req.Type,
-			Description:    req.Description,
-			VCPU:           req.VCPU,
-			RAMMIB:         req.RAMMIB,
-			Disk:           req.Disk,
-			CloneURL:       req.CloneURL,
-			CloneURLs:      req.CloneURLs,
-			Mode:           req.Mode,
-			AuthorizedKeys: sshKeys,
+			Name:             req.Name,
+			Type:             req.Type,
+			Description:      req.Description,
+			VCPU:             req.VCPU,
+			RAMMIB:           req.RAMMIB,
+			Disk:             req.Disk,
+			CloneURL:         req.CloneURL,
+			CloneURLs:        req.CloneURLs,
+			Mode:             req.Mode,
+			AuthorizedKeys:   sshKeys,
+			TailscaleAuthkey: req.TailscaleAuthkey,
 		}, func(evt *node.ProgressEvent) {
 			line, _ := json.Marshal(evt)
 			fmt.Fprintf(w, "%s\n", line)

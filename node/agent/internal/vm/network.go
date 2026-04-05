@@ -62,7 +62,36 @@ func SetupTAP(tap string, mark int) error {
 			return fmt.Errorf("running %s: %w", strings.Join(args, " "), err)
 		}
 	}
+
+	// Fix Tailscale CONNMARK conflict: Tailscale adds an unconditional
+	// "CONNMARK --restore-mark" at the end of mangle PREROUTING that
+	// overwrites our fwmark with 0 for new connections. Replace it with
+	// a conditional version that only restores when mark is 0.
+	fixTailscaleCONNMARK()
+
 	return nil
+}
+
+// fixTailscaleCONNMARK replaces an unconditional CONNMARK restore at the end
+// of mangle PREROUTING with a conditional one (mark == 0 only), so it doesn't
+// clobber VM fwmarks set by earlier rules.
+func fixTailscaleCONNMARK() {
+	out, err := exec.Command("iptables", "-t", "mangle", "-S", "PREROUTING").Output()
+	if err != nil {
+		return
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 {
+		return
+	}
+	last := lines[len(lines)-1]
+	// Match: "-A PREROUTING -j CONNMARK --restore-mark --nfmask 0xffffffff --ctmask 0xffffffff"
+	// (unconditional restore with no -m mark condition)
+	if strings.Contains(last, "CONNMARK --restore-mark") && !strings.Contains(last, "-m mark") {
+		// Delete the unconditional rule and add a conditional one
+		run("iptables", "-t", "mangle", "-D", "PREROUTING", "-j", "CONNMARK", "--restore-mark")
+		run("iptables", "-t", "mangle", "-A", "PREROUTING", "-m", "mark", "--mark", "0x0", "-j", "CONNMARK", "--restore-mark")
+	}
 }
 
 // TeardownTAP removes TAP device and all associated rules.
