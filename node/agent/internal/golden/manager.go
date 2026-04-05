@@ -79,10 +79,17 @@ func (m *Manager) SetHead(version string) error {
 	log.Printf("golden: head changing from %s to %s", m.currentHead, version)
 
 	if version == "build" || version == "latest" {
-		// Build locally from Dockerfile, but only if no golden image exists yet
-		if m.currentHead != "" {
-			log.Printf("golden: already have version %s, skipping build", m.currentHead)
-			return nil
+		// Build locally from Dockerfile, but only if no golden image exists yet.
+		// Check the actual symlink on disk (not just in-memory state) since
+		// a previous build may have been killed mid-conversion.
+		if m.goldenImageExists() {
+			if m.currentHead == "" {
+				m.currentHead = m.readCurrentVersion()
+			}
+			if m.currentHead != "" {
+				log.Printf("golden: already have version %s, skipping build", m.currentHead)
+				return nil
+			}
 		}
 		if err := m.buildLocal(); err != nil {
 			return fmt.Errorf("building golden image locally: %w", err)
@@ -90,7 +97,14 @@ func (m *Manager) SetHead(version string) error {
 		// Read the version that was just built
 		version = m.readCurrentVersion()
 		if version == "" {
-			return fmt.Errorf("golden image built but no version found")
+			// Build script exited 0 but didn't produce an image (flock race).
+			// Wait briefly and retry once — the other process may finish.
+			log.Printf("golden: build exited without producing image, waiting 60s for concurrent build...")
+			time.Sleep(60 * time.Second)
+			version = m.readCurrentVersion()
+			if version == "" {
+				return fmt.Errorf("golden image not found after build (concurrent build may have failed)")
+			}
 		}
 	} else {
 		// Check if we already have this version
@@ -122,6 +136,16 @@ func (m *Manager) SetHead(version string) error {
 	log.Printf("golden: now using version %s", version)
 
 	return nil
+}
+
+// goldenImageExists checks if the rootfs.ext4 symlink exists and points to a real file.
+func (m *Manager) goldenImageExists() bool {
+	target, err := filepath.EvalSymlinks(filepath.Join(m.goldenDir, "rootfs.ext4"))
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(target)
+	return err == nil && info.Size() > 0
 }
 
 // buildLocal runs docker-to-ext4.sh to build the golden image from the Dockerfile.

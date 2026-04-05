@@ -341,6 +341,10 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		for _, n := range nodes {
 			fc := node.NewFastClient(n.APIAddr)
 			if health := fc.Health(); health != nil {
+				if !health.GoldenReady {
+					log.Printf("Scheduling: node %s has no golden image, skipping", n.ID)
+					continue
+				}
 				n.RAMAllocatedMIB = health.RAMAllocatedMIB
 				n.VMsRunning = health.VMsRunning
 				n.RAMTotalMIB = health.RAMTotalMIB
