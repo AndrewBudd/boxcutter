@@ -123,9 +123,11 @@ RUN chmod 755 /usr/local/bin/boxcutter-tapegun && \
     ln -sf /etc/systemd/system/boxcutter-tapegun.service \
       /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service
 
-# --- Boxcutter CLI wrapper (VM → orchestrator SSH) ---
-COPY config/boxcutter-cli /usr/local/bin/boxcutter
-RUN chmod 755 /usr/local/bin/boxcutter
+# --- Boxcutter tools mount (squashfs on /dev/vdb → /opt/boxcutter/tools) ---
+# automount: mounted on first access, so VMs without the tools device won't fail
+RUN mkdir -p /opt/boxcutter/tools && \
+    echo '/dev/vdb  /opt/boxcutter/tools  squashfs  ro,noauto,x-systemd.automount  0  0' >> /etc/fstab && \
+    ln -sf /opt/boxcutter/tools/bin/boxcutter /usr/local/bin/boxcutter
 
 # --- Claude Code plugin directory (tapegun-guest plugin injected by docker-to-ext4.sh) ---
 RUN mkdir -p /home/dev/.claude/plugins && chown -R 1000:1000 /home/dev/.claude

@@ -127,6 +127,17 @@ build_node() {
   echo "  boxcutter-proxy"
   (cd "${REPO_DIR}/node/agent" && GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-node" ./cmd/node/)
   echo "  boxcutter-node"
+  (cd "${REPO_DIR}/tools" && CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-cli" ./cmd/boxcutter/)
+  echo "  boxcutter-cli (tools)"
+
+  # Build tools.img (squashfs containing the boxcutter CLI for VM mounts)
+  echo ""
+  echo "--- Building tools.img ---"
+  local TOOLS_STAGE="${BUILD_DIR}/tools-stage"
+  mkdir -p "${TOOLS_STAGE}/bin"
+  cp "${BUILD_DIR}/boxcutter-cli" "${TOOLS_STAGE}/bin/boxcutter"
+  mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp zstd -quiet
+  echo "  tools.img: $(du -h "${BUILD_DIR}/tools.img" | cut -f1)"
 
   # --- Package payload ---
   echo ""
@@ -147,6 +158,9 @@ build_node() {
   cp "${REPO_DIR}"/node/golden/nss_catchall.c "${REPO_DIR}"/node/golden/vsock_listen.c "${PD}/golden/"
   cp "${REPO_DIR}"/node/golden/gh-token-refresh.sh "${REPO_DIR}"/node/golden/gh-token-refresh.service "${REPO_DIR}"/node/golden/gh-token-refresh.timer "${PD}/golden/"
   cp -r "${REPO_DIR}"/node/golden/config "${PD}/golden/"
+
+  # Tools image for VM mounts
+  cp "${BUILD_DIR}/tools.img" "${PD}/tools.img"
 
   # Custom kernel with nf_tables support
   mkdir -p "${PD}/kernel"
@@ -240,6 +254,12 @@ write_files:
         mv "/tmp/release-\${FC_VERSION}-\${ARCH}/firecracker-\${FC_VERSION}-\${ARCH}" /usr/local/bin/firecracker
         chmod +x /usr/local/bin/firecracker
         rm -rf "/tmp/release-\${FC_VERSION}-\${ARCH}"
+      fi
+
+      # Tools image for VM mounts (squashfs with boxcutter CLI)
+      if [ -f "\$PD/tools.img" ]; then
+        cp "\$PD/tools.img" "\$BOXCUTTER_HOME/tools.img"
+        echo "  tools.img installed"
       fi
 
       # Firecracker kernel (custom build with nf_tables, or fallback to S3)

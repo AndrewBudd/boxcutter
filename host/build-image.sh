@@ -123,6 +123,14 @@ if [ "$VM_TYPE" = "node" ]; then
   echo "  boxcutter-proxy"
   (cd "${REPO_DIR}/node/agent" && GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-node" ./cmd/node/)
   echo "  boxcutter-node"
+  (cd "${REPO_DIR}/tools" && CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-cli" ./cmd/boxcutter/)
+  echo "  boxcutter-cli (tools)"
+  # Build tools.img
+  TOOLS_STAGE="${BUILD_DIR}/tools-stage"
+  mkdir -p "${TOOLS_STAGE}/bin"
+  cp "${BUILD_DIR}/boxcutter-cli" "${TOOLS_STAGE}/bin/boxcutter"
+  mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp zstd -quiet
+  echo "  tools.img: $(du -h "${BUILD_DIR}/tools.img" | cut -f1)"
 else
   (cd "${REPO_DIR}/orchestrator" && GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-orchestrator" ./cmd/orchestrator/)
   echo "  boxcutter-orchestrator"
@@ -153,6 +161,9 @@ if [ "$VM_TYPE" = "node" ]; then
      "${REPO_DIR}"/node/golden/gh-token-refresh.timer \
      "${PD}/golden/"
   cp -r "${REPO_DIR}"/node/golden/config "${PD}/golden/"
+
+  # Tools image for VM mounts
+  cp "${BUILD_DIR}/tools.img" "${PD}/tools.img"
 
   # Custom kernel with nf_tables support
   mkdir -p "${PD}/kernel"
@@ -312,6 +323,12 @@ write_files:
       mkdir -p "\$BOXCUTTER_HOME/kernel" "\$BOXCUTTER_HOME/vms" "\$BOXCUTTER_HOME/golden"
       cp -r "\$PD/golden/"* "\$BOXCUTTER_HOME/golden/" 2>/dev/null || true
       chmod +x "\$BOXCUTTER_HOME/golden/docker-to-ext4.sh" 2>/dev/null || true
+      # Tools image for VM mounts
+      if [ -f "\$PD/tools.img" ]; then
+        cp "\$PD/tools.img" "\$BOXCUTTER_HOME/tools.img"
+        echo "  tools.img installed"
+      fi
+
       # Firecracker
       if ! command -v firecracker &>/dev/null; then
         FC_VERSION="v1.12.0"; ARCH=\$(uname -m)

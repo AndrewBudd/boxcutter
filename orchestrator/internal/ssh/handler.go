@@ -711,10 +711,6 @@ printf '%s\n' \
   > /home/dev/.ssh/config
 chmod 700 /home/dev/.ssh
 chmod 600 /home/dev/.ssh/config
-if [ ! -f /usr/local/bin/boxcutter ]; then
-  printf '#!/bin/bash\nexec ssh -o ConnectTimeout=5 orchestrator "$@"\n' | sudo tee /usr/local/bin/boxcutter > /dev/null
-  sudo chmod 755 /usr/local/bin/boxcutter
-fi
 echo "ok"`
 
 	resp, err := h.post("/api/vms/"+name+"/exec", map[string]string{"command": setupScript})

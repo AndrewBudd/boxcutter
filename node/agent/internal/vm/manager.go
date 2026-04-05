@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	kernelPath = "/var/lib/boxcutter/kernel/vmlinux"
-	fixedMAC   = "AA:FC:00:00:00:01"
+	kernelPath     = "/var/lib/boxcutter/kernel/vmlinux"
+	toolsImagePath = "/var/lib/boxcutter/tools.img"
+	fixedMAC       = "AA:FC:00:00:00:01"
 )
 
 // Manager handles VM lifecycle operations.
@@ -918,19 +919,29 @@ func (m *Manager) collectExistingMarks() map[int]bool {
 func writeFirecrackerConfig(vmDir string, st *VMState) error {
 	bootIP := fmt.Sprintf("ip=10.0.0.2::10.0.0.1:255.255.255.252:%s:eth0:off:8.8.8.8", st.Name)
 
+	drives := []map[string]interface{}{
+		{
+			"drive_id":       "rootfs",
+			"path_on_host":   RootfsPath(vmDir),
+			"is_root_device": true,
+			"is_read_only":   false,
+		},
+	}
+	if _, err := os.Stat(toolsImagePath); err == nil {
+		drives = append(drives, map[string]interface{}{
+			"drive_id":       "tools",
+			"path_on_host":   toolsImagePath,
+			"is_root_device": false,
+			"is_read_only":   true,
+		})
+	}
+
 	fcConfig := map[string]interface{}{
 		"boot-source": map[string]string{
 			"kernel_image_path": kernelPath,
 			"boot_args":        fmt.Sprintf("console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on root=/dev/vda rw init=/sbin/init %s", bootIP),
 		},
-		"drives": []map[string]interface{}{
-			{
-				"drive_id":       "rootfs",
-				"path_on_host":   RootfsPath(vmDir),
-				"is_root_device": true,
-				"is_read_only":   false,
-			},
-		},
+		"drives": drives,
 		"network-interfaces": []map[string]string{
 			{
 				"iface_id":     "eth0",

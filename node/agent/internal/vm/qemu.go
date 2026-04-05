@@ -95,6 +95,11 @@ func launchQEMU(vmDir string, st *VMState) (int, error) {
 		args = append(args, "-initrd", initrd)
 	}
 
+	// Attach tools image (read-only squashfs with boxcutter CLI)
+	if _, err := os.Stat(toolsImagePath); err == nil {
+		args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
+	}
+
 	log.Printf("Launching QEMU VM %s: kernel=%s initrd=%s vcpu=%d ram=%dMiB",
 		st.Name, kernel, initrd, st.VCPU, st.RAMMIB)
 
