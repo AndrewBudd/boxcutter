@@ -687,12 +687,11 @@ printf '%s\n' \
   '  UserKnownHostsFile /dev/null' \
   '  LogLevel ERROR' \
   > /home/dev/.ssh/config
-chown -R 1000:1000 /home/dev/.ssh
 chmod 700 /home/dev/.ssh
 chmod 600 /home/dev/.ssh/config
 if [ ! -f /usr/local/bin/boxcutter ]; then
-  printf '#!/bin/bash\nexec ssh -o ConnectTimeout=5 orchestrator "$@"\n' > /usr/local/bin/boxcutter
-  chmod 755 /usr/local/bin/boxcutter
+  printf '#!/bin/bash\nexec ssh -o ConnectTimeout=5 orchestrator "$@"\n' | sudo tee /usr/local/bin/boxcutter > /dev/null
+  sudo chmod 755 /usr/local/bin/boxcutter
 fi
 echo "ok"`
 

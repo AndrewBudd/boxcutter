@@ -37,6 +37,8 @@ type Manager struct {
 }
 
 func NewManager(cfg *config.Config, vmidClient *vmid.Client) *Manager {
+	// Fix Tailscale CONNMARK conflict at startup (not just during SetupTAP)
+	fixTailscaleCONNMARK()
 	return &Manager{cfg: cfg, vmid: vmidClient, migratingSet: make(map[string]bool)}
 }
 
@@ -548,7 +550,7 @@ func (m *Manager) Exec(name string, command string) (string, error) {
 		return "", fmt.Errorf("VM '%s' is %s, not running", name, status)
 	}
 	sshKey := m.cfg.SSH.PrivateKeyPath
-	return VMSSH(st.TAP, sshKey, "bash", "-c", command)
+	return VMSSH(st.TAP, sshKey, command)
 }
 
 // List returns all VMs with their status.
