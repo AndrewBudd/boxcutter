@@ -1115,6 +1115,36 @@ func canScaleUp(cfg HostConfig, currentNodeCount int) (bool, string) {
 	return true, ""
 }
 
+// getAvailableMemoryMB returns the host's available memory in MB.
+func getAvailableMemoryMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range splitLines(string(data)) {
+		if len(line) > 13 && line[:13] == "MemAvailable:" {
+			var availKB int
+			fmt.Sscanf(line, "MemAvailable: %d kB", &availKB)
+			return availKB / 1024
+		}
+	}
+	return 0
+}
+
+// parseRAMMB parses a RAM string like "12G" into megabytes.
+func parseRAMMB(ram string) int {
+	var n int
+	fmt.Sscanf(ram, "%dG", &n)
+	if n > 0 {
+		return n * 1024
+	}
+	fmt.Sscanf(ram, "%dM", &n)
+	if n > 0 {
+		return n
+	}
+	return 0
+}
+
 func splitLines(s string) []string {
 	var lines []string
 	start := 0
@@ -2286,50 +2316,66 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	// Find the first old node that doesn't match the goal
 	oldNode := firstNodeNotMatchingGoal(state, goal)
 	if oldNode == nil {
-		return true, "", nil // all nodes match
+		// All nodes match the goal. If there are more nodes than
+		// InitialNodeCount, surplus nodes from a previous failed run
+		// are still around — trim them by draining the excess.
+		oldCount := goal.InitialNodeCount
+		if oldCount > 0 && state.ActiveNodeCount() > oldCount {
+			// Find the newest surplus node and drain it
+			surplus := state.Nodes[len(state.Nodes)-1]
+			log.Printf("Trimming surplus node %s (have %d, want %d)", surplus.ID, state.ActiveNodeCount(), oldCount)
+			state.SetNodeStatus(surplus.ID, "draining")
+			state.Save()
+			drainNode(cfg, state, surplus.ID)
+			return false, fmt.Sprintf("Trimmed surplus node %s", surplus.ID), nil
+		}
+		return true, "", nil // all nodes match, count is right
 	}
 
-	// Check for a pending replacement: we've launched a new node but haven't
-	// drained its counterpart yet. This is true when the total active count
-	// exceeds the initial count (each launch adds 1, each drain removes 1).
-	totalActive := state.ActiveNodeCount()
-	if totalActive > goal.InitialNodeCount && goal.InitialNodeCount > 0 {
-		// There's a surplus node — find it (newest node matching goal image)
-		replacement := findReplacementNode(state, goal)
-		if replacement != nil {
-			if queryNodeHealth(replacement.BridgeIP) != nil {
-				// Deploy latest agent binary from source before relying on this node.
-				// OCI images may contain stale binaries from build time.
-				if goal.DeployedNodeID != replacement.ID {
-					if err := deployNodeBinary(cfg, replacement.BridgeIP, replacement.ID); err != nil {
-						log.Printf("Deploy %s failed: %v (will retry)", replacement.ID, err)
-						return false, fmt.Sprintf("Deploy to %s failed, retrying", replacement.ID), nil
-					}
-					goal.DeployedNodeID = replacement.ID
-					state.Save()
-					return false, fmt.Sprintf("Deployed latest binary to %s", replacement.ID), nil
+	// Check if a replacement already exists (launched in a previous step).
+	// A replacement is any active node matching the goal image.
+	replacement := findReplacementNode(state, goal)
+	if replacement != nil && replacement.ID != oldNode.ID {
+		if queryNodeHealth(replacement.BridgeIP) != nil {
+			// Deploy latest agent binary from source before relying on this node.
+			// OCI images may contain stale binaries from build time.
+			if goal.DeployedNodeID != replacement.ID {
+				if err := deployNodeBinary(cfg, replacement.BridgeIP, replacement.ID); err != nil {
+					log.Printf("Deploy %s failed: %v (will retry)", replacement.ID, err)
+					return false, fmt.Sprintf("Deploy to %s failed, retrying", replacement.ID), nil
 				}
-
-				// New node healthy — wait for golden image, then mark old node for drain
-				if !isGoldenReady(replacement.BridgeIP) {
-					if goal.GoldenWaitStart == "" {
-						goal.GoldenWaitStart = time.Now().Format(time.RFC3339)
-						state.Save()
-					} else if t, err := time.Parse(time.RFC3339, goal.GoldenWaitStart); err == nil {
-						if time.Since(t) > 10*time.Minute {
-							return false, "", fmt.Errorf("golden image on %s not ready after 10 minutes", replacement.ID)
-						}
-					}
-					return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil
-				}
-				goal.GoldenWaitStart = "" // reset for next node
-				state.SetNodeStatus(oldNode.ID, "upgrading")
+				goal.DeployedNodeID = replacement.ID
 				state.Save()
-				return false, fmt.Sprintf("New node %s healthy, marked %s for drain", replacement.ID, oldNode.ID), nil
+				return false, fmt.Sprintf("Deployed latest binary to %s", replacement.ID), nil
 			}
-			// Not healthy yet — wait
-			return false, fmt.Sprintf("Waiting for new node %s to become healthy", replacement.ID), nil
+
+			// New node healthy — wait for golden image, then mark old node for drain
+			if !isGoldenReady(replacement.BridgeIP) {
+				if goal.GoldenWaitStart == "" {
+					goal.GoldenWaitStart = time.Now().Format(time.RFC3339)
+					state.Save()
+				} else if t, err := time.Parse(time.RFC3339, goal.GoldenWaitStart); err == nil {
+					if time.Since(t) > 10*time.Minute {
+						return false, "", fmt.Errorf("golden image on %s not ready after 10 minutes", replacement.ID)
+					}
+				}
+				return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil
+			}
+			goal.GoldenWaitStart = "" // reset for next node
+			state.SetNodeStatus(oldNode.ID, "upgrading")
+			state.Save()
+			return false, fmt.Sprintf("New node %s healthy, marked %s for drain", replacement.ID, oldNode.ID), nil
 		}
+		// Not healthy yet — wait
+		return false, fmt.Sprintf("Waiting for new node %s to become healthy", replacement.ID), nil
+	}
+
+	// Safety: refuse to launch if it would exceed available RAM.
+	// Each node uses cfg.NodeRAM. Check that we have headroom.
+	nodeRAMMB := parseRAMMB(cfg.NodeRAM)
+	availMB := getAvailableMemoryMB()
+	if nodeRAMMB > 0 && availMB > 0 && availMB < nodeRAMMB+cfg.MinFreeMemoryMB {
+		return false, "", fmt.Errorf("insufficient memory to launch replacement node (%dMB available, need %dMB + %dMB reserve)", availMB, nodeRAMMB, cfg.MinFreeMemoryMB)
 	}
 
 	// No pending replacement — launch one
