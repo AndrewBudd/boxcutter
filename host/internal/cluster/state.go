@@ -25,6 +25,9 @@ type VMEntry struct {
 	TAP      string `json:"tap"`
 	MAC      string `json:"mac"`
 
+	// Drain failure tracking (for upgrade resilience)
+	DrainFailCount int `json:"drain_fail_count,omitempty"`
+
 	// OCI image tracking (set when VM was created from a pulled image)
 	ImageVersion string `json:"image_version,omitempty"` // e.g., "v0.1.0"
 	ImageCommit  string `json:"image_commit,omitempty"`  // e.g., "049616f"
@@ -164,6 +167,11 @@ func Load(path string) (*State, error) {
 	}
 
 	return s, nil
+}
+
+// SetPath sets the file path for state persistence (useful for testing).
+func (s *State) SetPath(path string) {
+	s.path = path
 }
 
 // Save atomically writes the state to disk using write-fsync-rename.
@@ -341,6 +349,18 @@ func (s *State) FindNodeWithStatus(status string) *VMEntry {
 		}
 	}
 	return nil
+}
+
+// IncrDrainFailCount increments the drain failure counter for a node.
+func (s *State) IncrDrainFailCount(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.Nodes {
+		if s.Nodes[i].ID == id {
+			s.Nodes[i].DrainFailCount++
+			return
+		}
+	}
 }
 
 func (s *State) SetUpgradeGoal(goal *UpgradeGoal) {

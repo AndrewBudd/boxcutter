@@ -1552,7 +1552,22 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/vms", node.BridgeIP))
 	if err != nil {
 		log.Printf("Drain: cannot list VMs on %s: %v", nodeID, err)
-		state.SetNodeStatus(nodeID, "active") // revert
+		// Track drain failures — after 3 attempts, force-remove the node
+		// (it's unreachable and blocking the upgrade)
+		state.IncrDrainFailCount(nodeID)
+		n := state.GetNode(nodeID)
+		if n != nil && n.DrainFailCount >= 3 {
+			log.Printf("Drain: %s unreachable after %d attempts, force-removing", nodeID, n.DrainFailCount)
+			state.RemoveNode(nodeID)
+			state.Save()
+			qemu.Stop(nodeID, node.PID)
+			if node.TAP != "" {
+				bridge.DeleteTAP(node.TAP)
+			}
+			cleanupNodeArtifacts(cfg, nodeID)
+			log.Printf("Drain: %s force-removed (unreachable)", nodeID)
+			return
+		}
 		state.Save()
 		return
 	}
@@ -1903,6 +1918,16 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	os.Remove(pidFile)
 
 	log.Printf("Drain: %s complete", nodeID)
+}
+
+// cleanupNodeArtifacts removes disk, ISO, console log, and PID file for a node.
+func cleanupNodeArtifacts(cfg HostConfig, nodeID string) {
+	// Pattern: /var/lib/boxcutter/.images/boxcutter-<nodeID>.*
+	disk := filepath.Join(cfg.ImagesDir, nodeID+".qcow2")
+	os.Remove(disk)
+	os.Remove(filepath.Join(cfg.ImagesDir, nodeID+"-cloud-init.iso"))
+	os.Remove(strings.TrimSuffix(disk, ".qcow2") + "-console.log")
+	os.Remove(strings.TrimSuffix(disk, ".qcow2") + ".pid")
 }
 
 func jsonReader(data []byte) io.Reader {
