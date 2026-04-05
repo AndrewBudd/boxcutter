@@ -235,7 +235,7 @@ func (h *Handler) cmdNew(args []string) int {
 		fmt.Printf("  vCPU:    %.0f\n", vcpu)
 	}
 	if ramMIB > 0 {
-		fmt.Printf("  RAM:     %.0fG\n", ramMIB/1024)
+		fmt.Printf("  RAM:     %s\n", formatRAM(ramMIB))
 	}
 	if disk != "" {
 		fmt.Printf("  Disk:    %s\n", disk)
@@ -287,7 +287,7 @@ func (h *Handler) cmdList() int {
 		}
 
 		fmt.Printf("%-20s %-18s %-12s %-8s %-5.0f %-8s %-8s %-8s\n",
-			name, tsIP, nodeName, vmType, vcpu, fmt.Sprintf("%.0fG", ramMIB/1024), mode, status)
+			name, tsIP, nodeName, vmType, vcpu, formatRAM(ramMIB), mode, status)
 		if desc != "" {
 			fmt.Printf("  %s\n", desc)
 		}
@@ -378,8 +378,8 @@ func (h *Handler) cmdStatus() int {
 
 	fmt.Printf("Nodes:    %.0f active / %.0f total\n", nodesActive, nodesTotal)
 	fmt.Printf("VMs:      %.0f\n", vmsTotal)
-	fmt.Printf("RAM:      %.0fGB allocated / %.0fGB total\n", ramAlloc/1024, ramTotal/1024)
-	fmt.Printf("Headroom: %.0fGB\n", (ramTotal-ramAlloc)/1024)
+	fmt.Printf("RAM:      %s allocated / %s total\n", formatRAM(ramAlloc), formatRAM(ramTotal))
+	fmt.Printf("Headroom: %s\n", formatRAM(ramTotal-ramAlloc))
 	return 0
 }
 
@@ -416,8 +416,8 @@ func (h *Handler) cmdNodes() int {
 		ramTotalStr := "-"
 		vmsStr := "-"
 		if ramTotal > 0 {
-			ramUsedStr = fmt.Sprintf("%.0fG", ramAlloc/1024)
-			ramTotalStr = fmt.Sprintf("%.0fG", ramTotal/1024)
+			ramUsedStr = formatRAM(ramAlloc)
+			ramTotalStr = formatRAM(ramTotal)
 			vmsStr = fmt.Sprintf("%.0f", vmsRunning)
 		}
 
@@ -1071,6 +1071,18 @@ func (h *Handler) tapegunBroadcast(body string) int {
 		fmt.Printf("Failed: %s\n", strings.Join(names, ", "))
 	}
 	return 0
+}
+
+// formatRAM formats RAM in MiB to a human-readable string (e.g., 512M, 2G).
+func formatRAM(mib float64) string {
+	if mib < 1024 {
+		return fmt.Sprintf("%.0fM", mib)
+	}
+	gb := mib / 1024
+	if gb == float64(int(gb)) {
+		return fmt.Sprintf("%.0fG", gb)
+	}
+	return fmt.Sprintf("%.1fG", gb)
 }
 
 // tailnetFQDN returns name.tailnet.ts.net by querying local Tailscale.
