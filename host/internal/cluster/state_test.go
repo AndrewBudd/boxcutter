@@ -127,6 +127,83 @@ func TestState_SetNodeStatus(t *testing.T) {
 	}
 }
 
+func TestVMEntry_MatchesImage_StaleLatestTag(t *testing.T) {
+	// Regression test: when the OCI 'latest' tag isn't updated during push,
+	// the pulled image has the same digest as existing nodes, causing the
+	// reconciler to skip all nodes (no cycling). This test verifies that
+	// different digests correctly return false.
+	oldDigest := "sha256:b35a822d13eed968ab86c50d081ab8aafc5274396b08108909e0385344d28e3c"
+	newDigest := "sha256:05915f039c82f09c39f20de5f13a15ead54d3692622126ade783d0436e8e39c8"
+
+	node := VMEntry{
+		ID:          "boxcutter-node-15",
+		ImageDigest: oldDigest,
+	}
+	newImage := &ImageRef{
+		Digest:  newDigest,
+		Version: "v0.12.1",
+	}
+
+	if node.MatchesImage(newImage) {
+		t.Error("Node with old digest should NOT match new image — rolling upgrade must cycle this node")
+	}
+}
+
+func TestVMEntry_MatchesImage_SameDigestSkips(t *testing.T) {
+	// When a node already has the target image, the reconciler should skip it.
+	digest := "sha256:05915f039c82f09c39f20de5f13a15ead54d3692622126ade783d0436e8e39c8"
+	node := VMEntry{ID: "boxcutter-node-25", ImageDigest: digest}
+	newImage := &ImageRef{Digest: digest}
+
+	if !node.MatchesImage(newImage) {
+		t.Error("Node with matching digest should be skipped (already upgraded)")
+	}
+}
+
+func TestUpgradeGoal_NodeNeedsCycling(t *testing.T) {
+	// Simulate the reconciler's perspective: 3 nodes with old digest,
+	// goal has new digest. All 3 should need cycling.
+	goal := &UpgradeGoal{
+		VMType: "all",
+		Tag:    "latest",
+		NodeImage: &ImageRef{
+			Digest:  "sha256:new-image-digest",
+			Version: "v0.12.1",
+		},
+		InitialNodeCount: 3,
+	}
+
+	state := &State{
+		Nodes: []VMEntry{
+			{ID: "node-1", Status: "active", ImageDigest: "sha256:old-digest"},
+			{ID: "node-2", Status: "active", ImageDigest: "sha256:old-digest"},
+			{ID: "node-3", Status: "active", ImageDigest: "sha256:old-digest"},
+		},
+	}
+
+	// All nodes should be flagged as needing upgrade
+	for _, n := range state.Nodes {
+		if n.MatchesImage(goal.NodeImage) {
+			t.Errorf("Node %s with old digest should NOT match goal", n.ID)
+		}
+	}
+
+	// After one node is replaced
+	state.Nodes = append(state.Nodes, VMEntry{
+		ID: "node-4", Status: "active", ImageDigest: "sha256:new-image-digest",
+	})
+
+	// The new node should match
+	if !state.Nodes[3].MatchesImage(goal.NodeImage) {
+		t.Error("Replacement node should match goal image")
+	}
+
+	// Old nodes still shouldn't
+	if state.Nodes[0].MatchesImage(goal.NodeImage) {
+		t.Error("Old node should still not match")
+	}
+}
+
 func TestState_NextNodeNum(t *testing.T) {
 	s := &State{
 		Nodes: []VMEntry{
