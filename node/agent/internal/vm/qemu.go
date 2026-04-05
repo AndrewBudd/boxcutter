@@ -219,6 +219,10 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 			"xt_conntrack\nxt_addrtype\nxt_MASQUERADE\n"+
 			"nf_nat\nnf_conntrack\n"), 0644)
 
+	// Auto-load KVM modules for nested virtualization
+	os.WriteFile(filepath.Join(modulesDir, "kvm.conf"),
+		[]byte("kvm\nkvm_amd\nkvm_intel\n"), 0644)
+
 	// Configure Tailscale for kernel networking (Firecracker uses userspace)
 	tailscaleDefaults := filepath.Join(mountPoint, "etc", "default", "tailscaled")
 	os.WriteFile(tailscaleDefaults, []byte("PORT=0\nFLAGS=\n"), 0644)
