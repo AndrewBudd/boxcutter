@@ -54,7 +54,7 @@ func Connect(cfg Config) (*Client, error) {
 
 	opts := paho.NewClientOptions().
 		AddBroker(cfg.BrokerAddr).
-		SetClientID(fmt.Sprintf("boxcutter-node-%s", cfg.NodeID)).
+		SetClientID(cfg.NodeID).
 		SetAutoReconnect(true).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(5 * time.Second).

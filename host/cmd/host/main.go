@@ -33,6 +33,7 @@ var version = "dev"
 
 // Config for the host control plane, loaded from boxcutter.env equivalents.
 type HostConfig struct {
+	ClusterPrefix string // e.g. "boxcutter" or "boxcutter-dev" — used for node names, Tailscale hostnames
 	RepoDir       string
 	ImagesDir     string
 	HostNIC       string
@@ -75,6 +76,16 @@ type HostConfig struct {
 	GitHubAppID          int64
 	GitHubInstallationID int64
 	GitHubPrivateKeyPath string
+}
+
+// nodeID returns a node ID string like "boxcutter-node-3" using the configured prefix.
+func (cfg HostConfig) nodeID(num int) string {
+	return fmt.Sprintf("%s-node-%d", cfg.ClusterPrefix, num)
+}
+
+// nodeNameRegexp returns a compiled regexp that matches node IDs with the configured prefix.
+func (cfg HostConfig) nodeNameRegexp() *regexp.Regexp {
+	return regexp.MustCompile(regexp.QuoteMeta(cfg.ClusterPrefix) + `-node-(\d+)`)
 }
 
 // detectDefaultNIC finds the network interface used for the default route.
@@ -175,7 +186,13 @@ func defaultConfig() HostConfig {
 		}
 	}
 
+	clusterPrefix := os.Getenv("BOXCUTTER_PREFIX")
+	if clusterPrefix == "" {
+		clusterPrefix = "boxcutter"
+	}
+
 	return HostConfig{
+		ClusterPrefix:      clusterPrefix,
 		RepoDir:            repoDir,
 		BundleDir:          bundleDir,
 		ImagesDir:          repoDir + "/.images",
@@ -394,7 +411,7 @@ func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
 		}
 
 		// Parse QEMU args to extract VM identity
-		vmEntry := parseQEMUArgs(args, pid)
+		vmEntry := parseQEMUArgs(args, pid, cfg)
 		if vmEntry == nil {
 			continue
 		}
@@ -424,10 +441,10 @@ func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
 }
 
 // parseQEMUArgs extracts VM identity from QEMU command-line arguments.
-func parseQEMUArgs(args []string, pid int) *cluster.VMEntry {
+func parseQEMUArgs(args []string, pid int, cfg HostConfig) *cluster.VMEntry {
 	entry := &cluster.VMEntry{PID: pid}
 
-	nodeNameRe := regexp.MustCompile(`boxcutter-node-(\d+)`)
+	nodeNameRe := cfg.nodeNameRegexp()
 
 	for i, arg := range args {
 		switch {
@@ -471,13 +488,13 @@ func parseQEMUArgs(args []string, pid int) *cluster.VMEntry {
 		entry.BridgeIP = "192.168.50.2" // convention
 	} else if m := nodeNameRe.FindStringSubmatch(diskBase); m != nil {
 		entry.Type = "node"
-		entry.ID = "boxcutter-node-" + m[1]
 		nodeNum, _ := strconv.Atoi(m[1])
+		entry.ID = cfg.nodeID(nodeNum)
 		entry.BridgeIP = fmt.Sprintf("192.168.50.%d", 2+nodeNum)
 	} else if m := nodeNameRe.FindStringSubmatch(entry.TAP); m != nil {
 		entry.Type = "node"
-		entry.ID = "boxcutter-node-" + m[1]
 		nodeNum, _ := strconv.Atoi(m[1])
+		entry.ID = cfg.nodeID(nodeNum)
 		entry.BridgeIP = fmt.Sprintf("192.168.50.%d", 2+nodeNum)
 	} else {
 		return nil // unrecognized VM
@@ -1162,7 +1179,7 @@ func splitLines(s string) []string {
 
 func addNode(cfg HostConfig, state *cluster.State) {
 	nodeNum := state.NextNodeNum()
-	nodeID := fmt.Sprintf("boxcutter-node-%d", nodeNum)
+	nodeID := cfg.nodeID(nodeNum)
 	nodeOctet := cfg.NodeIPOffset + nodeNum
 	bridgeIP := fmt.Sprintf("%s.%d", cfg.NodeSubnet, nodeOctet)
 	tap := fmt.Sprintf("tap-node%d", nodeNum)
@@ -2620,7 +2637,7 @@ func pullAndDecompress(cfg HostConfig, vmType, tag string) (*cluster.ImageRef, s
 // launchReplacementNode provisions and launches a new node from the upgrade goal's base image.
 func launchReplacementNode(cfg HostConfig, state *cluster.State, goal *cluster.UpgradeGoal) (*cluster.VMEntry, error) {
 	newNum := state.NextNodeNum()
-	newID := fmt.Sprintf("boxcutter-node-%d", newNum)
+	newID := cfg.nodeID(newNum)
 	newOctet := cfg.NodeIPOffset + newNum
 	newBridgeIP := fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
 	newTAP := fmt.Sprintf("tap-node%d", newNum)
@@ -3553,7 +3570,7 @@ func startMosquitto(cfg HostConfig) *exec.Cmd {
 func buildFromSource(cfg HostConfig, vmType string) error {
 	args := []string{hostFile(cfg, "provision.sh"), vmType}
 	if vmType == "node" {
-		args = append(args, "boxcutter-node-1")
+		args = append(args, cfg.nodeID(1))
 	}
 	args = append(args, "--rebuild")
 
@@ -3697,9 +3714,10 @@ func runBootstrap() {
 	// Phase 2-4: Get images, create disks, generate ISOs
 	var orchMeta, nodeMeta *oci.ImageMetadata
 	orchDisk := filepath.Join(cfg.ImagesDir, "orchestrator.qcow2")
-	node1Disk := filepath.Join(cfg.ImagesDir, "boxcutter-node-1.qcow2")
+	node1ID := cfg.nodeID(1)
+	node1Disk := filepath.Join(cfg.ImagesDir, node1ID+".qcow2")
 	orchISO := filepath.Join(cfg.ImagesDir, "orchestrator-cloud-init.iso")
-	node1ISO := filepath.Join(cfg.ImagesDir, "boxcutter-node-1-cloud-init.iso")
+	node1ISO := filepath.Join(cfg.ImagesDir, node1ID+"-cloud-init.iso")
 
 	if fromSource {
 		// provision.sh builds binaries, creates COW disks, and generates ISOs
@@ -3755,7 +3773,7 @@ func runBootstrap() {
 
 		if !fileExists(node1ISO) {
 			log.Println("  Generating node-1 ISO...")
-			if err := generateCloudInitISO(cfg, "node", "boxcutter-node-1"); err != nil {
+			if err := generateCloudInitISO(cfg, "node", node1ID); err != nil {
 				log.Fatalf("Node-1 ISO: %v", err)
 			}
 		} else {
@@ -3816,7 +3834,7 @@ func runBootstrap() {
 	node1BridgeIP := fmt.Sprintf("%s.3", cfg.NodeSubnet)
 	node1MAC := "52:54:00:00:00:03"
 	node1Entry := cluster.VMEntry{
-		ID:       "boxcutter-node-1",
+		ID:       node1ID,
 		Type:     "node",
 		BridgeIP: node1BridgeIP,
 		Disk:     node1Disk,
@@ -3834,7 +3852,7 @@ func runBootstrap() {
 
 	alreadyRunning := false
 	for _, n := range state.Nodes {
-		if n.ID == "boxcutter-node-1" && qemu.IsRunning(n.PID) {
+		if n.ID == node1ID && qemu.IsRunning(n.PID) {
 			log.Printf("  Node-1 already running (PID %d)", n.PID)
 			node1Entry.PID = n.PID
 			alreadyRunning = true
@@ -3844,7 +3862,7 @@ func runBootstrap() {
 	if !alreadyRunning {
 		bridge.EnsureTAP("tap-node1", cfg.BridgeDevice, username)
 		node1PID, err := qemu.Launch(qemu.VMConfig{
-			Name: "boxcutter-node-1",
+			Name: node1ID,
 			VCPU: cfg.NodeVCPU,
 			RAM:  cfg.NodeRAM,
 			Disk: node1Disk,
