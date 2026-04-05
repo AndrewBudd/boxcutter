@@ -3031,6 +3031,9 @@ func cliBuildImage() {
 	fmt.Printf("Pushing %s image (tag: %s)...\n", vmType, tag)
 	ctx := context.Background()
 	tags := []string{tag}
+	if tag != "latest" {
+		tags = append(tags, "latest")
+	}
 
 	if err := oci.Push(ctx, oci.PushOptions{
 		Registry:   cfg.OCIRegistry,
