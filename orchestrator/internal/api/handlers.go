@@ -182,8 +182,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// VM exec
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleVMExec)
 
-	// VM-to-VM messaging relay
-	mux.HandleFunc("POST /api/messages/relay", h.handleMessageRelay)
+	// VM-to-VM messaging: lookup which node a VM is on
+	mux.HandleFunc("GET /api/vms/{name}/location", h.handleVMLocation)
 }
 
 // --- Node handlers ---
@@ -1540,36 +1540,28 @@ func (h *Handler) handleVMExec(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"output": output})
 }
 
-func (h *Handler) handleMessageRelay(w http.ResponseWriter, r *http.Request) {
-	var msg struct {
-		To string `json:"to"`
-	}
-	// Peek at the "to" field without consuming the body
-	body, _ := io.ReadAll(r.Body)
-	json.Unmarshal(body, &msg)
-
-	if msg.To == "" {
-		http.Error(w, "message missing 'to' field", http.StatusBadRequest)
+func (h *Handler) handleVMLocation(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		http.Error(w, "vm name required", http.StatusBadRequest)
 		return
 	}
 
-	v, err := h.db.GetVM(msg.To)
+	v, err := h.db.GetVM(name)
 	if err != nil {
-		http.Error(w, "target VM not found: "+msg.To, http.StatusNotFound)
+		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
 
 	n, err := h.db.GetNode(v.NodeID)
 	if err != nil || n.APIAddr == "" {
-		http.Error(w, "target node not available", http.StatusServiceUnavailable)
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
 	}
 
-	nc := node.NewClient(n.APIAddr)
-	if err := nc.PushMailbox(msg.To, json.RawMessage(body)); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]string{
+		"vm":        name,
+		"node_id":   n.ID,
+		"node_addr": n.APIAddr,
+	})
 }

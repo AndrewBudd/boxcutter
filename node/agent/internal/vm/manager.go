@@ -1130,6 +1130,31 @@ func (m *Manager) injectSSHKeys(st *VMState) {
 	run("chown", "-R", "1000:1000", sshDir)
 }
 
+// EnsureVMIDRegistered makes sure a VM is registered with vmid.
+// This handles the case where vmid restarted and lost its in-memory state.
+func (m *Manager) EnsureVMIDRegistered(name string) error {
+	if m.vmid == nil {
+		return fmt.Errorf("vmid client not available")
+	}
+	st, _, err := m.Get(name)
+	if err != nil {
+		return err
+	}
+	vmType := st.Type
+	if vmType == "" {
+		vmType = "firecracker"
+	}
+	return m.vmid.Register(&vmid.RegisterRequest{
+		VMID:        st.Name,
+		VMType:      vmType,
+		IP:          "10.0.0.2",
+		Mark:        st.Mark,
+		Mode:        st.Mode,
+		GitHubRepo:  st.GitHubRepo,
+		GitHubRepos: st.AllGitHubRepos(),
+	})
+}
+
 // exportMailboxToFile saves a VM's mailbox to vmDir/mailbox.json for migration.
 func (m *Manager) exportMailboxToFile(name, vmDir string) {
 	if m.vmid == nil {

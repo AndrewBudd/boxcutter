@@ -304,6 +304,42 @@ func TestMailbox_MultipleConsumersOneVM(t *testing.T) {
 	}
 }
 
+func TestMailbox_PushToUnregisteredVM_Fails(t *testing.T) {
+	// Simulates cross-node relay: target VM exists on node but vmid
+	// lost its registration (e.g., after vmid restart). PushMailbox
+	// should fail so the caller knows to re-register.
+	r := New()
+	// VM "target" is NOT registered
+	msg := &MailboxMessage{ID: "msg-1", From: "sender", To: "target", Body: "hi", CreatedAt: time.Now()}
+	if r.PushMailbox("target", msg) {
+		t.Fatal("PushMailbox should fail for unregistered VM (vmid may have restarted)")
+	}
+}
+
+func TestMailbox_PushAfterReRegister(t *testing.T) {
+	// Simulates the fix: caller re-registers the VM, then pushes successfully.
+	r := New()
+	msg := &MailboxMessage{ID: "msg-1", From: "sender", To: "target", Body: "hi", CreatedAt: time.Now()}
+
+	// Push fails initially
+	if r.PushMailbox("target", msg) {
+		t.Fatal("should fail before registration")
+	}
+
+	// Re-register the VM
+	r.Register(&VMRecord{VMID: "target", IP: "10.0.0.2", Mark: 200})
+
+	// Push succeeds now
+	if !r.PushMailbox("target", msg) {
+		t.Fatal("should succeed after registration")
+	}
+
+	msgs, _ := r.ConsumeMailbox("target")
+	if len(msgs) != 1 || msgs[0].ID != "msg-1" {
+		t.Fatalf("expected 1 message after re-register push, got %d", len(msgs))
+	}
+}
+
 func TestMailbox_ExportDoesNotMutateOriginal(t *testing.T) {
 	r := New()
 	r.Register(&VMRecord{VMID: "vm-1", IP: "10.0.0.2", Mark: 100})

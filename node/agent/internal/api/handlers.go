@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,10 +21,11 @@ import (
 )
 
 type Handler struct {
-	mgr            *vm.Manager
-	goldenMgr      *golden.Manager
-	vmidClient     *vmid.Client
+	mgr             *vm.Manager
+	goldenMgr       *golden.Manager
+	vmidClient      *vmid.Client
 	orchestratorURL string
+	vmLocationCache sync.Map // vm name → node API addr (string)
 }
 
 func NewHandler(mgr *vm.Manager) *Handler {
@@ -856,27 +858,25 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePushMailbox pushes a message into a local VM's mailbox via vmid admin socket.
+// If vmid doesn't know the VM (e.g., after vmid restart), re-registers it first.
 func (h *Handler) handlePushMailbox(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if h.vmidClient == nil {
-		http.Error(w, "vmid client not configured", http.StatusServiceUnavailable)
-		return
-	}
 	var msg vmid.MailboxMessage
 	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := h.vmidClient.PushMailbox(name, &msg); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+	if !h.tryLocalDelivery(name, &msg) {
+		http.Error(w, "vm not found: "+name, http.StatusNotFound)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
 }
 
 // handleMessageRelay receives a message from vmid and routes it.
-// If the target VM is local, delivers via vmid admin socket.
-// If remote, forwards to the orchestrator for routing.
+// 1. Try local delivery (vmid admin socket, with re-registration)
+// 2. Check VM location cache → deliver directly to target node
+// 3. Cache miss → ask orchestrator for location, cache, deliver to target node
 func (h *Handler) handleMessageRelay(w http.ResponseWriter, r *http.Request) {
 	var msg vmid.MailboxMessage
 	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
@@ -884,31 +884,87 @@ func (h *Handler) handleMessageRelay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try local delivery via vmid
-	if h.vmidClient != nil {
-		if err := h.vmidClient.PushMailbox(msg.To, &msg); err == nil {
+	// 1. Try local delivery
+	if h.tryLocalDelivery(msg.To, &msg) {
+		w.WriteHeader(http.StatusCreated)
+		return
+	}
+
+	// 2. Try cached location → direct node-to-node
+	if addr, ok := h.vmLocationCache.Load(msg.To); ok {
+		if h.pushToNode(addr.(string), msg.To, &msg) == nil {
 			w.WriteHeader(http.StatusCreated)
 			return
 		}
+		// Cache is stale — evict and fall through to lookup
+		h.vmLocationCache.Delete(msg.To)
 	}
 
-	// Not local — relay to orchestrator
-	if h.orchestratorURL == "" {
-		http.Error(w, "target VM not found", http.StatusNotFound)
-		return
-	}
-
-	body, _ := json.Marshal(msg)
-	resp, err := http.Post(h.orchestratorURL+"/api/messages/relay", "application/json", bytes.NewReader(body))
+	// 3. Cache miss — ask orchestrator for VM location
+	addr, err := h.lookupVMLocation(msg.To)
 	if err != nil {
-		http.Error(w, "orchestrator relay failed: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "target VM not found: "+err.Error(), http.StatusNotFound)
 		return
+	}
+	h.vmLocationCache.Store(msg.To, addr)
+
+	if err := h.pushToNode(addr, msg.To, &msg); err != nil {
+		http.Error(w, "delivery failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// tryLocalDelivery attempts to push a message to a local VM via vmid.
+// Re-registers the VM with vmid if necessary.
+func (h *Handler) tryLocalDelivery(vmName string, msg *vmid.MailboxMessage) bool {
+	if h.vmidClient == nil {
+		return false
+	}
+	if err := h.vmidClient.PushMailbox(vmName, msg); err == nil {
+		return true
+	}
+	// VM might exist locally but vmid lost registration — re-register and retry
+	if h.mgr.EnsureVMIDRegistered(vmName) == nil {
+		return h.vmidClient.PushMailbox(vmName, msg) == nil
+	}
+	return false
+}
+
+// pushToNode delivers a message to a VM on a remote node via its agent API.
+func (h *Handler) pushToNode(nodeAddr, vmName string, msg *vmid.MailboxMessage) error {
+	body, _ := json.Marshal(msg)
+	resp, err := http.Post("http://"+nodeAddr+"/api/vms/"+vmName+"/mailbox", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
-		http.Error(w, string(respBody), resp.StatusCode)
-		return
+		return fmt.Errorf("%s", string(respBody))
 	}
-	w.WriteHeader(http.StatusCreated)
+	return nil
+}
+
+// lookupVMLocation asks the orchestrator which node a VM is on.
+func (h *Handler) lookupVMLocation(vmName string) (string, error) {
+	if h.orchestratorURL == "" {
+		return "", fmt.Errorf("orchestrator not configured")
+	}
+	resp, err := http.Get(h.orchestratorURL + "/api/vms/" + vmName + "/location")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("vm %q not found", vmName)
+	}
+	var loc struct {
+		NodeAddr string `json:"node_addr"`
+	}
+	json.NewDecoder(resp.Body).Decode(&loc)
+	if loc.NodeAddr == "" {
+		return "", fmt.Errorf("no node_addr for %q", vmName)
+	}
+	return loc.NodeAddr, nil
 }
