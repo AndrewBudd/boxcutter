@@ -2001,7 +2001,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	// Build SSH options that use the control socket when available
 	sshArgs := append([]string{}, sshBase...)
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10", clusterKey)
 	if controlPath != "" {
 		sshArgs = append(sshArgs, "-o", "ControlPath="+controlPath)
 		sshOpts += " -o ControlPath=" + controlPath
@@ -2372,7 +2372,7 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	sshBase := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
 		"-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10"}
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ConnectTimeout=10", clusterKey)
 	sshArgs := append([]string{}, sshBase...)
 
 	// Clean target directory
@@ -2519,7 +2519,7 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 
 	sshBase := []string{"-i", clusterKey, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"}
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
 
 	cleanTarget := func() {
 		exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
@@ -3046,7 +3046,7 @@ func (m *Manager) ensureTargetHasGolden(version, targetAddr, targetBridgeIP stri
 	log.Printf("Transferring golden image %s to %s", version, targetBridgeIP)
 
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
-	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
+	sshOpts := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3", clusterKey)
 	goldenDir := "/var/lib/boxcutter/golden/"
 
 	// Ensure target golden dir exists

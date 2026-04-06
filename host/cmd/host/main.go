@@ -2724,7 +2724,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		if qemu.IsRunning(oldOrch.PID) {
 			sshKey := findClusterSSHKey(cfg)
 			if sshKey != "" {
-				exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+				exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
 					"-o", "ConnectTimeout=5", "-i", sshKey, fmt.Sprintf("ubuntu@%s", oldOrch.BridgeIP),
 					"sudo tailscale logout").Run()
 			}
@@ -2762,7 +2762,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			addCmd := fmt.Sprintf("sudo ip addr add %s/24 dev ens3 2>/dev/null || sudo ip addr add %s/24 dev eth0 2>/dev/null || true",
 				oldBridgeIP, oldBridgeIP)
 			log.Printf("Reassigning orchestrator IP: adding %s to new orch at %s", oldBridgeIP, goal.NewOrchIP)
-			out, sshErr := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+			out, sshErr := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
 				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP),
 				addCmd).CombinedOutput()
 			if sshErr != nil {
@@ -2814,7 +2814,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	if sshKey2 != "" {
 		for _, n := range state.Nodes {
 			go func(nodeIP string) {
-				exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+				exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
 					"-o", "ConnectTimeout=10", "-i", sshKey2, fmt.Sprintf("ubuntu@%s", nodeIP),
 					"sudo systemctl restart boxcutter-node").Run()
 				log.Printf("Restarted node agent on %s for re-registration", nodeIP)
@@ -3154,7 +3154,7 @@ func bootstrapGolden(cfg HostConfig, state *cluster.State) {
 		}
 		buildCmd := exec.Command("ssh",
 			"-i", sshKey,
-			"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+			"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
 			fmt.Sprintf("ubuntu@%s", nodeIP),
 			"sudo /var/lib/boxcutter/golden/docker-to-ext4.sh")
 		buildCmd.Stdout = os.Stdout
