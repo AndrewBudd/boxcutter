@@ -16,7 +16,7 @@ yaml_val() {
   # Simple yaml value extractor (single-level or dotted keys).
   # Works for our flat config; not a full YAML parser.
   local key=$1 file=${2:-$CONFIG}
-  grep -E "^\s*${key}:" "$file" | head -1 | sed 's/^[^:]*:\s*//' | sed 's/\s*#.*//' | sed 's/^\s*"\(.*\)"\s*$/\1/'
+  grep -E "^\s*${key}:" "$file" 2>/dev/null | head -1 | sed 's/^[^:]*:\s*//' | sed 's/\s*#.*//' | sed 's/^\s*"\(.*\)"\s*$/\1/' || true
 }
 
 # --- Validate bundle ---

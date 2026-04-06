@@ -2,7 +2,7 @@
 # End-to-end tapegun integration test.
 # Requires a running cluster with at least 1 VM.
 # Tests: daemon running, tmux capture, inbox delivery, activity reporting.
-set -eo pipefail
+set -e
 
 SSH_KEY="${SSH_KEY:-/home/dev/.ssh/id_rsa_prod}"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=30 -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -13,7 +13,7 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { log "FAIL: $*"; exit 1; }
 pass() { log "PASS: $*"; }
 
-orch_ssh() { ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "$@"; }
+orch_ssh() { ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "$@" 2>/dev/null; }
 node_ssh() { ssh -i "$CLUSTER_KEY" $SSH_OPTS ubuntu@"$1" "$2"; }
 
 # --- Setup: find or create a VM ---

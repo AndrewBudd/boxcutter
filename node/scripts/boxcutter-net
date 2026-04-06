@@ -22,6 +22,12 @@ case "${1:-up}" in
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     # Allow accepted TCP sockets to inherit the packet's fwmark (needed by vmid)
     sysctl -w net.ipv4.tcp_fwmark_accept=1 >/dev/null
+    # Accept packets to local IPs arriving on non-local interfaces (metadata routing:
+    # VMs send to 169.254.169.254 which is on loopback, arriving via TAP devices)
+    sysctl -w net.ipv4.conf.all.accept_local=1 >/dev/null
+    # Disable strict reverse path filtering (conflicts with accept_local)
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
 
     # Cloud metadata address — vmid listens here, VMs reach it via default gateway
     ip addr show lo | grep -q 169.254.169.254 || \
