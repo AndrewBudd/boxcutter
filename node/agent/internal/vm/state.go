@@ -25,7 +25,8 @@ type VMState struct {
 	CloneURL    string   `json:"clone_url,omitempty"`    // first/primary clone URL (backwards compat)
 	CloneURLs   []string `json:"clone_urls,omitempty"`   // all clone URLs
 	GitHubRepo  string   `json:"github_repo,omitempty"`  // backwards compat — single repo
-	GitHubRepos []string `json:"github_repos,omitempty"` // all GitHub repos (owner/repo)
+	GitHubRepos    []string `json:"github_repos,omitempty"`    // all GitHub repos (owner/repo)
+	GitHubProjects []string `json:"github_projects,omitempty"` // GitHub projects (owner/number)
 	TailscaleIP      string `json:"tailscale_ip,omitempty"`
 	TailscaleAuthkey string `json:"tailscale_authkey,omitempty"`
 	GoldenVer        string `json:"golden_version,omitempty"`

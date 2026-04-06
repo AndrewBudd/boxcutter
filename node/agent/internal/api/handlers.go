@@ -63,6 +63,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleAddRepo)
 	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleRemoveRepo)
 	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleListRepos)
+	mux.HandleFunc("POST /api/vms/{name}/projects", h.handleAddProject)
+	mux.HandleFunc("DELETE /api/vms/{name}/projects/{project...}", h.handleRemoveProject)
+	mux.HandleFunc("GET /api/vms/{name}/projects", h.handleListProjects)
 	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleLogs)
 	mux.HandleFunc("PATCH /api/vms/{name}", h.handleUpdate)
 	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
@@ -608,6 +611,44 @@ func (h *Handler) handleListRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"repos": repos})
+}
+
+func (h *Handler) handleAddProject(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req struct {
+		Project string `json:"project"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" {
+		http.Error(w, "project is required", http.StatusBadRequest)
+		return
+	}
+	projects, err := h.mgr.AddProject(name, req.Project)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"projects": projects})
+}
+
+func (h *Handler) handleRemoveProject(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	project := r.PathValue("project")
+	projects, err := h.mgr.RemoveProject(name, project)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"projects": projects})
+}
+
+func (h *Handler) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	projects, err := h.mgr.ListProjects(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"projects": projects})
 }
 
 func (h *Handler) handleGoldenVersions(w http.ResponseWriter, r *http.Request) {

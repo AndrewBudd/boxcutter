@@ -29,6 +29,9 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/vms/{id}/repos", h.handleAddRepo)
 	mux.HandleFunc("DELETE /internal/vms/{id}/repos/{repo...}", h.handleRemoveRepo)
 	mux.HandleFunc("GET /internal/vms/{id}/repos", h.handleListRepos)
+	mux.HandleFunc("POST /internal/vms/{id}/projects", h.handleAddProject)
+	mux.HandleFunc("DELETE /internal/vms/{id}/projects/{project...}", h.handleRemoveProject)
+	mux.HandleFunc("GET /internal/vms/{id}/projects", h.handleListProjects)
 	mux.HandleFunc("POST /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/ghcr-token", h.handleGHCRToken)
 	mux.HandleFunc("GET /internal/sentinel/{sentinel}", h.handleSentinelSwap)
@@ -197,6 +200,61 @@ func (h *AdminHandler) handleListRepos(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]interface{}{
 		"repos": rec.AllGitHubRepos(),
+	})
+}
+
+func (h *AdminHandler) handleAddProject(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	rec, ok := h.reg.LookupID(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	var req struct {
+		Project string `json:"project"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" {
+		http.Error(w, "project is required", http.StatusBadRequest)
+		return
+	}
+	rec.AddProject(req.Project)
+	writeJSON(w, map[string]interface{}{
+		"projects": rec.GitHubProjects,
+	})
+}
+
+func (h *AdminHandler) handleRemoveProject(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	project := r.PathValue("project")
+	rec, ok := h.reg.LookupID(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	if !rec.RemoveProject(project) {
+		http.Error(w, "project not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"projects": rec.GitHubProjects,
+	})
+}
+
+func (h *AdminHandler) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	rec, ok := h.reg.LookupID(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"projects": rec.GitHubProjects,
 	})
 }
 

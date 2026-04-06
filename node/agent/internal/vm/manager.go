@@ -1651,6 +1651,71 @@ func (m *Manager) ListRepos(name string) ([]string, error) {
 
 // ExportVM stops a VM and returns the path to its COW image for transfer.
 // Used as fallback when snapshot-based migration isn't possible.
+// AddProject adds a GitHub project to a VM's policy and registers it with vmid.
+func (m *Manager) AddProject(name, project string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+	for _, p := range st.GitHubProjects {
+		if p == project {
+			return st.GitHubProjects, nil
+		}
+	}
+	st.GitHubProjects = append(st.GitHubProjects, project)
+	if err := SaveVMState(vmDir, st); err != nil {
+		return nil, err
+	}
+	if m.vmid != nil {
+		m.vmid.AddProject(name, project)
+	}
+	return st.GitHubProjects, nil
+}
+
+// RemoveProject removes a GitHub project from a VM's policy.
+func (m *Manager) RemoveProject(name, project string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+	found := false
+	var newProjects []string
+	for _, p := range st.GitHubProjects {
+		if p == project {
+			found = true
+			continue
+		}
+		newProjects = append(newProjects, p)
+	}
+	if !found {
+		return nil, fmt.Errorf("project '%s' not in VM policy", project)
+	}
+	st.GitHubProjects = newProjects
+	if err := SaveVMState(vmDir, st); err != nil {
+		return nil, err
+	}
+	if m.vmid != nil {
+		m.vmid.RemoveProject(name, project)
+	}
+	return newProjects, nil
+}
+
+// ListProjects returns the GitHub projects configured for a VM.
+func (m *Manager) ListProjects(name string) ([]string, error) {
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+	return st.GitHubProjects, nil
+}
+
 func (m *Manager) ExportVM(name string) (string, *VMState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

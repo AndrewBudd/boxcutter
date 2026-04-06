@@ -86,6 +86,16 @@ func (c *Client) ListRepos(vmID string) ([]string, error) {
 	return result.Repos, nil
 }
 
+func (c *Client) AddProject(vmID, project string) {
+	body, _ := json.Marshal(map[string]string{"project": project})
+	c.http.Post("http://localhost/internal/vms/"+vmID+"/projects", "application/json", bytes.NewReader(body))
+}
+
+func (c *Client) RemoveProject(vmID, project string) {
+	req, _ := http.NewRequest("DELETE", "http://localhost/internal/vms/"+vmID+"/projects/"+project, nil)
+	c.http.Do(req)
+}
+
 func (c *Client) Register(req *RegisterRequest) error {
 	body, _ := json.Marshal(req)
 	resp, err := c.http.Post("http://localhost/internal/vms", "application/json", bytes.NewReader(body))

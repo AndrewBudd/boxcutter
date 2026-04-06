@@ -151,6 +151,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/repos", h.migrationGuard(h.handleVMAddRepo))
 	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.migrationGuard(h.handleVMRemoveRepo))
 	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleVMListRepos)
+	mux.HandleFunc("POST /api/vms/{name}/projects", h.migrationGuard(h.handleVMAddProject))
+	mux.HandleFunc("DELETE /api/vms/{name}/projects/{project...}", h.migrationGuard(h.handleVMRemoveProject))
+	mux.HandleFunc("GET /api/vms/{name}/projects", h.handleVMListProjects)
 
 	// Golden images
 	mux.HandleFunc("GET /api/golden", h.handleGoldenList)
@@ -925,6 +928,77 @@ func (h *Handler) handleVMListRepos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"repos": repos})
+}
+
+// --- VM projects ---
+
+func (h *Handler) handleVMAddProject(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var req struct{ Project string `json:"project"` }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Project == "" {
+		http.Error(w, "project is required", http.StatusBadRequest)
+		return
+	}
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+	n, _ := h.db.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+	nc := node.NewClient(n.APIAddr)
+	projects, err := nc.AddProject(name, req.Project)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"projects": projects})
+}
+
+func (h *Handler) handleVMRemoveProject(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	project := r.PathValue("project")
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+	n, _ := h.db.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+	nc := node.NewClient(n.APIAddr)
+	projects, err := nc.RemoveProject(name, project)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"projects": projects})
+}
+
+func (h *Handler) handleVMListProjects(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+	n, _ := h.db.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+	nc := node.NewClient(n.APIAddr)
+	projects, err := nc.ListProjects(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"projects": projects})
 }
 
 // --- Golden images ---

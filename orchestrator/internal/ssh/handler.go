@@ -107,6 +107,8 @@ func (h *Handler) Run(args []string) int {
 		return h.cmdListKeys()
 	case "repos":
 		return h.cmdRepos(args[1:])
+	case "projects":
+		return h.cmdProjects(args[1:])
 	case "tapegun":
 		return h.cmdTapegun(args[1:])
 	case "authorize":
@@ -690,6 +692,76 @@ func (h *Handler) cmdRepos(args []string) int {
 	}
 }
 
+func (h *Handler) cmdProjects(args []string) int {
+	if len(args) < 1 {
+		fmt.Println("Usage: ssh <host> projects <list|add|remove> <vm-name> [project]")
+		return 1
+	}
+	switch args[0] {
+	case "list":
+		if len(args) < 2 {
+			fmt.Println("Usage: ssh <host> projects list <vm-name>")
+			return 1
+		}
+		resp, err := h.get("/api/vms/" + args[1] + "/projects")
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		var result struct{ Projects []string `json:"projects"` }
+		json.Unmarshal(resp, &result)
+		if len(result.Projects) == 0 {
+			fmt.Printf("No projects configured for %s.\n", args[1])
+			return 0
+		}
+		fmt.Printf("Projects for %s:\n", args[1])
+		for _, p := range result.Projects {
+			fmt.Printf("  %s\n", p)
+		}
+		return 0
+	case "add":
+		if len(args) < 3 {
+			fmt.Println("Usage: ssh <host> projects add <vm-name> <owner/number>")
+			return 1
+		}
+		result, err := h.post("/api/vms/"+args[1]+"/projects", map[string]string{"project": args[2]})
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		var res struct{ Projects []string `json:"projects"` }
+		json.Unmarshal(result, &res)
+		fmt.Printf("Added %s. Projects for %s:\n", args[2], args[1])
+		for _, p := range res.Projects {
+			fmt.Printf("  %s\n", p)
+		}
+		return 0
+	case "remove":
+		if len(args) < 3 {
+			fmt.Println("Usage: ssh <host> projects remove <vm-name> <owner/number>")
+			return 1
+		}
+		result, err := h.delete("/api/vms/" + args[1] + "/projects/" + args[2])
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		var res struct{ Projects []string `json:"projects"` }
+		json.Unmarshal(result, &res)
+		fmt.Printf("Removed %s. Projects for %s:\n", args[2], args[1])
+		for _, p := range res.Projects {
+			fmt.Printf("  %s\n", p)
+		}
+		if len(res.Projects) == 0 {
+			fmt.Println("  (none)")
+		}
+		return 0
+	default:
+		fmt.Println("Usage: ssh <host> projects <list|add|remove> <vm-name> [project]")
+		return 1
+	}
+}
+
 func (h *Handler) cmdExec(name, command string) int {
 	resp, err := h.post("/api/vms/"+name+"/exec", map[string]string{"command": command})
 	if err != nil {
@@ -831,6 +903,10 @@ Commands:
   repos add <name> <repo> Add a repo to VM's GitHub policy
   repos remove <name> <repo>
                           Remove a repo from VM's GitHub policy
+  projects list <name>    List GitHub projects for a VM
+  projects add <name> <p> Add a project to VM's GitHub policy
+  projects remove <name> <p>
+                          Remove a project from VM's policy
   images                  List golden images across all nodes
   golden set-head <ver>   Set golden image head version (nodes pull via MQTT)
   status                  Cluster capacity summary

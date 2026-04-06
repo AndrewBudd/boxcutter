@@ -60,8 +60,9 @@ type VMRecord struct {
 	Mark        int               `json:"mark"`
 	Mode        string            `json:"mode"`
 	Labels      map[string]string `json:"labels,omitempty"`
-	GitHubRepo  string            `json:"github_repo,omitempty"`  // backwards compat
-	GitHubRepos []string          `json:"github_repos,omitempty"` // all repos
+	GitHubRepo     string            `json:"github_repo,omitempty"`     // backwards compat
+	GitHubRepos    []string          `json:"github_repos,omitempty"`    // all repos
+	GitHubProjects []string          `json:"github_projects,omitempty"` // authorized projects
 
 	LastActivity *ActivityReport   `json:"last_activity,omitempty"`
 	LastStatus   *StatusReport    `json:"last_status,omitempty"`
@@ -97,6 +98,28 @@ func (r *VMRecord) RemoveRepo(repo string) bool {
 	for i, existing := range repos {
 		if existing == repo {
 			r.GitHubRepos = append(repos[:i], repos[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// AddProject adds a project if not already present. Returns true if added.
+func (r *VMRecord) AddProject(project string) bool {
+	for _, existing := range r.GitHubProjects {
+		if existing == project {
+			return false
+		}
+	}
+	r.GitHubProjects = append(r.GitHubProjects, project)
+	return true
+}
+
+// RemoveProject removes a project. Returns true if removed.
+func (r *VMRecord) RemoveProject(project string) bool {
+	for i, existing := range r.GitHubProjects {
+		if existing == project {
+			r.GitHubProjects = append(r.GitHubProjects[:i], r.GitHubProjects[i+1:]...)
 			return true
 		}
 	}

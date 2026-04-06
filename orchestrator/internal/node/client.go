@@ -525,6 +525,53 @@ func (c *Client) ListRepos(vmName string) ([]string, error) {
 	return result.Repos, nil
 }
 
+func (c *Client) AddProject(vmName, project string) ([]string, error) {
+	body, _ := json.Marshal(map[string]string{"project": project})
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+vmName+"/projects", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(errBody)))
+	}
+	var result struct{ Projects []string `json:"projects"` }
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Projects, nil
+}
+
+func (c *Client) RemoveProject(vmName, project string) ([]string, error) {
+	req, _ := http.NewRequest("DELETE", c.baseURL+"/api/vms/"+vmName+"/projects/"+project, nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(errBody)))
+	}
+	var result struct{ Projects []string `json:"projects"` }
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Projects, nil
+}
+
+func (c *Client) ListProjects(vmName string) ([]string, error) {
+	resp, err := c.http.Get(c.baseURL + "/api/vms/" + vmName + "/projects")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(errBody)))
+	}
+	var result struct{ Projects []string `json:"projects"` }
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result.Projects, nil
+}
+
 func (c *Client) ListVMs() ([]json.RawMessage, error) {
 	resp, err := c.http.Get(c.baseURL + "/api/vms")
 	if err != nil {
