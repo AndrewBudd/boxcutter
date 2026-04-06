@@ -381,7 +381,8 @@ func runDaemon() {
 	// 8. Resume any interrupted upgrade in background
 	if state.UpgradeGoal != nil {
 		log.Printf("Found incomplete upgrade goal: %s (tag: %s)", state.UpgradeGoal.VMType, state.UpgradeGoal.Tag)
-		go runReconcileLoop(cfg, state)
+		// The startAPI function handles the upgrade lifecycle (mutex, cancel channel).
+		// Set a flag here so startAPI knows to resume.
 	}
 
 	log.Println("boxcutter-host ready")
@@ -1391,6 +1392,27 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 	os.Remove(cfg.SocketPath)
 
+	// Upgrade state — only one upgrade at a time
+	var upgradeMu sync.Mutex
+	var upgradeRunning bool
+	var upgradeCancelCh chan struct{}
+
+	// Resume interrupted upgrade if goal exists
+	if state.UpgradeGoal != nil {
+		upgradeRunning = true
+		upgradeCancelCh = make(chan struct{})
+		cancelCh := upgradeCancelCh
+		go func() {
+			defer func() {
+				upgradeMu.Lock()
+				upgradeRunning = false
+				upgradeCancelCh = nil
+				upgradeMu.Unlock()
+			}()
+			runReconcileLoop(cfg, state, cancelCh)
+		}()
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -1457,10 +1479,6 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "draining", "node": nodeID})
 	})
 
-	// upgradeMu prevents concurrent upgrades. Only one upgrade can run at a time.
-	var upgradeMu sync.Mutex
-	var upgradeRunning bool
-
 	mux.HandleFunc("POST /upgrade", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			VMType string `json:"vm_type"` // "node", "orchestrator", "all"
@@ -1484,6 +1502,8 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 			return
 		}
 		upgradeRunning = true
+		upgradeCancelCh = make(chan struct{})
+		cancelCh := upgradeCancelCh
 		upgradeMu.Unlock()
 
 		// Set upgrade goal in daemon's state (single source of truth)
@@ -1501,9 +1521,10 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 			defer func() {
 				upgradeMu.Lock()
 				upgradeRunning = false
+				upgradeCancelCh = nil
 				upgradeMu.Unlock()
 			}()
-			runReconcileLoop(cfg, state)
+			runReconcileLoop(cfg, state, cancelCh)
 		}()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -1511,6 +1532,40 @@ func startAPI(cfg HostConfig, state *cluster.State, hs *healthState) {
 			"status":  "started",
 			"vm_type": req.VMType,
 			"tag":     req.Tag,
+		})
+	})
+
+	mux.HandleFunc("POST /upgrade/cancel", func(w http.ResponseWriter, r *http.Request) {
+		upgradeMu.Lock()
+		if !upgradeRunning {
+			upgradeMu.Unlock()
+			http.Error(w, `{"error":"no upgrade in progress"}`, http.StatusConflict)
+			return
+		}
+		// Signal cancellation
+		if upgradeCancelCh != nil {
+			close(upgradeCancelCh)
+		}
+		upgradeMu.Unlock()
+
+		// Wait for reconciler to stop (up to 10s)
+		for i := 0; i < 20; i++ {
+			time.Sleep(500 * time.Millisecond)
+			upgradeMu.Lock()
+			running := upgradeRunning
+			upgradeMu.Unlock()
+			if !running {
+				break
+			}
+		}
+
+		// Clean up orphan replacement nodes (nodes with no VMs that don't match any pre-upgrade node)
+		cleaned := cleanupOrphanNodes(cfg, state)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":        "cancelled",
+			"nodes_cleaned": cleaned,
 		})
 	})
 
@@ -2176,6 +2231,13 @@ func cliPull() {
 //	boxcutter-host upgrade <node|orchestrator|all> [--tag TAG]
 func cliUpgrade() {
 	cfg := defaultConfig()
+
+	// Check for cancel subcommand
+	if len(os.Args) > 2 && os.Args[2] == "cancel" {
+		cliUpgradeCancel(cfg)
+		return
+	}
+
 	vmType, tag := parsePullArgs()
 
 	if vmType == "golden" {
@@ -2257,17 +2319,102 @@ func cliUpgrade() {
 	}
 }
 
+// cliUpgradeCancel cancels a running upgrade via the daemon API.
+func cliUpgradeCancel(cfg HostConfig) {
+	sockClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", cfg.SocketPath)
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	resp, err := sockClient.Post("http://localhost/upgrade/cancel", "application/json", nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot reach daemon (is boxcutter-host running?): %v\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	if resp.StatusCode == http.StatusConflict {
+		fmt.Println("No upgrade in progress.")
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "Cancel failed (%d): %s\n", resp.StatusCode, string(body))
+		os.Exit(1)
+	}
+
+	fmt.Println("Upgrade cancelled.")
+	if cleaned, ok := result["nodes_cleaned"].([]interface{}); ok && len(cleaned) > 0 {
+		fmt.Printf("Cleaned up %d orphan replacement node(s):\n", len(cleaned))
+		for _, n := range cleaned {
+			fmt.Printf("  - %v\n", n)
+		}
+	}
+}
+
 // runReconcileLoop runs the upgrade reconciler in a background goroutine
-// until the goal is satisfied. Used by the daemon on startup to resume
-// interrupted upgrades.
-func runReconcileLoop(cfg HostConfig, state *cluster.State) {
+// until the goal is satisfied, cancelled, or auto-aborted after too many failures.
+func runReconcileLoop(cfg HostConfig, state *cluster.State, cancelCh chan struct{}) {
+	const autoAbortThreshold = 50 // ~4 minutes at 5s interval
+	consecutiveFailures := 0
+	lastErr := ""
+
 	for {
+		// Check for cancellation
+		select {
+		case <-cancelCh:
+			log.Println("Upgrade cancelled by user")
+			state.ClearUpgradeGoal()
+			state.Save()
+			return
+		default:
+		}
+
 		done, action, err := reconcileUpgradeStep(cfg, state)
 		if err != nil {
-			log.Printf("Upgrade reconciliation failed: %v (retrying in 30s)", err)
-			time.Sleep(30 * time.Second)
+			errStr := err.Error()
+			if errStr == lastErr {
+				consecutiveFailures++
+			} else {
+				consecutiveFailures = 1
+				lastErr = errStr
+			}
+
+			if consecutiveFailures >= autoAbortThreshold {
+				log.Printf("Upgrade auto-aborted after %d consecutive failures: %v", consecutiveFailures, err)
+				state.ClearUpgradeGoal()
+				state.Save()
+				cleanupOrphanNodes(cfg, state)
+				return
+			}
+
+			if consecutiveFailures == 10 {
+				log.Printf("WARNING: upgrade stuck (%d consecutive failures): %v", consecutiveFailures, err)
+			}
+
+			log.Printf("Upgrade reconciliation failed: %v (retrying in 5s, failure %d/%d)", err, consecutiveFailures, autoAbortThreshold)
+			select {
+			case <-cancelCh:
+				log.Println("Upgrade cancelled by user")
+				state.ClearUpgradeGoal()
+				state.Save()
+				return
+			case <-time.After(5 * time.Second):
+			}
 			continue
 		}
+
+		// Reset failure counter on success
+		consecutiveFailures = 0
+		lastErr = ""
+
 		if action != "" {
 			log.Printf("[reconcile] %s", action)
 		}
@@ -2275,7 +2422,15 @@ func runReconcileLoop(cfg HostConfig, state *cluster.State) {
 			log.Println("Upgrade reconciliation complete")
 			return
 		}
-		time.Sleep(5 * time.Second)
+
+		select {
+		case <-cancelCh:
+			log.Println("Upgrade cancelled by user")
+			state.ClearUpgradeGoal()
+			state.Save()
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 }
 
@@ -2643,6 +2798,47 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	}
 
 	return true, fmt.Sprintf("Orchestrator upgraded (PID %d)", newPID), nil
+}
+
+// cleanupOrphanNodes stops and removes nodes that were launched as replacements
+// during an upgrade but never received any VMs. Returns list of cleaned node IDs.
+func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
+	var cleaned []string
+	initialCount := 0
+	if state.UpgradeGoal != nil {
+		initialCount = state.UpgradeGoal.InitialNodeCount
+	}
+
+	// Nodes beyond the initial count are potential replacements
+	for i := len(state.Nodes) - 1; i >= initialCount; i-- {
+		n := state.Nodes[i]
+		// Check if node has any VMs via its health data
+		if qemu.IsRunning(n.PID) {
+			// Query the node agent to check VM count
+			nodeClient := &http.Client{Timeout: 3 * time.Second}
+			resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/vms", n.BridgeIP))
+			hasVMs := false
+			if err == nil {
+				var vms []interface{}
+				json.NewDecoder(resp.Body).Decode(&vms)
+				resp.Body.Close()
+				hasVMs = len(vms) > 0
+			}
+			if hasVMs {
+				continue // Don't remove nodes with VMs
+			}
+			log.Printf("Stopping orphan replacement node %s (PID %d, no VMs)", n.ID, n.PID)
+			qemu.Stop(n.ID, n.PID)
+		}
+		// Remove from state
+		state.RemoveNode(n.ID)
+		cleaned = append(cleaned, n.ID)
+		log.Printf("Removed orphan node %s from cluster state", n.ID)
+	}
+	if len(cleaned) > 0 {
+		state.Save()
+	}
+	return cleaned
 }
 
 // --- Reconciler helpers ---
