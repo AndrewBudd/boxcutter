@@ -355,6 +355,202 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 	return pid, nil
 }
 
+// launchQEMUIncomingTCP starts a QEMU VM that listens for incoming live migration on a TCP port.
+// Returns (pid, port, error). The port is chosen by the OS (port 0 = auto-assign).
+func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
+	rootfs := RootfsPath(vmDir)
+	logPath := filepath.Join(vmDir, "console.log")
+	pidFile := filepath.Join(vmDir, "qemu.pid")
+
+	kernel, initrd := findQEMUKernel()
+	if kernel == "" {
+		return 0, 0, fmt.Errorf("no kernel found for QEMU VM")
+	}
+
+	bootArgs := fmt.Sprintf(
+		"console=ttyS0 root=/dev/vda rw init=/sbin/init "+
+			"net.ifnames=0 biosdevname=0 "+
+			"ip=10.0.0.2::10.0.0.1:255.255.255.252:%s:eth0:off:8.8.8.8",
+		st.Name)
+
+	diskFormat := "raw"
+	if _, err := os.Stat(filepath.Join(vmDir, "rootfs.qcow2")); err == nil {
+		diskFormat = "qcow2"
+	}
+
+	// Use a fixed port range (49152-49199) to find a free one
+	migratePort := 0
+	for p := 49152; p < 49200; p++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err == nil {
+			ln.Close()
+			migratePort = p
+			break
+		}
+	}
+	if migratePort == 0 {
+		return 0, 0, fmt.Errorf("no free TCP port for incoming migration")
+	}
+
+	args := []string{
+		"-enable-kvm",
+		"-cpu", "host",
+		"-smp", fmt.Sprintf("%d", st.VCPU),
+		"-m", fmt.Sprintf("%d", st.RAMMIB),
+		"-kernel", kernel,
+		"-append", bootArgs,
+		"-drive", fmt.Sprintf("file=%s,format=%s,if=virtio,cache=writeback", rootfs, diskFormat),
+		"-netdev", fmt.Sprintf("tap,id=net0,ifname=%s,script=no,downscript=no", st.TAP),
+		"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s", st.MAC),
+		"-serial", fmt.Sprintf("file:%s", logPath),
+		"-display", "none",
+		"-no-reboot",
+		"-pidfile", pidFile,
+		"-qmp", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(vmDir, "qmp.sock")),
+		"-incoming", fmt.Sprintf("tcp:0:%d", migratePort),
+		"-daemonize",
+	}
+
+	if initrd != "" {
+		args = append(args, "-initrd", initrd)
+	}
+
+	log.Printf("Launching QEMU VM %s (incoming live migration on port %d)", st.Name, migratePort)
+
+	stderrLog, _ := os.Create(filepath.Join(vmDir, "qemu-incoming.log"))
+	cmd := exec.Command("qemu-system-x86_64", args...)
+	if stderrLog != nil {
+		cmd.Stderr = stderrLog
+	}
+	out, err := cmd.Output()
+	if stderrLog != nil {
+		stderrLog.Close()
+	}
+	if err != nil {
+		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
+		return 0, 0, fmt.Errorf("qemu incoming tcp: %s %s: %w", string(out), string(stderrContent), err)
+	}
+
+	// Wait for PID file
+	var pid int
+	for i := 0; i < 20; i++ {
+		data, readErr := os.ReadFile(pidFile)
+		if readErr == nil {
+			fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid)
+			if pid > 0 {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if pid == 0 {
+		return 0, 0, fmt.Errorf("QEMU incoming TCP: PID file not found")
+	}
+
+	log.Printf("QEMU VM %s ready for incoming live migration on port %d (PID %d)", st.Name, migratePort, pid)
+	return pid, migratePort, nil
+}
+
+// qmpMigrateLive initiates QEMU native live migration to a target TCP endpoint.
+// The VM keeps running while memory pages are streamed incrementally.
+// Returns when migration completes (VM is now running on target).
+func qmpMigrateLive(vmDir string, targetIP string, targetPort int, ramMiB int) error {
+	conn, err := qmpDial(vmDir)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// Set migration parameters for faster convergence
+	qmpCommand(conn, "migrate-set-capabilities", map[string]interface{}{
+		"capabilities": []map[string]interface{}{
+			{"capability": "auto-converge", "state": true},
+		},
+	})
+
+	// Set downtime limit (100ms — QEMU will pause for at most this long)
+	qmpCommand(conn, "migrate-set-parameters", map[string]interface{}{
+		"downtime-limit": 100,
+	})
+
+	// Set max bandwidth (0 = unlimited)
+	qmpCommand(conn, "migrate-set-parameters", map[string]interface{}{
+		"max-bandwidth": int64(0),
+	})
+
+	// Start migration
+	migrateURI := fmt.Sprintf("tcp:%s:%d", targetIP, targetPort)
+	log.Printf("qmpMigrateLive: starting migration to %s", migrateURI)
+	_, err = qmpCommand(conn, "migrate", map[string]interface{}{
+		"uri": migrateURI,
+	})
+	if err != nil {
+		return fmt.Errorf("qmp migrate: %w", err)
+	}
+
+	// Poll until migration completes
+	// Timeout: 5 min base + 2 min per GB (live migration is faster than state save)
+	maxIterations := 600
+	if ramMiB > 0 {
+		maxIterations += (ramMiB / 1024) * 240 // 2 min per GB
+	}
+	timeoutSec := maxIterations / 2
+	log.Printf("qmpMigrateLive: timeout %dm%ds", timeoutSec/60, timeoutSec%60)
+
+	lastLog := time.Now()
+	for i := 0; i < maxIterations; i++ {
+		time.Sleep(500 * time.Millisecond)
+
+		result, err := qmpCommand(conn, "query-migrate", nil)
+		if err != nil {
+			continue
+		}
+
+		var status struct {
+			Status string `json:"status"`
+			RAM    *struct {
+				Transferred int64 `json:"transferred"`
+				Remaining   int64 `json:"remaining"`
+				Total       int64 `json:"total"`
+				Dirty       int64 `json:"dirty-pages-rate"`
+				MBps        int64 `json:"mbps"`
+			} `json:"ram"`
+		}
+		json.Unmarshal(result, &status)
+
+		// Log progress every 10s
+		if time.Since(lastLog) >= 10*time.Second {
+			if status.RAM != nil {
+				pct := float64(0)
+				if status.RAM.Total > 0 {
+					pct = float64(status.RAM.Transferred) / float64(status.RAM.Total) * 100
+				}
+				log.Printf("qmpMigrateLive: %s — %.1f%% (%dMB/%dMB, %dMB remaining, %d dirty/s, %dMbps)",
+					status.Status, pct,
+					status.RAM.Transferred/1024/1024, status.RAM.Total/1024/1024,
+					status.RAM.Remaining/1024/1024, status.RAM.Dirty, status.RAM.MBps)
+			} else {
+				log.Printf("qmpMigrateLive: status=%s", status.Status)
+			}
+			lastLog = time.Now()
+		}
+
+		switch status.Status {
+		case "completed":
+			log.Printf("qmpMigrateLive: migration completed")
+			return nil
+		case "failed":
+			return fmt.Errorf("QEMU live migration failed")
+		case "cancelled":
+			return fmt.Errorf("QEMU live migration cancelled")
+		}
+	}
+
+	// Timeout — cancel the migration
+	qmpCommand(conn, "migrate_cancel", nil)
+	return fmt.Errorf("QEMU live migration timed out after %ds", timeoutSec)
+}
+
 // qmpLoadState loads a saved state file into a QEMU VM started with -incoming defer.
 // ramMiB is used to scale the timeout (large VMs need longer to load state from disk).
 func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {

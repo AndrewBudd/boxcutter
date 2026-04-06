@@ -74,6 +74,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleExec)
+	mux.HandleFunc("POST /api/vms/{name}/launch-incoming-tcp", h.handleLaunchIncomingTCP)
 	mux.HandleFunc("POST /api/vms/{name}/cp-to", h.handleCopyTo)
 	mux.HandleFunc("GET /api/vms/{name}/cp-from", h.handleCopyFrom)
 	mux.HandleFunc("POST /api/messages/relay", h.handleMessageRelay)
@@ -902,6 +903,23 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, result)
+}
+
+// handleLaunchIncomingTCP launches a QEMU VM listening for live migration on a TCP port.
+// The VM's rootfs must already be pre-synced to the target.
+func (h *Handler) handleLaunchIncomingTCP(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	pid, port, err := h.mgr.LaunchIncomingTCP(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"name":         name,
+		"pid":          pid,
+		"migrate_port": port,
+		"status":       "waiting",
+	})
 }
 
 // handleCopyTo streams the request body into a file on the VM.
