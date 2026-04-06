@@ -346,7 +346,8 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 }
 
 // qmpLoadState loads a saved state file into a QEMU VM started with -incoming defer.
-func qmpLoadState(vmDir, statePath string) error {
+// ramMiB is used to scale the timeout (large VMs need longer to load state from disk).
+func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 	conn, err := qmpDial(vmDir)
 	if err != nil {
 		return err
@@ -361,8 +362,16 @@ func qmpLoadState(vmDir, statePath string) error {
 		return fmt.Errorf("qmp migrate-incoming: %w", err)
 	}
 
-	// Poll until loaded
-	for i := 0; i < 600; i++ {
+	// Poll until loaded — timeout scales with RAM size
+	// Base: 5 min (600 iterations * 500ms) + 1 min per GB of RAM
+	maxIterations := 600
+	if len(ramMiB) > 0 && ramMiB[0] > 0 {
+		extraIterations := (ramMiB[0] / 1024) * 120 // 120 iterations (60s) per GB
+		maxIterations += extraIterations
+	}
+	timeoutSec := maxIterations / 2
+	log.Printf("qmpLoadState: loading %s (timeout %dm%ds)", statePath, timeoutSec/60, timeoutSec%60)
+	for i := 0; i < maxIterations; i++ {
 		time.Sleep(500 * time.Millisecond)
 		result, err := qmpCommand(conn, "query-migrate", nil)
 		if err != nil {

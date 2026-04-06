@@ -2527,8 +2527,8 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		return nil, fmt.Errorf("launching QEMU incoming: %w", err)
 	}
 
-	// Load saved state
-	if err := qmpLoadState(vmDir, statePath); err != nil {
+	// Load saved state (timeout scales with RAM)
+	if err := qmpLoadState(vmDir, statePath, st.RAMMIB); err != nil {
 		// Kill the QEMU process
 		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
 		TeardownTAP(st.TAP, st.Mark)
