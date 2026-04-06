@@ -23,6 +23,38 @@ export BOXCUTTER_BUNDLE="$BUNDLE_DIR"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 fail() { log "FAIL: $*"; exit 1; }
 
+# --- Phase 0: Cleanup from previous runs ---
+log "=== Phase 0: Cleanup ==="
+
+# Stop daemon (match exact binary, not our script name)
+pkill -f '/usr/local/bin/boxcutter-host run' 2>/dev/null || true
+sleep 2
+
+# Kill QEMU VMs (not runner)
+for pid in $(pgrep qemu-system 2>/dev/null); do
+  if ! cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ' | grep -q runner; then
+    kill -9 $pid 2>/dev/null || true
+  fi
+done
+sleep 1
+
+# Clean TAPs
+for tap in $(ip link show 2>/dev/null | grep -oP 'tap-\S+' | tr -d ':'); do
+  ip link del $tap 2>/dev/null || true
+done
+
+# Clean instance images (keep *-base.qcow2 and ubuntu*)
+find "$IMAGES_DIR" -maxdepth 1 -name '*.qcow2' ! -name '*-base.qcow2' -delete 2>/dev/null || true
+find "$IMAGES_DIR" -maxdepth 1 -name '*.iso' -delete 2>/dev/null || true
+find "$IMAGES_DIR" -maxdepth 1 -name '*.pid' -delete 2>/dev/null || true
+find "$IMAGES_DIR" -maxdepth 1 -name '*console.log' -delete 2>/dev/null || true
+rm -f /run/boxcutter-host.sock
+
+# Verify base images exist
+[ -f "$IMAGES_DIR/node-base.qcow2" ] || fail "node-base.qcow2 missing — run: boxcutter-host pull node"
+[ -f "$IMAGES_DIR/orchestrator-base.qcow2" ] || fail "orchestrator-base.qcow2 missing — run: boxcutter-host pull orchestrator"
+log "Cleanup done"
+
 # --- Phase 1: Provision cluster ---
 log "=== Phase 1: Provision cluster ==="
 
