@@ -296,12 +296,18 @@ func (s *State) NextNodeNum() int {
 	defer s.mu.RUnlock()
 	max := 0
 	for _, n := range s.Nodes {
-		// Extract number from "boxcutter-node-N"
-		var num int
-		if _, err := fmt.Sscanf(n.ID, "boxcutter-node-%d", &num); err == nil {
-			if num > max {
-				max = num
+		// Extract trailing number from node IDs like "boxcutter-node-1" or "boxcutter-dev-node-1"
+		id := n.ID
+		num := 0
+		// Find the last '-' and parse the number after it
+		for i := len(id) - 1; i >= 0; i-- {
+			if id[i] == '-' {
+				fmt.Sscanf(id[i+1:], "%d", &num)
+				break
 			}
+		}
+		if num > max {
+			max = num
 		}
 	}
 	return max + 1
