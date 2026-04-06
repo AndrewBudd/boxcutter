@@ -2575,18 +2575,14 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		sshKey := findClusterSSHKey(cfg)
 		if sshKey != "" {
 			// Change the VM's IP from temp (.105) to the original (.2)
-			// Write a script on the remote host, then execute it in background.
-			// The script adds the new IP, then removes the old one.
-			// It runs via nohup so it survives SSH disconnection.
-			script := fmt.Sprintf(`#!/bin/bash
-IFACE=$(ip -4 -o addr show | grep '%s' | awk '{print $2}')
-[ -z "$IFACE" ] && exit 1
-ip addr add %s/24 dev $IFACE
-ip addr del %s/24 dev $IFACE
-`, goal.NewOrchIP, oldBridgeIP, goal.NewOrchIP)
+			// Add the old IP as a secondary address on the orchestrator's interface.
+			// This lets nodes reach the orch at the original IP.
+			// We don't remove the temp IP — having both is fine.
+			addCmd := fmt.Sprintf("sudo ip addr add %s/24 dev $(ip -4 -o addr show | grep '%s' | awk '{print $2}')",
+				oldBridgeIP, goal.NewOrchIP)
 			exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
 				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP),
-				"sudo", "bash", "-c", fmt.Sprintf("cat > /tmp/swap-ip.sh << 'SWAPEOF'\n%sSWAPEOF\nchmod +x /tmp/swap-ip.sh && nohup /tmp/swap-ip.sh >/dev/null 2>&1 &", script)).Run()
+				"bash", "-c", addCmd).CombinedOutput()
 			// Wait for IP to take effect, then verify
 			time.Sleep(3 * time.Second)
 			if isOrchHealthy(oldBridgeIP) {
