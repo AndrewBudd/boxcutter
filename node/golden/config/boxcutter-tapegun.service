@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=dev
+Group=dev
 ExecStart=/usr/local/bin/boxcutter-tapegun
 Restart=always
 RestartSec=5

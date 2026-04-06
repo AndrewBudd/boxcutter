@@ -10,7 +10,6 @@ INBOX_FILE="${INBOX_DIR}/inbox.json"
 POLL_INTERVAL=5
 
 mkdir -p "$INBOX_DIR"
-chown 1000:1000 "$INBOX_DIR"
 
 # Wait for metadata service
 for i in $(seq 1 30); do
@@ -23,11 +22,8 @@ done
 
 echo "tapegun: daemon started (poll every ${POLL_INTERVAL}s)"
 
-# If running as root, tmux sessions belong to dev user
+# tmux command — runs as the dev user (service runs as User=dev)
 TMUX_CMD="tmux"
-if [ "$(id -u)" = "0" ] && id dev >/dev/null 2>&1; then
-    TMUX_CMD="sudo -u dev tmux"
-fi
 
 while true; do
     # --- Post activity ---
@@ -71,7 +67,7 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
         else
             echo "$MSGS" > "$INBOX_FILE"
         fi
-        chown 1000:1000 "$INBOX_FILE"
+        chmod 644 "$INBOX_FILE"
 
         # Inject send_keys messages into tmux
         if command -v jq >/dev/null 2>&1 && $TMUX_CMD has-session 2>/dev/null; then
