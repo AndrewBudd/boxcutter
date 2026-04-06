@@ -211,6 +211,10 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("ORCH_VCPU"); v != "" {
 		fmt.Sscanf(v, "%d", &orchVCPU)
 	}
+	minFreeMB := 8192
+	if v := os.Getenv("MIN_FREE_MEMORY_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &minFreeMB)
+	}
 
 	return HostConfig{
 		ClusterPrefix:      clusterPrefix,
@@ -239,7 +243,7 @@ func defaultConfig() HostConfig {
 		ScaleUpThresholdPct:  80,
 		ScaleDownThresholdPct: 30,
 		ScaleCooldown:        5 * time.Minute,
-		MinFreeMemoryMB:       8192,  // 8GB — never launch a node if host has less than this free
+		MinFreeMemoryMB:       minFreeMB,
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
 		MaxNodes:              0,     // 0 = no hard cap, limited only by host resources
