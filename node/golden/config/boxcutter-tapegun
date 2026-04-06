@@ -7,9 +7,59 @@
 METADATA="http://169.254.169.254"
 INBOX_DIR="/home/dev/.tapegun"
 INBOX_FILE="${INBOX_DIR}/inbox.json"
+CONFIG_FILE="${INBOX_DIR}/config"
 POLL_INTERVAL=5
 
 mkdir -p "$INBOX_DIR"
+
+# --- Auto-start Claude Code under tmux (opt-in via config) ---
+# Config file: /home/dev/.tapegun/config
+# AUTOSTART_CLAUDE=true
+# CLAUDE_FLAGS="--dangerously-skip-permissions"
+# CLAUDE_RESUME=false
+# CLAUDE_WORKING_DIR="/home/dev/project"
+AUTOSTART_CLAUDE=false
+CLAUDE_FLAGS="--dangerously-skip-permissions"
+CLAUDE_RESUME=false
+CLAUDE_WORKING_DIR=""
+
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+fi
+
+# Also check metadata labels for autostart config
+LABELS=$(curl -sf --max-time 2 "${METADATA}/identity" 2>/dev/null | jq -r '.labels // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
+if echo "$LABELS" | grep -q "tapegun.autostart=true"; then
+    AUTOSTART_CLAUDE=true
+fi
+if echo "$LABELS" | grep -q "tapegun.resume=true"; then
+    CLAUDE_RESUME=true
+fi
+
+if [ "$AUTOSTART_CLAUDE" = "true" ]; then
+    echo "tapegun: auto-starting Claude Code under tmux"
+
+    # Create tmux session if not exists
+    if ! tmux has-session -t main 2>/dev/null; then
+        tmux new-session -d -s main
+        sleep 1
+
+        # Change to working directory if specified
+        if [ -n "$CLAUDE_WORKING_DIR" ] && [ -d "$CLAUDE_WORKING_DIR" ]; then
+            tmux send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
+            sleep 0.5
+        fi
+
+        # Start Claude Code
+        CLAUDE_CMD="claude"
+        [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+        [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
+        tmux send-keys -t main "$CLAUDE_CMD" Enter
+        echo "tapegun: Claude Code started (flags: $CLAUDE_FLAGS, resume: $CLAUDE_RESUME)"
+    else
+        echo "tapegun: tmux session 'main' already exists, skipping autostart"
+    fi
+fi
 
 # Wait for metadata service
 for i in $(seq 1 30); do
