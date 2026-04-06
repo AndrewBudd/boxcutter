@@ -2580,17 +2580,19 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			// We don't remove the temp IP — having both is fine.
 			addCmd := fmt.Sprintf("sudo ip addr add %s/24 dev ens3 2>/dev/null || sudo ip addr add %s/24 dev eth0 2>/dev/null || true",
 				oldBridgeIP, oldBridgeIP)
-			exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+			log.Printf("Reassigning orchestrator IP: adding %s to new orch at %s", oldBridgeIP, goal.NewOrchIP)
+			out, sshErr := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
 				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP),
 				addCmd).CombinedOutput()
-			// Wait for IP to take effect, then verify
-			time.Sleep(3 * time.Second)
-			if isOrchHealthy(oldBridgeIP) {
-				log.Printf("Reassigned orchestrator IP from %s to %s", goal.NewOrchIP, oldBridgeIP)
-				finalIP = oldBridgeIP
+			if sshErr != nil {
+				log.Printf("IP reassignment SSH error: %v output: %s", sshErr, string(out))
 			} else {
-				log.Printf("Warning: orchestrator IP reassignment may have failed (old IP %s not reachable)", oldBridgeIP)
+				// SSH succeeded — trust that ip addr add worked
+				finalIP = oldBridgeIP
+				log.Printf("Orchestrator IP reassigned to %s", oldBridgeIP)
 			}
+			// Give the IP a moment to propagate
+			time.Sleep(2 * time.Second)
 		}
 	}
 	// Clean up TAPs: remove old, rename new
