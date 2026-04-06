@@ -2838,6 +2838,16 @@ func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
 	if len(cleaned) > 0 {
 		state.Save()
 	}
+
+	// Reset any draining/upgrading nodes back to active
+	for _, n := range state.Nodes {
+		if n.Status == "draining" || n.Status == "upgrading" {
+			log.Printf("Resetting node %s from '%s' to 'active'", n.ID, n.Status)
+			state.SetNodeStatus(n.ID, "active")
+		}
+	}
+	state.Save()
+
 	return cleaned
 }
 
