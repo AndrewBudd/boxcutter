@@ -224,12 +224,29 @@ for n in d.get('nodes',[]):
     print(f'Node {n[\"id\"]}: healthy={n.get(\"service_healthy\")} vms={h.get(\"vms_running\",0)} golden={h.get(\"golden_ready\",False)}')
 "
 
-# Verify VM survived migration
-VM_COUNT=$(ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@192.168.50.2 "list" 2>/dev/null | grep -c "running" || echo 0)
+# Get orchestrator IP from daemon (may have changed during upgrade)
+ORCH_IP=$(curl -sf --unix-socket /run/boxcutter-host.sock http://localhost/status | \
+  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('orchestrator',{}).get('bridge_ip','192.168.50.2'))" 2>/dev/null)
+log "Orchestrator at $ORCH_IP"
+
+# Wait for SSH on new orchestrator
+log "Waiting for orchestrator SSH..."
+for i in $(seq 1 30); do
+  ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "help" >/dev/null 2>&1 && break
+  sleep 10
+done
+
+# Wait for orchestrator to discover VMs from nodes (health poll every 30s)
+log "Waiting for VM discovery..."
+for i in $(seq 1 12); do
+  VM_COUNT=$(ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "list" 2>/dev/null | grep -c "running" || echo 0)
+  [ "$VM_COUNT" -gt 0 ] && break
+  sleep 10
+done
 [ "$VM_COUNT" -gt 0 ] || fail "VMs lost during upgrade!"
 log "VMs survived upgrade: ${VM_COUNT} running"
 
-ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@192.168.50.2 "list"
+ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "list"
 
 log ""
 log "========================================="
