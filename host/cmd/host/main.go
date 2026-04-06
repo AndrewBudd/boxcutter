@@ -1285,10 +1285,11 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 		return fmt.Errorf("no cluster SSH key found")
 	}
 
-	// Build the binary from source
+	// Build the binary from source (skip if source not available — deb/image installs have binaries baked in)
 	agentDir := filepath.Join(cfg.RepoDir, "node", "agent")
 	if _, err := os.Stat(agentDir); err != nil {
-		return fmt.Errorf("agent source not found at %s", agentDir)
+		log.Printf("Deploy %s: skipping (agent source not at %s — node image has binaries baked in)", nodeID, agentDir)
+		return nil
 	}
 
 	tmpBin := filepath.Join(os.TempDir(), fmt.Sprintf("boxcutter-node-%s", nodeID))
