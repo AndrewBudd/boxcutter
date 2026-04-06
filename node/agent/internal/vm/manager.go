@@ -553,6 +553,9 @@ type ExecResult struct {
 }
 
 func (m *Manager) Exec(name string, command string) (*ExecResult, error) {
+	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+		return nil, fmt.Errorf("VM '%s' is being migrated", name)
+	}
 	st, status, err := m.Get(name)
 	if err != nil {
 		return nil, err
@@ -575,6 +578,9 @@ func (m *Manager) Exec(name string, command string) (*ExecResult, error) {
 
 // CopyToVM streams data from reader into a file on the VM.
 func (m *Manager) CopyToVM(name string, dstPath string, src io.Reader) error {
+	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+		return fmt.Errorf("VM '%s' is being migrated", name)
+	}
 	st, status, err := m.Get(name)
 	if err != nil {
 		return err
@@ -597,6 +603,9 @@ func (m *Manager) CopyToVM(name string, dstPath string, src io.Reader) error {
 
 // CopyFromVM streams a file from the VM to the writer.
 func (m *Manager) CopyFromVM(name string, srcPath string, dst io.Writer) error {
+	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+		return fmt.Errorf("VM '%s' is being migrated", name)
+	}
 	st, status, err := m.Get(name)
 	if err != nil {
 		return err
@@ -1717,6 +1726,9 @@ func (m *Manager) ListProjects(name string) ([]string, error) {
 }
 
 func (m *Manager) ExportVM(name string) (string, *VMState, error) {
+	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+		return "", nil, fmt.Errorf("VM '%s' is being migrated", name)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1747,6 +1759,9 @@ func (m *Manager) ExportVM(name string) (string, *VMState, error) {
 // CopyVM creates a new VM by copying an existing VM's disk.
 // The source VM is stopped during the copy, then restarted.
 func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*CreateResponse, error) {
+	if m.IsMigratingVM(srcName) || IsMigrating(VMDir(srcName)) {
+		return nil, fmt.Errorf("VM '%s' is being migrated", srcName)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

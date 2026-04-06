@@ -177,6 +177,10 @@ func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = extractName(r.URL.Path, "/api/vms/")
 	}
+	if h.mgr.IsMigratingVM(name) || vm.IsMigrating(vm.VMDir(name)) {
+		http.Error(w, fmt.Sprintf("VM '%s' is being migrated", name), http.StatusConflict)
+		return
+	}
 
 	var req struct {
 		Description *string `json:"description,omitempty"`
