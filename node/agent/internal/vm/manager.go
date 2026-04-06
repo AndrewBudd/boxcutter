@@ -1967,6 +1967,10 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return m.relocateStoppedVM(name, st, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey)
 	}
 
+	hostname, _ := os.Hostname()
+	telem := NewMigrationTelemetry(name, hostname, targetBridgeIP, "firecracker", st.RAMMIB)
+	defer telem.Write(vmDir)
+
 	fileRootfs := IsFileRootfs(vmDir)
 	var diskName string
 	if fileRootfs {
@@ -2053,9 +2057,8 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return nil, fmt.Errorf("prep target: %s: %w", string(out), err)
 	}
 
-	// Pre-sync disk using tar --sparse. This uses SEEK_DATA/SEEK_HOLE to read
-	// only allocated blocks, not the full sparse file. For a 50GB sparse file
-	// with 6.5GB actual data, this reads 6.5GB instead of 50GB (~7x faster).
+	// Pre-sync disk using tar --sparse.
+	telem.StartPhase("pre-sync")
 	preSyncStart := time.Now()
 	log.Printf("Migrating %s: pre-syncing %s with tar --sparse", name, diskName)
 	preSyncCmd := exec.Command("bash", "-c", fmt.Sprintf(
@@ -2065,6 +2068,12 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		cleanTarget() // clean up mkdir + any partial pre-sync files on target
 		return nil, fmt.Errorf("pre-sync disk transfer failed (aborting migration): %s: %w", string(out), err)
 	}
+	diskInfo, _ := os.Stat(filepath.Join(vmDir, diskName))
+	preSyncBytes := int64(0)
+	if diskInfo != nil {
+		preSyncBytes = diskInfo.Size()
+	}
+	telem.EndPhase("pre-sync", preSyncBytes)
 	log.Printf("Migrating %s: pre-sync completed in %s (phase 1 total: %s)",
 		name, time.Since(preSyncStart).Round(time.Millisecond), time.Since(phase1Start).Round(time.Millisecond))
 
@@ -2082,12 +2091,16 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	}
 
 	// --- Phase 2: Pause + Snapshot + delta transfer (downtime starts) ---
+	telem.StartPhase("pause")
 	downtimeStart := time.Now()
 	log.Printf("Migrating %s: pausing VM (downtime starts)", name)
 	if err := fcPause(vmDir); err != nil {
-		cleanTarget() // clean up pre-synced files on target
+		telem.FailPhase("pause", err)
+		telem.Fail(err)
+		cleanTarget()
 		return nil, fmt.Errorf("pause: %w", err)
 	}
+	telem.EndPhase("pause", 0)
 	log.Printf("Migrating %s: VM paused in %s", name, time.Since(downtimeStart).Round(time.Millisecond))
 
 	// From here on, any error must resume the source VM — but only after
@@ -2143,19 +2156,28 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// is rare because rollback resumes the VM, resetting KVM tracking.
 
 	// Snapshot to regular files (Firecracker requires truncatable mem file, not FIFO)
+	telem.StartPhase("snapshot")
 	snapStart := time.Now()
 	snapPath, memPath, err := fcSnapshot(vmDir)
 	if err != nil {
+		telem.FailPhase("snapshot", err)
+		telem.Fail(err)
 		rollback("snapshot failed: " + err.Error())
 		return nil, fmt.Errorf("snapshot: %w", err)
 	}
-	log.Printf("Migrating %s: snapshot created in %s", name, time.Since(snapStart).Round(time.Millisecond))
 
 	memInfo, _ := os.Stat(memPath)
 	memSize := int64(0)
 	if memInfo != nil {
 		memSize = memInfo.Size()
 	}
+	snapInfo, _ := os.Stat(snapPath)
+	snapSize := int64(0)
+	if snapInfo != nil {
+		snapSize = snapInfo.Size()
+	}
+	telem.EndPhase("snapshot", memSize+snapSize)
+	log.Printf("Migrating %s: snapshot created in %s", name, time.Since(snapStart).Round(time.Millisecond))
 
 	// Transfer mem + snap after pause. Disk delta is skipped because:
 	// 1. Pre-sync already transferred all allocated blocks
@@ -2204,6 +2226,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// head-of-line blocking that occurs when parallel transfers share a multiplexed connection.
 
 	// vm.snap first (tiny, a few KB)
+	telem.StartPhase("transfer")
 	snapXferStart := time.Now()
 	snapCmd := exec.Command("bash", "-c", fmt.Sprintf(
 		"cat %s | %s ubuntu@%s 'sudo tee %s/vm.snap > /dev/null'",
@@ -2224,9 +2247,11 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return nil, fmt.Errorf("mem transfer: %w", err)
 	}
 	log.Printf("Migrating %s: mem transfer completed in %s", name, time.Since(memStart).Round(time.Millisecond))
+	telem.EndPhase("transfer", memSize+snapSize)
 	log.Printf("Migrating %s: all transfers completed in %s", name, time.Since(xferStart).Round(time.Millisecond))
 
 	// --- Resume on target (import-snapshot) ---
+	telem.StartPhase("import")
 	importStart := time.Now()
 	log.Printf("Migrating %s: resuming on target %s", name, targetAddr)
 	stJSON, _ := json.Marshal(st)
@@ -2247,9 +2272,11 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	var importResp CreateResponse
 	json.Unmarshal(body, &importResp)
+	telem.EndPhase("import", 0)
 	log.Printf("Migrating %s: import-snapshot completed in %s", name, time.Since(importStart).Round(time.Millisecond))
 
 	// --- Phase 3: Verify target is healthy before committing ---
+	telem.StartPhase("verify")
 	verifyStart := time.Now()
 	log.Printf("Migrating %s: verifying target is healthy...", name)
 	targetHealthy := false
@@ -2276,10 +2303,12 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		targetClient.Do(destroyReq)
 		return nil, fmt.Errorf("target VM not healthy — rolled back to source")
 	}
+	telem.EndPhase("verify", 0)
 	log.Printf("Migrating %s: target verified healthy in %s", name, time.Since(verifyStart).Round(time.Millisecond))
 
 	// --- Target confirmed healthy — commit: stop source, cleanup ---
 	downtime := time.Since(downtimeStart)
+	telem.Complete(downtime.Milliseconds())
 	log.Printf("Migration complete: %s → %s | mem=%dMB | downtime=%s | phase1=%s | transfers=%s | verify=%s",
 		name, targetAddr, memSize/1024/1024,
 		downtime.Round(time.Millisecond),
