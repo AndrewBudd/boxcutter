@@ -236,14 +236,17 @@ for i in $(seq 1 30); do
   sleep 10
 done
 
-# Wait for orchestrator to discover VMs from nodes (health poll every 30s)
-log "Waiting for VM discovery..."
-for i in $(seq 1 12); do
-  VM_COUNT=$(ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "list" 2>/dev/null | grep -c "running" || echo 0)
-  [ "$VM_COUNT" -gt 0 ] && break
-  sleep 10
+# Wait for node re-registration and VM discovery
+# After orch upgrade, nodes need time to reconnect (heartbeat interval 30s, may need several cycles)
+log "Waiting for VM discovery (node re-registration may take 1-3 min)..."
+VM_COUNT=0
+for i in $(seq 1 36); do
+  VM_COUNT=$(ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "list" 2>/dev/null | tail -n +2 | grep -c "running" || true)
+  [ "$VM_COUNT" -gt 0 ] 2>/dev/null && break
+  [ $((i % 6)) -eq 0 ] && log "  Still waiting for VMs... ($((i*5))s)"
+  sleep 5
 done
-[ "$VM_COUNT" -gt 0 ] || fail "VMs lost during upgrade!"
+[ "$VM_COUNT" -gt 0 ] 2>/dev/null || fail "VMs lost during upgrade!"
 log "VMs survived upgrade: ${VM_COUNT} running"
 
 ssh -i "$SSH_KEY" $SSH_OPTS boxcutter@"$ORCH_IP" "list"
