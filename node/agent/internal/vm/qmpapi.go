@@ -314,10 +314,20 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 
 	log.Printf("Launching QEMU VM %s (incoming migration mode)", st.Name)
 
+	// Capture stderr to a log file for migration diagnostics
+	stderrLog, _ := os.Create(filepath.Join(vmDir, "qemu-incoming.log"))
+
 	cmd := exec.Command("qemu-system-x86_64", args...)
-	out, err := cmd.CombinedOutput()
+	if stderrLog != nil {
+		cmd.Stderr = stderrLog
+	}
+	out, err := cmd.Output()
+	if stderrLog != nil {
+		stderrLog.Close()
+	}
 	if err != nil {
-		return 0, fmt.Errorf("qemu-system-x86_64 incoming: %s: %w", strings.TrimSpace(string(out)), err)
+		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
+		return 0, fmt.Errorf("qemu-system-x86_64 incoming: %s %s: %w", strings.TrimSpace(string(out)), strings.TrimSpace(string(stderrContent)), err)
 	}
 
 	// Wait for PID file
@@ -371,9 +381,21 @@ func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 	}
 	timeoutSec := maxIterations / 2
 	log.Printf("qmpLoadState: loading %s (timeout %dm%ds)", statePath, timeoutSec/60, timeoutSec%60)
+	lastQMPLog := time.Now()
 	for i := 0; i < maxIterations; i++ {
 		time.Sleep(500 * time.Millisecond)
 		result, err := qmpCommand(conn, "query-migrate", nil)
+
+		// Log QMP response every 30s for diagnostics
+		if time.Since(lastQMPLog) >= 30*time.Second {
+			elapsed := time.Duration(i) * 500 * time.Millisecond
+			if result != nil {
+				log.Printf("qmpLoadState: progress at %s: %s", elapsed.Round(time.Second), string(result))
+			} else {
+				log.Printf("qmpLoadState: polling at %s (no response)", elapsed.Round(time.Second))
+			}
+			lastQMPLog = time.Now()
+		}
 		if err != nil {
 			// After successful load, query-migrate may return empty
 			// Check if VM is running

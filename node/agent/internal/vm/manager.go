@@ -2316,6 +2316,10 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 // Flow: pre-sync disk → pause → save state → transfer state → restore on target → verify.
 func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBridgeIP string) (*MigrateResponse, error) {
 	vmDir := VMDir(name)
+	hostname, _ := os.Hostname()
+	telem := NewMigrationTelemetry(name, hostname, targetBridgeIP, "qemu", st.RAMMIB)
+	defer telem.Write(vmDir) // always write telemetry, even on failure
+
 	m.exportMailboxToFile(name, vmDir)
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
 	dstVMDir := fmt.Sprintf("/var/lib/boxcutter/vms/%s/", name)
@@ -2347,24 +2351,32 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	}
 
 	// Phase 1: Pre-sync rootfs while VM is running (zero downtime)
-	log.Printf("Migrating QEMU %s: pre-syncing %s with tar --sparse", name, diskName)
-	preSyncStart := time.Now()
+	telem.StartPhase("pre-sync")
+	diskInfo, _ := os.Stat(filepath.Join(vmDir, diskName))
+	diskBytes := int64(0)
+	if diskInfo != nil {
+		diskBytes = diskInfo.Size()
+	}
 	preSyncCmd := exec.Command("bash", "-c", fmt.Sprintf(
 		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := preSyncCmd.CombinedOutput(); err != nil {
+		telem.FailPhase("pre-sync", fmt.Errorf("%s: %w", string(out), err))
+		telem.Fail(err)
 		return nil, fmt.Errorf("pre-sync disk: %s: %w", string(out), err)
 	}
-	log.Printf("Migrating QEMU %s: pre-sync completed in %s", name, time.Since(preSyncStart).Round(time.Millisecond))
+	telem.EndPhase("pre-sync", diskBytes)
 
 	// Phase 2: Pause + Save state (downtime starts)
-	log.Printf("Migrating QEMU %s: pausing VM (downtime starts)", name)
+	telem.StartPhase("pause")
 	downtimeStart := time.Now()
 
 	if err := qmpStop(vmDir); err != nil {
+		telem.FailPhase("pause", err)
+		telem.Fail(err)
 		return nil, fmt.Errorf("qmp stop: %w", err)
 	}
-	log.Printf("Migrating QEMU %s: VM paused in %s", name, time.Since(downtimeStart).Round(time.Millisecond))
+	telem.EndPhase("pause", 0)
 
 	// Rollback function
 	rollback := func(reason string) {
@@ -2382,9 +2394,11 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	}
 
 	// Save state
-	snapStart := time.Now()
+	telem.StartPhase("state-save")
 	statePath, err := qmpSaveState(vmDir)
 	if err != nil {
+		telem.FailPhase("state-save", err)
+		telem.Fail(err)
 		rollback("state save failed: " + err.Error())
 		return nil, fmt.Errorf("qmp save state: %w", err)
 	}
@@ -2393,20 +2407,21 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	if stateInfo != nil {
 		stateSize = stateInfo.Size()
 	}
-	log.Printf("Migrating QEMU %s: state saved in %s (%dMB)", name,
-		time.Since(snapStart).Round(time.Millisecond), stateSize/1024/1024)
+	telem.EndPhase("state-save", stateSize)
 
 	// Transfer state file
-	xferStart := time.Now()
+	telem.StartPhase("state-transfer")
 	dstStatePath := filepath.Join(dstVMDir, "qemu-state.bin")
 	xferCmd := exec.Command("bash", "-c", fmt.Sprintf(
 		"dd if=%s bs=4M 2>/dev/null | %s ubuntu@%s 'sudo dd of=%s bs=4M'",
 		statePath, sshOpts, targetBridgeIP, dstStatePath))
 	if out, err := xferCmd.CombinedOutput(); err != nil {
+		telem.FailPhase("state-transfer", fmt.Errorf("%s: %w", string(out), err))
+		telem.Fail(err)
 		rollback("state transfer failed: " + string(out) + ": " + err.Error())
 		return nil, fmt.Errorf("state transfer: %w", err)
 	}
-	log.Printf("Migrating QEMU %s: state transferred in %s", name, time.Since(xferStart).Round(time.Millisecond))
+	telem.EndPhase("state-transfer", stateSize)
 
 	// Transfer vm.json
 	vmJsonCmd := exec.Command("bash", "-c", fmt.Sprintf(
@@ -2415,8 +2430,7 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	vmJsonCmd.Run()
 
 	// Phase 3: Import on target
-	log.Printf("Migrating QEMU %s: restoring on target %s", name, targetAddr)
-	importStart := time.Now()
+	telem.StartPhase("state-load")
 
 	importBody := map[string]interface{}{
 		"state_path": dstStatePath,
@@ -2435,21 +2449,29 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 
 	if importResp.StatusCode >= 300 {
 		errMsg := strings.TrimSpace(string(importBody2))
+		importErr := fmt.Errorf("import failed: HTTP %d: %s", importResp.StatusCode, errMsg)
+		telem.FailPhase("state-load", importErr)
+		telem.Fail(importErr)
 		rollback(fmt.Sprintf("import returned %d: %s", importResp.StatusCode, errMsg))
-		return nil, fmt.Errorf("import failed: HTTP %d", importResp.StatusCode)
+		return nil, importErr
 	}
-	log.Printf("Migrating QEMU %s: import completed in %s", name, time.Since(importStart).Round(time.Millisecond))
+	telem.EndPhase("state-load", stateSize)
 
 	// Verify target is healthy
+	telem.StartPhase("verify")
 	verifyClient := &http.Client{Timeout: 5 * time.Second}
 	verifyResp, err := verifyClient.Get(fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name))
 	if err != nil {
+		telem.FailPhase("verify", err)
+		telem.Fail(err)
 		rollback("verify failed: " + err.Error())
 		return nil, fmt.Errorf("verify: %w", err)
 	}
 	verifyResp.Body.Close()
+	telem.EndPhase("verify", 0)
 
 	downtime := time.Since(downtimeStart)
+	telem.Complete(downtime.Milliseconds())
 	log.Printf("Migration complete: QEMU %s → %s | ram=%dMB | downtime=%s",
 		name, targetAddr, st.RAMMIB, downtime.Round(time.Millisecond))
 
@@ -2600,20 +2622,50 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		return nil, fmt.Errorf("setting up TAP: %w", err)
 	}
 
-	// Launch QEMU in incoming mode
+	// Launch QEMU in incoming mode (capture stderr for telemetry)
 	pid, err := launchQEMUIncoming(vmDir, st)
 	if err != nil {
 		TeardownTAP(st.TAP, st.Mark)
 		return nil, fmt.Errorf("launching QEMU incoming: %w", err)
 	}
 
+	// Capture resource snapshot before state load
+	hostname, _ := os.Hostname()
+	targetTelem := NewMigrationTelemetry(name, "source", hostname, "qemu", st.RAMMIB)
+	targetTelem.AddResource(CaptureNodeResources(pid))
+	targetTelem.StartPhase("state-load")
+
 	// Load saved state (timeout scales with RAM)
 	if err := qmpLoadState(vmDir, statePath, st.RAMMIB); err != nil {
+		targetTelem.FailPhase("state-load", err)
+		targetTelem.AddResource(CaptureNodeResources(pid)) // snapshot at failure
+		// Capture QEMU stderr if available
+		if stderrData, readErr := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log")); readErr == nil {
+			targetTelem.SetQEMUStderr(string(stderrData))
+		}
+		// Check dmesg for OOM
+		if dmesgOut, dmesgErr := exec.Command("dmesg", "--since", "5 minutes ago").Output(); dmesgErr == nil {
+			oomLines := ""
+			for _, line := range strings.Split(string(dmesgOut), "\n") {
+				if strings.Contains(line, "oom") || strings.Contains(line, "OOM") || strings.Contains(line, "Killed process") {
+					oomLines += line + "\n"
+				}
+			}
+			if oomLines != "" {
+				targetTelem.SetDmesgErrors(oomLines)
+			}
+		}
+		targetTelem.Fail(err)
+		targetTelem.Write(vmDir)
 		// Kill the QEMU process
 		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
 		TeardownTAP(st.TAP, st.Mark)
 		return nil, fmt.Errorf("loading state: %w", err)
 	}
+	targetTelem.EndPhase("state-load", 0)
+	targetTelem.AddResource(CaptureNodeResources(pid)) // snapshot after success
+	targetTelem.Complete(0)
+	targetTelem.Write(vmDir)
 
 	log.Printf("QEMU VM %s imported and resumed (PID %d)", name, pid)
 
