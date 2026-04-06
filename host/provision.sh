@@ -184,6 +184,15 @@ build_node() {
     echo "Warning: custom kernel not found at ${REPO_DIR}/kernel/vmlinux — will fall back to S3 download"
   fi
 
+  # Ensure cluster SSH pubkey is in authorized-keys (vmid serves this to VMs,
+  # needed for exec, cp-to, cp-from, Tailscale join via node agent SSH)
+  if [ -f "${BUNDLE_DIR}/secrets/cluster-ssh.key.pub" ]; then
+    touch "${PD}/bundle/secrets/authorized-keys"
+    if ! grep -qF "$(cat "${BUNDLE_DIR}/secrets/cluster-ssh.key.pub")" "${PD}/bundle/secrets/authorized-keys" 2>/dev/null; then
+      cat "${BUNDLE_DIR}/secrets/cluster-ssh.key.pub" >> "${PD}/bundle/secrets/authorized-keys"
+    fi
+  fi
+
   # Template node-specific values into boxcutter.yaml
   sed -e "s|BRIDGE_IP_PLACEHOLDER|${THIS_NODE_IP}|g" \
       -e "s|ORCHESTRATOR_URL_PLACEHOLDER|http://${ORCH_IP}:8801|g" \
@@ -341,6 +350,9 @@ write_files:
         # Add cluster pubkey to ubuntu's authorized_keys
         if [ -f /etc/boxcutter/secrets/cluster-ssh.key.pub ]; then
           cat /etc/boxcutter/secrets/cluster-ssh.key.pub >> /home/ubuntu/.ssh/authorized_keys
+          # Also add to vmid authorized-keys so VMs accept node agent SSH (exec, cp-to, cp-from)
+          grep -qF "\$(cat /etc/boxcutter/secrets/cluster-ssh.key.pub)" /etc/boxcutter/secrets/authorized-keys 2>/dev/null || \
+            cat /etc/boxcutter/secrets/cluster-ssh.key.pub >> /etc/boxcutter/secrets/authorized-keys
         fi
       fi
 
@@ -744,6 +756,9 @@ done)
           CLUSTER_PUB=\$(cat /etc/boxcutter/secrets/cluster-ssh.key.pub)
           grep -qF "\$CLUSTER_PUB" /home/ubuntu/.ssh/authorized_keys 2>/dev/null || \
             echo "\$CLUSTER_PUB" >> /home/ubuntu/.ssh/authorized_keys
+          # Also add to vmid authorized-keys so VMs accept node agent SSH (exec, cp-to, cp-from)
+          grep -qF "\$CLUSTER_PUB" /etc/boxcutter/secrets/authorized-keys 2>/dev/null || \
+            echo "\$CLUSTER_PUB" >> /etc/boxcutter/secrets/authorized-keys
         fi
       fi
 
