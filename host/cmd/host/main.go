@@ -2627,6 +2627,20 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		os.Remove(oldDisk)
 	}
 
+	// Restart node agents so they re-register with the new orchestrator.
+	// After orch upgrade, nodes may have backed off their heartbeat timer.
+	sshKey2 := findClusterSSHKey(cfg)
+	if sshKey2 != "" {
+		for _, n := range state.Nodes {
+			go func(nodeIP string) {
+				exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+					"-o", "ConnectTimeout=10", "-i", sshKey2, fmt.Sprintf("ubuntu@%s", nodeIP),
+					"sudo systemctl restart boxcutter-node").Run()
+				log.Printf("Restarted node agent on %s for re-registration", nodeIP)
+			}(n.BridgeIP)
+		}
+	}
+
 	return true, fmt.Sprintf("Orchestrator upgraded (PID %d)", newPID), nil
 }
 
