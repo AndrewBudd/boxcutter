@@ -24,7 +24,9 @@ jobs:
         vm_type: [node, orchestrator]
     steps:
       - name: Clean workspace
-        run: sudo rm -rf "$GITHUB_WORKSPACE"/.images 2>/dev/null || true
+        run: |
+          sudo pkill -f 'qemu.*build-' 2>/dev/null || true
+          sudo rm -rf "$GITHUB_WORKSPACE"/.images 2>/dev/null || true
 
       - uses: actions/checkout@v4
 
@@ -44,7 +46,9 @@ jobs:
           fi
 
       - name: Set up bridge network
-        run: sudo bash host/setup.sh
+        run: |
+          sudo ip link del tap-build 2>/dev/null || true
+          sudo bash host/setup.sh
 
       - name: Build image
         run: sudo env PATH="/usr/local/go/bin:$PATH" bash host/build-image.sh ${{ matrix.vm_type }}
