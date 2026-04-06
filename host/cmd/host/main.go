@@ -314,6 +314,10 @@ func main() {
 		cliPushGolden()
 	case "cleanup-nodes":
 		cliCleanupNodes()
+	case "stop-node":
+		cliStopNode()
+	case "remove-node":
+		cliRemoveNode()
 	case "recover":
 		cliRecover()
 	case "self-update":
@@ -448,17 +452,24 @@ func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
 			if state.Orchestrator != nil && qemu.IsRunning(state.Orchestrator.PID) {
 				continue // already have a running orchestrator
 			}
-			log.Printf("  Discovered orphaned orchestrator (PID %d, disk %s)", pid, vmEntry.Disk)
+			log.Printf("  Discovered orphaned orchestrator (PID %d, disk %s) — recovering", pid, vmEntry.Disk)
 			state.SetOrchestrator(*vmEntry)
 			discovered++
 		} else if vmEntry.Type == "node" {
 			existing := state.GetNode(vmEntry.ID)
 			if existing != nil && qemu.IsRunning(existing.PID) {
-				continue
+				continue // already tracked and running
 			}
-			log.Printf("  Discovered orphaned node %s (PID %d, disk %s)", vmEntry.ID, pid, vmEntry.Disk)
-			state.AddNode(*vmEntry)
-			discovered++
+			if existing != nil {
+				// Entry exists but PID changed — update it
+				log.Printf("  Discovered orphaned node %s (PID %d, disk %s) — recovering", vmEntry.ID, pid, vmEntry.Disk)
+				state.AddNode(*vmEntry)
+				discovered++
+			} else {
+				// Unknown QEMU process not in cluster state — kill it (ghost from failed cleanup)
+				log.Printf("  Found unknown QEMU process %s (PID %d) not in cluster state — killing ghost", vmEntry.ID, pid)
+				qemu.Stop(vmEntry.ID, pid)
+			}
 		}
 	}
 
@@ -2341,6 +2352,97 @@ func cliCleanupNodes() {
 	}
 }
 
+// cliStopNode stops a specific node's QEMU process and removes it from cluster state.
+func cliStopNode() {
+	cfg := defaultConfig()
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: boxcutter-host stop-node <node-id>")
+		os.Exit(1)
+	}
+	nodeID := os.Args[2]
+
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		os.Exit(1)
+	}
+
+	node := state.GetNode(nodeID)
+	if node == nil {
+		fmt.Fprintf(os.Stderr, "Node '%s' not found in cluster state\n", nodeID)
+		os.Exit(1)
+	}
+
+	// Check for VMs unless --force
+	force := len(os.Args) > 3 && os.Args[3] == "--force"
+	if !force {
+		nodeClient := &http.Client{Timeout: 5 * time.Second}
+		resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/vms", node.BridgeIP))
+		if err == nil {
+			var vms []interface{}
+			json.NewDecoder(resp.Body).Decode(&vms)
+			resp.Body.Close()
+			if len(vms) > 0 {
+				fmt.Fprintf(os.Stderr, "Node '%s' has %d running VM(s). Use --force to stop anyway.\n", nodeID, len(vms))
+				os.Exit(1)
+			}
+		}
+	}
+
+	// Kill QEMU
+	if qemu.IsRunning(node.PID) {
+		fmt.Printf("Stopping %s (PID %d)...\n", nodeID, node.PID)
+		qemu.Stop(nodeID, node.PID)
+	}
+
+	// Clean up TAP
+	if node.TAP != "" {
+		bridge.DeleteTAP(node.TAP)
+	}
+
+	// Remove from state
+	state.RemoveNode(nodeID)
+	state.Save()
+	fmt.Printf("Node '%s' stopped and removed.\n", nodeID)
+}
+
+// cliRemoveNode removes a node from cluster state (without stopping QEMU — for ghost entries).
+func cliRemoveNode() {
+	cfg := defaultConfig()
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: boxcutter-host remove-node <node-id>")
+		os.Exit(1)
+	}
+	nodeID := os.Args[2]
+
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		os.Exit(1)
+	}
+
+	node := state.GetNode(nodeID)
+	if node == nil {
+		fmt.Fprintf(os.Stderr, "Node '%s' not found in cluster state\n", nodeID)
+		os.Exit(1)
+	}
+
+	// Also kill QEMU if running
+	if qemu.IsRunning(node.PID) {
+		fmt.Printf("Killing QEMU process (PID %d)...\n", node.PID)
+		qemu.Stop(nodeID, node.PID)
+	}
+
+	// Clean up TAP
+	if node.TAP != "" {
+		bridge.DeleteTAP(node.TAP)
+	}
+
+	state.RemoveNode(nodeID)
+	state.Save()
+	fmt.Printf("Node '%s' removed from cluster state.\n", nodeID)
+}
+
 // cliUpgradeCancel cancels a running upgrade via the daemon API.
 func cliUpgradeCancel(cfg HostConfig) {
 	sockClient := &http.Client{
@@ -2527,6 +2629,13 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 
 	// Is there a node marked as upgrading (needs to be drained)?
 	if n := state.FindNodeWithStatus("upgrading"); n != nil {
+		// Deploy latest node agent to the OLD node before draining.
+		// The old node runs the migration — it needs the new binary
+		// (e.g., native live migration code) to migrate large VMs.
+		if err := deployNodeBinary(cfg, n.BridgeIP, n.ID); err != nil {
+			log.Printf("Pre-drain deploy to %s: %v (continuing with existing binary)", n.ID, err)
+		}
+
 		state.SetNodeStatus(n.ID, "draining")
 		state.Save()
 		drainNode(cfg, state, n.ID)
