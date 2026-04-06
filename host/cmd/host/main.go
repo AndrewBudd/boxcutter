@@ -312,6 +312,8 @@ func main() {
 		cliBuildImage()
 	case "push-golden":
 		cliPushGolden()
+	case "cleanup-nodes":
+		cliCleanupNodes()
 	case "recover":
 		cliRecover()
 	case "self-update":
@@ -2319,6 +2321,26 @@ func cliUpgrade() {
 	}
 }
 
+// cliCleanupNodes removes all nodes with 0 VMs (orphans from failed upgrades).
+func cliCleanupNodes() {
+	cfg := defaultConfig()
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		os.Exit(1)
+	}
+
+	cleaned := cleanupOrphanNodes(cfg, state)
+	if len(cleaned) == 0 {
+		fmt.Println("No orphan nodes found (all nodes have VMs).")
+		return
+	}
+	fmt.Printf("Cleaned up %d orphan node(s):\n", len(cleaned))
+	for _, id := range cleaned {
+		fmt.Printf("  - %s\n", id)
+	}
+}
+
 // cliUpgradeCancel cancels a running upgrade via the daemon API.
 func cliUpgradeCancel(cfg HostConfig) {
 	sockClient := &http.Client{
@@ -2805,41 +2827,71 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 
 // cleanupOrphanNodes stops and removes nodes that were launched as replacements
 // during an upgrade but never received any VMs. Returns list of cleaned node IDs.
+// cleanupOrphanNodes stops and removes ALL nodes with 0 VMs, except one
+// (we always keep at least one node). Also resets draining/upgrading status.
 func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
 	var cleaned []string
-	initialCount := 0
-	if state.UpgradeGoal != nil {
-		initialCount = state.UpgradeGoal.InitialNodeCount
+	nodeClient := &http.Client{Timeout: 5 * time.Second}
+
+	// Count how many nodes have VMs — we need at least one node with VMs
+	// If no VMs exist at all, keep the first active node
+	nodesWithVMs := 0
+	for _, n := range state.Nodes {
+		if !qemu.IsRunning(n.PID) {
+			continue
+		}
+		resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/vms", n.BridgeIP))
+		if err == nil {
+			var vms []interface{}
+			json.NewDecoder(resp.Body).Decode(&vms)
+			resp.Body.Close()
+			if len(vms) > 0 {
+				nodesWithVMs++
+			}
+		}
 	}
 
-	// Nodes beyond the initial count are potential replacements
-	for i := len(state.Nodes) - 1; i >= initialCount; i-- {
+	// Iterate in reverse to safely remove while iterating
+	for i := len(state.Nodes) - 1; i >= 0; i-- {
 		n := state.Nodes[i]
-		// Check if node has any VMs via its health data
+
+		// Keep at least one node
+		if len(state.Nodes)-len(cleaned) <= 1 {
+			break
+		}
+
+		// Check if this node has VMs
+		hasVMs := false
 		if qemu.IsRunning(n.PID) {
-			// Query the node agent to check VM count
-			nodeClient := &http.Client{Timeout: 3 * time.Second}
 			resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/vms", n.BridgeIP))
-			hasVMs := false
 			if err == nil {
 				var vms []interface{}
 				json.NewDecoder(resp.Body).Decode(&vms)
 				resp.Body.Close()
 				hasVMs = len(vms) > 0
 			}
-			if hasVMs {
-				continue // Don't remove nodes with VMs
-			}
-			log.Printf("Stopping orphan replacement node %s (PID %d, no VMs)", n.ID, n.PID)
-			qemu.Stop(n.ID, n.PID)
 		}
-		// Remove from state
+
+		if hasVMs {
+			continue // Never remove nodes with VMs
+		}
+
+		// Node has 0 VMs — stop and remove
+		if qemu.IsRunning(n.PID) {
+			log.Printf("Stopping orphan node %s (PID %d, 0 VMs)", n.ID, n.PID)
+			qemu.Stop(n.ID, n.PID)
+			// Clean up TAP
+			if n.TAP != "" {
+				bridge.DeleteTAP(n.TAP)
+			}
+			// Clean up disk
+			if n.Disk != "" {
+				os.Remove(n.Disk)
+			}
+		}
 		state.RemoveNode(n.ID)
 		cleaned = append(cleaned, n.ID)
 		log.Printf("Removed orphan node %s from cluster state", n.ID)
-	}
-	if len(cleaned) > 0 {
-		state.Save()
 	}
 
 	// Reset any draining/upgrading nodes back to active
@@ -2848,6 +2900,10 @@ func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
 			log.Printf("Resetting node %s from '%s' to 'active'", n.ID, n.Status)
 			state.SetNodeStatus(n.ID, "active")
 		}
+	}
+
+	if len(cleaned) > 0 {
+		state.Save()
 	}
 	state.Save()
 
