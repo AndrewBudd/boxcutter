@@ -862,6 +862,11 @@ done)
         chmod 600 /root/.ssh/cluster-ssh.key
         printf '%s\n' 'Host 192.168.50.*' '  IdentityFile /root/.ssh/cluster-ssh.key' '  User ubuntu' '  StrictHostKeyChecking no' '  UserKnownHostsFile /dev/null' > /root/.ssh/config
         chmod 600 /root/.ssh/config
+        # Add cluster pubkey to ubuntu's authorized_keys (for rsync during orch upgrade)
+        if [ -f /etc/boxcutter/secrets/cluster-ssh.key.pub ]; then
+          grep -qF "\$(cat /etc/boxcutter/secrets/cluster-ssh.key.pub)" /home/ubuntu/.ssh/authorized_keys 2>/dev/null || \
+            cat /etc/boxcutter/secrets/cluster-ssh.key.pub >> /home/ubuntu/.ssh/authorized_keys
+        fi
       fi
 
       # Join Tailscale — prefer dedicated orchestrator key (non-fatal on failure)
