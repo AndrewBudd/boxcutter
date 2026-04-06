@@ -1969,7 +1969,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	hostname, _ := os.Hostname()
 	telem := NewMigrationTelemetry(name, hostname, targetBridgeIP, "firecracker", st.RAMMIB)
-	defer telem.Write(vmDir)
+	// Note: telem.Write() called explicitly before vmDir cleanup, not via defer
 
 	fileRootfs := IsFileRootfs(vmDir)
 	var diskName string
@@ -2145,6 +2145,7 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		// space and interfere with future migrations.
 		os.Remove(filepath.Join(vmDir, "vm.snap"))
 		os.Remove(filepath.Join(vmDir, "vm.mem"))
+		telem.Write(vmDir) // write telemetry on failure too
 	}
 
 	// Note: KVM dirty page tracking setup is slow (~25s for 512MB) on the first
@@ -2316,6 +2317,16 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		time.Since(xferStart).Round(time.Millisecond),
 		time.Since(verifyStart).Round(time.Millisecond))
 
+	// Write telemetry log before cleanup (vmDir gets removed)
+	telem.Write(vmDir)
+	// Copy telemetry to target so it survives source cleanup
+	telemSrc := filepath.Join(vmDir, "migration.log")
+	if _, err := os.Stat(telemSrc); err == nil {
+		exec.Command("bash", "-c", fmt.Sprintf(
+			"cat %s | %s ubuntu@%s 'sudo tee %s/migration.log > /dev/null'",
+			telemSrc, sshOpts, targetBridgeIP, dstVMDir)).Run()
+	}
+
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
 	}
@@ -2347,7 +2358,7 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	vmDir := VMDir(name)
 	hostname, _ := os.Hostname()
 	telem := NewMigrationTelemetry(name, hostname, targetBridgeIP, "qemu", st.RAMMIB)
-	defer telem.Write(vmDir) // always write telemetry, even on failure
+	// Note: telem.Write() called explicitly before vmDir cleanup
 
 	m.exportMailboxToFile(name, vmDir)
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
@@ -2503,6 +2514,13 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	telem.Complete(downtime.Milliseconds())
 	log.Printf("Migration complete: QEMU %s → %s | ram=%dMB | downtime=%s",
 		name, targetAddr, st.RAMMIB, downtime.Round(time.Millisecond))
+
+	// Write telemetry before cleanup
+	telem.Write(vmDir)
+	// Copy to target
+	exec.Command("bash", "-c", fmt.Sprintf(
+		"cat %s | %s ubuntu@%s 'sudo tee %s/migration.log > /dev/null'",
+		filepath.Join(vmDir, "migration.log"), sshOpts, targetBridgeIP, dstVMDir)).Run()
 
 	// Commit: mark migrated, stop source, cleanup
 	SetMigrated(vmDir, true)
