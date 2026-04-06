@@ -2575,14 +2575,19 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		sshKey := findClusterSSHKey(cfg)
 		if sshKey != "" {
 			// Change the VM's IP from temp (.105) to the original (.2)
-			cmd := fmt.Sprintf("sudo ip addr del %s/24 dev eth0 2>/dev/null; sudo ip addr add %s/24 dev eth0", goal.NewOrchIP, oldBridgeIP)
-			out, err := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP), cmd).CombinedOutput()
-			if err != nil {
-				log.Printf("Warning: could not reassign orch IP: %s: %v", string(out), err)
-			} else {
+			// Use nohup + background so the command survives the SSH disconnection
+			// (removing the current IP kills the SSH session)
+			cmd := fmt.Sprintf("nohup bash -c 'ip addr add %s/24 dev eth0 && ip addr del %s/24 dev eth0' >/dev/null 2>&1 &", oldBridgeIP, goal.NewOrchIP)
+			exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP),
+				"sudo", "bash", "-c", cmd).Run()
+			// Wait for IP to take effect, then verify
+			time.Sleep(3 * time.Second)
+			if isOrchHealthy(oldBridgeIP) {
 				log.Printf("Reassigned orchestrator IP from %s to %s", goal.NewOrchIP, oldBridgeIP)
 				finalIP = oldBridgeIP
+			} else {
+				log.Printf("Warning: orchestrator IP reassignment may have failed (old IP %s not reachable)", oldBridgeIP)
 			}
 		}
 	}
