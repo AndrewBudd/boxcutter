@@ -2578,11 +2578,11 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			// Add the old IP as a secondary address on the orchestrator's interface.
 			// This lets nodes reach the orch at the original IP.
 			// We don't remove the temp IP — having both is fine.
-			addCmd := fmt.Sprintf("sudo ip addr add %s/24 dev $(ip -4 -o addr show | grep '%s' | awk '{print $2}')",
-				oldBridgeIP, goal.NewOrchIP)
+			addCmd := fmt.Sprintf("sudo ip addr add %s/24 dev ens3 2>/dev/null || sudo ip addr add %s/24 dev eth0 2>/dev/null || true",
+				oldBridgeIP, oldBridgeIP)
 			exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
 				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP),
-				"bash", "-c", addCmd).CombinedOutput()
+				addCmd).CombinedOutput()
 			// Wait for IP to take effect, then verify
 			time.Sleep(3 * time.Second)
 			if isOrchHealthy(oldBridgeIP) {
