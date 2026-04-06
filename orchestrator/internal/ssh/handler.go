@@ -122,6 +122,18 @@ func (h *Handler) Run(args []string) int {
 		}
 		cmd := strings.Join(args[2:], " ")
 		return h.cmdExec(target, cmd)
+	case "cp-to":
+		if len(args) < 4 {
+			fmt.Println("Usage: ssh <host> cp-to <vm-name> <local-path|->" + " <remote-path>")
+			return 1
+		}
+		return h.cmdCopyTo(args[1], args[2], args[3])
+	case "cp-from":
+		if len(args) < 4 {
+			fmt.Println("Usage: ssh <host> cp-from <vm-name> <remote-path> <local-path|->")
+			return 1
+		}
+		return h.cmdCopyFrom(args[1], args[2], args[3])
 	case "help":
 		h.printHelp()
 		return 0
@@ -693,6 +705,69 @@ func (h *Handler) cmdExec(name, command string) int {
 	return result.ExitCode
 }
 
+func (h *Handler) cmdCopyTo(vmName, srcPath, dstPath string) int {
+	var src io.Reader
+	if srcPath == "-" {
+		src = os.Stdin
+	} else {
+		f, err := os.Open(srcPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		defer f.Close()
+		src = f
+	}
+
+	url := fmt.Sprintf("%s/api/vms/%s/cp-to?path=%s", h.apiBase, vmName, dstPath)
+	resp, err := http.Post(url, "application/octet-stream", src)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "Error: %s\n", strings.TrimSpace(string(body)))
+		return 1
+	}
+	return 0
+}
+
+func (h *Handler) cmdCopyFrom(vmName, srcPath, dstPath string) int {
+	url := fmt.Sprintf("%s/api/vms/%s/cp-from?path=%s", h.apiBase, vmName, srcPath)
+	resp, err := http.Get(url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Fprintf(os.Stderr, "Error: %s\n", strings.TrimSpace(string(body)))
+		return 1
+	}
+
+	var dst io.Writer
+	if dstPath == "-" {
+		dst = os.Stdout
+	} else {
+		f, err := os.Create(dstPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		defer f.Close()
+		dst = f
+	}
+
+	if _, err := io.Copy(dst, resp.Body); err != nil {
+		fmt.Fprintf(os.Stderr, "Error copying data: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 func (h *Handler) cmdAuthorize(name string) int {
 	// Tell the VM to fetch its SSH key from the metadata service and configure SSH.
 	setupScript := `set -e
@@ -770,6 +845,11 @@ Commands:
   tapegun sendkeys <name> <cmd>
                           Inject a command into a VM's tmux pane
   tapegun broadcast <msg> Broadcast to all running VMs
+  exec <name> <cmd>       Run a command on a VM
+  cp-to <name> <src> <dst>
+                          Copy a file into a VM (use - for stdin)
+  cp-from <name> <src> <dst>
+                          Copy a file out of a VM (use - for stdout)
   help                    Show this help
 
 Usage: ssh <host> <command> [args]

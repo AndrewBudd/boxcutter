@@ -71,6 +71,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleExec)
+	mux.HandleFunc("POST /api/vms/{name}/cp-to", h.handleCopyTo)
+	mux.HandleFunc("GET /api/vms/{name}/cp-from", h.handleCopyFrom)
 	mux.HandleFunc("POST /api/messages/relay", h.handleMessageRelay)
 	mux.HandleFunc("POST /api/vms/{name}/mailbox", h.handlePushMailbox)
 
@@ -855,6 +857,39 @@ func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, result)
+}
+
+// handleCopyTo streams the request body into a file on the VM.
+// Path: POST /api/vms/{name}/cp-to?path=/remote/path
+func (h *Handler) handleCopyTo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	dstPath := r.URL.Query().Get("path")
+	if dstPath == "" {
+		http.Error(w, "path query parameter is required", http.StatusBadRequest)
+		return
+	}
+	if err := h.mgr.CopyToVM(name, dstPath, r.Body); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCopyFrom streams a file from the VM into the response body.
+// Path: GET /api/vms/{name}/cp-from?path=/remote/path
+func (h *Handler) handleCopyFrom(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	srcPath := r.URL.Query().Get("path")
+	if srcPath == "" {
+		http.Error(w, "path query parameter is required", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if err := h.mgr.CopyFromVM(name, srcPath, w); err != nil {
+		// If we haven't written anything yet, we can still send an error
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 // handlePushMailbox pushes a message into a local VM's mailbox via vmid admin socket.

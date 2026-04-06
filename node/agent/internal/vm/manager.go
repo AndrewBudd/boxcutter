@@ -573,6 +573,55 @@ func (m *Manager) Exec(name string, command string) (*ExecResult, error) {
 	return &ExecResult{Output: output, ExitCode: exitCode}, nil
 }
 
+// CopyToVM streams data from reader into a file on the VM.
+func (m *Manager) CopyToVM(name string, dstPath string, src io.Reader) error {
+	st, status, err := m.Get(name)
+	if err != nil {
+		return err
+	}
+	if status != "running" {
+		return fmt.Errorf("VM '%s' is %s, not running", name, status)
+	}
+	sshKey := m.cfg.SSH.PrivateKeyPath
+
+	// Use ssh + cat to stream data into the VM
+	cmd := VMSSHCmd(st.TAP, sshKey, "cat > "+shellQuote(dstPath))
+	cmd.Stdin = src
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cp-to failed: %s: %w", stderr.String(), err)
+	}
+	return nil
+}
+
+// CopyFromVM streams a file from the VM to the writer.
+func (m *Manager) CopyFromVM(name string, srcPath string, dst io.Writer) error {
+	st, status, err := m.Get(name)
+	if err != nil {
+		return err
+	}
+	if status != "running" {
+		return fmt.Errorf("VM '%s' is %s, not running", name, status)
+	}
+	sshKey := m.cfg.SSH.PrivateKeyPath
+
+	// Use ssh + cat to stream data out of the VM
+	cmd := VMSSHCmd(st.TAP, sshKey, "cat "+shellQuote(srcPath))
+	cmd.Stdout = dst
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("cp-from failed: %s: %w", stderr.String(), err)
+	}
+	return nil
+}
+
+// shellQuote wraps a string in single quotes for safe shell argument passing.
+func shellQuote(s string) string {
+	return "'" + fmt.Sprintf("%s", strings.ReplaceAll(s, "'", "'\\''")) + "'"
+}
+
 // List returns all VMs with their status.
 func (m *Manager) List() ([]map[string]interface{}, error) {
 	vms, err := ListVMs()

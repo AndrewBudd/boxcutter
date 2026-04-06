@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -166,6 +167,37 @@ func (c *Client) ExecInVM(name, command string) (*ExecResult, error) {
 	var result ExecResult
 	json.Unmarshal(respBody, &result)
 	return &result, nil
+}
+
+// CopyToVM streams data from reader into a file on the VM via the node agent.
+func (c *Client) CopyToVM(name, dstPath string, src io.Reader) error {
+	url := fmt.Sprintf("%s/api/vms/%s/cp-to?path=%s", c.baseURL, name, dstPath)
+	resp, err := c.http.Post(url, "application/octet-stream", src)
+	if err != nil {
+		return fmt.Errorf("node cp-to: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("node cp-to: %s", strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// CopyFromVM streams a file from the VM to writer via the node agent.
+func (c *Client) CopyFromVM(name, srcPath string, dst io.Writer) error {
+	url := fmt.Sprintf("%s/api/vms/%s/cp-from?path=%s", c.baseURL, name, srcPath)
+	resp, err := c.http.Get(url)
+	if err != nil {
+		return fmt.Errorf("node cp-from: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("node cp-from: %s", strings.TrimSpace(string(body)))
+	}
+	_, err = io.Copy(dst, resp.Body)
+	return err
 }
 
 // PushMailbox delivers a message to a VM's mailbox on this node.

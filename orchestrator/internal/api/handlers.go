@@ -181,6 +181,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	// VM exec
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleVMExec)
+	mux.HandleFunc("POST /api/vms/{name}/cp-to", h.handleVMCopyTo)
+	mux.HandleFunc("GET /api/vms/{name}/cp-from", h.handleVMCopyFrom)
 
 	// VM-to-VM messaging: lookup which node a VM is on
 	mux.HandleFunc("GET /api/vms/{name}/location", h.handleVMLocation)
@@ -1538,6 +1540,60 @@ func (h *Handler) handleVMExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, result)
+}
+
+func (h *Handler) handleVMCopyTo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	dstPath := r.URL.Query().Get("path")
+	if dstPath == "" {
+		http.Error(w, "path query parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	n, err := h.db.GetNode(v.NodeID)
+	if err != nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	nc := node.NewClient(n.APIAddr)
+	if err := nc.CopyToVM(name, dstPath, r.Body); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) handleVMCopyFrom(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	srcPath := r.URL.Query().Get("path")
+	if srcPath == "" {
+		http.Error(w, "path query parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	v, err := h.db.GetVM(name)
+	if err != nil {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	n, err := h.db.GetNode(v.NodeID)
+	if err != nil || n.APIAddr == "" {
+		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	nc := node.NewClient(n.APIAddr)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	if err := nc.CopyFromVM(name, srcPath, w); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 func (h *Handler) handleVMLocation(w http.ResponseWriter, r *http.Request) {

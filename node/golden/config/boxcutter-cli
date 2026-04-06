@@ -3,6 +3,37 @@
 # Usage: boxcutter <command> [args]
 # Examples:
 #   boxcutter list
+#   boxcutter cp-to <vm-name> <local-path> <remote-path>
+#   boxcutter cp-from <vm-name> <remote-path> <local-path>
 #   boxcutter tapegun activity
-#   boxcutter tapegun send <vm-name> <message>
-exec ssh -o ConnectTimeout=5 orchestrator "$@"
+
+SSH_OPTS="-o ConnectTimeout=5"
+
+case "$1" in
+  cp-to)
+    # boxcutter cp-to <vm> <local-path> <remote-path>
+    # If local-path is -, read from stdin. Otherwise read from file and pipe through SSH.
+    [ $# -lt 4 ] && { echo "Usage: boxcutter cp-to <vm-name> <local-path|->" " <remote-path>" >&2; exit 1; }
+    VM="$2"; SRC="$3"; DST="$4"
+    if [ "$SRC" = "-" ]; then
+      exec ssh $SSH_OPTS orchestrator "cp-to $VM - $DST"
+    else
+      [ -f "$SRC" ] || { echo "Error: file not found: $SRC" >&2; exit 1; }
+      exec ssh $SSH_OPTS orchestrator "cp-to $VM - $DST" < "$SRC"
+    fi
+    ;;
+  cp-from)
+    # boxcutter cp-from <vm> <remote-path> <local-path>
+    # If local-path is -, write to stdout. Otherwise write to file.
+    [ $# -lt 4 ] && { echo "Usage: boxcutter cp-from <vm-name> <remote-path> <local-path|->" >&2; exit 1; }
+    VM="$2"; SRC="$3"; DST="$4"
+    if [ "$DST" = "-" ]; then
+      exec ssh $SSH_OPTS orchestrator "cp-from $VM $SRC -"
+    else
+      ssh $SSH_OPTS orchestrator "cp-from $VM $SRC -" > "$DST"
+    fi
+    ;;
+  *)
+    exec ssh $SSH_OPTS orchestrator "$@"
+    ;;
+esac

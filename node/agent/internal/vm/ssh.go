@@ -26,6 +26,24 @@ func VMSSH(tap, sshKey string, args ...string) (string, error) {
 	return string(out), err
 }
 
+// VMSSHCmd returns an *exec.Cmd for SSH into a VM, with stdin/stdout/stderr
+// available for streaming. Caller must call cmd.Start() and cmd.Wait().
+func VMSSHCmd(tap, sshKey string, args ...string) *exec.Cmd {
+	proxyCmd := fmt.Sprintf("socat - TCP:10.0.0.2:22,so-bindtodevice=%s", tap)
+	sshArgs := []string{
+		"-o", "ProxyCommand=" + proxyCmd,
+		"-i", sshKey,
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "LogLevel=ERROR",
+		"-o", "ConnectTimeout=5",
+		"-o", "BatchMode=yes",
+		"dev@10.0.0.2",
+	}
+	sshArgs = append(sshArgs, args...)
+	return exec.Command("ssh", sshArgs...)
+}
+
 // WaitForSSH polls until SSH is ready on the VM.
 func WaitForSSH(tap, sshKey string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
