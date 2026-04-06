@@ -2559,20 +2559,51 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	newPID := findQEMUPID(newDisk)
 
 	oldDisk := ""
+	oldBridgeIP := ""
+	oldTAP := ""
 	if oldOrch != nil {
 		oldDisk = oldOrch.Disk
+		oldBridgeIP = oldOrch.BridgeIP
+		oldTAP = oldOrch.TAP
+	}
+
+	// Reconfigure new orchestrator to use old IP so nodes can find it
+	finalTAP := goal.NewOrchTAP
+	finalIP := goal.NewOrchIP
+	finalMAC := goal.NewOrchMAC // MAC stays as assigned (QEMU-level)
+	if oldBridgeIP != "" && oldBridgeIP != goal.NewOrchIP {
+		sshKey := findClusterSSHKey(cfg)
+		if sshKey != "" {
+			// Change the VM's IP from temp (.105) to the original (.2)
+			cmd := fmt.Sprintf("sudo ip addr del %s/24 dev eth0 2>/dev/null; sudo ip addr add %s/24 dev eth0", goal.NewOrchIP, oldBridgeIP)
+			out, err := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP), cmd).CombinedOutput()
+			if err != nil {
+				log.Printf("Warning: could not reassign orch IP: %s: %v", string(out), err)
+			} else {
+				log.Printf("Reassigned orchestrator IP from %s to %s", goal.NewOrchIP, oldBridgeIP)
+				finalIP = oldBridgeIP
+			}
+		}
+	}
+	// Clean up TAPs: remove old, rename new
+	if oldTAP != "" && oldTAP != goal.NewOrchTAP {
+		exec.Command("ip", "link", "del", oldTAP).Run()
+		if err := exec.Command("ip", "link", "set", goal.NewOrchTAP, "name", oldTAP).Run(); err == nil {
+			finalTAP = oldTAP
+		}
 	}
 
 	state.SetOrchestrator(cluster.VMEntry{
 		ID:           "orchestrator",
-		BridgeIP:     goal.NewOrchIP,
+		BridgeIP:     finalIP,
 		Disk:         newDisk,
 		ISO:          orchISO,
 		PID:          newPID,
 		VCPU:         cfg.OrchestratorVCPU,
 		RAM:          cfg.OrchestratorRAM,
-		TAP:          goal.NewOrchTAP,
-		MAC:          goal.NewOrchMAC,
+		TAP:          finalTAP,
+		MAC:          finalMAC,
 		ImageVersion: goal.OrchImage.Version,
 		ImageCommit:  goal.OrchImage.Commit,
 		ImageDigest:  goal.OrchImage.Digest,
