@@ -2569,11 +2569,14 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	}
 
 	// Safety: refuse to launch if it would exceed available RAM.
-	// Each node uses cfg.NodeRAM. Check that we have headroom.
+	// During an active upgrade, the old node will be stopped after drain,
+	// so we only need enough for the replacement node + a modest buffer.
+	// The full MinFreeMemoryMB reserve is for auto-scaler, not upgrades.
 	nodeRAMMB := parseRAMMB(cfg.NodeRAM)
 	availMB := getAvailableMemoryMB()
-	if nodeRAMMB > 0 && availMB > 0 && availMB < nodeRAMMB+cfg.MinFreeMemoryMB {
-		return false, "", fmt.Errorf("insufficient memory to launch replacement node (%dMB available, need %dMB + %dMB reserve)", availMB, nodeRAMMB, cfg.MinFreeMemoryMB)
+	upgradeReserveMB := 1024 // 1GB buffer during upgrade (old node frees RAM after drain)
+	if nodeRAMMB > 0 && availMB > 0 && availMB < nodeRAMMB+upgradeReserveMB {
+		return false, "", fmt.Errorf("insufficient memory to launch replacement node (%dMB available, need %dMB + %dMB reserve)", availMB, nodeRAMMB, upgradeReserveMB)
 	}
 
 	// No pending replacement — launch one
