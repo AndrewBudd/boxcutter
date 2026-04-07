@@ -2797,23 +2797,30 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 
 	// Is there a node marked as upgrading (needs to be drained)?
 	if n := state.FindNodeWithStatus("upgrading"); n != nil {
-		// Deploy latest node agent to the OLD node before draining.
-		// The old node runs the migration — it needs the new binary
-		// (e.g., native live migration code) to migrate large VMs.
-		// Prefer copying from the replacement node (has the new image's binary),
-		// falling back to building from source if no replacement is available.
-		deployed := false
-		if replacement := findReplacementNode(state, goal); replacement != nil {
-			if err := deployNodeBinaryFromPeer(cfg, replacement.BridgeIP, n.BridgeIP, n.ID); err != nil {
-				log.Printf("Pre-drain deploy from peer to %s: %v (trying source build)", n.ID, err)
-			} else {
-				deployed = true
+		// Deploy latest node agent to the OLD node before draining — but only
+		// once. Repeated deploys restart the agent, which aborts in-progress
+		// migrations and creates a drain→fail→redeploy→drain loop.
+		if goal.DeployedOldNodeID != n.ID {
+			// The old node runs the migration — it needs the new binary
+			// (e.g., native live migration code) to migrate large VMs.
+			// Prefer copying from the replacement node (has the new image's binary),
+			// falling back to building from source if no replacement is available.
+			deployed := false
+			if replacement := findReplacementNode(state, goal); replacement != nil {
+				if err := deployNodeBinaryFromPeer(cfg, replacement.BridgeIP, n.BridgeIP, n.ID); err != nil {
+					log.Printf("Pre-drain deploy from peer to %s: %v (trying source build)", n.ID, err)
+				} else {
+					deployed = true
+				}
 			}
-		}
-		if !deployed {
-			if err := deployNodeBinary(cfg, n.BridgeIP, n.ID); err != nil {
-				log.Printf("Pre-drain deploy to %s: %v (continuing with existing binary)", n.ID, err)
+			if !deployed {
+				if err := deployNodeBinary(cfg, n.BridgeIP, n.ID); err != nil {
+					log.Printf("Pre-drain deploy to %s: %v (continuing with existing binary)", n.ID, err)
+				}
 			}
+			goal.DeployedOldNodeID = n.ID
+			state.Save()
+			return false, fmt.Sprintf("Deployed latest binary to old node %s", n.ID), nil
 		}
 
 		state.SetNodeStatus(n.ID, "draining")

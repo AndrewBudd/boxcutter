@@ -1400,7 +1400,12 @@ func (m *Manager) exportMailboxToFile(name, vmDir string) {
 		return
 	}
 	msgs, err := m.vmid.ExportMailbox(name)
-	if err != nil || len(msgs) == 0 {
+	if err != nil {
+		// Don't delete existing mailbox.json on error — the VM may be stopped/
+		// deregistered (e.g., live migration fallback) and a prior export exists.
+		return
+	}
+	if len(msgs) == 0 {
 		os.Remove(filepath.Join(vmDir, "mailbox.json"))
 		return
 	}
@@ -2144,13 +2149,25 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// Export mailbox before migration so it travels with the VM files
 	m.exportMailboxToFile(name, vmDir)
 
-	// QEMU VMs use QMP-based state save/restore for live migration.
-	if st.Type == "qemu" && IsRunning(vmDir) {
-		return m.migrateQEMUVM(name, st, targetAddr, targetBridgeIP)
-	}
-
 	clusterKey := "/etc/boxcutter/secrets/cluster-ssh.key"
 	dstVMDir := fmt.Sprintf("/var/lib/boxcutter/vms/%s/", name)
+
+	// QEMU VMs use QMP-based state save/restore for live migration.
+	// If live migration fails (e.g., target OOM on large VMs), gracefully
+	// fall back to stop+relocate rather than leaving the drain stuck.
+	if st.Type == "qemu" && IsRunning(vmDir) {
+		resp, err := m.migrateQEMUVM(name, st, targetAddr, targetBridgeIP)
+		if err == nil {
+			return resp, nil
+		}
+		log.Printf("QEMU live migration failed for %s: %v — falling back to stop+relocate", name, err)
+		if err := m.stopVM(name); err != nil {
+			return nil, fmt.Errorf("fallback stop failed after live migration error: %w", err)
+		}
+		// Reload state after stop (status changed)
+		st, _ = LoadVMState(vmDir)
+		return m.relocateStoppedVM(name, st, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey)
+	}
 
 	// --- Stopped VM: just transfer files, no snapshot needed ---
 	if !IsRunning(vmDir) {
