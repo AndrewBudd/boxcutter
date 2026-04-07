@@ -267,6 +267,10 @@ func (h *Handler) handleNodeList(w http.ResponseWriter, r *http.Request) {
 			if health := fc.Health(); health != nil {
 				nodes[idx].RAMTotalMIB = health.RAMTotalMIB
 				nodes[idx].RAMAllocatedMIB = health.RAMAllocatedMIB
+				nodes[idx].RAMAvailableMIB = health.RAMAvailableMIB
+				nodes[idx].DiskTotalMB = health.DiskTotalMB
+				nodes[idx].DiskUsedMB = health.DiskUsedMB
+				nodes[idx].DiskVMsMB = health.DiskVMsMB
 				nodes[idx].VMsRunning = health.VMsRunning
 			}
 		}(i, n.APIAddr)
@@ -364,6 +368,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				n.RAMAllocatedMIB = health.RAMAllocatedMIB
+				n.RAMAvailableMIB = health.RAMAvailableMIB
 				n.VMsRunning = health.VMsRunning
 				n.RAMTotalMIB = health.RAMTotalMIB
 				candidates = append(candidates, n)

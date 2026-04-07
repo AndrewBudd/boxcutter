@@ -35,8 +35,9 @@ type OrchestratorConfig struct {
 }
 
 type NodeConfig struct {
-	Hostname string `yaml:"hostname"`
-	BridgeIP string `yaml:"bridge_ip"` // This node's IP on the host bridge (e.g., 192.168.50.3)
+	Hostname             string  `yaml:"hostname"`
+	BridgeIP             string  `yaml:"bridge_ip"`              // This node's IP on the host bridge (e.g., 192.168.50.3)
+	MemoryOvercommitRatio float64 `yaml:"memory_overcommit_ratio"` // Allow declared RAM to exceed physical by this ratio (e.g., 1.5 = 150%). 0 or 1.0 = no overcommit.
 }
 
 type TailscaleConfig struct {

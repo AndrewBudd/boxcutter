@@ -106,6 +106,10 @@ type Node struct {
 	// Transient fields — populated at runtime from node health, not stored in DB
 	RAMTotalMIB     int `json:"ram_total_mib,omitempty"`
 	RAMAllocatedMIB int `json:"ram_allocated_mib,omitempty"`
+	RAMAvailableMIB int `json:"ram_available_mib,omitempty"`
+	DiskTotalMB     int `json:"disk_total_mb,omitempty"`
+	DiskUsedMB      int `json:"disk_used_mb,omitempty"`
+	DiskVMsMB       int `json:"disk_vms_mb,omitempty"`
 	VMsRunning      int `json:"vms_running,omitempty"`
 }
 

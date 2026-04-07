@@ -52,7 +52,11 @@ type HealthResponse struct {
 	VCPUTotal       int    `json:"vcpu_total"`
 	RAMTotalMIB     int    `json:"ram_total_mib"`
 	RAMAllocatedMIB int    `json:"ram_allocated_mib"`
+	RAMAvailableMIB int    `json:"ram_available_mib"`
 	RAMFreeMIB      int    `json:"ram_free_mib"`
+	DiskTotalMB     int    `json:"disk_total_mb"`
+	DiskUsedMB      int    `json:"disk_used_mb"`
+	DiskVMsMB       int    `json:"disk_vms_mb"`
 	VMsTotal        int    `json:"vms_total"`
 	VMsRunning      int    `json:"vms_running"`
 	GoldenReady     bool   `json:"golden_ready"`
