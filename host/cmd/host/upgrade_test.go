@@ -417,6 +417,135 @@ func TestDrain_AlreadyMigrating409(t *testing.T) {
 	}
 }
 
+func TestDrain_Stale409RetrySucceeds(t *testing.T) {
+	// Bug #37: node agent's migratingSet has stale entry from a previous
+	// failed migration. First POST returns 409, but actual VM status is
+	// "running". After the stale state clears, retry should succeed.
+	var mu sync.Mutex
+	stale409 := true // first migrate call returns stale 409
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/vms/{name}", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		// VM is actually running (not migrating) — stale state
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"vm":     map[string]interface{}{"name": r.PathValue("name")},
+			"status": "running",
+		})
+	})
+	mux.HandleFunc("POST /api/vms/{name}/migrate", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if stale409 {
+			stale409 = false // clear after first attempt
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte("already migrating"))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "migrating"})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// Simulate the drain's migrate + retry-on-stale-409 logic
+	client := &http.Client{Timeout: 5 * time.Second}
+	migrateReq := map[string]string{
+		"target_addr":      "10.0.0.2:8800",
+		"target_bridge_ip": "10.0.0.2",
+	}
+	data, _ := json.Marshal(migrateReq)
+
+	// First attempt — should get 409
+	resp, err := client.Post(srv.URL+"/api/vms/test-vm/migrate",
+		"application/json", jsonReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 409 {
+		t.Fatalf("first migrate = %d, want 409", resp.StatusCode)
+	}
+
+	// Check actual status — should be "running" (stale 409)
+	statusResp, err := client.Get(srv.URL + "/api/vms/test-vm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail map[string]interface{}
+	json.NewDecoder(statusResp.Body).Decode(&detail)
+	statusResp.Body.Close()
+	actualStatus, _ := detail["status"].(string)
+	if actualStatus != "running" {
+		t.Fatalf("actual status = %q, want running", actualStatus)
+	}
+
+	// Retry after stale 409 clears — should get 202
+	data2, _ := json.Marshal(migrateReq)
+	resp2, err := client.Post(srv.URL+"/api/vms/test-vm/migrate",
+		"application/json", jsonReader(data2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != 202 {
+		t.Errorf("retry after stale 409 = %d, want 202", resp2.StatusCode)
+	}
+}
+
+func TestDrain_Genuine409NotRetried(t *testing.T) {
+	// When a VM is genuinely migrating (status=migrating), the 409 should
+	// be accepted and the drain should poll — not retry.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/vms/{name}", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"vm":     map[string]interface{}{"name": r.PathValue("name")},
+			"status": "migrating", // genuinely migrating
+		})
+	})
+	migrateCallCount := 0
+	var mu sync.Mutex
+	mux.HandleFunc("POST /api/vms/{name}/migrate", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		migrateCallCount++
+		mu.Unlock()
+		w.WriteHeader(http.StatusConflict)
+		w.Write([]byte("already migrating"))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// First attempt — 409
+	resp, _ := client.Post(srv.URL+"/api/vms/test-vm/migrate",
+		"application/json", nil)
+	resp.Body.Close()
+	if resp.StatusCode != 409 {
+		t.Fatalf("migrate = %d, want 409", resp.StatusCode)
+	}
+
+	// Check actual status — "migrating" means it's genuine
+	statusResp, _ := client.Get(srv.URL + "/api/vms/test-vm")
+	var detail map[string]interface{}
+	json.NewDecoder(statusResp.Body).Decode(&detail)
+	statusResp.Body.Close()
+	actualStatus, _ := detail["status"].(string)
+	if actualStatus != "migrating" {
+		t.Fatalf("status = %q, want migrating", actualStatus)
+	}
+
+	// Verify: only 1 migrate call (no retry for genuine migration)
+	mu.Lock()
+	if migrateCallCount != 1 {
+		t.Errorf("migrate called %d times, want 1 (should not retry genuine 409)", migrateCallCount)
+	}
+	mu.Unlock()
+}
+
 // --- State persistence tests ---
 
 func TestUpgrade_GoalPersistence(t *testing.T) {

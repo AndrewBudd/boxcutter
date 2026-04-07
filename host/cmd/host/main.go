@@ -1905,7 +1905,42 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			}
 			migrateResp.Body.Close()
 			if migrateResp.StatusCode == 409 {
-				log.Printf("Drain: %s already migrating — will poll", vmName)
+				// 409 may be stale — the node agent's in-memory migratingSet
+				// can linger after a failed migration if EndMigration hasn't
+				// been called yet. Check actual VM status before deciding.
+				srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
+				if err == nil {
+					var detail map[string]interface{}
+					json.NewDecoder(srcResp.Body).Decode(&detail)
+					srcResp.Body.Close()
+					actualStatus, _ := detail["status"].(string)
+					if actualStatus == "running" || actualStatus == "stopped" {
+						// VM is not actually migrating — stale 409. Wait for
+						// the node agent to clear its migratingSet, then retry.
+						log.Printf("Drain: %s got 409 but actual status is %s — waiting for stale state to clear", vmName, actualStatus)
+						time.Sleep(5 * time.Second)
+						data2, _ := json.Marshal(migrateReq)
+						retryResp, retryErr := migrateClient.Post(
+							fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
+							"application/json",
+							jsonReader(data2),
+						)
+						if retryErr != nil {
+							log.Printf("Drain: retry after stale 409 failed for %s: %v", vmName, retryErr)
+						} else {
+							retryResp.Body.Close()
+							if retryResp.StatusCode < 300 {
+								log.Printf("Drain: started migration of %s (after clearing stale 409)", vmName)
+							} else {
+								log.Printf("Drain: retry after stale 409 for %s returned %d", vmName, retryResp.StatusCode)
+							}
+						}
+					} else {
+						log.Printf("Drain: %s already migrating (status: %s) — will poll", vmName, actualStatus)
+					}
+				} else {
+					log.Printf("Drain: %s got 409 and status check failed: %v — will poll", vmName, err)
+				}
 			} else if migrateResp.StatusCode >= 300 {
 				log.Printf("Drain: migrate %s returned %d", vmName, migrateResp.StatusCode)
 			} else {
@@ -2054,7 +2089,36 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 					continue
 				}
 				migrateResp.Body.Close()
-				log.Printf("Drain: retry started migration of %s", vmName)
+				if migrateResp.StatusCode == 409 {
+					// Stale 409 from previous attempt — wait for node agent
+					// to clear its migratingSet, then retry once more.
+					log.Printf("Drain: retry %s got stale 409 — waiting for state to clear", vmName)
+					time.Sleep(5 * time.Second)
+					data2, _ := json.Marshal(migrateReq)
+					retryResp2, retryErr2 := migrateClient.Post(
+						fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
+						"application/json",
+						jsonReader(data2),
+					)
+					if retryErr2 != nil {
+						log.Printf("Drain: retry %s failed after stale 409: %v", vmName, retryErr2)
+						retryFailed++
+						continue
+					}
+					retryResp2.Body.Close()
+					if retryResp2.StatusCode >= 300 {
+						log.Printf("Drain: retry %s still failing after stale 409 (status %d)", vmName, retryResp2.StatusCode)
+						retryFailed++
+						continue
+					}
+					log.Printf("Drain: retry started migration of %s (after clearing stale 409)", vmName)
+				} else if migrateResp.StatusCode >= 300 {
+					log.Printf("Drain: retry %s returned %d", vmName, migrateResp.StatusCode)
+					retryFailed++
+					continue
+				} else {
+					log.Printf("Drain: retry started migration of %s", vmName)
+				}
 
 				// Poll this single retry
 				const retryTimeout = 3 * time.Minute
