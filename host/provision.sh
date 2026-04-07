@@ -904,6 +904,8 @@ done)
         fi
       fi
 
+      # Reset any failed state (service may have crashed before cloud-init wrote config)
+      systemctl reset-failed boxcutter-orchestrator 2>/dev/null || true
       systemctl restart boxcutter-orchestrator || echo "WARNING: boxcutter-orchestrator restart failed"
 
       # Verify the service is running
