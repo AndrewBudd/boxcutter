@@ -1920,6 +1920,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 				const inactivityTimeout = 2 * time.Minute
 				lastActivity := time.Now()
 				migrated := false
+				seenMigrating := false
 
 				for {
 					time.Sleep(3 * time.Second)
@@ -1954,6 +1955,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 					srcStatus, _ := srcDetail["status"].(string)
 
 					if srcStatus == "migrating" {
+						seenMigrating = true
 						lastActivity = time.Now()
 						continue
 					}
@@ -1967,7 +1969,12 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 						break
 					}
 					if srcStatus == "stopped" {
-						// Could be user-stopped or migration cleanup in progress
+						if seenMigrating {
+							// Was migrating, now stopped — relocation failed
+							log.Printf("Drain: %s migration failed (stopped VM relocation reverted)", name)
+							break
+						}
+						// Not yet migrating — migration request may still be starting
 						lastActivity = time.Now()
 						continue
 					}
@@ -2014,7 +2021,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		// like Firecracker socket timeout shouldn't abort the entire drain).
 		var retryList []string
 		for _, vm := range toMigrate {
-			// Check if VM is still on source (migration failed, it's still running)
+			// Check if VM is still on source (migration failed — still running or stopped)
 			checkResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vm))
 			if err != nil {
 				continue
@@ -2022,7 +2029,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			var detail map[string]interface{}
 			json.NewDecoder(checkResp.Body).Decode(&detail)
 			checkResp.Body.Close()
-			if status, _ := detail["status"].(string); status == "running" {
+			if status, _ := detail["status"].(string); status == "running" || status == "stopped" {
 				retryList = append(retryList, vm)
 			}
 		}
@@ -2053,6 +2060,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 				const retryTimeout = 3 * time.Minute
 				deadline := time.Now().Add(retryTimeout)
 				migrated := false
+				retrySawMigrating := false
 				for time.Now().Before(deadline) {
 					time.Sleep(3 * time.Second)
 					srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
@@ -2067,8 +2075,16 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 					var srcDetail map[string]interface{}
 					json.NewDecoder(srcResp.Body).Decode(&srcDetail)
 					srcResp.Body.Close()
-					if s, _ := srcDetail["status"].(string); s == "running" {
+					s, _ := srcDetail["status"].(string)
+					if s == "migrating" {
+						retrySawMigrating = true
+						continue
+					}
+					if s == "running" {
 						break // failed again
+					}
+					if s == "stopped" && retrySawMigrating {
+						break // stopped VM relocation failed again
 					}
 				}
 				if migrated {
