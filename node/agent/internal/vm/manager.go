@@ -1024,6 +1024,24 @@ func (m *Manager) Health() map[string]interface{} {
 		}
 	}
 
+	// QEMU version (for migration compatibility checks)
+	qemuVersion := ""
+	if qOut, qErr := runOutput("qemu-system-x86_64", "--version"); qErr == nil {
+		// Parse "QEMU emulator version X.Y.Z ..." → "X.Y.Z"
+		for _, line := range strings.Split(qOut, "\n") {
+			if strings.Contains(line, "version") {
+				fields := strings.Fields(line)
+				for i, f := range fields {
+					if f == "version" && i+1 < len(fields) {
+						qemuVersion = fields[i+1]
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+
 	return map[string]interface{}{
 		"hostname":          hostname,
 		"vcpu_total":        cpuCount,
@@ -1036,11 +1054,21 @@ func (m *Manager) Health() map[string]interface{} {
 		"vms_total":         len(vms),
 		"vms_running":       running,
 		"golden_ready":      goldenReady,
+		"qemu_version":      qemuVersion,
 		"status":            "active",
 	}
 }
 
 // --- Helpers ---
+
+// majorMinor extracts "X.Y" from a version string like "X.Y.Z" or "X.Y.Z-extra".
+func majorMinor(ver string) string {
+	parts := strings.SplitN(ver, ".", 3)
+	if len(parts) >= 2 {
+		return parts[0] + "." + parts[1]
+	}
+	return ""
+}
 
 func (m *Manager) collectExistingMarks() map[int]bool {
 	marks := make(map[int]bool)
@@ -2513,6 +2541,63 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	cleanCmd := exec.Command("ssh", append(append([]string{}, sshArgs...), append([]string{"ubuntu@" + targetBridgeIP}, cleanArgs...)...)...)
 	cleanCmd.Run()
 
+	// Pre-flight: validate target can accept this VM before doing expensive work.
+	// Fail fast before any data transfer — source VM stays running, zero impact.
+	log.Printf("Migrating QEMU %s to %s: pre-flight validation", name, targetAddr)
+	preflightClient := &http.Client{Timeout: 10 * time.Second}
+	if hResp, err := preflightClient.Get(fmt.Sprintf("http://%s/api/health", targetAddr)); err == nil {
+		var health map[string]interface{}
+		json.NewDecoder(hResp.Body).Decode(&health)
+		hResp.Body.Close()
+		// RAM check
+		if freeMiB, ok := health["ram_free_mib"].(float64); ok {
+			if int(freeMiB) < st.RAMMIB {
+				return nil, fmt.Errorf("pre-flight failed: target has %dMiB free RAM but VM needs %dMiB",
+					int(freeMiB), st.RAMMIB)
+			}
+		}
+		// Disk check: need space for rootfs + state file (~RAM size)
+		diskInfo, _ := os.Stat(filepath.Join(vmDir, diskName))
+		neededMB := st.RAMMIB // state file ≈ RAM size
+		if diskInfo != nil {
+			neededMB += int(diskInfo.Size() / 1024 / 1024)
+		}
+		diskTotalMB, _ := health["disk_total_mb"].(float64)
+		diskUsedMB, _ := health["disk_used_mb"].(float64)
+		diskFreeMB := int(diskTotalMB - diskUsedMB)
+		if diskTotalMB > 0 && diskFreeMB < neededMB {
+			return nil, fmt.Errorf("pre-flight failed: target has %dMB free disk but migration needs ~%dMB",
+				diskFreeMB, neededMB)
+		}
+		// QEMU version compatibility check
+		if targetVer, ok := health["qemu_version"].(string); ok && targetVer != "" {
+			srcVer := ""
+			if qOut, qErr := runOutput("qemu-system-x86_64", "--version"); qErr == nil {
+				for _, line := range strings.Split(qOut, "\n") {
+					if strings.Contains(line, "version") {
+						fields := strings.Fields(line)
+						for i, f := range fields {
+							if f == "version" && i+1 < len(fields) {
+								srcVer = fields[i+1]
+								break
+							}
+						}
+						break
+					}
+				}
+			}
+			// Compare major.minor — patch differences are usually compatible
+			srcMajMin := majorMinor(srcVer)
+			tgtMajMin := majorMinor(targetVer)
+			if srcMajMin != "" && tgtMajMin != "" && srcMajMin != tgtMajMin {
+				return nil, fmt.Errorf("pre-flight failed: QEMU version mismatch (source=%s, target=%s) — state format may be incompatible",
+					srcVer, targetVer)
+			}
+		}
+	} else {
+		log.Printf("WARNING: pre-flight health check failed (non-fatal): %v", err)
+	}
+
 	// Pre-flight: ensure target has golden image (including QCOW2 version) + create vmDir
 	log.Printf("Migrating QEMU %s to %s: pre-staging", name, targetAddr)
 	prepCmd := exec.Command("bash", "-c", fmt.Sprintf(
@@ -2581,7 +2666,7 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	log.Printf("Migrating QEMU %s: target listening on port %d", name, launchResult.MigratePort)
 
 	// Initiate QEMU native live migration — VM keeps running while pages stream
-	if err := qmpMigrateLive(vmDir, targetBridgeIP, launchResult.MigratePort, st.RAMMIB); err != nil {
+	if err := qmpMigrateLive(vmDir, targetBridgeIP, launchResult.MigratePort); err != nil {
 		telem.FailPhase("live-migrate", err)
 		telem.Fail(err)
 		// Clean up target

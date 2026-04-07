@@ -125,10 +125,13 @@ if [ "$VM_TYPE" = "node" ]; then
   echo "  boxcutter-node"
   (cd "${REPO_DIR}/tools" && CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-cli" ./cmd/boxcutter/)
   echo "  boxcutter-cli (tools)"
-  # Build tools.img
+  # Build tools.img (squashfs containing boxcutter CLI + tapegun daemon)
   TOOLS_STAGE="${BUILD_DIR}/tools-stage"
-  mkdir -p "${TOOLS_STAGE}/bin"
+  mkdir -p "${TOOLS_STAGE}/bin" "${TOOLS_STAGE}/etc/systemd"
   cp "${BUILD_DIR}/boxcutter-cli" "${TOOLS_STAGE}/bin/boxcutter"
+  cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun" "${TOOLS_STAGE}/bin/boxcutter-tapegun"
+  chmod 755 "${TOOLS_STAGE}/bin/boxcutter-tapegun"
+  cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun.service" "${TOOLS_STAGE}/etc/systemd/boxcutter-tapegun.service"
   mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp zstd -quiet
   echo "  tools.img: $(du -h "${BUILD_DIR}/tools.img" | cut -f1)"
 else

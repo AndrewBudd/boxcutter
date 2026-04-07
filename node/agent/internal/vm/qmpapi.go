@@ -458,7 +458,7 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 // qmpMigrateLive initiates QEMU native live migration to a target TCP endpoint.
 // The VM keeps running while memory pages are streamed incrementally.
 // Returns when migration completes (VM is now running on target).
-func qmpMigrateLive(vmDir string, targetIP string, targetPort int, ramMiB int) error {
+func qmpMigrateLive(vmDir string, targetIP string, targetPort int) error {
 	conn, err := qmpDial(vmDir)
 	if err != nil {
 		return err
@@ -492,21 +492,27 @@ func qmpMigrateLive(vmDir string, targetIP string, targetPort int, ramMiB int) e
 		return fmt.Errorf("qmp migrate: %w", err)
 	}
 
-	// Poll until migration completes
-	// Timeout: 5 min base + 2 min per GB (live migration is faster than state save)
-	maxIterations := 600
-	if ramMiB > 0 {
-		maxIterations += (ramMiB / 1024) * 240 // 2 min per GB
-	}
-	timeoutSec := maxIterations / 2
-	log.Printf("qmpMigrateLive: timeout %dm%ds", timeoutSec/60, timeoutSec%60)
+	// Poll until migration completes. Uses progress-based timeout:
+	// keep waiting as long as bytes are being transferred. Only timeout
+	// after 2 minutes of zero progress (stall). This handles any VM size
+	// without guessing how long the migration will take.
+	const stallTimeout = 2 * time.Minute
+	log.Printf("qmpMigrateLive: polling with %s stall timeout", stallTimeout)
 
 	lastLog := time.Now()
-	for i := 0; i < maxIterations; i++ {
+	lastProgress := time.Now()
+	var lastTransferred int64
+	startTime := time.Now()
+
+	for {
 		time.Sleep(500 * time.Millisecond)
 
 		result, err := qmpCommand(conn, "query-migrate", nil)
 		if err != nil {
+			if time.Since(lastProgress) > stallTimeout {
+				qmpCommand(conn, "migrate_cancel", nil)
+				return fmt.Errorf("QEMU live migration stalled (no QMP response for %s)", stallTimeout)
+			}
 			continue
 		}
 
@@ -522,37 +528,47 @@ func qmpMigrateLive(vmDir string, targetIP string, targetPort int, ramMiB int) e
 		}
 		json.Unmarshal(result, &status)
 
+		// Track progress
+		if status.RAM != nil && status.RAM.Transferred > lastTransferred {
+			lastProgress = time.Now()
+			lastTransferred = status.RAM.Transferred
+		}
+
 		// Log progress every 10s
 		if time.Since(lastLog) >= 10*time.Second {
+			elapsed := time.Since(startTime).Round(time.Second)
 			if status.RAM != nil {
 				pct := float64(0)
 				if status.RAM.Total > 0 {
 					pct = float64(status.RAM.Transferred) / float64(status.RAM.Total) * 100
 				}
-				log.Printf("qmpMigrateLive: %s — %.1f%% (%dMB/%dMB, %dMB remaining, %d dirty/s, %dMbps)",
+				log.Printf("qmpMigrateLive: %s — %.1f%% (%dMB/%dMB, %dMB remaining, %d dirty/s, %dMbps) [%s elapsed]",
 					status.Status, pct,
 					status.RAM.Transferred/1024/1024, status.RAM.Total/1024/1024,
-					status.RAM.Remaining/1024/1024, status.RAM.Dirty, status.RAM.MBps)
+					status.RAM.Remaining/1024/1024, status.RAM.Dirty, status.RAM.MBps, elapsed)
 			} else {
-				log.Printf("qmpMigrateLive: status=%s", status.Status)
+				log.Printf("qmpMigrateLive: status=%s [%s elapsed]", status.Status, elapsed)
 			}
 			lastLog = time.Now()
 		}
 
 		switch status.Status {
 		case "completed":
-			log.Printf("qmpMigrateLive: migration completed")
+			log.Printf("qmpMigrateLive: migration completed in %s", time.Since(startTime).Round(time.Second))
 			return nil
 		case "failed":
 			return fmt.Errorf("QEMU live migration failed")
 		case "cancelled":
 			return fmt.Errorf("QEMU live migration cancelled")
 		}
-	}
 
-	// Timeout — cancel the migration
-	qmpCommand(conn, "migrate_cancel", nil)
-	return fmt.Errorf("QEMU live migration timed out after %ds", timeoutSec)
+		// Stall detection
+		if time.Since(lastProgress) > stallTimeout {
+			qmpCommand(conn, "migrate_cancel", nil)
+			return fmt.Errorf("QEMU live migration stalled (no progress for %s, transferred %dMB)",
+				stallTimeout, lastTransferred/1024/1024)
+		}
+	}
 }
 
 // qmpLoadState loads a saved state file into a QEMU VM started with -incoming defer.
@@ -572,41 +588,41 @@ func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 		return fmt.Errorf("qmp migrate-incoming: %w", err)
 	}
 
-	// Poll until loaded — timeout scales with RAM size
-	// Base: 5 min (600 iterations * 500ms) + 1 min per GB of RAM
-	maxIterations := 600
-	if len(ramMiB) > 0 && ramMiB[0] > 0 {
-		extraIterations := (ramMiB[0] / 1024) * 120 // 120 iterations (60s) per GB
-		maxIterations += extraIterations
-	}
-	timeoutSec := maxIterations / 2
-	log.Printf("qmpLoadState: loading %s (timeout %dm%ds)", statePath, timeoutSec/60, timeoutSec%60)
+	// Poll until loaded. Uses progress-based timeout: keep waiting as long
+	// as bytes are being loaded. Only timeout after 2 minutes of zero progress.
+	// This handles any VM size without guessing how long the load will take.
+	const stallTimeout = 2 * time.Minute
+	log.Printf("qmpLoadState: loading %s (stall timeout %s)", statePath, stallTimeout)
+
 	lastQMPLog := time.Now()
+	lastProgress := time.Now()
+	var lastTransferred int64
 	consecutiveErrors := 0
-	for i := 0; i < maxIterations; i++ {
+	startTime := time.Now()
+
+	for {
 		time.Sleep(500 * time.Millisecond)
 
 		// Check if QEMU process is still alive — detect crashes early
 		if !IsRunning(vmDir) {
-			return fmt.Errorf("QEMU process died during state load (detected at iteration %d)", i)
+			return fmt.Errorf("QEMU process died during state load (after %s)",
+				time.Since(startTime).Round(time.Second))
 		}
 
 		result, err := qmpCommand(conn, "query-migrate", nil)
 
 		// Log QMP response every 30s for diagnostics
 		if time.Since(lastQMPLog) >= 30*time.Second {
-			elapsed := time.Duration(i) * 500 * time.Millisecond
+			elapsed := time.Since(startTime).Round(time.Second)
 			if result != nil {
-				log.Printf("qmpLoadState: progress at %s: %s", elapsed.Round(time.Second), string(result))
+				log.Printf("qmpLoadState: progress at %s: %s", elapsed, string(result))
 			} else {
-				log.Printf("qmpLoadState: polling at %s (no response)", elapsed.Round(time.Second))
+				log.Printf("qmpLoadState: polling at %s (no response)", elapsed)
 			}
 			lastQMPLog = time.Now()
 		}
 		if err != nil {
 			consecutiveErrors++
-			// If we get many consecutive QMP errors, QEMU is likely dead or
-			// the socket is stale — bail out early instead of polling forever
 			if consecutiveErrors >= 10 {
 				return fmt.Errorf("QEMU appears unresponsive (%d consecutive QMP errors): %w", consecutiveErrors, err)
 			}
@@ -621,29 +637,48 @@ func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 				}
 				json.Unmarshal(statusResult, &qs)
 				if qs.Status == "postmigrate" || qs.Status == "paused" {
-					// State loaded, VM paused. Resume it.
+					log.Printf("qmpLoadState: completed in %s", time.Since(startTime).Round(time.Second))
 					_, err = qmpCommand(conn, "cont", nil)
 					return err
 				}
+			}
+			// If errors but process alive, check stall
+			if time.Since(lastProgress) > stallTimeout {
+				return fmt.Errorf("qmp state load stalled (no progress for %s, transferred %dMB)",
+					stallTimeout, lastTransferred/1024/1024)
 			}
 			continue
 		}
 		consecutiveErrors = 0
 
+		// Parse progress for stall detection
 		var status struct {
 			Status string `json:"status"`
+			RAM    *struct {
+				Transferred int64 `json:"transferred"`
+				Total       int64 `json:"total"`
+			} `json:"ram"`
 		}
 		json.Unmarshal(result, &status)
 
+		if status.RAM != nil && status.RAM.Transferred > lastTransferred {
+			lastProgress = time.Now()
+			lastTransferred = status.RAM.Transferred
+		}
+
 		switch status.Status {
 		case "completed":
-			// Resume the VM
+			log.Printf("qmpLoadState: completed in %s", time.Since(startTime).Round(time.Second))
 			_, err = qmpCommand(conn, "cont", nil)
 			return err
 		case "failed":
 			return fmt.Errorf("qmp incoming migration failed")
 		}
-	}
 
-	return fmt.Errorf("qmp incoming migration timed out")
+		// Stall detection
+		if time.Since(lastProgress) > stallTimeout {
+			return fmt.Errorf("qmp state load stalled (no progress for %s, transferred %dMB)",
+				stallTimeout, lastTransferred/1024/1024)
+		}
+	}
 }

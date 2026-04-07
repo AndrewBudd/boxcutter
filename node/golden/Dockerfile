@@ -122,18 +122,16 @@ RUN chmod 755 /usr/local/bin/boxcutter-fetch-metadata && \
     ln -sf /etc/systemd/system/boxcutter-metadata.service \
       /etc/systemd/system/multi-user.target.wants/boxcutter-metadata.service
 
-# --- Tapegun agent communication daemon ---
-COPY config/boxcutter-tapegun /usr/local/bin/boxcutter-tapegun
-COPY config/boxcutter-tapegun.service /etc/systemd/system/boxcutter-tapegun.service
-RUN chmod 755 /usr/local/bin/boxcutter-tapegun && \
-    ln -sf /etc/systemd/system/boxcutter-tapegun.service \
-      /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service
-
 # --- Boxcutter tools mount (squashfs on /dev/vdb → /opt/boxcutter/tools) ---
 # automount: mounted on first access, so VMs without the tools device won't fail
+# tools.img contains: boxcutter CLI, boxcutter-tapegun daemon, systemd units
 RUN mkdir -p /opt/boxcutter/tools && \
     echo '/dev/vdb  /opt/boxcutter/tools  squashfs  ro,noauto,x-systemd.automount  0  0' >> /etc/fstab && \
-    ln -sf /opt/boxcutter/tools/bin/boxcutter /usr/local/bin/boxcutter
+    ln -sf /opt/boxcutter/tools/bin/boxcutter /usr/local/bin/boxcutter && \
+    ln -sf /opt/boxcutter/tools/bin/boxcutter-tapegun /usr/local/bin/boxcutter-tapegun && \
+    ln -sf /opt/boxcutter/tools/etc/systemd/boxcutter-tapegun.service /etc/systemd/system/boxcutter-tapegun.service && \
+    ln -sf /etc/systemd/system/boxcutter-tapegun.service \
+      /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service
 
 # --- Claude Code plugin directory (tapegun-guest plugin injected by docker-to-ext4.sh) ---
 RUN mkdir -p /home/dev/.claude/plugins && chown -R 1000:1000 /home/dev/.claude
