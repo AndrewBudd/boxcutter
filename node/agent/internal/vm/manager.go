@@ -2485,6 +2485,10 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		if s, _ := detail["status"].(string); s == "running" {
 			targetHealthy = true
 			break
+		} else if s == "stopped" || s == "not-found" {
+			// Target process died — fail fast instead of polling for 60s
+			log.Printf("Migrating %s: target VM died (status=%s), rolling back immediately", name, s)
+			break
 		}
 	}
 
@@ -2713,8 +2717,9 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		filepath.Join(vmDir, "vm.json"), sshOpts, targetBridgeIP, filepath.Join(dstVMDir, "vm.json")))
 	vmJsonCmd.Run()
 
-	// Verify target is healthy
-	// Verify target is healthy (VM should be running on target now)
+	// Verify target is healthy (VM should be running on target now).
+	// Fail fast if the target reports the VM as stopped/not-found — this
+	// means QEMU crashed (e.g., OOM killed) rather than still starting up.
 	telem.StartPhase("verify")
 	verifyClient := &http.Client{Timeout: 10 * time.Second}
 	var verifyOK bool
@@ -2727,6 +2732,14 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 			if s, _ := detail["status"].(string); s == "running" {
 				verifyOK = true
 				break
+			} else if s == "stopped" || s == "not-found" {
+				// QEMU process died — fail fast instead of waiting 60s
+				diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
+				verifyErr := fmt.Errorf("target QEMU process died (status=%s) after live migration%s", s, diag)
+				log.Printf("Migration verify failed (fast) for %s on %s: status=%s%s", name, targetBridgeIP, s, diag)
+				telem.FailPhase("verify", verifyErr)
+				telem.Fail(verifyErr)
+				return nil, verifyErr
 			}
 		}
 		time.Sleep(2 * time.Second)

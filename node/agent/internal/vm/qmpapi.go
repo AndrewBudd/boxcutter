@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -307,7 +308,7 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 		"-qmp", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(vmDir, "qmp.sock")),
 		"-D", qemuLogPath,
 		"-incoming", "defer",
-		"-daemonize",
+		// No -daemonize: manage process directly for crash detection
 	}
 
 	if initrd != "" {
@@ -320,33 +321,39 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 	stderrLog, _ := os.Create(filepath.Join(vmDir, "qemu-incoming.log"))
 
 	cmd := exec.Command("qemu-system-x86_64", args...)
-	if stderrLog != nil {
-		cmd.Stderr = stderrLog
+	cmd.Stdout = stderrLog
+	cmd.Stderr = stderrLog
+	if err := cmd.Start(); err != nil {
+		if stderrLog != nil {
+			stderrLog.Close()
+		}
+		return 0, fmt.Errorf("qemu-system-x86_64 incoming start: %w", err)
 	}
-	out, err := cmd.Output()
+	pid := cmd.Process.Pid
 	if stderrLog != nil {
 		stderrLog.Close()
 	}
-	if err != nil {
-		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
-		return 0, fmt.Errorf("qemu-system-x86_64 incoming: %s %s: %w", strings.TrimSpace(string(out)), strings.TrimSpace(string(stderrContent)), err)
-	}
 
-	// Wait for PID file
-	var pid int
-	for i := 0; i < 20; i++ {
-		data, readErr := os.ReadFile(pidFile)
-		if readErr == nil {
-			fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid)
-			if pid > 0 {
-				break
+	// Write PID file ourselves (no -daemonize to do it for us)
+	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", pid)), 0644)
+
+	// Monitor process in background for crash diagnostics
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
+			dmesgOOM := ""
+			if dmesgOut, dErr := exec.Command("dmesg", "--since", "2 minutes ago").Output(); dErr == nil {
+				for _, line := range strings.Split(string(dmesgOut), "\n") {
+					if strings.Contains(line, "oom") || strings.Contains(line, "OOM") || strings.Contains(line, "Killed process") {
+						dmesgOOM += line + "\n"
+					}
+				}
 			}
+			log.Printf("QEMU VM %s (incoming defer) exited unexpectedly: %v | stderr: %s | OOM: %s",
+				st.Name, err, strings.TrimSpace(string(stderrContent)), strings.TrimSpace(dmesgOOM))
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if pid == 0 {
-		return 0, fmt.Errorf("QEMU incoming: PID file not found")
-	}
+	}()
 
 	// Wait for QMP socket
 	if err := qmpWaitForSocket(vmDir, 10*time.Second); err != nil {
@@ -412,7 +419,9 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 		"-qmp", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(vmDir, "qmp.sock")),
 		"-D", qemuLogPath,
 		"-incoming", fmt.Sprintf("tcp:0:%d", migratePort),
-		"-daemonize",
+		// No -daemonize: we manage the process directly so we can detect
+		// crashes during live migration (OOM kills, KVM failures, etc.)
+		// instead of losing the exit code to the daemonized child.
 	}
 
 	if initrd != "" {
@@ -423,32 +432,47 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 
 	stderrLog, _ := os.Create(filepath.Join(vmDir, "qemu-incoming.log"))
 	cmd := exec.Command("qemu-system-x86_64", args...)
-	if stderrLog != nil {
-		cmd.Stderr = stderrLog
+	cmd.Stdout = stderrLog // capture any stdout too
+	cmd.Stderr = stderrLog
+	if err := cmd.Start(); err != nil {
+		if stderrLog != nil {
+			stderrLog.Close()
+		}
+		return 0, 0, fmt.Errorf("qemu incoming tcp start: %w", err)
 	}
-	out, err := cmd.Output()
+	pid := cmd.Process.Pid
 	if stderrLog != nil {
 		stderrLog.Close()
 	}
-	if err != nil {
-		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
-		return 0, 0, fmt.Errorf("qemu incoming tcp: %s %s: %w", string(out), string(stderrContent), err)
-	}
 
-	// Wait for PID file
-	var pid int
-	for i := 0; i < 20; i++ {
-		data, readErr := os.ReadFile(pidFile)
-		if readErr == nil {
-			fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid)
-			if pid > 0 {
-				break
+	// Write PID file (QEMU would have written it with -daemonize, but
+	// since we manage the process directly, write it ourselves).
+	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", pid)), 0644)
+
+	// Monitor process in background — log crash details (exit code, OOM, stderr)
+	// so migration failures have actionable diagnostics instead of "VM not running".
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
+			dmesgOOM := ""
+			if dmesgOut, dErr := exec.Command("dmesg", "--since", "2 minutes ago").Output(); dErr == nil {
+				for _, line := range strings.Split(string(dmesgOut), "\n") {
+					if strings.Contains(line, "oom") || strings.Contains(line, "OOM") || strings.Contains(line, "Killed process") {
+						dmesgOOM += line + "\n"
+					}
+				}
 			}
+			log.Printf("QEMU VM %s (incoming migration) exited unexpectedly: %v | stderr: %s | OOM: %s",
+				st.Name, err, strings.TrimSpace(string(stderrContent)), strings.TrimSpace(dmesgOOM))
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if pid == 0 {
-		return 0, 0, fmt.Errorf("QEMU incoming TCP: PID file not found")
+	}()
+
+	// Wait briefly for QEMU to initialize and start listening on the migration port
+	time.Sleep(200 * time.Millisecond)
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
+		return 0, 0, fmt.Errorf("QEMU incoming TCP died immediately: %s", strings.TrimSpace(string(stderrContent)))
 	}
 
 	log.Printf("QEMU VM %s ready for incoming live migration on port %d (PID %d)", st.Name, migratePort, pid)
