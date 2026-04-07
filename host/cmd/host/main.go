@@ -2038,6 +2038,16 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			log.Printf("Drain: retrying %d failed migration(s): %v", len(retryList), retryList)
 			retryFailed := 0
 			for _, vmName := range retryList {
+				// Clear any stale migration state from the previous attempt.
+				// Without this, the node agent may reject the retry with 409
+				// "already migrating" if the previous goroutine's state wasn't
+				// cleaned up (panic, hang, race with agent restart).
+				cancelReq, _ := http.NewRequest("DELETE",
+					fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName), nil)
+				if cancelResp, err := pollClient.Do(cancelReq); err == nil {
+					cancelResp.Body.Close()
+				}
+
 				migrateReq := map[string]string{
 					"target_addr":      fmt.Sprintf("%s:8800", targetNode.BridgeIP),
 					"target_bridge_ip": targetNode.BridgeIP,

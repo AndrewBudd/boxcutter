@@ -46,11 +46,24 @@ func NewManager(cfg *config.Config, vmidClient *vmid.Client) *Manager {
 // StartMigration atomically checks if a VM is already migrating and marks it.
 // Returns true if migration was started, false if already migrating.
 // The targetAddr is stored in the marker file for crash recovery (split-brain detection).
+//
+// If the in-memory set says "migrating" but no filesystem marker exists, the
+// previous migration goroutine completed/panicked without clearing the set.
+// In that case, the stale entry is auto-cleared and the new migration proceeds.
 func (m *Manager) StartMigration(name, targetAddr string) bool {
 	m.migratingMu.Lock()
 	defer m.migratingMu.Unlock()
 	if m.migratingSet[name] {
-		return false
+		// Check for stale in-memory state: if the filesystem marker is gone,
+		// the previous migration finished but didn't clear migratingSet
+		// (panic, goroutine leak, etc.). Safe to clear and proceed.
+		vmDir := VMDir(name)
+		if !IsMigrating(vmDir) {
+			log.Printf("StartMigration %s: clearing stale in-memory state (no filesystem marker)", name)
+			delete(m.migratingSet, name)
+		} else {
+			return false
+		}
 	}
 	m.migratingSet[name] = true
 	vmDir := VMDir(name)
