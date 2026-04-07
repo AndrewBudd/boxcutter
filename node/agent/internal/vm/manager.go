@@ -297,6 +297,22 @@ func (m *Manager) startSetup(name string) (*VMState, error) {
 
 	// Clean up stale TAP/rules from previous runs (idempotent)
 	TeardownTAP(st.TAP, st.Mark)
+
+	// Re-allocate mark to prevent collisions (e.g., after relocation from
+	// another node where a different set of VMs existed). TAP name is
+	// deterministic from the VM name so it doesn't need re-allocation.
+	existingMarks := m.collectExistingMarks()
+	delete(existingMarks, st.Mark) // don't collide with ourselves
+	newMark := AllocateMark(st.Name, existingMarks)
+	if newMark != st.Mark {
+		log.Printf("VM %s: re-allocated mark %d → %d (collision avoidance)", name, st.Mark, newMark)
+		st.Mark = newMark
+		st.TAP = TAPName(st.Name)
+		if err := SaveVMState(vmDir, st); err != nil {
+			return nil, fmt.Errorf("saving re-allocated mark: %w", err)
+		}
+	}
+
 	CleanupSnapshot(vmDir)
 
 	// Ensure dm-snapshot is active (resolve golden version for this VM)
@@ -2650,6 +2666,24 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	default:
 		diskName = "cow.img"
 	}
+
+	// QCOW2 rootfs files use a backing file (golden image). The target node
+	// may have a different golden version, which would silently corrupt the
+	// overlay. Flatten the QCOW2 to a standalone file before transfer.
+	flattenedQCOW2 := ""
+	if diskName == "rootfs.qcow2" {
+		flatPath := filepath.Join(vmDir, "rootfs-flat.qcow2")
+		log.Printf("Flattening QCOW2 for stopped relocation of %s", name)
+		flatCmd := exec.Command("qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", filepath.Join(vmDir, "rootfs.qcow2"), flatPath)
+		if out, err := flatCmd.CombinedOutput(); err != nil {
+			cleanTarget()
+			return nil, fmt.Errorf("flatten qcow2: %s: %w", string(out), err)
+		}
+		flattenedQCOW2 = flatPath
+		// Transfer the flattened file as rootfs.qcow2 on the target
+		diskName = "rootfs-flat.qcow2"
+	}
+
 	tarFiles := diskName + " vm.json"
 	if _, err := os.Stat(filepath.Join(vmDir, "mailbox.json")); err == nil {
 		tarFiles += " mailbox.json"
@@ -2665,8 +2699,23 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, tarFiles, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := tarCmd.CombinedOutput(); err != nil {
+		if flattenedQCOW2 != "" {
+			os.Remove(flattenedQCOW2)
+		}
 		cleanTarget()
 		return nil, fmt.Errorf("tar transfer %s: %s: %w", diskName, string(out), err)
+	}
+
+	// Clean up local flattened file and rename on target
+	if flattenedQCOW2 != "" {
+		os.Remove(flattenedQCOW2)
+		// Rename rootfs-flat.qcow2 → rootfs.qcow2 on target
+		renameCmd := exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
+			"sudo", "mv", dstVMDir+"rootfs-flat.qcow2", dstVMDir+"rootfs.qcow2")...)
+		if out, err := renameCmd.CombinedOutput(); err != nil {
+			cleanTarget()
+			return nil, fmt.Errorf("rename flattened qcow2 on target: %s: %w", string(out), err)
+		}
 	}
 
 	// Transfer snapshot.json if it exists (dm-snapshot VMs only)
@@ -2681,9 +2730,17 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	}
 	log.Printf("Relocated stopped VM %s: file transfer took %s", name, time.Since(xferStart).Round(time.Millisecond))
 
+	// Create .stopped marker on target so the VM stays stopped after relocation.
+	// Without this, the target node agent's RestartAll would auto-start it.
+	stoppedCmd := exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
+		"sudo", "touch", dstVMDir+".stopped")...)
+	stoppedCmd.Run() // best effort — VM still relocates if this fails
+
 	// Verify target has the VM files before deleting source
 	verifyCmd := exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
-		"test", "-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+diskName)...)
+		"test", "-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+"rootfs.qcow2", "-o",
+		"-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+"rootfs.ext4", "-o",
+		"-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+"cow.img")...)
 	if err := verifyCmd.Run(); err != nil {
 		cleanTarget()
 		return nil, fmt.Errorf("target verification failed — source preserved: %w", err)

@@ -2970,11 +2970,38 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 				return false, "", fmt.Errorf("launching new orchestrator: %w", err)
 			}
 			_ = pid
+			goal.NewOrchLaunchTime = time.Now().Format(time.RFC3339)
 			state.Save()
 			return false, fmt.Sprintf("Launched new orchestrator at %s", goal.NewOrchIP), nil
 		}
 
-		// Disk exists but not healthy yet — wait
+		// Disk exists but not healthy yet — check for timeout.
+		// Cloud-init + systemd boot typically takes 30-90 seconds. If the
+		// orchestrator hasn't become healthy after 5 minutes, something is wrong.
+		const orchHealthTimeout = 5 * time.Minute
+		if goal.NewOrchLaunchTime != "" {
+			launchTime, _ := time.Parse(time.RFC3339, goal.NewOrchLaunchTime)
+			if !launchTime.IsZero() && time.Since(launchTime) > orchHealthTimeout {
+				// Clean up the failed new orchestrator
+				failedIP := goal.NewOrchIP
+				newPID := findQEMUPID(newDisk)
+				if newPID > 0 {
+					qemu.Stop("orchestrator-new", newPID)
+				}
+				os.Remove(newDisk)
+				os.Remove(orchISO)
+				bridge.DeleteTAP(goal.NewOrchTAP)
+				goal.NewOrchIP = ""
+				goal.NewOrchTAP = ""
+				goal.NewOrchMAC = ""
+				goal.NewOrchLaunchTime = ""
+				state.SetNodeStatus("orchestrator", "active")
+				state.Save()
+				return false, "", fmt.Errorf("new orchestrator at %s did not become healthy within %s — cleaned up, will retry",
+					failedIP, orchHealthTimeout)
+			}
+		}
+
 		return false, fmt.Sprintf("Waiting for new orchestrator at %s to become healthy", goal.NewOrchIP), nil
 	}
 
@@ -3091,6 +3118,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	goal.NewOrchIP = ""
 	goal.NewOrchTAP = ""
 	goal.NewOrchMAC = ""
+	goal.NewOrchLaunchTime = ""
 	state.Save()
 
 	if oldDisk != "" && oldDisk != newDisk {

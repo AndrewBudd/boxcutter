@@ -88,9 +88,10 @@ type UpgradeGoal struct {
 	GoldenWaitStart string `json:"golden_wait_start,omitempty"`
 
 	// Orchestrator upgrade: temp bridge IP/TAP/MAC for new orchestrator
-	NewOrchIP  string `json:"new_orch_ip,omitempty"`
-	NewOrchTAP string `json:"new_orch_tap,omitempty"`
-	NewOrchMAC string `json:"new_orch_mac,omitempty"`
+	NewOrchIP         string `json:"new_orch_ip,omitempty"`
+	NewOrchTAP        string `json:"new_orch_tap,omitempty"`
+	NewOrchMAC        string `json:"new_orch_mac,omitempty"`
+	NewOrchLaunchTime string `json:"new_orch_launch_time,omitempty"`
 
 	CreatedAt string `json:"created_at"`
 }
