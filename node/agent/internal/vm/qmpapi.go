@@ -289,6 +289,7 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 		diskFormat = "qcow2"
 	}
 
+	qemuLogPath := filepath.Join(vmDir, "qemu-daemon.log")
 	args := []string{
 		"-enable-kvm",
 		"-cpu", "host",
@@ -304,6 +305,7 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 		"-no-reboot",
 		"-pidfile", pidFile,
 		"-qmp", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(vmDir, "qmp.sock")),
+		"-D", qemuLogPath,
 		"-incoming", "defer",
 		"-daemonize",
 	}
@@ -392,6 +394,7 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 		return 0, 0, fmt.Errorf("no free TCP port for incoming migration")
 	}
 
+	qemuLogPath := filepath.Join(vmDir, "qemu-daemon.log")
 	args := []string{
 		"-enable-kvm",
 		"-cpu", "host",
@@ -407,6 +410,7 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 		"-no-reboot",
 		"-pidfile", pidFile,
 		"-qmp", fmt.Sprintf("unix:%s,server,nowait", filepath.Join(vmDir, "qmp.sock")),
+		"-D", qemuLogPath,
 		"-incoming", fmt.Sprintf("tcp:0:%d", migratePort),
 		"-daemonize",
 	}

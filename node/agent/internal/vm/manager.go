@@ -449,11 +449,16 @@ func (m *Manager) Stop(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Write .stopped marker BEFORE killing the process so the marker survives
+	// agent crashes or restarts (e.g. during binary deploy). If stopVM fails,
+	// we remove the marker to keep things consistent.
+	markerPath := filepath.Join(VMDir(name), ".stopped")
+	os.WriteFile(markerPath, nil, 0644)
+
 	if err := m.stopVM(name); err != nil {
+		os.Remove(markerPath) // rollback marker on failure
 		return err
 	}
-	// Mark VM as intentionally stopped so RestartAll won't restart it.
-	os.WriteFile(filepath.Join(VMDir(name), ".stopped"), nil, 0644)
 	return nil
 }
 
@@ -811,15 +816,18 @@ func (m *Manager) RestartAll() {
 		}
 		SetMigrating(vmDir, false) // clear stale marker regardless
 
-		if IsRunning(vmDir) {
-			log.Printf("  %s: already running, re-registering with vmid", st.Name)
-			m.registerWithVMID(st)
+		// Check .stopped marker FIRST, before IsRunning. The marker is written
+		// before the VM process is killed (see Stop()), so during agent restart
+		// after a deploy, we may find the process still dying while the marker
+		// already exists. Checking the marker first prevents accidental restarts.
+		if _, err := os.Stat(filepath.Join(vmDir, ".stopped")); err == nil {
+			log.Printf("  %s: stopped marker found, skipping restart", st.Name)
 			continue
 		}
 
-		// Skip VMs that were intentionally stopped via the Stop API.
-		if _, err := os.Stat(filepath.Join(vmDir, ".stopped")); err == nil {
-			log.Printf("  %s: stopped marker found, skipping restart", st.Name)
+		if IsRunning(vmDir) {
+			log.Printf("  %s: already running, re-registering with vmid", st.Name)
+			m.registerWithVMID(st)
 			continue
 		}
 
@@ -1474,6 +1482,28 @@ func (m *Manager) getSystemRAMMiB() int {
 			var ram int
 			fmt.Sscanf(strings.Fields(line)[1], "%d", &ram)
 			return ram
+		}
+	}
+	return 0
+}
+
+// getAvailableRAMMiB reads MemAvailable from /proc/meminfo — the kernel's
+// estimate of how much memory is available for new allocations without swapping.
+// This is more accurate than (total - allocated) because it accounts for kernel
+// overhead, page cache, slab, and other non-reclaimable memory.
+func getAvailableRAMMiB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemAvailable:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				var kB int
+				fmt.Sscanf(fields[1], "%d", &kB)
+				return kB / 1024
+			}
 		}
 	}
 	return 0
@@ -2490,7 +2520,10 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		time.Sleep(2 * time.Second)
 	}
 	if !verifyOK {
-		verifyErr := fmt.Errorf("target VM not running after live migration")
+		// Collect diagnostics from target: dmesg OOM kills + QEMU daemon log
+		diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
+		verifyErr := fmt.Errorf("target VM not running after live migration%s", diag)
+		log.Printf("Migration verify failed for %s on %s:%s", name, targetBridgeIP, diag)
 		telem.FailPhase("verify", verifyErr)
 		telem.Fail(verifyErr)
 		return nil, verifyErr
@@ -2521,6 +2554,38 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		TargetNode: targetAddr,
 		Status:     fmt.Sprintf("migrated (downtime: %s)", downtime.Round(time.Millisecond)),
 	}, nil
+}
+
+// collectTargetDiagnostics SSHes to the target node and collects dmesg OOM
+// messages and QEMU daemon log output. Returns a formatted string for logging.
+func collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir string) string {
+	var diag string
+
+	// Check dmesg for OOM kills
+	dmesgCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"%s ubuntu@%s 'sudo dmesg --since \"5 minutes ago\" 2>/dev/null | grep -iE \"oom|killed process|out of memory\" || true'",
+		sshOpts, targetBridgeIP))
+	if dmesgOut, err := dmesgCmd.Output(); err == nil && len(strings.TrimSpace(string(dmesgOut))) > 0 {
+		diag += fmt.Sprintf("\n  dmesg OOM: %s", strings.TrimSpace(string(dmesgOut)))
+	}
+
+	// Read QEMU daemon log
+	logCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"%s ubuntu@%s 'sudo cat %s/qemu-daemon.log 2>/dev/null || true'",
+		sshOpts, targetBridgeIP, dstVMDir))
+	if logOut, err := logCmd.Output(); err == nil && len(strings.TrimSpace(string(logOut))) > 0 {
+		diag += fmt.Sprintf("\n  qemu-daemon.log: %s", strings.TrimSpace(string(logOut)))
+	}
+
+	// Read QEMU stderr log
+	stderrCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"%s ubuntu@%s 'sudo cat %s/qemu-incoming.log 2>/dev/null || true'",
+		sshOpts, targetBridgeIP, dstVMDir))
+	if stderrOut, err := stderrCmd.Output(); err == nil && len(strings.TrimSpace(string(stderrOut))) > 0 {
+		diag += fmt.Sprintf("\n  qemu-incoming.log: %s", strings.TrimSpace(string(stderrOut)))
+	}
+
+	return diag
 }
 
 // relocateStoppedVM transfers a stopped VM's files to the target node.
@@ -2652,13 +2717,23 @@ func (m *Manager) LaunchIncomingTCP(name string) (int, int, error) {
 		return 0, 0, fmt.Errorf("VM state not found: %w", err)
 	}
 
-	// Capacity check
+	// Capacity check: both declared allocation AND actual available memory.
+	// The declared check catches overcommit; the MemAvailable check catches
+	// actual OOM risk (kernel overhead, fragmentation, page cache pressure).
 	sysRAM := m.getSystemRAMMiB()
 	if sysRAM > 0 {
 		allocatedRAM := m.getAllocatedRAMMiB()
 		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
-			return 0, 0, &CapacityError{msg: "node is full"}
+			return 0, 0, &CapacityError{msg: fmt.Sprintf(
+				"node is full (allocated=%dMiB + incoming=%dMiB > %dMiB [90%% of %dMiB])",
+				allocatedRAM, st.RAMMIB, sysRAM*90/100, sysRAM)}
 		}
+	}
+	availRAM := getAvailableRAMMiB()
+	if availRAM > 0 && st.RAMMIB > availRAM-512 {
+		return 0, 0, &CapacityError{msg: fmt.Sprintf(
+			"not enough available memory (need=%dMiB, available=%dMiB, headroom=512MiB)",
+			st.RAMMIB, availRAM)}
 	}
 
 	// Ensure golden QCOW2 exists
@@ -2697,13 +2772,21 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		return nil, fmt.Errorf("VM state not found: %w", err)
 	}
 
-	// Capacity check
+	// Capacity check: declared allocation + actual MemAvailable
 	sysRAM := m.getSystemRAMMiB()
 	if sysRAM > 0 {
 		allocatedRAM := m.getAllocatedRAMMiB()
 		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
-			return nil, &CapacityError{msg: "node is full"}
+			return nil, &CapacityError{msg: fmt.Sprintf(
+				"node is full (allocated=%dMiB + incoming=%dMiB > %dMiB [90%% of %dMiB])",
+				allocatedRAM, st.RAMMIB, sysRAM*90/100, sysRAM)}
 		}
+	}
+	availRAM := getAvailableRAMMiB()
+	if availRAM > 0 && st.RAMMIB > availRAM-512 {
+		return nil, &CapacityError{msg: fmt.Sprintf(
+			"not enough available memory (need=%dMiB, available=%dMiB, headroom=512MiB)",
+			st.RAMMIB, availRAM)}
 	}
 
 	// Ensure golden QCOW2 exists if this is a QCOW2-backed VM
