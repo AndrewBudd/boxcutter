@@ -2882,7 +2882,7 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		// Deploy latest node agent to the OLD node before draining — but only
 		// once. Repeated deploys restart the agent, which aborts in-progress
 		// migrations and creates a drain→fail→redeploy→drain loop.
-		if goal.DeployedOldNodeID != n.ID {
+		if !goal.DeployedOldNodeIDs[n.ID] {
 			// The old node runs the migration — it needs the new binary
 			// (e.g., native live migration code) to migrate large VMs.
 			// Prefer copying from the replacement node (has the new image's binary),
@@ -2900,7 +2900,10 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 					log.Printf("Pre-drain deploy to %s: %v (continuing with existing binary)", n.ID, err)
 				}
 			}
-			goal.DeployedOldNodeID = n.ID
+			if goal.DeployedOldNodeIDs == nil {
+				goal.DeployedOldNodeIDs = make(map[string]bool)
+			}
+			goal.DeployedOldNodeIDs[n.ID] = true
 			state.Save()
 			return false, fmt.Sprintf("Deployed latest binary to old node %s", n.ID), nil
 		}

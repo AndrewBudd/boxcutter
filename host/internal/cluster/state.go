@@ -83,10 +83,10 @@ type UpgradeGoal struct {
 	// Reset when a new replacement is launched.
 	DeployedNodeID string `json:"deployed_node_id,omitempty"`
 
-	// Node upgrade: ID of the old node that has received the latest agent binary
+	// Node upgrade: set of old node IDs that have received the latest agent binary
 	// before drain. Prevents repeated deploy+restart cycles when drain fails and
 	// retries — restarting the agent mid-migration aborts in-progress transfers.
-	DeployedOldNodeID string `json:"deployed_old_node_id,omitempty"`
+	DeployedOldNodeIDs map[string]bool `json:"deployed_old_node_ids,omitempty"`
 
 	// Timestamp when we started waiting for golden image on replacement node.
 	// Used to detect stuck golden image builds and time out.
