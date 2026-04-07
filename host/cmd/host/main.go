@@ -318,12 +318,14 @@ func main() {
 		cliStopNode()
 	case "remove-node":
 		cliRemoveNode()
+	case "list-orphans":
+		cliListOrphans()
 	case "recover":
 		cliRecover()
 	case "self-update":
 		cliSelfUpdate()
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <run|status|bootstrap|pull|upgrade|recover|self-update|version|build-image|push-golden>\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <command>\n\n")
 		fmt.Fprintf(os.Stderr, "Commands:\n")
 		fmt.Fprintf(os.Stderr, "  run                          Run the host daemon\n")
 		fmt.Fprintf(os.Stderr, "  status                       Show cluster status\n")
@@ -334,6 +336,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  self-update [--version TAG]  Update boxcutter-host to latest stable release\n")
 		fmt.Fprintf(os.Stderr, "  pull <type> [--tag TAG]      Pull a VM image from OCI registry\n")
 		fmt.Fprintf(os.Stderr, "  upgrade <type> [--tag TAG]   Rolling upgrade of VMs\n")
+		fmt.Fprintf(os.Stderr, "  stop-node <id> [--force] [--delete-disk]  Stop a node and remove from state\n")
+		fmt.Fprintf(os.Stderr, "  remove-node <id>             Remove a node entry (kills QEMU if running)\n")
+		fmt.Fprintf(os.Stderr, "  list-orphans                 Show nodes with 0 VMs (cleanup candidates)\n")
+		fmt.Fprintf(os.Stderr, "  cleanup-nodes                Remove all orphan nodes\n")
 		os.Exit(1)
 	}
 }
@@ -1288,6 +1294,67 @@ func addNode(cfg HostConfig, state *cluster.State) {
 			log.Printf("Deploy %s (background): %v", nodeID, err)
 		}
 	}()
+}
+
+// deployNodeBinaryFromPeer copies the node agent binary from a peer node (e.g.,
+// the new replacement) to an existing node and restarts the service. This ensures
+// old nodes run the latest migration code before drain, even when source isn't available.
+func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targetNodeID string) error {
+	sshKey := findClusterSSHKey(cfg)
+	if sshKey == "" {
+		return fmt.Errorf("no cluster SSH key found")
+	}
+
+	sshOpts := []string{
+		"-i", sshKey,
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=5",
+	}
+
+	// Copy binary from peer to host /tmp
+	tmpBin := filepath.Join(os.TempDir(), fmt.Sprintf("boxcutter-node-%s", targetNodeID))
+	defer os.Remove(tmpBin)
+
+	scpFrom := exec.Command("scp", append(sshOpts, "ubuntu@"+peerBridgeIP+":/usr/local/bin/boxcutter-node", tmpBin)...)
+	if out, err := scpFrom.CombinedOutput(); err != nil {
+		return fmt.Errorf("SCP from peer %s: %v\n%s", peerBridgeIP, err, string(out))
+	}
+
+	// SCP binary to target node
+	scpTo := exec.Command("scp", append(sshOpts, tmpBin, "ubuntu@"+targetBridgeIP+":/tmp/boxcutter-node")...)
+	if out, err := scpTo.CombinedOutput(); err != nil {
+		return fmt.Errorf("SCP to target %s: %v\n%s", targetBridgeIP, err, string(out))
+	}
+
+	// Install and restart
+	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+targetBridgeIP,
+		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
+		"&&", "sudo", "systemctl", "restart", "boxcutter-node")...)
+	if out, err := installCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("install on %s: %v\n%s", targetBridgeIP, err, string(out))
+	}
+
+	// Verify agent health after restart
+	client := &http.Client{Timeout: 5 * time.Second}
+	healthOK := false
+	for i := 0; i < 12; i++ {
+		time.Sleep(5 * time.Second)
+		resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", targetBridgeIP))
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				healthOK = true
+				break
+			}
+		}
+	}
+	if !healthOK {
+		return fmt.Errorf("agent on %s not healthy after restart (waited 60s)", targetBridgeIP)
+	}
+
+	log.Printf("Deploy %s: binary from peer %s deployed successfully", targetNodeID, peerBridgeIP)
+	return nil
 }
 
 // deployNodeBinary builds the node agent from source and deploys it to a node.
@@ -2352,14 +2419,72 @@ func cliCleanupNodes() {
 	}
 }
 
+// cliListOrphans displays nodes with zero VMs that are candidates for cleanup.
+func cliListOrphans() {
+	cfg := defaultConfig()
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Loading cluster state: %v\n", err)
+		os.Exit(1)
+	}
+
+	nodeClient := &http.Client{Timeout: 5 * time.Second}
+	found := 0
+	for _, n := range state.Nodes {
+		vmCount := -1 // unknown
+		if qemu.IsRunning(n.PID) {
+			resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/vms", n.BridgeIP))
+			if err == nil {
+				var vms []interface{}
+				json.NewDecoder(resp.Body).Decode(&vms)
+				resp.Body.Close()
+				vmCount = len(vms)
+			}
+		}
+
+		isOrphan := false
+		reason := ""
+		if !qemu.IsRunning(n.PID) {
+			isOrphan = true
+			reason = "dead QEMU process"
+		} else if vmCount == 0 {
+			isOrphan = true
+			reason = "0 VMs"
+		}
+
+		if isOrphan {
+			fmt.Printf("  %s  status=%-10s  PID=%-6d  bridge=%-14s  reason=%s\n",
+				n.ID, n.Status, n.PID, n.BridgeIP, reason)
+			found++
+		}
+	}
+	if found == 0 {
+		fmt.Println("No orphan nodes found.")
+	} else {
+		fmt.Printf("\n%d orphan node(s). Use 'cleanup-nodes' to remove or 'stop-node <id>' individually.\n", found)
+	}
+}
+
 // cliStopNode stops a specific node's QEMU process and removes it from cluster state.
 func cliStopNode() {
 	cfg := defaultConfig()
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: boxcutter-host stop-node <node-id>")
+		fmt.Println("Usage: boxcutter-host stop-node <node-id> [--force] [--delete-disk]")
 		os.Exit(1)
 	}
 	nodeID := os.Args[2]
+
+	// Parse flags
+	force := false
+	deleteDisk := false
+	for _, arg := range os.Args[3:] {
+		switch arg {
+		case "--force":
+			force = true
+		case "--delete-disk":
+			deleteDisk = true
+		}
+	}
 
 	state, err := cluster.Load(cfg.StatePath)
 	if err != nil {
@@ -2374,7 +2499,6 @@ func cliStopNode() {
 	}
 
 	// Check for VMs unless --force
-	force := len(os.Args) > 3 && os.Args[3] == "--force"
 	if !force {
 		nodeClient := &http.Client{Timeout: 5 * time.Second}
 		resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/vms", node.BridgeIP))
@@ -2400,13 +2524,30 @@ func cliStopNode() {
 		bridge.DeleteTAP(node.TAP)
 	}
 
+	// Clean up disk artifacts
+	if deleteDisk && node.Disk != "" {
+		if err := os.Remove(node.Disk); err == nil {
+			fmt.Printf("Removed disk %s\n", node.Disk)
+		}
+	}
+	// Always clean ISO and console log (small files, no reason to keep)
+	if node.Disk != "" {
+		consoleLog := strings.TrimSuffix(node.Disk, ".qcow2") + "-console.log"
+		os.Remove(consoleLog)
+		pidFile := strings.TrimSuffix(node.Disk, ".qcow2") + ".pid"
+		os.Remove(pidFile)
+	}
+	if node.ISO != "" {
+		os.Remove(node.ISO)
+	}
+
 	// Remove from state
 	state.RemoveNode(nodeID)
 	state.Save()
 	fmt.Printf("Node '%s' stopped and removed.\n", nodeID)
 }
 
-// cliRemoveNode removes a node from cluster state (without stopping QEMU — for ghost entries).
+// cliRemoveNode removes a node from cluster state and kills its QEMU process if running.
 func cliRemoveNode() {
 	cfg := defaultConfig()
 	if len(os.Args) < 3 {
@@ -2427,7 +2568,7 @@ func cliRemoveNode() {
 		os.Exit(1)
 	}
 
-	// Also kill QEMU if running
+	// Kill QEMU if running (prevents ghost re-adoption on daemon restart)
 	if qemu.IsRunning(node.PID) {
 		fmt.Printf("Killing QEMU process (PID %d)...\n", node.PID)
 		qemu.Stop(nodeID, node.PID)
@@ -2436,6 +2577,17 @@ func cliRemoveNode() {
 	// Clean up TAP
 	if node.TAP != "" {
 		bridge.DeleteTAP(node.TAP)
+	}
+
+	// Clean up disk artifacts
+	if node.Disk != "" {
+		consoleLog := strings.TrimSuffix(node.Disk, ".qcow2") + "-console.log"
+		os.Remove(consoleLog)
+		pidFile := strings.TrimSuffix(node.Disk, ".qcow2") + ".pid"
+		os.Remove(pidFile)
+	}
+	if node.ISO != "" {
+		os.Remove(node.ISO)
 	}
 
 	state.RemoveNode(nodeID)
@@ -2632,8 +2784,20 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		// Deploy latest node agent to the OLD node before draining.
 		// The old node runs the migration — it needs the new binary
 		// (e.g., native live migration code) to migrate large VMs.
-		if err := deployNodeBinary(cfg, n.BridgeIP, n.ID); err != nil {
-			log.Printf("Pre-drain deploy to %s: %v (continuing with existing binary)", n.ID, err)
+		// Prefer copying from the replacement node (has the new image's binary),
+		// falling back to building from source if no replacement is available.
+		deployed := false
+		if replacement := findReplacementNode(state, goal); replacement != nil {
+			if err := deployNodeBinaryFromPeer(cfg, replacement.BridgeIP, n.BridgeIP, n.ID); err != nil {
+				log.Printf("Pre-drain deploy from peer to %s: %v (trying source build)", n.ID, err)
+			} else {
+				deployed = true
+			}
+		}
+		if !deployed {
+			if err := deployNodeBinary(cfg, n.BridgeIP, n.ID); err != nil {
+				log.Printf("Pre-drain deploy to %s: %v (continuing with existing binary)", n.ID, err)
+			}
 		}
 
 		state.SetNodeStatus(n.ID, "draining")
@@ -2989,14 +3153,21 @@ func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
 		if qemu.IsRunning(n.PID) {
 			log.Printf("Stopping orphan node %s (PID %d, 0 VMs)", n.ID, n.PID)
 			qemu.Stop(n.ID, n.PID)
-			// Clean up TAP
-			if n.TAP != "" {
-				bridge.DeleteTAP(n.TAP)
-			}
-			// Clean up disk
-			if n.Disk != "" {
-				os.Remove(n.Disk)
-			}
+		}
+		// Clean up TAP
+		if n.TAP != "" {
+			bridge.DeleteTAP(n.TAP)
+		}
+		// Clean up disk artifacts
+		if n.Disk != "" {
+			os.Remove(n.Disk)
+			consoleLog := strings.TrimSuffix(n.Disk, ".qcow2") + "-console.log"
+			os.Remove(consoleLog)
+			pidFile := strings.TrimSuffix(n.Disk, ".qcow2") + ".pid"
+			os.Remove(pidFile)
+		}
+		if n.ISO != "" {
+			os.Remove(n.ISO)
 		}
 		state.RemoveNode(n.ID)
 		cleaned = append(cleaned, n.ID)
@@ -3011,9 +3182,6 @@ func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
 		}
 	}
 
-	if len(cleaned) > 0 {
-		state.Save()
-	}
 	state.Save()
 
 	return cleaned
