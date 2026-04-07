@@ -3082,12 +3082,18 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		// The source still has the authoritative copy, so this is safe.
 		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
 		TeardownTAP(st.TAP, st.Mark)
-		// Clean up the entire VM directory — the source still has the
-		// authoritative copy, so these files are just orphaned waste.
-		log.Printf("Cleaning up failed migration target directory: %s", vmDir)
-		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
-		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))
-		os.RemoveAll(vmDir)
+		// Clean up the VM directory if this is a migration target (not a
+		// pre-existing stopped VM that happened to share the name).
+		_, hasIncomingLog := os.Stat(filepath.Join(vmDir, "qemu-incoming.log"))
+		_, hasStopped := os.Stat(filepath.Join(vmDir, ".stopped"))
+		if hasIncomingLog == nil || hasStopped != nil {
+			log.Printf("Cleaning up failed migration target directory: %s", vmDir)
+			os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
+			os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))
+			os.RemoveAll(vmDir)
+		} else {
+			log.Printf("ImportQEMUState %s: state load failed but vmDir appears to be a pre-existing stopped VM, preserving", name)
+		}
 		return nil, fmt.Errorf("loading state: %w", err)
 	}
 	targetTelem.EndPhase("state-load", 0)
