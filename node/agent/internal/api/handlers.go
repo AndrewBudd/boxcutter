@@ -60,6 +60,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/import-qemu-state", h.handleImportQEMUState)
 	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleCopy)
 	mux.HandleFunc("POST /api/vms/{name}/migrate", h.handleMigrate)
+	mux.HandleFunc("DELETE /api/vms/{name}/migrate", h.handleMigrateCancel)
 	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleAddRepo)
 	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleRemoveRepo)
 	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleListRepos)
@@ -501,17 +502,38 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 	// Start migration in background — caller polls GET /api/vms/{name} for status
 	go func() {
+		// Use defer to guarantee cleanup even if MigrateVM panics.
+		// EndMigration clears both in-memory set and filesystem marker.
+		// On success, MigrateVM already removed vmDir, so SetMigrating is a no-op.
+		defer h.mgr.EndMigration(name)
 		_, err := h.mgr.MigrateVM(name, req.TargetAddr, req.TargetBridgeIP)
 		if err != nil {
 			log.Printf("Migration failed for %s: %v", name, err)
 		}
-		// EndMigration clears both in-memory set and filesystem marker.
-		// On success, MigrateVM already removed vmDir, so SetMigrating is a no-op.
-		h.mgr.EndMigration(name)
 	}()
 
 	w.WriteHeader(http.StatusAccepted)
 	writeJSON(w, map[string]string{"name": name, "status": "migrating"})
+}
+
+// handleMigrateCancel clears stale migration state for a VM.
+// Called by the host drain code when a previous migration attempt left
+// the in-memory migratingSet or filesystem marker in a stale state,
+// preventing new migration attempts from proceeding.
+func (h *Handler) handleMigrateCancel(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+
+	if !h.mgr.IsMigratingVM(name) {
+		writeJSON(w, map[string]string{"name": name, "status": "not_migrating"})
+		return
+	}
+
+	log.Printf("Migration cancel for %s: clearing stale migration state", name)
+	h.mgr.EndMigration(name)
+	writeJSON(w, map[string]string{"name": name, "status": "cancelled"})
 }
 
 func (h *Handler) handleCopy(w http.ResponseWriter, r *http.Request) {
