@@ -92,19 +92,6 @@ func localKernel(vmDir string) (kernel string, initrd string, err error) {
 	return localKernelPath, "", nil
 }
 
-// copyFile copies src to dst, preserving permissions.
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	info, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, info.Mode())
-}
-
 // launchQEMU starts a QEMU VM with direct kernel boot.
 // Returns the PID of the QEMU process.
 func launchQEMU(vmDir string, st *VMState) (int, error) {
