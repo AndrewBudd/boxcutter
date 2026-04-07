@@ -845,6 +845,12 @@ done)
       set -e
       hostnamectl set-hostname boxcutter
 
+      # Stop services that auto-started from the base image (before cloud-init).
+      # They'll be restarted after config is applied. Without this, the service
+      # crash-loops (no config file yet) and systemd may refuse later restarts.
+      systemctl stop boxcutter-orchestrator 2>/dev/null || true
+      systemctl reset-failed boxcutter-orchestrator 2>/dev/null || true
+
       # Configure boxcutter.yaml with real values
       sed -i "s|hostname:.*HOSTNAME_PLACEHOLDER|hostname: boxcutter|" /etc/boxcutter/boxcutter.yaml
       sed -i "s|bridge_ip:.*BRIDGE_IP_PLACEHOLDER|bridge_ip: ${ORCH_IP}|" /etc/boxcutter/boxcutter.yaml
@@ -895,7 +901,16 @@ done)
         fi
       fi
 
-      systemctl restart boxcutter-orchestrator 2>/dev/null || true
+      systemctl restart boxcutter-orchestrator || echo "WARNING: boxcutter-orchestrator restart failed"
+
+      # Verify the service is running
+      sleep 2
+      if systemctl is-active --quiet boxcutter-orchestrator; then
+        echo "boxcutter-orchestrator is running"
+      else
+        echo "ERROR: boxcutter-orchestrator failed to start"
+        journalctl -u boxcutter-orchestrator --no-pager -n 20 || true
+      fi
 
       # Start web services + rotate TLS cert (if image has web UI baked in)
       systemctl start nginx boxcutter-web boxcutter-terminal 2>/dev/null || true

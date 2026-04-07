@@ -137,6 +137,9 @@ func launchQEMU(vmDir string, st *VMState) (int, error) {
 	// Attach tools image (read-only squashfs with boxcutter CLI)
 	if _, err := os.Stat(toolsImagePath); err == nil {
 		args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
+		log.Printf("QEMU VM %s: attached tools.img as /dev/vdb", st.Name)
+	} else {
+		log.Printf("WARNING: tools.img not found at %s — VMs will lack /opt/boxcutter/tools", toolsImagePath)
 	}
 
 	log.Printf("Launching QEMU VM %s: kernel=%s initrd=%s vcpu=%d ram=%dMiB",

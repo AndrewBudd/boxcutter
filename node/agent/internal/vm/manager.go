@@ -180,13 +180,9 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
-		// Check capacity: reject if adding this VM would exceed 90% of system RAM
-		sysRAM := m.getSystemRAMMiB()
-		if sysRAM > 0 {
-			allocatedRAM := m.getAllocatedRAMMiB()
-			if allocatedRAM+req.RAMMIB > sysRAM*90/100 {
-				return &CapacityError{msg: "node is full"}
-			}
+		// Check capacity using hybrid declared+actual memory check
+		if err := m.checkCapacity(req.RAMMIB); err != nil {
+			return err
 		}
 
 		vmDir := VMDir(req.Name)
@@ -741,6 +737,48 @@ func cleanupMigrationArtifacts() {
 		os.RemoveAll(dir)
 	}
 
+	// Clean up orphaned VM directories that have vm.json but no running process
+	// and no .stopped marker. These are failed migration targets — the source
+	// still has the authoritative copy, so these files are safe to remove.
+	// Indicators of a failed migration target:
+	//   - Has vm.json (created during import setup)
+	//   - No running QEMU/FC process
+	//   - No .stopped marker (not an intentionally stopped VM)
+	//   - Has a "migrating" marker OR a qemu-state.bin (migration in progress)
+	//   - Directory is old enough (>10 min) to rule out active migrations
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(vmBase, e.Name())
+		if _, err := os.Stat(filepath.Join(dir, "vm.json")); err != nil {
+			continue // no vm.json — handled by the orphan check above
+		}
+		if IsRunning(dir) {
+			continue // process is alive
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".stopped")); err == nil {
+			continue // intentionally stopped VM
+		}
+		// Check for migration indicators
+		hasMigratingMarker := IsMigrating(dir)
+		_, hasStateFile := os.Stat(filepath.Join(dir, "qemu-state.bin"))
+		if !hasMigratingMarker && hasStateFile != nil {
+			continue // no migration indicators — might be a crashed VM, leave for RestartAll
+		}
+		// Check age
+		info, err := e.Info()
+		if err == nil && time.Since(info.ModTime()) < 10*time.Minute {
+			log.Printf("Skipping recent failed migration target (age=%s): %s",
+				time.Since(info.ModTime()).Round(time.Second), dir)
+			continue
+		}
+		log.Printf("Removing orphaned failed migration target: %s (migrating=%v, state_file=%v)",
+			dir, hasMigratingMarker, hasStateFile == nil)
+		CleanupSnapshot(dir)
+		os.RemoveAll(dir)
+	}
+
 	// Clean up orphaned /dev/shm directories for VMs that no longer exist.
 	// These persist after VM destruction because Firecracker mmaps vm.mem from
 	// /dev/shm — the unlinked file's tmpfs space stays until FC exits. After
@@ -1033,6 +1071,9 @@ func writeFirecrackerConfig(vmDir string, st *VMState) error {
 			"is_root_device": false,
 			"is_read_only":   true,
 		})
+		log.Printf("Firecracker VM %s: attached tools.img as /dev/vdb", st.Name)
+	} else {
+		log.Printf("WARNING: tools.img not found at %s — VMs will lack /opt/boxcutter/tools", toolsImagePath)
 	}
 
 	fcConfig := map[string]interface{}{
@@ -1534,6 +1575,38 @@ func (m *Manager) getAllocatedRAMMiB() int {
 		}
 	}
 	return total
+}
+
+// checkCapacity validates that the node can accept a VM with the given RAM.
+// Uses a hybrid approach: checks both actual available memory (MemAvailable)
+// and declared allocation. The VM is rejected only if BOTH checks fail,
+// allowing VMs to run when actual memory is available even if declared
+// allocations appear full (since VMs rarely use their full declared RAM).
+// A hard headroom of 512 MiB is always reserved for system stability.
+func (m *Manager) checkCapacity(ramMiB int) error {
+	// Check actual available memory (most accurate)
+	availRAM := getAvailableRAMMiB()
+	actualOK := availRAM == 0 || ramMiB <= availRAM-512
+
+	// Check declared allocation (safety net for extreme overcommit)
+	sysRAM := m.getSystemRAMMiB()
+	declaredOK := sysRAM == 0 || m.getAllocatedRAMMiB()+ramMiB <= sysRAM*90/100
+
+	if actualOK {
+		return nil
+	}
+	if declaredOK {
+		// Declared allocation says OK but actual memory is tight.
+		// This shouldn't normally happen — trust the actual memory check.
+		return &CapacityError{msg: fmt.Sprintf(
+			"not enough available memory (need=%dMiB, available=%dMiB, headroom=512MiB)",
+			ramMiB, availRAM)}
+	}
+	// Both checks failed
+	allocatedRAM := m.getAllocatedRAMMiB()
+	return &CapacityError{msg: fmt.Sprintf(
+		"node is full (declared: allocated=%dMiB + new=%dMiB > %dMiB [90%% of %dMiB]; actual: available=%dMiB < needed=%dMiB+512MiB)",
+		allocatedRAM, ramMiB, sysRAM*90/100, sysRAM, availRAM, ramMiB)}
 }
 
 func (m *Manager) injectSSHKeysFromPath(st *VMState, authKeysPath string) {
@@ -2789,23 +2862,10 @@ func (m *Manager) LaunchIncomingTCP(name string) (int, int, error) {
 		return 0, 0, fmt.Errorf("VM state not found: %w", err)
 	}
 
-	// Capacity check: both declared allocation AND actual available memory.
-	// The declared check catches overcommit; the MemAvailable check catches
-	// actual OOM risk (kernel overhead, fragmentation, page cache pressure).
-	sysRAM := m.getSystemRAMMiB()
-	if sysRAM > 0 {
-		allocatedRAM := m.getAllocatedRAMMiB()
-		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
-			return 0, 0, &CapacityError{msg: fmt.Sprintf(
-				"node is full (allocated=%dMiB + incoming=%dMiB > %dMiB [90%% of %dMiB])",
-				allocatedRAM, st.RAMMIB, sysRAM*90/100, sysRAM)}
-		}
-	}
-	availRAM := getAvailableRAMMiB()
-	if availRAM > 0 && st.RAMMIB > availRAM-512 {
-		return 0, 0, &CapacityError{msg: fmt.Sprintf(
-			"not enough available memory (need=%dMiB, available=%dMiB, headroom=512MiB)",
-			st.RAMMIB, availRAM)}
+	// Capacity check using hybrid declared+actual memory check
+	if err := m.checkCapacity(st.RAMMIB); err != nil {
+		capErr := err.(*CapacityError)
+		return 0, 0, capErr
 	}
 
 	// Ensure golden QCOW2 exists
@@ -2828,6 +2888,9 @@ func (m *Manager) LaunchIncomingTCP(name string) (int, int, error) {
 	pid, port, err := launchQEMUIncomingTCP(vmDir, st)
 	if err != nil {
 		TeardownTAP(st.TAP, st.Mark)
+		// Clean up VM directory — source still has the authoritative copy
+		log.Printf("Cleaning up failed incoming migration directory: %s", vmDir)
+		os.RemoveAll(vmDir)
 		return 0, 0, fmt.Errorf("launching QEMU incoming TCP: %w", err)
 	}
 
@@ -2844,21 +2907,9 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		return nil, fmt.Errorf("VM state not found: %w", err)
 	}
 
-	// Capacity check: declared allocation + actual MemAvailable
-	sysRAM := m.getSystemRAMMiB()
-	if sysRAM > 0 {
-		allocatedRAM := m.getAllocatedRAMMiB()
-		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
-			return nil, &CapacityError{msg: fmt.Sprintf(
-				"node is full (allocated=%dMiB + incoming=%dMiB > %dMiB [90%% of %dMiB])",
-				allocatedRAM, st.RAMMIB, sysRAM*90/100, sysRAM)}
-		}
-	}
-	availRAM := getAvailableRAMMiB()
-	if availRAM > 0 && st.RAMMIB > availRAM-512 {
-		return nil, &CapacityError{msg: fmt.Sprintf(
-			"not enough available memory (need=%dMiB, available=%dMiB, headroom=512MiB)",
-			st.RAMMIB, availRAM)}
+	// Capacity check using hybrid declared+actual memory check
+	if err := m.checkCapacity(st.RAMMIB); err != nil {
+		return nil, err
 	}
 
 	// Ensure golden QCOW2 exists if this is a QCOW2-backed VM
@@ -2915,6 +2966,10 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		// Kill the QEMU process
 		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
 		TeardownTAP(st.TAP, st.Mark)
+		// Clean up the entire VM directory — the source still has the
+		// authoritative copy, so these files are just orphaned waste.
+		log.Printf("Cleaning up failed migration target directory: %s", vmDir)
+		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("loading state: %w", err)
 	}
 	targetTelem.EndPhase("state-load", 0)
@@ -2989,13 +3044,9 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 	vmDir := VMDir(st.Name)
 	shmDir := filepath.Join("/dev/shm", "bc-"+st.Name)
 
-	// Check capacity: reject if this VM would overcommit the node (Bug #102)
-	sysRAM := m.getSystemRAMMiB()
-	if sysRAM > 0 {
-		allocatedRAM := m.getAllocatedRAMMiB()
-		if allocatedRAM+st.RAMMIB > sysRAM*90/100 {
-			return nil, &CapacityError{msg: "node is full (import rejected)"}
-		}
+	// Capacity check using hybrid declared+actual memory check
+	if err := m.checkCapacity(st.RAMMIB); err != nil {
+		return nil, err
 	}
 
 	// Check if a VM with this name already exists (running or stopped)

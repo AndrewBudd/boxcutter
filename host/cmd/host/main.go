@@ -2975,19 +2975,67 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			return false, fmt.Sprintf("Launched new orchestrator at %s", goal.NewOrchIP), nil
 		}
 
-		// Disk exists but not healthy yet — check for timeout.
+		// Disk exists but not healthy yet — check QEMU liveness and timeout.
 		// Cloud-init + systemd boot typically takes 30-90 seconds. If the
 		// orchestrator hasn't become healthy after 5 minutes, something is wrong.
 		const orchHealthTimeout = 5 * time.Minute
+
+		// Check if QEMU process is still alive
+		newPID := findQEMUPID(newDisk)
+		if newPID <= 0 {
+			// QEMU died — dump console log and clean up
+			consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
+			if data, err := os.ReadFile(consoleLog); err == nil {
+				lines := strings.Split(string(data), "\n")
+				start := 0
+				if len(lines) > 30 {
+					start = len(lines) - 30
+				}
+				log.Printf("orchestrator-new console (last 30 lines):\n%s", strings.Join(lines[start:], "\n"))
+			}
+			os.Remove(newDisk)
+			os.Remove(orchISO)
+			bridge.DeleteTAP(goal.NewOrchTAP)
+			goal.NewOrchIP = ""
+			goal.NewOrchTAP = ""
+			goal.NewOrchMAC = ""
+			goal.NewOrchLaunchTime = ""
+			state.SetNodeStatus("orchestrator", "active")
+			state.Save()
+			return false, "", fmt.Errorf("new orchestrator QEMU process died — cleaned up, will retry")
+		}
+
 		if goal.NewOrchLaunchTime != "" {
 			launchTime, _ := time.Parse(time.RFC3339, goal.NewOrchLaunchTime)
-			if !launchTime.IsZero() && time.Since(launchTime) > orchHealthTimeout {
+			elapsed := time.Since(launchTime)
+
+			// Log diagnostics periodically (every ~30s based on 5s reconcile interval)
+			if !launchTime.IsZero() && int(elapsed.Seconds())%30 < 6 && elapsed > 30*time.Second {
+				consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
+				if data, err := os.ReadFile(consoleLog); err == nil {
+					lines := strings.Split(string(data), "\n")
+					start := 0
+					if len(lines) > 10 {
+						start = len(lines) - 10
+					}
+					log.Printf("orchestrator-new (PID %d, %s elapsed) console tail:\n%s",
+						newPID, elapsed.Round(time.Second), strings.Join(lines[start:], "\n"))
+				}
+			}
+
+			if !launchTime.IsZero() && elapsed > orchHealthTimeout {
 				// Clean up the failed new orchestrator
 				failedIP := goal.NewOrchIP
-				newPID := findQEMUPID(newDisk)
-				if newPID > 0 {
-					qemu.Stop("orchestrator-new", newPID)
+				consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
+				if data, err := os.ReadFile(consoleLog); err == nil {
+					lines := strings.Split(string(data), "\n")
+					start := 0
+					if len(lines) > 50 {
+						start = len(lines) - 50
+					}
+					log.Printf("orchestrator-new FAILED — console log (last 50 lines):\n%s", strings.Join(lines[start:], "\n"))
 				}
+				qemu.Stop("orchestrator-new", newPID)
 				os.Remove(newDisk)
 				os.Remove(orchISO)
 				bridge.DeleteTAP(goal.NewOrchTAP)
@@ -3002,7 +3050,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			}
 		}
 
-		return false, fmt.Sprintf("Waiting for new orchestrator at %s to become healthy", goal.NewOrchIP), nil
+		return false, fmt.Sprintf("Waiting for new orchestrator at %s to become healthy (PID %d)", goal.NewOrchIP, newPID), nil
 	}
 
 	// Step C: New orchestrator is healthy — trigger migration if old is still running

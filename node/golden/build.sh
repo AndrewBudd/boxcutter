@@ -64,6 +64,10 @@ EOF
 
 # --- fstab ---
 echo "/dev/vda / ext4 defaults 0 1" > "${WORK}/mnt/etc/fstab"
+# tools.img (squashfs) mounted via systemd automount on first access
+mkdir -p "${WORK}/mnt/opt/boxcutter/tools"
+echo '/dev/vdb  /opt/boxcutter/tools  squashfs  ro,noauto,x-systemd.automount  0  0' >> "${WORK}/mnt/etc/fstab"
+ln -sf /opt/boxcutter/tools/bin/boxcutter "${WORK}/mnt/usr/local/bin/boxcutter"
 
 # --- Set hostname from kernel ip= parameter ---
 cat > "${WORK}/mnt/etc/systemd/system/set-hostname.service" << 'SVCEOF'

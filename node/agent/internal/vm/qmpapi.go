@@ -582,8 +582,15 @@ func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 	timeoutSec := maxIterations / 2
 	log.Printf("qmpLoadState: loading %s (timeout %dm%ds)", statePath, timeoutSec/60, timeoutSec%60)
 	lastQMPLog := time.Now()
+	consecutiveErrors := 0
 	for i := 0; i < maxIterations; i++ {
 		time.Sleep(500 * time.Millisecond)
+
+		// Check if QEMU process is still alive — detect crashes early
+		if !IsRunning(vmDir) {
+			return fmt.Errorf("QEMU process died during state load (detected at iteration %d)", i)
+		}
+
 		result, err := qmpCommand(conn, "query-migrate", nil)
 
 		// Log QMP response every 30s for diagnostics
@@ -597,10 +604,17 @@ func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 			lastQMPLog = time.Now()
 		}
 		if err != nil {
+			consecutiveErrors++
+			// If we get many consecutive QMP errors, QEMU is likely dead or
+			// the socket is stale — bail out early instead of polling forever
+			if consecutiveErrors >= 10 {
+				return fmt.Errorf("QEMU appears unresponsive (%d consecutive QMP errors): %w", consecutiveErrors, err)
+			}
 			// After successful load, query-migrate may return empty
 			// Check if VM is running
 			statusResult, statusErr := qmpCommand(conn, "query-status", nil)
 			if statusErr == nil {
+				consecutiveErrors = 0
 				var qs struct {
 					Status  string `json:"status"`
 					Running bool   `json:"running"`
@@ -614,6 +628,7 @@ func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 			}
 			continue
 		}
+		consecutiveErrors = 0
 
 		var status struct {
 			Status string `json:"status"`
