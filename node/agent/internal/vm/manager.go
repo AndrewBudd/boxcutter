@@ -2440,9 +2440,17 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	if diskInfo != nil {
 		diskBytes = diskInfo.Size()
 	}
+	preSyncFiles := diskName + " vm.json"
+	// Include kernel and initrd so the VM boots with the same kernel on the target node.
+	if _, err := os.Stat(filepath.Join(vmDir, "vmlinuz")); err == nil {
+		preSyncFiles += " vmlinuz"
+	}
+	if _, err := os.Stat(filepath.Join(vmDir, "initrd.img")); err == nil {
+		preSyncFiles += " initrd.img"
+	}
 	preSyncCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"tar --sparse -cf - -C %s %s vm.json | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
-		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
+		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+		vmDir, preSyncFiles, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := preSyncCmd.CombinedOutput(); err != nil {
 		telem.FailPhase("pre-sync", fmt.Errorf("%s: %w", string(out), err))
 		telem.Fail(err)
@@ -2645,6 +2653,13 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	tarFiles := diskName + " vm.json"
 	if _, err := os.Stat(filepath.Join(vmDir, "mailbox.json")); err == nil {
 		tarFiles += " mailbox.json"
+	}
+	// Include kernel and initrd so the VM boots with the same kernel on the target node.
+	if _, err := os.Stat(filepath.Join(vmDir, "vmlinuz")); err == nil {
+		tarFiles += " vmlinuz"
+	}
+	if _, err := os.Stat(filepath.Join(vmDir, "initrd.img")); err == nil {
+		tarFiles += " initrd.img"
 	}
 	tarCmd := exec.Command("bash", "-c", fmt.Sprintf(
 		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",

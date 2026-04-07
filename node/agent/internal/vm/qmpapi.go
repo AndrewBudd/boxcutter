@@ -272,9 +272,9 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 	logPath := filepath.Join(vmDir, "console.log")
 	pidFile := filepath.Join(vmDir, "qemu.pid")
 
-	kernel, initrd := findQEMUKernel()
-	if kernel == "" {
-		return 0, fmt.Errorf("no kernel found for QEMU VM")
+	kernel, initrd, err := localKernel(vmDir)
+	if err != nil {
+		return 0, fmt.Errorf("no kernel found for QEMU VM: %w", err)
 	}
 
 	bootArgs := fmt.Sprintf(
@@ -364,9 +364,9 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 	logPath := filepath.Join(vmDir, "console.log")
 	pidFile := filepath.Join(vmDir, "qemu.pid")
 
-	kernel, initrd := findQEMUKernel()
-	if kernel == "" {
-		return 0, 0, fmt.Errorf("no kernel found for QEMU VM")
+	kernel, initrd, err := localKernel(vmDir)
+	if err != nil {
+		return 0, 0, fmt.Errorf("no kernel found for QEMU VM: %w", err)
 	}
 
 	bootArgs := fmt.Sprintf(

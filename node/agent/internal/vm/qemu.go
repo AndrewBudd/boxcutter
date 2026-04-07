@@ -53,6 +53,58 @@ func findQEMUKernel() (kernel string, initrd string) {
 	return kernel, ""
 }
 
+// localKernel returns kernel and initrd paths local to the VM directory.
+// On first launch, it copies the host kernel/initrd into vmDir so the kernel
+// travels with the VM during migration. On subsequent launches (including on
+// a migration target), the already-present local copies are used.
+func localKernel(vmDir string) (kernel string, initrd string, err error) {
+	localKernelPath := filepath.Join(vmDir, "vmlinuz")
+	localInitrdPath := filepath.Join(vmDir, "initrd.img")
+
+	// If local kernel already exists (e.g. migrated VM), use it directly.
+	if _, statErr := os.Stat(localKernelPath); statErr == nil {
+		kernel = localKernelPath
+		if _, statErr := os.Stat(localInitrdPath); statErr == nil {
+			initrd = localInitrdPath
+		}
+		return kernel, initrd, nil
+	}
+
+	// First launch on this node: find the host kernel and copy it into vmDir.
+	srcKernel, srcInitrd := findQEMUKernel()
+	if srcKernel == "" {
+		return "", "", fmt.Errorf("no kernel found for QEMU VM (checked /var/lib/boxcutter/kernel/vmlinuz-qemu and /boot/vmlinuz-*)")
+	}
+
+	if err := copyFile(srcKernel, localKernelPath); err != nil {
+		return "", "", fmt.Errorf("copy kernel to VM dir: %w", err)
+	}
+	log.Printf("Copied kernel %s -> %s", srcKernel, localKernelPath)
+
+	if srcInitrd != "" {
+		if err := copyFile(srcInitrd, localInitrdPath); err != nil {
+			return "", "", fmt.Errorf("copy initrd to VM dir: %w", err)
+		}
+		log.Printf("Copied initrd %s -> %s", srcInitrd, localInitrdPath)
+		return localKernelPath, localInitrdPath, nil
+	}
+
+	return localKernelPath, "", nil
+}
+
+// copyFile copies src to dst, preserving permissions.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, info.Mode())
+}
+
 // launchQEMU starts a QEMU VM with direct kernel boot.
 // Returns the PID of the QEMU process.
 func launchQEMU(vmDir string, st *VMState) (int, error) {
@@ -60,9 +112,9 @@ func launchQEMU(vmDir string, st *VMState) (int, error) {
 	logPath := filepath.Join(vmDir, "console.log")
 	pidFile := filepath.Join(vmDir, "qemu.pid")
 
-	kernel, initrd := findQEMUKernel()
-	if kernel == "" {
-		return 0, fmt.Errorf("no kernel found for QEMU VM (checked /var/lib/boxcutter/kernel/vmlinuz-qemu and /boot/vmlinuz-*)")
+	kernel, initrd, err := localKernel(vmDir)
+	if err != nil {
+		return 0, err
 	}
 
 	// Boot args: direct kernel boot with network config via kernel ip= parameter.
