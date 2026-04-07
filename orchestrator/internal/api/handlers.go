@@ -19,9 +19,21 @@ import (
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/scheduler"
 )
 
+// queuedMessage is a tapegun message waiting for delivery to a migrating VM.
+type queuedMessage struct {
+	vmName    string
+	msg       node.TapegunMessage
+	queuedAt  time.Time
+}
+
 type Handler struct {
 	db   *db.DB
 	mqtt *orchmqtt.Client
+
+	// Tapegun message queue: messages for VMs that are temporarily unreachable
+	// (e.g., during migration). Background goroutine retries delivery.
+	msgQueue   []queuedMessage
+	msgQueueMu sync.Mutex
 
 	// Migration state: when preparing for migration, mutating requests are rejected.
 	// Auto-expires after migrateDeadline to prevent permanent lockout if migration fails.
@@ -33,6 +45,7 @@ type Handler struct {
 func NewHandler(database *db.DB) *Handler {
 	h := &Handler{db: database}
 	go h.healthMonitorLoop()
+	go h.messageDeliveryLoop()
 	return h
 }
 
@@ -1508,13 +1521,19 @@ func (h *Handler) handleTapegunMessage(w http.ResponseWriter, r *http.Request) {
 
 	n, err := h.db.GetNode(v.NodeID)
 	if err != nil || n.APIAddr == "" {
-		http.Error(w, "node not available", http.StatusServiceUnavailable)
+		// Node unreachable — queue for retry (VM may be migrating)
+		h.queueMessage(name, msg)
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]string{"status": "queued", "message_id": msg.ID, "reason": "node unavailable"})
 		return
 	}
 
 	nc := node.NewClient(n.APIAddr)
 	if err := nc.SendTapegunMessage(name, &msg); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// Delivery failed — queue for retry (VM may be migrating between nodes)
+		h.queueMessage(name, msg)
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]string{"status": "queued", "message_id": msg.ID, "reason": "delivery failed, will retry"})
 		return
 	}
 
@@ -1699,4 +1718,76 @@ func (h *Handler) handleVMLocation(w http.ResponseWriter, r *http.Request) {
 		"node_id":   n.ID,
 		"node_addr": n.APIAddr,
 	})
+}
+
+// --- Tapegun message queue ---
+
+const messageQueueTTL = 30 * time.Minute
+
+// queueMessage adds a message to the retry queue for later delivery.
+func (h *Handler) queueMessage(vmName string, msg node.TapegunMessage) {
+	h.msgQueueMu.Lock()
+	defer h.msgQueueMu.Unlock()
+	h.msgQueue = append(h.msgQueue, queuedMessage{
+		vmName:   vmName,
+		msg:      msg,
+		queuedAt: time.Now(),
+	})
+	log.Printf("tapegun: queued message %s for VM %s (queue size: %d)", msg.ID, vmName, len(h.msgQueue))
+}
+
+// messageDeliveryLoop periodically attempts to deliver queued messages
+// and expires messages older than the TTL.
+func (h *Handler) messageDeliveryLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		h.msgQueueMu.Lock()
+		if len(h.msgQueue) == 0 {
+			h.msgQueueMu.Unlock()
+			continue
+		}
+
+		// Copy queue and clear — we'll re-queue failures
+		pending := make([]queuedMessage, len(h.msgQueue))
+		copy(pending, h.msgQueue)
+		h.msgQueue = h.msgQueue[:0]
+		h.msgQueueMu.Unlock()
+
+		var requeue []queuedMessage
+		for _, qm := range pending {
+			// Expire old messages
+			if time.Since(qm.queuedAt) > messageQueueTTL {
+				log.Printf("tapegun: expired queued message %s for VM %s (age: %s)",
+					qm.msg.ID, qm.vmName, time.Since(qm.queuedAt).Round(time.Second))
+				continue
+			}
+
+			// Try to deliver
+			v, err := h.db.GetVM(qm.vmName)
+			if err != nil {
+				requeue = append(requeue, qm)
+				continue
+			}
+			n, err := h.db.GetNode(v.NodeID)
+			if err != nil || n.APIAddr == "" {
+				requeue = append(requeue, qm)
+				continue
+			}
+			nc := node.NewClient(n.APIAddr)
+			if err := nc.SendTapegunMessage(qm.vmName, &qm.msg); err != nil {
+				requeue = append(requeue, qm)
+				continue
+			}
+			log.Printf("tapegun: delivered queued message %s to VM %s (was queued %s)",
+				qm.msg.ID, qm.vmName, time.Since(qm.queuedAt).Round(time.Second))
+		}
+
+		if len(requeue) > 0 {
+			h.msgQueueMu.Lock()
+			h.msgQueue = append(h.msgQueue, requeue...)
+			h.msgQueueMu.Unlock()
+		}
+	}
 }
