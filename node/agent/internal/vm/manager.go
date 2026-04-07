@@ -2540,18 +2540,37 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 		return nil, fmt.Errorf("mkdir on target: %s: %w", string(out), err)
 	}
 
+	// For QCOW2 VMs backed by golden, ensure target has the golden QCOW2
+	// (the rootfs.qcow2 uses it as a backing file and won't work without it)
+	if DiskFormat(vmDir) == "qcow2" {
+		ensureCmd := exec.Command("bash", "-c", fmt.Sprintf(
+			"%s ubuntu@%s 'if [ ! -f /var/lib/boxcutter/golden/rootfs.qcow2 ] && [ -f /var/lib/boxcutter/golden/rootfs.ext4 ]; then sudo qemu-img convert -f raw -O qcow2 /var/lib/boxcutter/golden/rootfs.ext4 /var/lib/boxcutter/golden/rootfs.qcow2; fi'",
+			sshOpts, targetBridgeIP))
+		if out, err := ensureCmd.CombinedOutput(); err != nil {
+			cleanTarget()
+			return nil, fmt.Errorf("ensure golden qcow2 on target: %s: %w", string(out), err)
+		}
+	}
+
 	// Transfer all VM files using tar --sparse (reads only allocated blocks,
 	// not the full sparse extent — 7x faster for typical sparse rootfs files)
 	xferStart := time.Now()
 	var diskName string
-	if fileRootfs {
+	switch DiskFormat(vmDir) {
+	case "qcow2":
+		diskName = "rootfs.qcow2"
+	case "raw":
 		diskName = "rootfs.ext4"
-	} else {
+	default:
 		diskName = "cow.img"
 	}
+	tarFiles := diskName + " vm.json"
+	if _, err := os.Stat(filepath.Join(vmDir, "mailbox.json")); err == nil {
+		tarFiles += " mailbox.json"
+	}
 	tarCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"tar --sparse -cf - -C %s %s vm.json | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
-		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
+		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+		vmDir, tarFiles, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := tarCmd.CombinedOutput(); err != nil {
 		cleanTarget()
 		return nil, fmt.Errorf("tar transfer %s: %s: %w", diskName, string(out), err)
