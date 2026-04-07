@@ -751,12 +751,17 @@ func cleanupMigrationArtifacts() {
 		if !hasMigratingMarker && hasStateFile != nil {
 			continue // no migration indicators — might be a crashed VM, leave for RestartAll
 		}
-		// Check age
-		info, err := e.Info()
-		if err == nil && time.Since(info.ModTime()) < 10*time.Minute {
-			log.Printf("Skipping recent failed migration target (age=%s): %s",
-				time.Since(info.ModTime()).Round(time.Second), dir)
-			continue
+		// A non-running VM with an explicit "migrating" marker is definitionally
+		// stale at agent startup — clean it up immediately. Only apply the age
+		// guard to the qemu-state.bin heuristic (no marker) to avoid racing
+		// with active pre-syncs from a remote source. (Bug #40)
+		if !hasMigratingMarker {
+			info, err := e.Info()
+			if err == nil && time.Since(info.ModTime()) < 10*time.Minute {
+				log.Printf("Skipping recent failed migration target (age=%s): %s",
+					time.Since(info.ModTime()).Round(time.Second), dir)
+				continue
+			}
 		}
 		log.Printf("Removing orphaned failed migration target: %s (migrating=%v, state_file=%v)",
 			dir, hasMigratingMarker, hasStateFile == nil)

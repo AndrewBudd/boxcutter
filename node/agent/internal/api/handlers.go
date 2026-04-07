@@ -459,10 +459,13 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pre-flight: reject if target already has a VM with this name.
+	// Pre-flight: reject if target already has a VM with this name and it is
+	// running or stopped (i.e. a real VM, not stale migration debris).
 	// If the target's copy has status "migrating" (being cleaned up after
 	// migrating OUT), wait briefly for cleanup to complete before proceeding.
 	// This prevents false rejections during rapid ping-pong migrations. (Bug #99)
+	// If cleanup doesn't complete in time, treat it as stale and proceed —
+	// the target will clean up the orphan directory during import. (Bug #40)
 	preflightClient := &http.Client{Timeout: 10 * time.Second}
 	targetClear := false
 	for attempt := 0; attempt < 15; attempt++ {
@@ -480,14 +483,26 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(preflightResp.Body).Decode(&detail)
 		preflightResp.Body.Close()
 		tgtStatus, _ := detail["status"].(string)
-		if tgtStatus != "migrating" {
-			break // VM exists and isn't leaving — reject below
+		if tgtStatus == "running" || tgtStatus == "stopped" {
+			break // VM exists and is real — reject below
 		}
-		// VM is migrating out, wait for cleanup
-		if attempt == 0 {
-			log.Printf("Migrate %s: target has migrating copy, waiting for cleanup...", name)
+		if tgtStatus == "migrating" {
+			// VM is migrating out, wait for cleanup
+			if attempt == 0 {
+				log.Printf("Migrate %s: target has migrating copy, waiting for cleanup...", name)
+			}
+			if attempt == 14 {
+				// Cleanup didn't finish — treat stale migrating dir as clear
+				log.Printf("Migrate %s: target still has stale migrating copy after %d attempts, proceeding anyway", name, attempt+1)
+				targetClear = true
+			}
+			time.Sleep(time.Second)
+			continue
 		}
-		time.Sleep(time.Second)
+		// Any other status (migrated, unknown) — treat as stale, proceed
+		log.Printf("Migrate %s: target has VM with status %q, treating as stale", name, tgtStatus)
+		targetClear = true
+		break
 	}
 	if !targetClear {
 		http.Error(w, fmt.Sprintf("target already has VM '%s'", name), http.StatusConflict)
