@@ -1024,6 +1024,27 @@ func (m *Manager) Health() map[string]interface{} {
 		}
 	}
 
+	// Actual available memory from /proc/meminfo (kernel's estimate of
+	// memory available for new allocations without swapping)
+	availRAM := getAvailableRAMMiB()
+
+	// Disk used by VM directories
+	var diskVMsMB int
+	vmBase := "/var/lib/boxcutter/vms"
+	if entries, err := os.ReadDir(vmBase); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			duOut, duErr := runOutput("du", "-sm", filepath.Join(vmBase, e.Name()))
+			if duErr == nil {
+				var mb int
+				fmt.Sscanf(duOut, "%d", &mb)
+				diskVMsMB += mb
+			}
+		}
+	}
+
 	// QEMU version (for migration compatibility checks)
 	qemuVersion := ""
 	if qOut, qErr := runOutput("qemu-system-x86_64", "--version"); qErr == nil {
@@ -1048,9 +1069,11 @@ func (m *Manager) Health() map[string]interface{} {
 		"vcpu_allocated":    allocatedVCPU,
 		"ram_total_mib":     sysRAM,
 		"ram_allocated_mib": totalRAM,
+		"ram_available_mib": availRAM,
 		"ram_free_mib":      sysRAM - totalRAM,
 		"disk_total_mb":     diskTotalMB,
 		"disk_used_mb":      diskUsedMB,
+		"disk_vms_mb":       diskVMsMB,
 		"vms_total":         len(vms),
 		"vms_running":       running,
 		"golden_ready":      goldenReady,
@@ -1616,9 +1639,16 @@ func (m *Manager) checkCapacity(ramMiB int) error {
 	availRAM := getAvailableRAMMiB()
 	actualOK := availRAM == 0 || ramMiB <= availRAM-512
 
-	// Check declared allocation (safety net for extreme overcommit)
+	// Check declared allocation (safety net for extreme overcommit).
+	// A configurable overcommit ratio allows declared RAM to exceed physical
+	// (e.g., 1.5 = allow 150% of physical). KVM/QEMU don't allocate all
+	// declared RAM upfront, so overcommit is safe for many workloads.
 	sysRAM := m.getSystemRAMMiB()
-	declaredOK := sysRAM == 0 || m.getAllocatedRAMMiB()+ramMiB <= sysRAM*90/100
+	limit := sysRAM * 90 / 100
+	if ratio := m.cfg.Node.MemoryOvercommitRatio; ratio > 1.0 {
+		limit = int(float64(sysRAM) * ratio * 90 / 100)
+	}
+	declaredOK := sysRAM == 0 || m.getAllocatedRAMMiB()+ramMiB <= limit
 
 	if actualOK {
 		return nil
@@ -1633,8 +1663,8 @@ func (m *Manager) checkCapacity(ramMiB int) error {
 	// Both checks failed
 	allocatedRAM := m.getAllocatedRAMMiB()
 	return &CapacityError{msg: fmt.Sprintf(
-		"node is full (declared: allocated=%dMiB + new=%dMiB > %dMiB [90%% of %dMiB]; actual: available=%dMiB < needed=%dMiB+512MiB)",
-		allocatedRAM, ramMiB, sysRAM*90/100, sysRAM, availRAM, ramMiB)}
+		"node is full (declared: allocated=%dMiB + new=%dMiB > %dMiB limit; actual: available=%dMiB < needed=%dMiB+512MiB)",
+		allocatedRAM, ramMiB, limit, availRAM, ramMiB)}
 }
 
 func (m *Manager) injectSSHKeysFromPath(st *VMState, authKeysPath string) {
@@ -3048,12 +3078,15 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		}
 		targetTelem.Fail(err)
 		targetTelem.Write(vmDir)
-		// Kill the QEMU process
+		// Kill the QEMU process and clean up all transferred files.
+		// The source still has the authoritative copy, so this is safe.
 		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
 		TeardownTAP(st.TAP, st.Mark)
 		// Clean up the entire VM directory — the source still has the
 		// authoritative copy, so these files are just orphaned waste.
 		log.Printf("Cleaning up failed migration target directory: %s", vmDir)
+		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
+		os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))
 		os.RemoveAll(vmDir)
 		return nil, fmt.Errorf("loading state: %w", err)
 	}

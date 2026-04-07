@@ -89,3 +89,34 @@ func TestPickNode_SkipsDraining(t *testing.T) {
 		t.Errorf("PickNode = %s, want n3 (only active)", n.ID)
 	}
 }
+
+func TestPickNode_PrefersActualAvailableRAM(t *testing.T) {
+	// n1 has more declared free (10288) but less actual available (3000)
+	// n2 has less declared free (4288) but more actual available (7500)
+	nodes := []*db.Node{
+		{ID: "n1", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 2000, RAMAvailableMIB: 3000},
+		{ID: "n2", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 8000, RAMAvailableMIB: 7500},
+	}
+	n, err := PickNode(nodes, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ID != "n2" {
+		t.Errorf("PickNode = %s, want n2 (more actual available RAM)", n.ID)
+	}
+}
+
+func TestPickNode_FallsBackToDeclaredWhenNoAvailable(t *testing.T) {
+	// RAMAvailableMIB is 0 (not reported), should use declared
+	nodes := []*db.Node{
+		{ID: "n1", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 8000},
+		{ID: "n2", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 2000},
+	}
+	n, err := PickNode(nodes, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ID != "n2" {
+		t.Errorf("PickNode = %s, want n2 (most declared free RAM)", n.ID)
+	}
+}
