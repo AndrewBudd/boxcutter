@@ -180,7 +180,7 @@ func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = extractName(r.URL.Path, "/api/vms/")
 	}
-	if h.mgr.IsMigratingVM(name) || vm.IsMigrating(vm.VMDir(name)) {
+	if vm.IsMigrating(vm.VMDir(name)) {
 		http.Error(w, fmt.Sprintf("VM '%s' is being migrated", name), http.StatusConflict)
 		return
 	}
@@ -518,15 +518,15 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 
 // handleMigrateCancel clears stale migration state for a VM.
 // Called by the host drain code when a previous migration attempt left
-// the in-memory migratingSet or filesystem marker in a stale state,
-// preventing new migration attempts from proceeding.
+// the filesystem marker in a stale state, preventing new migration
+// attempts from proceeding.
 func (h *Handler) handleMigrateCancel(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if name == "" {
 		name = extractStopStartName(r.URL.Path)
 	}
 
-	if !h.mgr.IsMigratingVM(name) {
+	if !vm.IsMigrating(vm.VMDir(name)) {
 		writeJSON(w, map[string]string{"name": name, "status": "not_migrating"})
 		return
 	}

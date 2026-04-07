@@ -30,61 +30,33 @@ const (
 
 // Manager handles VM lifecycle operations.
 type Manager struct {
-	mu          sync.Mutex
-	cfg         *config.Config
-	vmid        *vmid.Client
-	migratingMu sync.Mutex
-	migratingSet map[string]bool // names of VMs currently being migrated
+	mu   sync.Mutex
+	cfg  *config.Config
+	vmid *vmid.Client
 }
 
 func NewManager(cfg *config.Config, vmidClient *vmid.Client) *Manager {
 	// Fix Tailscale CONNMARK conflict at startup (not just during SetupTAP)
 	fixTailscaleCONNMARK()
-	return &Manager{cfg: cfg, vmid: vmidClient, migratingSet: make(map[string]bool)}
+	return &Manager{cfg: cfg, vmid: vmidClient}
 }
 
 // StartMigration atomically checks if a VM is already migrating and marks it.
 // Returns true if migration was started, false if already migrating.
-// The targetAddr is stored in the marker file for crash recovery (split-brain detection).
-//
-// If the in-memory set says "migrating" but no filesystem marker exists, the
-// previous migration goroutine completed/panicked without clearing the set.
-// In that case, the stale entry is auto-cleared and the new migration proceeds.
+// Uses filesystem marker with O_CREATE|O_EXCL for atomic check-and-set.
+// No in-memory state — survives agent restarts without stale 409s.
 func (m *Manager) StartMigration(name, targetAddr string) bool {
-	m.migratingMu.Lock()
-	defer m.migratingMu.Unlock()
-	if m.migratingSet[name] {
-		// Check for stale in-memory state: if the filesystem marker is gone,
-		// the previous migration finished but didn't clear migratingSet
-		// (panic, goroutine leak, etc.). Safe to clear and proceed.
-		vmDir := VMDir(name)
-		if !IsMigrating(vmDir) {
-			log.Printf("StartMigration %s: clearing stale in-memory state (no filesystem marker)", name)
-			delete(m.migratingSet, name)
-		} else {
-			return false
-		}
-	}
-	m.migratingSet[name] = true
-	vmDir := VMDir(name)
-	SetMigrating(vmDir, true, targetAddr)
-	return true
+	return TrySetMigrating(VMDir(name), targetAddr)
 }
 
 // EndMigration clears the migration marker for a VM.
 func (m *Manager) EndMigration(name string) {
-	m.migratingMu.Lock()
-	defer m.migratingMu.Unlock()
-	delete(m.migratingSet, name)
-	vmDir := VMDir(name)
-	SetMigrating(vmDir, false)
+	ClearMigrating(VMDir(name))
 }
 
-// IsMigratingVM checks if a VM is currently being migrated (in-memory check).
+// IsMigratingVM checks if a VM is currently being migrated (filesystem check).
 func (m *Manager) IsMigratingVM(name string) bool {
-	m.migratingMu.Lock()
-	defer m.migratingMu.Unlock()
-	return m.migratingSet[name]
+	return IsMigrating(VMDir(name))
 }
 
 // BridgeIP returns this node's bridge IP from config.
@@ -270,7 +242,7 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 
 // Start starts an existing stopped VM.
 func (m *Manager) Start(name string) (*CreateResponse, error) {
-	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+	if IsMigrating(VMDir(name)) {
 		return nil, fmt.Errorf("VM '%s' is being migrated", name)
 	}
 	// Clear stopped marker so the VM can be restarted by RestartAll in the future.
@@ -468,7 +440,7 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 
 // Stop stops a running VM.
 func (m *Manager) Stop(name string) error {
-	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+	if IsMigrating(VMDir(name)) {
 		return fmt.Errorf("VM '%s' is being migrated", name)
 	}
 	m.mu.Lock()
@@ -541,7 +513,7 @@ func (m *Manager) Destroy(name string) error {
 	// Reject destroy during active migration to prevent race conditions.
 	// Destroying mid-migration leaves orphaned files on the target and causes
 	// the migration goroutine to fail with confusing errors.
-	if m.IsMigratingVM(name) || IsMigrating(vmDir) {
+	if IsMigrating(vmDir) {
 		return fmt.Errorf("VM '%s' is being migrated", name)
 	}
 
@@ -590,7 +562,7 @@ type ExecResult struct {
 }
 
 func (m *Manager) Exec(name string, command string) (*ExecResult, error) {
-	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+	if IsMigrating(VMDir(name)) {
 		return nil, fmt.Errorf("VM '%s' is being migrated", name)
 	}
 	st, status, err := m.Get(name)
@@ -615,7 +587,7 @@ func (m *Manager) Exec(name string, command string) (*ExecResult, error) {
 
 // CopyToVM streams data from reader into a file on the VM.
 func (m *Manager) CopyToVM(name string, dstPath string, src io.Reader) error {
-	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+	if IsMigrating(VMDir(name)) {
 		return fmt.Errorf("VM '%s' is being migrated", name)
 	}
 	st, status, err := m.Get(name)
@@ -640,7 +612,7 @@ func (m *Manager) CopyToVM(name string, dstPath string, src io.Reader) error {
 
 // CopyFromVM streams a file from the VM to the writer.
 func (m *Manager) CopyFromVM(name string, srcPath string, dst io.Writer) error {
-	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+	if IsMigrating(VMDir(name)) {
 		return fmt.Errorf("VM '%s' is being migrated", name)
 	}
 	st, status, err := m.Get(name)
@@ -1934,7 +1906,7 @@ func (m *Manager) ListProjects(name string) ([]string, error) {
 }
 
 func (m *Manager) ExportVM(name string) (string, *VMState, error) {
-	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
+	if IsMigrating(VMDir(name)) {
 		return "", nil, fmt.Errorf("VM '%s' is being migrated", name)
 	}
 	m.mu.Lock()
@@ -1967,7 +1939,7 @@ func (m *Manager) ExportVM(name string) (string, *VMState, error) {
 // CopyVM creates a new VM by copying an existing VM's disk.
 // The source VM is stopped during the copy, then restarted.
 func (m *Manager) CopyVM(srcName, dstName string, progressFn ProgressFunc) (*CreateResponse, error) {
-	if m.IsMigratingVM(srcName) || IsMigrating(VMDir(srcName)) {
+	if IsMigrating(VMDir(srcName)) {
 		return nil, fmt.Errorf("VM '%s' is being migrated", srcName)
 	}
 	m.mu.Lock()

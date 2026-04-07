@@ -64,6 +64,30 @@ func IsMigrating(vmDir string) bool {
 	return err == nil
 }
 
+// TrySetMigrating atomically creates the migration marker file using O_CREATE|O_EXCL.
+// Returns true if the marker was created (no migration was in progress).
+// Returns false if the marker already exists (migration already in progress).
+// This replaces the old in-memory migratingSet — the filesystem IS the state.
+func TrySetMigrating(vmDir string, target string) bool {
+	marker := filepath.Join(vmDir, "migrating")
+	content := "1"
+	if target != "" {
+		content = target
+	}
+	f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if err != nil {
+		return false // file already exists or dir missing — either way, not started
+	}
+	f.Write([]byte(content))
+	f.Close()
+	return true
+}
+
+// ClearMigrating removes the migration marker file.
+func ClearMigrating(vmDir string) {
+	os.Remove(filepath.Join(vmDir, "migrating"))
+}
+
 // SetMigrating creates or removes the migration marker file.
 // When migrating is true, the marker stores the target address (addr:port)
 // so that crash recovery can check if the target already has the VM.

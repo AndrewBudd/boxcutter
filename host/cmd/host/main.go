@@ -1905,9 +1905,9 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			}
 			migrateResp.Body.Close()
 			if migrateResp.StatusCode == 409 {
-				// 409 may be stale — the node agent's in-memory migratingSet
-				// can linger after a failed migration if EndMigration hasn't
-				// been called yet. Check actual VM status before deciding.
+				// 409 may be stale — the filesystem migration marker can
+				// linger after a failed migration. Check actual VM status
+				// before deciding.
 				srcResp, err := pollClient.Get(fmt.Sprintf("http://%s:8800/api/vms/%s", node.BridgeIP, vmName))
 				if err == nil {
 					var detail map[string]interface{}
@@ -1915,10 +1915,14 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 					srcResp.Body.Close()
 					actualStatus, _ := detail["status"].(string)
 					if actualStatus == "running" || actualStatus == "stopped" {
-						// VM is not actually migrating — stale 409. Wait for
-						// the node agent to clear its migratingSet, then retry.
-						log.Printf("Drain: %s got 409 but actual status is %s — waiting for stale state to clear", vmName, actualStatus)
-						time.Sleep(5 * time.Second)
+						// VM is not actually migrating — stale 409. Clear the
+						// stale filesystem marker via DELETE, then retry.
+						log.Printf("Drain: %s got 409 but actual status is %s — clearing stale marker and retrying", vmName, actualStatus)
+						cancelReq, _ := http.NewRequest("DELETE",
+							fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName), nil)
+						if cancelResp, cancelErr := pollClient.Do(cancelReq); cancelErr == nil {
+							cancelResp.Body.Close()
+						}
 						data2, _ := json.Marshal(migrateReq)
 						retryResp, retryErr := migrateClient.Post(
 							fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),
@@ -2100,10 +2104,14 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 				}
 				migrateResp.Body.Close()
 				if migrateResp.StatusCode == 409 {
-					// Stale 409 from previous attempt — wait for node agent
-					// to clear its migratingSet, then retry once more.
-					log.Printf("Drain: retry %s got stale 409 — waiting for state to clear", vmName)
-					time.Sleep(5 * time.Second)
+					// Stale 409 from previous attempt — clear the filesystem
+					// marker via DELETE, then retry once more.
+					log.Printf("Drain: retry %s got stale 409 — clearing marker and retrying", vmName)
+					cancelReq2, _ := http.NewRequest("DELETE",
+						fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName), nil)
+					if cancelResp2, cancelErr2 := pollClient.Do(cancelReq2); cancelErr2 == nil {
+						cancelResp2.Body.Close()
+					}
 					data2, _ := json.Marshal(migrateReq)
 					retryResp2, retryErr2 := migrateClient.Post(
 						fmt.Sprintf("http://%s:8800/api/vms/%s/migrate", node.BridgeIP, vmName),

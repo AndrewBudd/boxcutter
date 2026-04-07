@@ -418,11 +418,13 @@ func TestDrain_AlreadyMigrating409(t *testing.T) {
 }
 
 func TestDrain_Stale409RetrySucceeds(t *testing.T) {
-	// Bug #37: node agent's migratingSet has stale entry from a previous
-	// failed migration. First POST returns 409, but actual VM status is
-	// "running". After the stale state clears, retry should succeed.
+	// Bug #37: node agent's filesystem migration marker lingers from a
+	// previous failed migration. First POST returns 409, but actual VM
+	// status is "running". Host calls DELETE to clear the marker, then
+	// retry should succeed.
 	var mu sync.Mutex
 	stale409 := true // first migrate call returns stale 409
+	deleteCalled := false
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/vms/{name}", func(w http.ResponseWriter, r *http.Request) {
@@ -434,11 +436,17 @@ func TestDrain_Stale409RetrySucceeds(t *testing.T) {
 			"status": "running",
 		})
 	})
+	mux.HandleFunc("DELETE /api/vms/{name}/migrate", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		deleteCalled = true
+		stale409 = false // DELETE clears the stale marker
+		json.NewEncoder(w).Encode(map[string]string{"status": "cancelled"})
+	})
 	mux.HandleFunc("POST /api/vms/{name}/migrate", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		if stale409 {
-			stale409 = false // clear after first attempt
 			w.WriteHeader(http.StatusConflict)
 			w.Write([]byte("already migrating"))
 			return
@@ -450,7 +458,7 @@ func TestDrain_Stale409RetrySucceeds(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	// Simulate the drain's migrate + retry-on-stale-409 logic
+	// Simulate the drain's migrate + DELETE + retry flow
 	client := &http.Client{Timeout: 5 * time.Second}
 	migrateReq := map[string]string{
 		"target_addr":      "10.0.0.2:8800",
@@ -482,7 +490,15 @@ func TestDrain_Stale409RetrySucceeds(t *testing.T) {
 		t.Fatalf("actual status = %q, want running", actualStatus)
 	}
 
-	// Retry after stale 409 clears — should get 202
+	// DELETE to clear stale marker
+	delReq, _ := http.NewRequest("DELETE", srv.URL+"/api/vms/test-vm/migrate", nil)
+	delResp, err := client.Do(delReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delResp.Body.Close()
+
+	// Retry after DELETE — should get 202
 	data2, _ := json.Marshal(migrateReq)
 	resp2, err := client.Post(srv.URL+"/api/vms/test-vm/migrate",
 		"application/json", jsonReader(data2))
@@ -491,8 +507,14 @@ func TestDrain_Stale409RetrySucceeds(t *testing.T) {
 	}
 	resp2.Body.Close()
 	if resp2.StatusCode != 202 {
-		t.Errorf("retry after stale 409 = %d, want 202", resp2.StatusCode)
+		t.Errorf("retry after DELETE = %d, want 202", resp2.StatusCode)
 	}
+
+	mu.Lock()
+	if !deleteCalled {
+		t.Error("DELETE /api/vms/{name}/migrate was not called")
+	}
+	mu.Unlock()
 }
 
 func TestDrain_Genuine409NotRetried(t *testing.T) {
