@@ -264,6 +264,8 @@ func (m *Manager) Start(name string) (*CreateResponse, error) {
 	if m.IsMigratingVM(name) || IsMigrating(VMDir(name)) {
 		return nil, fmt.Errorf("VM '%s' is being migrated", name)
 	}
+	// Clear stopped marker so the VM can be restarted by RestartAll in the future.
+	os.Remove(filepath.Join(VMDir(name), ".stopped"))
 	st, err := m.startSetup(name)
 	if err != nil {
 		return nil, err
@@ -447,7 +449,12 @@ func (m *Manager) Stop(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.stopVM(name)
+	if err := m.stopVM(name); err != nil {
+		return err
+	}
+	// Mark VM as intentionally stopped so RestartAll won't restart it.
+	os.WriteFile(filepath.Join(VMDir(name), ".stopped"), nil, 0644)
+	return nil
 }
 
 
@@ -807,6 +814,12 @@ func (m *Manager) RestartAll() {
 		if IsRunning(vmDir) {
 			log.Printf("  %s: already running, re-registering with vmid", st.Name)
 			m.registerWithVMID(st)
+			continue
+		}
+
+		// Skip VMs that were intentionally stopped via the Stop API.
+		if _, err := os.Stat(filepath.Join(vmDir, ".stopped")); err == nil {
+			log.Printf("  %s: stopped marker found, skipping restart", st.Name)
 			continue
 		}
 
@@ -2060,9 +2073,9 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	// Pre-sync disk using tar --sparse.
 	telem.StartPhase("pre-sync")
 	preSyncStart := time.Now()
-	log.Printf("Migrating %s: pre-syncing %s with tar --sparse", name, diskName)
+	log.Printf("Migrating %s: pre-syncing %s + vm.json with tar --sparse", name, diskName)
 	preSyncCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+		"tar --sparse -cf - -C %s %s vm.json | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := preSyncCmd.CombinedOutput(); err != nil {
 		cleanTarget() // clean up mkdir + any partial pre-sync files on target
@@ -2398,7 +2411,7 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		diskBytes = diskInfo.Size()
 	}
 	preSyncCmd := exec.Command("bash", "-c", fmt.Sprintf(
-		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+		"tar --sparse -cf - -C %s %s vm.json | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := preSyncCmd.CombinedOutput(); err != nil {
 		telem.FailPhase("pre-sync", fmt.Errorf("%s: %w", string(out), err))
