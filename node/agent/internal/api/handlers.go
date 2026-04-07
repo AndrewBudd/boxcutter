@@ -74,6 +74,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleExec)
+	mux.HandleFunc("POST /api/vms/{name}/finalize-migration", h.handleFinalizeMigration)
 	mux.HandleFunc("POST /api/vms/{name}/launch-incoming-tcp", h.handleLaunchIncomingTCP)
 	mux.HandleFunc("POST /api/vms/{name}/cp-to", h.handleCopyTo)
 	mux.HandleFunc("GET /api/vms/{name}/cp-from", h.handleCopyFrom)
@@ -920,6 +921,18 @@ func (h *Handler) handleLaunchIncomingTCP(w http.ResponseWriter, r *http.Request
 		"migrate_port": port,
 		"status":       "waiting",
 	})
+}
+
+// handleFinalizeMigration registers the VM with vmid and imports its mailbox.
+// Called by the source node after verifying the VM is running on this target.
+// This is the atomic handoff point — after this call, this node owns the VM's identity.
+func (h *Handler) handleFinalizeMigration(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := h.mgr.FinalizeMigration(name); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "finalized", "name": name})
 }
 
 // handleCopyTo streams the request body into a file on the VM.

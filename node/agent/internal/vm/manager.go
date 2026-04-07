@@ -2724,6 +2724,26 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		"cat %s | %s ubuntu@%s 'sudo tee %s/migration.log > /dev/null'",
 		filepath.Join(vmDir, "migration.log"), sshOpts, targetBridgeIP, dstVMDir)).Run()
 
+	// Atomic identity handoff: tell target to register vmid + import mailbox
+	// BEFORE we deregister on source. This ensures zero-gap identity ownership.
+	finalizeClient := &http.Client{Timeout: 30 * time.Second}
+	finalizeResp, finalizeErr := finalizeClient.Post(
+		fmt.Sprintf("http://%s/api/vms/%s/finalize-migration", targetAddr, name),
+		"application/json", nil)
+	if finalizeErr != nil {
+		log.Printf("WARNING: finalize-migration call failed (non-fatal): %v", finalizeErr)
+	} else {
+		finalizeResp.Body.Close()
+		if finalizeResp.StatusCode >= 300 {
+			log.Printf("WARNING: finalize-migration returned %d (non-fatal)", finalizeResp.StatusCode)
+		}
+	}
+
+	// Deregister vmid on source — target now owns the identity
+	if m.vmid != nil {
+		m.vmid.Deregister(name)
+	}
+
 	// Commit: mark migrated, stop source, cleanup
 	// After live migration, source QEMU process has already exited
 	SetMigrated(vmDir, true)
@@ -2980,6 +3000,57 @@ func (m *Manager) LaunchIncomingTCP(name string) (int, int, error) {
 	}
 
 	return pid, port, nil
+}
+
+// FinalizeMigration registers a live-migrated VM with vmid and imports its mailbox.
+// Called by the source node after verifying the VM is running on this target.
+// This is the atomic identity handoff — after this call, this node owns the VM.
+func (m *Manager) FinalizeMigration(name string) error {
+	vmDir := VMDir(name)
+	st, err := LoadVMState(vmDir)
+	if err != nil {
+		return fmt.Errorf("VM state not found: %w", err)
+	}
+	if !IsRunning(vmDir) {
+		return fmt.Errorf("VM %s is not running", name)
+	}
+
+	// Register with vmid
+	if m.vmid != nil {
+		vmType := st.Type
+		if vmType == "" {
+			vmType = "qemu"
+		}
+		m.vmid.Register(&vmid.RegisterRequest{
+			VMID:        name,
+			VMType:      vmType,
+			IP:          "10.0.0.2",
+			Mark:        st.Mark,
+			Mode:        st.Mode,
+			GitHubRepo:  st.GitHubRepo,
+			GitHubRepos: st.AllGitHubRepos(),
+		})
+		log.Printf("FinalizeMigration: registered %s with vmid (mark=%d)", name, st.Mark)
+	}
+
+	// Import mailbox (tapegun messages from source)
+	m.importMailboxFromFile(name, vmDir)
+
+	// Rejoin Tailscale after migration in background
+	go func() {
+		sshKey := m.cfg.SSH.PrivateKeyPath
+		authkey := st.TailscaleAuthkey
+		if authkey == "" {
+			authkeyData, _ := os.ReadFile(m.cfg.Tailscale.VMAuthkeyFile)
+			authkey = strings.TrimSpace(string(authkeyData))
+		}
+		if authkey != "" && sshKey != "" {
+			VMSSH(st.TAP, sshKey, fmt.Sprintf("sudo tailscale up --authkey=%s --hostname=%s --accept-routes 2>/dev/null || true", authkey, name))
+		}
+	}()
+
+	log.Printf("FinalizeMigration: %s identity handoff complete", name)
+	return nil
 }
 
 func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, error) {
