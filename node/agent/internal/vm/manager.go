@@ -1024,6 +1024,27 @@ func (m *Manager) Health() map[string]interface{} {
 		}
 	}
 
+	// Actual available memory from /proc/meminfo (kernel's estimate of
+	// memory available for new allocations without swapping)
+	availRAM := getAvailableRAMMiB()
+
+	// Disk used by VM directories
+	var diskVMsMB int
+	vmBase := "/var/lib/boxcutter/vms"
+	if entries, err := os.ReadDir(vmBase); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			duOut, duErr := runOutput("du", "-sm", filepath.Join(vmBase, e.Name()))
+			if duErr == nil {
+				var mb int
+				fmt.Sscanf(duOut, "%d", &mb)
+				diskVMsMB += mb
+			}
+		}
+	}
+
 	// QEMU version (for migration compatibility checks)
 	qemuVersion := ""
 	if qOut, qErr := runOutput("qemu-system-x86_64", "--version"); qErr == nil {
@@ -1048,9 +1069,11 @@ func (m *Manager) Health() map[string]interface{} {
 		"vcpu_allocated":    allocatedVCPU,
 		"ram_total_mib":     sysRAM,
 		"ram_allocated_mib": totalRAM,
+		"ram_available_mib": availRAM,
 		"ram_free_mib":      sysRAM - totalRAM,
 		"disk_total_mb":     diskTotalMB,
 		"disk_used_mb":      diskUsedMB,
+		"disk_vms_mb":       diskVMsMB,
 		"vms_total":         len(vms),
 		"vms_running":       running,
 		"golden_ready":      goldenReady,
@@ -1616,9 +1639,16 @@ func (m *Manager) checkCapacity(ramMiB int) error {
 	availRAM := getAvailableRAMMiB()
 	actualOK := availRAM == 0 || ramMiB <= availRAM-512
 
-	// Check declared allocation (safety net for extreme overcommit)
+	// Check declared allocation (safety net for extreme overcommit).
+	// A configurable overcommit ratio allows declared RAM to exceed physical
+	// (e.g., 1.5 = allow 150% of physical). KVM/QEMU don't allocate all
+	// declared RAM upfront, so overcommit is safe for many workloads.
 	sysRAM := m.getSystemRAMMiB()
-	declaredOK := sysRAM == 0 || m.getAllocatedRAMMiB()+ramMiB <= sysRAM*90/100
+	limit := sysRAM * 90 / 100
+	if ratio := m.cfg.Node.MemoryOvercommitRatio; ratio > 1.0 {
+		limit = int(float64(sysRAM) * ratio * 90 / 100)
+	}
+	declaredOK := sysRAM == 0 || m.getAllocatedRAMMiB()+ramMiB <= limit
 
 	if actualOK {
 		return nil
@@ -1633,8 +1663,8 @@ func (m *Manager) checkCapacity(ramMiB int) error {
 	// Both checks failed
 	allocatedRAM := m.getAllocatedRAMMiB()
 	return &CapacityError{msg: fmt.Sprintf(
-		"node is full (declared: allocated=%dMiB + new=%dMiB > %dMiB [90%% of %dMiB]; actual: available=%dMiB < needed=%dMiB+512MiB)",
-		allocatedRAM, ramMiB, sysRAM*90/100, sysRAM, availRAM, ramMiB)}
+		"node is full (declared: allocated=%dMiB + new=%dMiB > %dMiB limit; actual: available=%dMiB < needed=%dMiB+512MiB)",
+		allocatedRAM, ramMiB, limit, availRAM, ramMiB)}
 }
 
 func (m *Manager) injectSSHKeysFromPath(st *VMState, authKeysPath string) {
@@ -2455,6 +2485,10 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		if s, _ := detail["status"].(string); s == "running" {
 			targetHealthy = true
 			break
+		} else if s == "stopped" || s == "not-found" {
+			// Target process died — fail fast instead of polling for 60s
+			log.Printf("Migrating %s: target VM died (status=%s), rolling back immediately", name, s)
+			break
 		}
 	}
 
@@ -2683,8 +2717,9 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		filepath.Join(vmDir, "vm.json"), sshOpts, targetBridgeIP, filepath.Join(dstVMDir, "vm.json")))
 	vmJsonCmd.Run()
 
-	// Verify target is healthy
-	// Verify target is healthy (VM should be running on target now)
+	// Verify target is healthy (VM should be running on target now).
+	// Fail fast if the target reports the VM as stopped/not-found — this
+	// means QEMU crashed (e.g., OOM killed) rather than still starting up.
 	telem.StartPhase("verify")
 	verifyClient := &http.Client{Timeout: 10 * time.Second}
 	var verifyOK bool
@@ -2697,6 +2732,14 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 			if s, _ := detail["status"].(string); s == "running" {
 				verifyOK = true
 				break
+			} else if s == "stopped" || s == "not-found" {
+				// QEMU process died — fail fast instead of waiting 60s
+				diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
+				verifyErr := fmt.Errorf("target QEMU process died (status=%s) after live migration%s", s, diag)
+				log.Printf("Migration verify failed (fast) for %s on %s: status=%s%s", name, targetBridgeIP, s, diag)
+				telem.FailPhase("verify", verifyErr)
+				telem.Fail(verifyErr)
+				return nil, verifyErr
 			}
 		}
 		time.Sleep(2 * time.Second)
@@ -3048,13 +3091,22 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		}
 		targetTelem.Fail(err)
 		targetTelem.Write(vmDir)
-		// Kill the QEMU process
+		// Kill the QEMU process and clean up all transferred files.
+		// The source still has the authoritative copy, so this is safe.
 		exec.Command("kill", "-9", fmt.Sprint(pid)).Run()
 		TeardownTAP(st.TAP, st.Mark)
-		// Clean up the entire VM directory — the source still has the
-		// authoritative copy, so these files are just orphaned waste.
-		log.Printf("Cleaning up failed migration target directory: %s", vmDir)
-		os.RemoveAll(vmDir)
+		// Clean up the VM directory if this is a migration target (not a
+		// pre-existing stopped VM that happened to share the name).
+		_, hasIncomingLog := os.Stat(filepath.Join(vmDir, "qemu-incoming.log"))
+		_, hasStopped := os.Stat(filepath.Join(vmDir, ".stopped"))
+		if hasIncomingLog == nil || hasStopped != nil {
+			log.Printf("Cleaning up failed migration target directory: %s", vmDir)
+			os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
+			os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name))
+			os.RemoveAll(vmDir)
+		} else {
+			log.Printf("ImportQEMUState %s: state load failed but vmDir appears to be a pre-existing stopped VM, preserving", name)
+		}
 		return nil, fmt.Errorf("loading state: %w", err)
 	}
 	targetTelem.EndPhase("state-load", 0)
