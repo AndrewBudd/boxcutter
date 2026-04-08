@@ -12,6 +12,17 @@ POLL_INTERVAL=5
 
 mkdir -p "$INBOX_DIR"
 
+# --- Stop hook: notify metadata service on shutdown ---
+cleanup() {
+    echo "tapegun: shutting down, posting final status"
+    curl -sf -X POST "${METADATA}/tapegun/activity" \
+        -H "Content-Type: application/json" \
+        -d '{"pane_content":"","status":"stopped"}' \
+        --max-time 2 2>/dev/null || true
+    exit 0
+}
+trap cleanup SIGTERM SIGINT
+
 # --- Auto-start Claude Code under tmux (opt-in via config) ---
 # Config file: /home/dev/.tapegun/config
 # AUTOSTART_CLAUDE=true
