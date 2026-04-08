@@ -1632,7 +1632,21 @@ func (m *Manager) getAllocatedRAMMiB() int {
 // allowing VMs to run when actual memory is available even if declared
 // allocations appear full (since VMs rarely use their full declared RAM).
 // A hard headroom of 512 MiB is always reserved for system stability.
+//
+// Hard cap: total declared allocation must never exceed physical RAM,
+// regardless of overcommit settings. This prevents OOM kills when VMs
+// touch their full declared memory. (Bug #53)
 func (m *Manager) checkCapacity(ramMiB int) error {
+	sysRAM := m.getSystemRAMMiB()
+	allocatedRAM := m.getAllocatedRAMMiB()
+
+	// Hard cap: total declared allocation must not exceed physical RAM.
+	if sysRAM > 0 && allocatedRAM+ramMiB > sysRAM {
+		return &CapacityError{msg: fmt.Sprintf(
+			"would exceed physical RAM (allocated=%dMiB + new=%dMiB = %dMiB > %dMiB physical)",
+			allocatedRAM, ramMiB, allocatedRAM+ramMiB, sysRAM)}
+	}
+
 	// Check actual available memory (most accurate)
 	availRAM := getAvailableRAMMiB()
 	actualOK := availRAM == 0 || ramMiB <= availRAM-512
@@ -1641,12 +1655,11 @@ func (m *Manager) checkCapacity(ramMiB int) error {
 	// A configurable overcommit ratio allows declared RAM to exceed physical
 	// (e.g., 1.5 = allow 150% of physical). KVM/QEMU don't allocate all
 	// declared RAM upfront, so overcommit is safe for many workloads.
-	sysRAM := m.getSystemRAMMiB()
 	limit := sysRAM * 90 / 100
 	if ratio := m.cfg.Node.MemoryOvercommitRatio; ratio > 1.0 {
 		limit = int(float64(sysRAM) * ratio * 90 / 100)
 	}
-	declaredOK := sysRAM == 0 || m.getAllocatedRAMMiB()+ramMiB <= limit
+	declaredOK := sysRAM == 0 || allocatedRAM+ramMiB <= limit
 
 	if actualOK {
 		return nil
@@ -1659,7 +1672,6 @@ func (m *Manager) checkCapacity(ramMiB int) error {
 			ramMiB, availRAM)}
 	}
 	// Both checks failed
-	allocatedRAM := m.getAllocatedRAMMiB()
 	return &CapacityError{msg: fmt.Sprintf(
 		"node is full (declared: allocated=%dMiB + new=%dMiB > %dMiB limit; actual: available=%dMiB < needed=%dMiB+512MiB)",
 		allocatedRAM, ramMiB, limit, availRAM, ramMiB)}
