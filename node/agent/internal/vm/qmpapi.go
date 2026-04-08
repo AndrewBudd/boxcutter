@@ -486,10 +486,7 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 		}
 	}()
 
-	// Wait for QMP socket — QEMU binds the -incoming TCP port before opening
-	// the QMP socket, so QMP readiness guarantees the migration port is listening.
-	// Do NOT probe the TCP port directly: QEMU treats any TCP connection as a
-	// migration stream, and a probe would crash the target with "Not a migration stream".
+	// Wait for QMP socket first — this is a necessary but not sufficient condition.
 	if err := qmpWaitForSocket(vmDir, 10*time.Second); err != nil {
 		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
 		return 0, 0, fmt.Errorf("QEMU incoming TCP: %w (stderr: %s)", err, strings.TrimSpace(string(stderrContent)))
@@ -499,6 +496,18 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
 		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
 		return 0, 0, fmt.Errorf("QEMU incoming TCP died after init: %s", strings.TrimSpace(string(stderrContent)))
+	}
+
+	// Wait for the migration TCP port to actually be in LISTEN state.
+	// QMP socket readiness does NOT guarantee the TCP port is bound — under
+	// nested virtualization or load, QEMU may open QMP before binding the
+	// incoming migration port, causing "Connection refused" on the source.
+	// Do NOT probe by connecting: QEMU treats any TCP connection as a migration
+	// stream, and a probe crashes the target with "Not a migration stream".
+	// Instead, check /proc/net/tcp for the port in LISTEN state (safe, no connection).
+	if err := waitForPortListen(migratePort, 10*time.Second); err != nil {
+		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
+		return 0, 0, fmt.Errorf("QEMU incoming TCP port not listening: %w (stderr: %s)", err, strings.TrimSpace(string(stderrContent)))
 	}
 
 	log.Printf("QEMU VM %s ready for incoming live migration on port %d (PID %d)", st.Name, migratePort, pid)
@@ -737,4 +746,33 @@ func qmpLoadState(vmDir, statePath string, ramMiB ...int) error {
 				stallTimeout, lastTransferred/1024/1024)
 		}
 	}
+}
+
+// waitForPortListen checks /proc/net/tcp until the given port appears in LISTEN state.
+// This avoids making a TCP connection (which QEMU would interpret as a migration stream).
+func waitForPortListen(port int, timeout time.Duration) error {
+	// In /proc/net/tcp, port is hex in the 2nd column (local_address) after ':'
+	// and state 0A = LISTEN.
+	portHex := fmt.Sprintf("%04X", port)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile("/proc/net/tcp")
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+			// fields[1] = local_address (hex_ip:hex_port), fields[3] = state
+			parts := strings.SplitN(fields[1], ":", 2)
+			if len(parts) == 2 && parts[1] == portHex && fields[3] == "0A" {
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("port %d not in LISTEN state after %s", port, timeout)
 }

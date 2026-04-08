@@ -35,6 +35,9 @@ func Setup() error {
 	// Allow established return traffic
 	iptablesIdempotent("-A", "FORWARD", "-i", uplink, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 
+	// Allow incoming QEMU live migration from sibling nodes on the bridge
+	iptablesIdempotent("-A", "INPUT", "-i", uplink, "-p", "tcp", "--dport", "49152:49199", "-j", "ACCEPT")
+
 	return nil
 }
 

@@ -54,6 +54,10 @@ case "${1:-up}" in
       # Allow established return traffic
       iptables -C FORWARD -i "$UPLINK" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
       iptables -A FORWARD -i "$UPLINK" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+      # Allow incoming QEMU live migration from sibling nodes on the bridge
+      iptables -C INPUT -i "$UPLINK" -p tcp --dport 49152:49199 -j ACCEPT 2>/dev/null || \
+      iptables -A INPUT -i "$UPLINK" -p tcp --dport 49152:49199 -j ACCEPT
     fi
 
     echo "Network ready (per-TAP fwmark routing)."
@@ -66,6 +70,7 @@ case "${1:-up}" in
       iptables -t mangle -D POSTROUTING -m mark ! --mark 0 -j CONNMARK --save-mark 2>/dev/null || true
       iptables -t nat -D POSTROUTING -s 10.0.0.2/32 -o "$UPLINK" -j MASQUERADE 2>/dev/null || true
       iptables -D FORWARD -i "$UPLINK" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+      iptables -D INPUT -i "$UPLINK" -p tcp --dport 49152:49199 -j ACCEPT 2>/dev/null || true
     fi
     echo "Network rules removed."
     ;;
