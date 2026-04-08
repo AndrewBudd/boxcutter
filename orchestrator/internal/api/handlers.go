@@ -38,6 +38,7 @@ type Handler struct {
 	msgQueueMu sync.Mutex
 
 	// MaxVMSizeMB is the largest VM (by RAM in MiB) the cluster can place.
+	// VM creation requests exceeding this are rejected.
 	MaxVMSizeMB int
 }
 
@@ -401,6 +402,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		req.Disk = "50G"
 	}
 
+	// Reject VMs larger than the cluster's max VM size
 	if h.MaxVMSizeMB > 0 && req.RAMMIB > h.MaxVMSizeMB {
 		http.Error(w, fmt.Sprintf("requested RAM %d MiB exceeds max VM size %d MiB", req.RAMMIB, h.MaxVMSizeMB), http.StatusBadRequest)
 		return
