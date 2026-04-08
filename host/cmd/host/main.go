@@ -2188,6 +2188,28 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	if failedMigrations > 0 {
 		log.Printf("Drain: %d migration(s) failed after retry — aborting drain, node %s NOT stopped", failedMigrations, nodeID)
 		state.SetNodeStatus(nodeID, "active") // revert so health monitor manages it
+
+		// Issue #41: During an upgrade, destroy the replacement node completely
+		// so the next attempt starts fresh. Stale VM files on the replacement
+		// cause 409 conflicts and infinite failure loops.
+		if goal := state.UpgradeGoal; goal != nil && goal.DrainTargetNodeID != "" {
+			replID := goal.DrainTargetNodeID
+			if repl := state.GetNode(replID); repl != nil {
+				log.Printf("Drain: destroying replacement node %s after failed drain (fresh node next attempt)", replID)
+				state.RemoveNode(replID)
+				qemu.Stop(replID, repl.PID)
+				if repl.TAP != "" {
+					bridge.DeleteTAP(repl.TAP)
+				}
+				cleanupNodeArtifacts(cfg, replID)
+			}
+			// Reset upgrade goal tracking so reconciler launches a fresh replacement
+			goal.DrainTargetNodeID = ""
+			goal.DeployedNodeID = ""
+			delete(goal.DeployedOldNodeIDs, nodeID)
+			goal.GoldenWaitStart = ""
+		}
+
 		state.Save()
 		return
 	}
@@ -2195,6 +2217,12 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	// QEMU VMs are now live-migrated (no post-drain start needed).
 	// All VMs migrated and verified — stop the node
 	log.Printf("Drain: stopping %s", nodeID)
+
+	// Clear drain target tracking on success
+	if goal := state.UpgradeGoal; goal != nil {
+		goal.DrainTargetNodeID = ""
+	}
+
 	state.RemoveNode(nodeID)
 	state.Save()
 	qemu.Stop(nodeID, node.PID)
@@ -2241,9 +2269,24 @@ func jsonReader(data []byte) io.Reader {
 }
 
 // pickDrainTarget selects the best target node for a VM migration during drain.
-// Picks the active node with the most free RAM (excluding the draining node).
+// During an upgrade, targets the designated replacement node (DrainTargetNodeID)
+// if set. Otherwise picks the active node with the most free RAM.
 // Returns nil if no suitable target exists.
 func pickDrainTarget(state *cluster.State, excludeNodeID string) *cluster.VMEntry {
+	// Issue #41: If upgrade goal has a designated drain target, use it exclusively.
+	// This ensures VMs only land on the specific replacement node for this attempt.
+	if g := state.UpgradeGoal; g != nil && g.DrainTargetNodeID != "" {
+		for _, n := range state.Nodes {
+			if n.ID == g.DrainTargetNodeID && n.IsActive() && qemu.IsRunning(n.PID) {
+				if queryNodeHealth(n.BridgeIP) != nil {
+					entry := n
+					return &entry
+				}
+			}
+		}
+		// Designated target not healthy — fall through to general selection
+	}
+
 	var best *cluster.VMEntry
 	var bestFreeRAM float64 = -1
 
@@ -2973,6 +3016,7 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 				return false, fmt.Sprintf("Waiting for golden image on %s", replacement.ID), nil
 			}
 			goal.GoldenWaitStart = "" // reset for next node
+			goal.DrainTargetNodeID = replacement.ID
 			state.SetNodeStatus(oldNode.ID, "upgrading")
 			state.Save()
 			return false, fmt.Sprintf("New node %s healthy, marked %s for drain", replacement.ID, oldNode.ID), nil
