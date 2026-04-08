@@ -64,6 +64,7 @@ type HostConfig struct {
 	DiskUsageThresholdPct int           // Scale up when node disk usage > this %
 	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
 	MaxNodes              int           // Hard cap on node count (0 = limited only by resources)
+	MaxVMSizeMB           int           // Headroom: scale up if no node has this much free RAM (MiB)
 
 	// Bootstrap bundle (secrets + config)
 	BundleDir string // Path to ~/.boxcutter/ bundle directory
@@ -215,6 +216,10 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("MIN_FREE_MEMORY_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &minFreeMB)
 	}
+	maxVMSizeMB := 8192
+	if v := os.Getenv("MAX_VM_SIZE_MB"); v != "" {
+		fmt.Sscanf(v, "%d", &maxVMSizeMB)
+	}
 
 	return HostConfig{
 		ClusterPrefix:      clusterPrefix,
@@ -247,6 +252,7 @@ func defaultConfig() HostConfig {
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
 		MaxNodes:              0,     // 0 = no hard cap, limited only by host resources
+		MaxVMSizeMB:           maxVMSizeMB, // scale up if no node can fit a VM this large
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,
@@ -860,6 +866,7 @@ type nodeCapacity struct {
 	bridgeIP     string
 	totalRAM     int
 	usedRAM      int
+	freeRAM      int
 	totalVCPU    int
 	usedVCPU     int
 	diskTotalMB  int
@@ -972,6 +979,9 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 				nc.usedVCPU = int(v)
 				usedVCPU += int(v)
 			}
+			if v, ok := health["ram_free_mib"].(float64); ok {
+				nc.freeRAM = int(v)
+			}
 			if v, ok := health["disk_total_mb"].(float64); ok {
 				nc.diskTotalMB = int(v)
 				totalDiskMB += int(v)
@@ -1008,7 +1018,8 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 			continue
 		}
 
-		// Scale up if RAM, CPU, or disk usage exceeds threshold
+		// Scale up if RAM, CPU, or disk usage exceeds threshold,
+		// or if no node has enough free RAM to fit a max-sized VM (headroom check).
 		scaleUpReason := ""
 		if usedPct >= cfg.ScaleUpThresholdPct {
 			scaleUpReason = fmt.Sprintf("RAM at %d%%", usedPct)
@@ -1016,6 +1027,17 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 			scaleUpReason = fmt.Sprintf("CPU at %d%%", cpuPct)
 		} else if diskPct >= cfg.DiskUsageThresholdPct {
 			scaleUpReason = fmt.Sprintf("disk at %d%%", diskPct)
+		}
+		if scaleUpReason == "" && cfg.MaxVMSizeMB > 0 {
+			largestFree := 0
+			for _, nc := range nodes {
+				if nc.freeRAM > largestFree {
+					largestFree = nc.freeRAM
+				}
+			}
+			if largestFree < cfg.MaxVMSizeMB {
+				scaleUpReason = fmt.Sprintf("headroom: largest free %d MiB < max VM size %d MiB", largestFree, cfg.MaxVMSizeMB)
+			}
 		}
 		if scaleUpReason != "" {
 			log.Printf("Capacity pressure (%s), checking if scale-up is possible...", scaleUpReason)
