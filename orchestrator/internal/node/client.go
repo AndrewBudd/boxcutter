@@ -606,10 +606,17 @@ type TapegunMessage struct {
 	ReadAt    *string `json:"read_at,omitempty"`
 }
 
+// TapegunStatusReport is a self-reported status from Claude Code (via hooks).
+type TapegunStatusReport struct {
+	Timestamp string `json:"timestamp"`
+	Status    string `json:"status"`
+}
+
 // TapegunVMActivity is a summary of a VM's tapegun state.
 type TapegunVMActivity struct {
 	VMID            string                 `json:"vm_id"`
 	LastActivity    *TapegunActivityReport `json:"last_activity,omitempty"`
+	LastStatus      *TapegunStatusReport   `json:"last_status,omitempty"`
 	PendingMessages int                    `json:"pending_messages"`
 }
 

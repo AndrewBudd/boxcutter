@@ -1368,6 +1368,7 @@ type tapegunActivityEntry struct {
 	NodeName    string                       `json:"node_name"`
 	VMStatus    string                       `json:"vm_status"`
 	Activity    *node.TapegunActivityReport  `json:"activity,omitempty"`
+	AgentStatus *node.TapegunStatusReport    `json:"agent_status,omitempty"`
 	PendingMsgs int                          `json:"pending_messages"`
 }
 
@@ -1434,6 +1435,7 @@ func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) 
 		if nodeAct, ok := activityByNode[v.NodeID]; ok {
 			if act, ok := nodeAct[v.Name]; ok {
 				entry.Activity = act.LastActivity
+				entry.AgentStatus = act.LastStatus
 				entry.PendingMsgs = act.PendingMessages
 			}
 		}
@@ -1476,6 +1478,7 @@ func (h *Handler) handleTapegunVMActivity(w http.ResponseWriter, r *http.Request
 				NodeName:    nodeName,
 				VMStatus:    v.Status,
 				Activity:    act.LastActivity,
+				AgentStatus: act.LastStatus,
 				PendingMsgs: act.PendingMessages,
 			})
 			return
