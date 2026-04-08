@@ -2297,6 +2297,32 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 	// QEMU VMs are now live-migrated (no post-drain start needed).
 	// All VMs migrated and verified — stop the node
+
+	// Issue #48: Capture node agent journal logs before stopping, for post-drain debugging.
+	if sshKey := findClusterSSHKey(cfg); sshKey != "" && node.BridgeIP != "" {
+		sshOpts := []string{
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "ConnectTimeout=5",
+			"-i", sshKey,
+			fmt.Sprintf("ubuntu@%s", node.BridgeIP),
+			"journalctl", "-u", "boxcutter-node", "--no-pager",
+		}
+		out, err := exec.Command("ssh", sshOpts...).CombinedOutput()
+		if err != nil {
+			log.Printf("Drain: failed to capture journal logs from %s: %v", nodeID, err)
+		} else {
+			logDir := "/var/log/boxcutter"
+			os.MkdirAll(logDir, 0755)
+			logFile := filepath.Join(logDir, fmt.Sprintf("drain-%s.log", nodeID))
+			if werr := os.WriteFile(logFile, out, 0644); werr != nil {
+				log.Printf("Drain: failed to write journal log to %s: %v", logFile, werr)
+			} else {
+				log.Printf("Drain: saved node agent journal to %s", logFile)
+			}
+		}
+	}
+
 	log.Printf("Drain: stopping %s", nodeID)
 
 	// Clear drain target tracking on success
