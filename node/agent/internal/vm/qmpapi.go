@@ -315,6 +315,11 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 		args = append(args, "-initrd", initrd)
 	}
 
+	// Attach tools.img — must match source VM's device topology for migration.
+	if _, err := os.Stat(toolsImagePath); err == nil {
+		args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
+	}
+
 	log.Printf("Launching QEMU VM %s (incoming migration mode)", st.Name)
 
 	// Capture stderr to a log file for migration diagnostics
@@ -426,6 +431,14 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 
 	if initrd != "" {
 		args = append(args, "-initrd", initrd)
+	}
+
+	// Attach tools.img — must match source VM's device topology for live migration.
+	// QEMU rejects incoming migration if the target has fewer virtio drives than
+	// the source, causing silent fallback to stop+relocate.
+	if _, err := os.Stat(toolsImagePath); err == nil {
+		args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
+		log.Printf("QEMU VM %s (incoming): attached tools.img as /dev/vdb", st.Name)
 	}
 
 	log.Printf("Launching QEMU VM %s (incoming live migration on port %d)", st.Name, migratePort)
