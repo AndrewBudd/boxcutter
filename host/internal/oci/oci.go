@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"oras.land/oras-go/v2"
@@ -298,5 +299,60 @@ func Push(ctx context.Context, opts PushOptions) error {
 		}
 	}
 
+	return nil
+}
+
+// parseSemver extracts major, minor, patch from a "vX.Y.Z" or "X.Y.Z" string.
+// Returns (0,0,0, error) if the string is not a valid semver.
+func parseSemver(v string) (major, minor, patch int, err error) {
+	v = strings.TrimPrefix(v, "v")
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) != 3 {
+		return 0, 0, 0, fmt.Errorf("not semver: %q", v)
+	}
+	major, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad major: %w", err)
+	}
+	minor, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad minor: %w", err)
+	}
+	// Patch may have pre-release suffix (e.g., "1-rc1"); take only the numeric prefix.
+	patchStr := strings.SplitN(parts[2], "-", 2)[0]
+	patch, err = strconv.Atoi(patchStr)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("bad patch: %w", err)
+	}
+	return major, minor, patch, nil
+}
+
+// CheckVersionRegression resolves the current "latest" tag in the registry and
+// returns an error if newVersion is older than the current latest. Skips the
+// check if the current latest cannot be resolved (e.g., first push) or if
+// either version is not valid semver.
+func CheckVersionRegression(ctx context.Context, opts PullOptions, newVersion string) error {
+	newMaj, newMin, newPat, err := parseSemver(newVersion)
+	if err != nil {
+		return nil // not semver — skip check
+	}
+
+	opts.Tag = "latest"
+	meta, err := Resolve(ctx, opts)
+	if err != nil {
+		return nil // no existing latest — first push, skip
+	}
+
+	curMaj, curMin, curPat, err := parseSemver(meta.Version)
+	if err != nil {
+		return nil // existing latest has no semver — skip
+	}
+
+	newTotal := newMaj*1000000 + newMin*1000 + newPat
+	curTotal := curMaj*1000000 + curMin*1000 + curPat
+
+	if newTotal < curTotal {
+		return fmt.Errorf("version regression: pushing %s but registry already has %s — use --force to override", newVersion, meta.Version)
+	}
 	return nil
 }

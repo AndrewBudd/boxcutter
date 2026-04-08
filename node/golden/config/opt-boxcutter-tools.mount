@@ -1,0 +1,14 @@
+[Unit]
+Description=Boxcutter tools squashfs (/dev/vdb)
+DefaultDependencies=no
+After=dev-vdb.device
+ConditionPathExists=/dev/vdb
+
+[Mount]
+What=/dev/vdb
+Where=/opt/boxcutter/tools
+Type=squashfs
+Options=ro
+
+[Install]
+WantedBy=local-fs.target

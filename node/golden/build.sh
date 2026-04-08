@@ -64,9 +64,16 @@ EOF
 
 # --- fstab ---
 echo "/dev/vda / ext4 defaults 0 1" > "${WORK}/mnt/etc/fstab"
-# tools.img (squashfs) mounted via systemd automount on first access
+# tools.img (squashfs) — explicit .mount + .automount units (fstab x-systemd.automount doesn't trigger on QEMU VMs)
 mkdir -p "${WORK}/mnt/opt/boxcutter/tools"
-echo '/dev/vdb  /opt/boxcutter/tools  squashfs  ro,noauto,x-systemd.automount  0  0' >> "${WORK}/mnt/etc/fstab"
+SRC_DIR="${SRC:-$(dirname "$0")}"
+cp "${SRC_DIR}/config/opt-boxcutter-tools.mount" "${WORK}/mnt/etc/systemd/system/opt-boxcutter-tools.mount" 2>/dev/null || \
+  cp "$(dirname "$0")/config/opt-boxcutter-tools.mount" "${WORK}/mnt/etc/systemd/system/opt-boxcutter-tools.mount"
+cp "${SRC_DIR}/config/opt-boxcutter-tools.automount" "${WORK}/mnt/etc/systemd/system/opt-boxcutter-tools.automount" 2>/dev/null || \
+  cp "$(dirname "$0")/config/opt-boxcutter-tools.automount" "${WORK}/mnt/etc/systemd/system/opt-boxcutter-tools.automount"
+mkdir -p "${WORK}/mnt/etc/systemd/system/local-fs.target.wants"
+ln -sf /etc/systemd/system/opt-boxcutter-tools.automount \
+  "${WORK}/mnt/etc/systemd/system/local-fs.target.wants/opt-boxcutter-tools.automount"
 ln -sf /opt/boxcutter/tools/bin/boxcutter "${WORK}/mnt/usr/local/bin/boxcutter"
 
 # --- Set hostname from kernel ip= parameter ---

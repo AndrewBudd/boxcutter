@@ -123,10 +123,15 @@ RUN chmod 755 /usr/local/bin/boxcutter-fetch-metadata && \
       /etc/systemd/system/multi-user.target.wants/boxcutter-metadata.service
 
 # --- Boxcutter tools mount (squashfs on /dev/vdb → /opt/boxcutter/tools) ---
-# automount: mounted on first access, so VMs without the tools device won't fail
+# Explicit .mount + .automount units (fstab x-systemd.automount doesn't trigger on QEMU VMs).
+# ConditionPathExists=/dev/vdb means VMs without the tools device won't fail.
 # tools.img contains: boxcutter CLI, boxcutter-tapegun daemon, systemd units
+COPY config/opt-boxcutter-tools.mount /etc/systemd/system/opt-boxcutter-tools.mount
+COPY config/opt-boxcutter-tools.automount /etc/systemd/system/opt-boxcutter-tools.automount
 RUN mkdir -p /opt/boxcutter/tools && \
-    echo '/dev/vdb  /opt/boxcutter/tools  squashfs  ro,noauto,x-systemd.automount  0  0' >> /etc/fstab && \
+    mkdir -p /etc/systemd/system/local-fs.target.wants && \
+    ln -sf /etc/systemd/system/opt-boxcutter-tools.automount \
+      /etc/systemd/system/local-fs.target.wants/opt-boxcutter-tools.automount && \
     ln -sf /opt/boxcutter/tools/bin/boxcutter /usr/local/bin/boxcutter && \
     ln -sf /opt/boxcutter/tools/bin/boxcutter-tapegun /usr/local/bin/boxcutter-tapegun && \
     ln -sf /opt/boxcutter/tools/etc/systemd/boxcutter-tapegun.service /etc/systemd/system/boxcutter-tapegun.service && \

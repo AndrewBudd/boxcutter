@@ -1,0 +1,10 @@
+[Unit]
+Description=Automount boxcutter tools squashfs
+ConditionPathExists=/dev/vdb
+
+[Automount]
+Where=/opt/boxcutter/tools
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=local-fs.target

@@ -3871,6 +3871,7 @@ func cliBuildImage() {
 
 	push := false
 	pushOnly := false
+	force := false
 	tag := ""
 	for i, arg := range os.Args {
 		if arg == "--push" {
@@ -3882,6 +3883,9 @@ func cliBuildImage() {
 		}
 		if arg == "--tag" && i+1 < len(os.Args) {
 			tag = os.Args[i+1]
+		}
+		if arg == "--force" {
+			force = true
 		}
 	}
 
@@ -3940,6 +3944,20 @@ func cliBuildImage() {
 
 	fmt.Printf("Pushing %s image (tag: %s)...\n", vmType, tag)
 	ctx := context.Background()
+
+	// Check for version regression before pushing.
+	if !force {
+		if err := oci.CheckVersionRegression(ctx, oci.PullOptions{
+			Registry:   cfg.OCIRegistry,
+			Repository: cfg.OCIRepository,
+			VMType:     vmType,
+			Auth:       cfg.ociAuth(),
+		}, version); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	tags := []string{tag}
 	if tag != "latest" {
 		tags = append(tags, "latest")
