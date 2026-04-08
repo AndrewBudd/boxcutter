@@ -1337,6 +1337,7 @@ func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targ
 	if out, err := scpSvc.CombinedOutput(); err != nil {
 		log.Printf("Deploy %s: service file SCP from peer failed (non-fatal): %v\n%s", targetNodeID, err, string(out))
 	} else {
+		log.Printf("Deploy %s: service file SCP from peer %s succeeded", targetNodeID, peerBridgeIP)
 		defer os.Remove("/tmp/boxcutter-node-" + targetNodeID + ".service")
 		scpSvcTarget := exec.Command("scp", append(sshOpts,
 			"/tmp/boxcutter-node-"+targetNodeID+".service",
@@ -1344,11 +1345,22 @@ func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targ
 		if out, err := scpSvcTarget.CombinedOutput(); err != nil {
 			log.Printf("Deploy %s: service file SCP to target failed (non-fatal): %v\n%s", targetNodeID, err, string(out))
 		} else {
+			log.Printf("Deploy %s: service file SCP to target %s succeeded", targetNodeID, targetBridgeIP)
 			svcInstall := exec.Command("ssh", append(sshOpts, "ubuntu@"+targetBridgeIP,
 				"sudo", "mv", "/tmp/boxcutter-node.service", "/etc/systemd/system/boxcutter-node.service",
 				"&&", "sudo", "systemctl", "daemon-reload")...)
 			if out, err := svcInstall.CombinedOutput(); err != nil {
 				log.Printf("Deploy %s: service file install failed (non-fatal): %v\n%s", targetNodeID, err, string(out))
+			} else {
+				log.Printf("Deploy %s: daemon-reload succeeded, verifying KillMode on target", targetNodeID)
+				// Verify the deployed service file actually has KillMode=process
+				verifyCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+targetBridgeIP,
+					"grep", "KillMode", "/etc/systemd/system/boxcutter-node.service")...)
+				if verifyOut, verifyErr := verifyCmd.CombinedOutput(); verifyErr != nil {
+					log.Printf("Deploy %s: WARNING: could not verify KillMode on target: %v\n%s", targetNodeID, verifyErr, string(verifyOut))
+				} else {
+					log.Printf("Deploy %s: target service file KillMode line: %s", targetNodeID, strings.TrimSpace(string(verifyOut)))
+				}
 			}
 		}
 	}

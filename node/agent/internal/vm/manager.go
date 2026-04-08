@@ -811,6 +811,11 @@ func (m *Manager) RestartAll() {
 	for _, st := range vms {
 		vmDir := VMDir(st.Name)
 
+		// Log PID and running status for each VM to help debug post-restart state
+		pid := ReadPID(vmDir)
+		running := pid > 0 && syscall.Kill(pid, 0) == nil
+		log.Printf("  %s: pid=%d running=%v", st.Name, pid, running)
+
 		// If a migration was in progress when the agent died, the VM might
 		// be paused with a stale "migrating" marker. Before resuming, check
 		// if the target already has this VM running (split-brain prevention).
