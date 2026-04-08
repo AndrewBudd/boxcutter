@@ -1296,6 +1296,67 @@ func addNode(cfg HostConfig, state *cluster.State) {
 	}()
 }
 
+// getNodeRunningVMs queries the node agent health endpoint and returns the number
+// of running VMs. Returns 0 if the agent is unreachable or the response can't be parsed.
+func getNodeRunningVMs(bridgeIP string) int {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", bridgeIP))
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0
+	}
+	var health map[string]interface{}
+	if err := json.Unmarshal(body, &health); err != nil {
+		return 0
+	}
+	if v, ok := health["vms_running"]; ok {
+		if n, ok := v.(float64); ok {
+			return int(n)
+		}
+	}
+	return 0
+}
+
+// waitForNodeVMs waits for the node agent to become healthy AND report at least
+// expectedVMs running VMs. This ensures RestartAll has finished re-registering
+// VMs after an agent restart, preventing a race where drain starts before VMs
+// are back.
+func waitForNodeVMs(bridgeIP string, expectedVMs int, timeout time.Duration) error {
+	client := &http.Client{Timeout: 5 * time.Second}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Second)
+		resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", bridgeIP))
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+		var health map[string]interface{}
+		if err := json.Unmarshal(body, &health); err != nil {
+			continue
+		}
+		vmsRunning := 0
+		if v, ok := health["vms_running"]; ok {
+			if n, ok := v.(float64); ok {
+				vmsRunning = int(n)
+			}
+		}
+		if vmsRunning >= expectedVMs {
+			return nil
+		}
+		log.Printf("Waiting for VMs on %s: %d/%d running", bridgeIP, vmsRunning, expectedVMs)
+	}
+	return fmt.Errorf("agent on %s did not reach %d running VMs within %v", bridgeIP, expectedVMs, timeout)
+}
+
 // deployNodeBinaryFromPeer copies the node agent binary from a peer node (e.g.,
 // the new replacement) to an existing node and restarts the service. This ensures
 // old nodes run the latest migration code before drain, even when source isn't available.
@@ -1365,6 +1426,10 @@ func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targ
 		}
 	}
 
+	// Record pre-restart VM count so we can wait for them to come back
+	preRestartVMs := getNodeRunningVMs(targetBridgeIP)
+	log.Printf("Deploy %s: %d VMs running before restart", targetNodeID, preRestartVMs)
+
 	// Install and restart
 	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+targetBridgeIP,
 		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
@@ -1373,22 +1438,9 @@ func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targ
 		return fmt.Errorf("install on %s: %v\n%s", targetBridgeIP, err, string(out))
 	}
 
-	// Verify agent health after restart
-	client := &http.Client{Timeout: 5 * time.Second}
-	healthOK := false
-	for i := 0; i < 12; i++ {
-		time.Sleep(5 * time.Second)
-		resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", targetBridgeIP))
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				healthOK = true
-				break
-			}
-		}
-	}
-	if !healthOK {
-		return fmt.Errorf("agent on %s not healthy after restart (waited 60s)", targetBridgeIP)
+	// Wait for agent to be healthy AND all VMs to be re-registered
+	if err := waitForNodeVMs(targetBridgeIP, preRestartVMs, 120*time.Second); err != nil {
+		return err
 	}
 
 	log.Printf("Deploy %s: binary from peer %s deployed successfully", targetNodeID, peerBridgeIP)
@@ -1476,6 +1528,10 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 		}
 	}
 
+	// Record pre-restart VM count so we can wait for them to come back
+	preRestartVMs := getNodeRunningVMs(bridgeIP)
+	log.Printf("Deploy %s: %d VMs running before restart", nodeID, preRestartVMs)
+
 	// Install and restart
 	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP,
 		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
@@ -1484,22 +1540,9 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 		return fmt.Errorf("install failed: %v\n%s", err, string(out))
 	}
 
-	// Verify: wait for agent to come back healthy after restart
-	client := &http.Client{Timeout: 5 * time.Second}
-	healthOK := false
-	for i := 0; i < 12; i++ {
-		time.Sleep(5 * time.Second)
-		resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", bridgeIP))
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 200 {
-				healthOK = true
-				break
-			}
-		}
-	}
-	if !healthOK {
-		return fmt.Errorf("agent not healthy after restart (waited 60s)")
+	// Wait for agent to be healthy AND all VMs to be re-registered
+	if err := waitForNodeVMs(bridgeIP, preRestartVMs, 120*time.Second); err != nil {
+		return err
 	}
 
 	log.Printf("Deploy %s: latest node agent binary deployed successfully", nodeID)
