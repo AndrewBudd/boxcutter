@@ -2306,7 +2306,7 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 			"-o", "ConnectTimeout=5",
 			"-i", sshKey,
 			fmt.Sprintf("ubuntu@%s", node.BridgeIP),
-			"journalctl", "-u", "boxcutter-node", "--no-pager",
+			"sudo", "journalctl", "-u", "boxcutter-node", "--no-pager",
 		}
 		out, err := exec.Command("ssh", sshOpts...).CombinedOutput()
 		if err != nil {
