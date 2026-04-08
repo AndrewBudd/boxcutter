@@ -24,6 +24,7 @@ func (f *FirecrackerBackend) Launch(vmDir string, st *VMState) (int, error) {
 	)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		return 0, fmt.Errorf("starting firecracker: %w", err)

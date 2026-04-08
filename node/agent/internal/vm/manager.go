@@ -791,8 +791,10 @@ func cleanupMigrationArtifacts() {
 	}
 }
 
-// RestartAll restarts all VMs found on disk. Called on node agent startup
-// to recover VMs after a node reboot.
+// RestartAll recovers VMs after an agent restart or node reboot.
+// VMs launched with Setsid survive agent restarts (KillMode=process only
+// kills the agent). Already-running VMs are re-registered with vmid
+// without interruption; only genuinely dead VMs are restarted from scratch.
 func (m *Manager) RestartAll() {
 	// Kill orphaned SSH ControlMaster processes from interrupted migrations.
 	// These survive agent restart (KillMode=process) because they're forked
@@ -804,11 +806,7 @@ func (m *Manager) RestartAll() {
 		return
 	}
 
-	log.Printf("Found %d VM(s) on disk, restarting...", len(vms))
-
-	// Brief delay to let systemd finish killing orphaned Firecracker processes
-	// from the previous agent run (they may still be alive during cgroup cleanup)
-	time.Sleep(2 * time.Second)
+	log.Printf("Found %d VM(s) on disk, recovering...", len(vms))
 
 	for _, st := range vms {
 		vmDir := VMDir(st.Name)
