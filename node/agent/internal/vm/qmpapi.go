@@ -181,7 +181,8 @@ func qmpSaveState(vmDir string) (string, error) {
 		}
 
 		var status struct {
-			Status string `json:"status"`
+			Status   string `json:"status"`
+			ErrorDesc string `json:"error-desc"`
 		}
 		json.Unmarshal(result, &status)
 
@@ -190,7 +191,11 @@ func qmpSaveState(vmDir string) (string, error) {
 			log.Printf("qmpSaveState: completed")
 			return statePath, nil
 		case "failed":
-			return "", fmt.Errorf("qmp migrate failed")
+			log.Printf("qmpSaveState: full query-migrate response: %s", string(result))
+			if status.ErrorDesc != "" {
+				return "", fmt.Errorf("qmp migrate failed: %s", status.ErrorDesc)
+			}
+			return "", fmt.Errorf("qmp migrate failed (no error-desc in response: %s)", string(result))
 		case "active", "setup":
 			continue
 		default:
@@ -481,11 +486,19 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 		}
 	}()
 
-	// Wait briefly for QEMU to initialize and start listening on the migration port
-	time.Sleep(200 * time.Millisecond)
+	// Wait for QMP socket — QEMU binds the -incoming TCP port before opening
+	// the QMP socket, so QMP readiness guarantees the migration port is listening.
+	// Do NOT probe the TCP port directly: QEMU treats any TCP connection as a
+	// migration stream, and a probe would crash the target with "Not a migration stream".
+	if err := qmpWaitForSocket(vmDir, 10*time.Second); err != nil {
+		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
+		return 0, 0, fmt.Errorf("QEMU incoming TCP: %w (stderr: %s)", err, strings.TrimSpace(string(stderrContent)))
+	}
+
+	// Verify QEMU is still alive after init
 	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
 		stderrContent, _ := os.ReadFile(filepath.Join(vmDir, "qemu-incoming.log"))
-		return 0, 0, fmt.Errorf("QEMU incoming TCP died immediately: %s", strings.TrimSpace(string(stderrContent)))
+		return 0, 0, fmt.Errorf("QEMU incoming TCP died after init: %s", strings.TrimSpace(string(stderrContent)))
 	}
 
 	log.Printf("QEMU VM %s ready for incoming live migration on port %d (PID %d)", st.Name, migratePort, pid)
@@ -554,8 +567,9 @@ func qmpMigrateLive(vmDir string, targetIP string, targetPort int) error {
 		}
 
 		var status struct {
-			Status string `json:"status"`
-			RAM    *struct {
+			Status    string `json:"status"`
+			ErrorDesc string `json:"error-desc"`
+			RAM       *struct {
 				Transferred int64 `json:"transferred"`
 				Remaining   int64 `json:"remaining"`
 				Total       int64 `json:"total"`
@@ -594,7 +608,12 @@ func qmpMigrateLive(vmDir string, targetIP string, targetPort int) error {
 			log.Printf("qmpMigrateLive: migration completed in %s", time.Since(startTime).Round(time.Second))
 			return nil
 		case "failed":
-			return fmt.Errorf("QEMU live migration failed")
+			elapsed := time.Since(startTime).Round(time.Millisecond)
+			log.Printf("qmpMigrateLive: FAILED after %s — full query-migrate response: %s", elapsed, string(result))
+			if status.ErrorDesc != "" {
+				return fmt.Errorf("QEMU live migration failed after %s: %s", elapsed, status.ErrorDesc)
+			}
+			return fmt.Errorf("QEMU live migration failed after %s (no error-desc in response: %s)", elapsed, string(result))
 		case "cancelled":
 			return fmt.Errorf("QEMU live migration cancelled")
 		}
