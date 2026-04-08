@@ -64,7 +64,8 @@ type HostConfig struct {
 	DiskUsageThresholdPct int           // Scale up when node disk usage > this %
 	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
 	MaxNodes              int           // Hard cap on node count (0 = limited only by resources)
-	MaxVMSizeMB           int           // Headroom: scale up if no node has this much free RAM (MiB)
+	HeadroomPct           int           // Headroom percentage: max VM size = node RAM * this / 100
+	MaxVMSizeMB           int           // Computed: max placeable VM size in MiB (derived from HeadroomPct)
 
 	// Bootstrap bundle (secrets + config)
 	BundleDir string // Path to ~/.boxcutter/ bundle directory
@@ -216,9 +217,13 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("MIN_FREE_MEMORY_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &minFreeMB)
 	}
-	maxVMSizeMB := 8192
-	if v := os.Getenv("MAX_VM_SIZE_MB"); v != "" {
-		fmt.Sscanf(v, "%d", &maxVMSizeMB)
+	headroomPct := 80
+	if v := os.Getenv("HEADROOM_PCT"); v != "" {
+		fmt.Sscanf(v, "%d", &headroomPct)
+	}
+	maxVMSizeMB := parseRAMMB(nodeRAM) * headroomPct / 100
+	if maxVMSizeMB <= 0 {
+		maxVMSizeMB = 8192 // fallback
 	}
 
 	return HostConfig{
@@ -252,7 +257,8 @@ func defaultConfig() HostConfig {
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
 		MaxNodes:              0,     // 0 = no hard cap, limited only by host resources
-		MaxVMSizeMB:           maxVMSizeMB, // scale up if no node can fit a VM this large
+		HeadroomPct:           headroomPct,
+		MaxVMSizeMB:           maxVMSizeMB, // nodeRAM * headroomPct / 100
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,

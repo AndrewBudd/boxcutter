@@ -40,10 +40,31 @@ type Handler struct {
 	migrating       bool
 	migrateDeadline time.Time
 	migrateMu       sync.Mutex
+
+	// MaxVMSizeMB is the largest VM (by RAM) the cluster will accept.
+	// Derived from node RAM * HEADROOM_PCT / 100.
+	MaxVMSizeMB int
 }
 
 func NewHandler(database *db.DB) *Handler {
-	h := &Handler{db: database}
+	headroomPct := 80
+	if v := os.Getenv("HEADROOM_PCT"); v != "" {
+		fmt.Sscanf(v, "%d", &headroomPct)
+	}
+	nodeRAM := "12G"
+	if v := os.Getenv("NODE_RAM"); v != "" {
+		nodeRAM = v
+	}
+	var nodeRAMMB int
+	fmt.Sscanf(nodeRAM, "%dG", &nodeRAMMB)
+	nodeRAMMB *= 1024
+	if nodeRAMMB == 0 {
+		nodeRAMMB = 12 * 1024
+	}
+	maxVMSizeMB := nodeRAMMB * headroomPct / 100
+
+	h := &Handler{db: database, MaxVMSizeMB: maxVMSizeMB}
+	log.Printf("Max VM size: %d MiB (node RAM %s * %d%%)", maxVMSizeMB, nodeRAM, headroomPct)
 	go h.healthMonitorLoop()
 	go h.messageDeliveryLoop()
 	return h
@@ -333,6 +354,12 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Disk == "" {
 		req.Disk = "50G"
+	}
+
+	// Reject VMs larger than the cluster's max VM size
+	if h.MaxVMSizeMB > 0 && req.RAMMIB > h.MaxVMSizeMB {
+		http.Error(w, fmt.Sprintf("requested RAM %d MiB exceeds max VM size %d MiB", req.RAMMIB, h.MaxVMSizeMB), http.StatusBadRequest)
+		return
 	}
 
 	// Check if VM already exists
