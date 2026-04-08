@@ -88,6 +88,12 @@ type UpgradeGoal struct {
 	// retries — restarting the agent mid-migration aborts in-progress transfers.
 	DeployedOldNodeIDs map[string]bool `json:"deployed_old_node_ids,omitempty"`
 
+	// DrainTargetNodeID is the specific replacement node that the current drain
+	// should migrate VMs to. Set when a drain starts, cleared on success or when
+	// the replacement is destroyed after failure. Ensures drain targets only the
+	// designated replacement node, not arbitrary active nodes.
+	DrainTargetNodeID string `json:"drain_target_node_id,omitempty"`
+
 	// Timestamp when we started waiting for golden image on replacement node.
 	// Used to detect stuck golden image builds and time out.
 	GoldenWaitStart string `json:"golden_wait_start,omitempty"`

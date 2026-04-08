@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Handler dispatches SSH ForceCommand actions to the orchestrator HTTP API.
@@ -1042,6 +1043,7 @@ func (h *Handler) cmdTapegun(args []string) int {
 Commands:
   tapegun activity              Show activity for all VMs
   tapegun activity <name>       Show activity for a specific VM
+  tapegun wait <name>           Block until VM agent becomes idle
   tapegun send <name> <message> Send a message to a VM
   tapegun broadcast <message>   Broadcast a message to all running VMs
   tapegun sendkeys <name> <cmd> Inject a command into a VM's tmux pane
@@ -1058,6 +1060,13 @@ Usage: ssh <host> tapegun <command> [args]
 			return h.tapegunActivityVM(args[1])
 		}
 		return h.tapegunActivityAll()
+
+	case "wait":
+		if len(args) < 2 {
+			fmt.Println("Usage: ssh <host> tapegun wait <vm-name>")
+			return 1
+		}
+		return h.tapegunWait(args[1])
 
 	case "send":
 		if len(args) < 3 {
@@ -1113,6 +1122,13 @@ func (h *Handler) tapegunActivityAll() int {
 		fmt.Printf("=== %s (node: %s, status: %s, pending: %.0f) ===\n",
 			name, nodeName, vmStatus, pending)
 
+		// Show agent status from Claude Code hooks (Stop/UserPromptSubmit)
+		if agentStatus, ok := e["agent_status"].(map[string]interface{}); ok {
+			aStatus, _ := agentStatus["status"].(string)
+			aTs, _ := agentStatus["timestamp"].(string)
+			fmt.Printf("Agent:    %s (since: %s)\n", aStatus, aTs)
+		}
+
 		if activity, ok := e["activity"].(map[string]interface{}); ok {
 			status, _ := activity["status"].(string)
 			pane, _ := activity["pane_content"].(string)
@@ -1158,6 +1174,13 @@ func (h *Handler) tapegunActivityVM(name string) int {
 	fmt.Printf("Status:   %s\n", vmStatus)
 	fmt.Printf("Pending:  %.0f message(s)\n", pending)
 
+	// Show agent status from Claude Code hooks
+	if agentStatus, ok := e["agent_status"].(map[string]interface{}); ok {
+		aStatus, _ := agentStatus["status"].(string)
+		aTs, _ := agentStatus["timestamp"].(string)
+		fmt.Printf("Agent:    %s (since: %s)\n", aStatus, aTs)
+	}
+
 	if activity, ok := e["activity"].(map[string]interface{}); ok {
 		status, _ := activity["status"].(string)
 		pane, _ := activity["pane_content"].(string)
@@ -1175,6 +1198,40 @@ func (h *Handler) tapegunActivityVM(name string) int {
 		fmt.Println("Activity: no data")
 	}
 	return 0
+}
+
+func (h *Handler) tapegunWait(name string) int {
+	fmt.Printf("Waiting for %s to become idle...\n", name)
+	for {
+		resp, err := h.get("/api/tapegun/activity/" + name)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+
+		var e map[string]interface{}
+		json.Unmarshal(resp, &e)
+
+		// Check agent status from Claude Code hooks (most reliable)
+		if agentStatus, ok := e["agent_status"].(map[string]interface{}); ok {
+			aStatus, _ := agentStatus["status"].(string)
+			if aStatus == "idle" || aStatus == "stopped" || aStatus == "error" {
+				fmt.Printf("%s is %s\n", name, aStatus)
+				return 0
+			}
+		}
+
+		// Fallback: check daemon activity status
+		if activity, ok := e["activity"].(map[string]interface{}); ok {
+			status, _ := activity["status"].(string)
+			if status == "idle" || status == "stopped" {
+				fmt.Printf("%s is %s\n", name, status)
+				return 0
+			}
+		}
+
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func (h *Handler) tapegunSend(name, body string, sendKeys bool) int {

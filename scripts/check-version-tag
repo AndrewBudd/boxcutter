@@ -1,0 +1,180 @@
+#!/bin/bash
+# check-version-tag — Prevents version tag regression.
+# Validates that a new tag is greater than the latest existing tag.
+#
+# Usage:
+#   scripts/check-version-tag v0.38.0         # validate a specific tag
+#   scripts/check-version-tag --next patch     # suggest next patch/minor/major
+#   scripts/check-version-tag --install-hook   # install as git pre-push hook
+#
+# Exits 0 if the tag is valid (greater than latest), 1 otherwise.
+
+set -euo pipefail
+
+# Ensure we have ALL tags from the remote before comparing.
+fetch_tags() {
+    if git remote get-url origin &>/dev/null; then
+        echo "Fetching tags from remote..."
+        git fetch --tags --quiet 2>/dev/null || echo "Warning: could not fetch tags (offline?)"
+    fi
+}
+
+# Get the latest version tag (vX.Y.Z), sorted by semver.
+latest_tag() {
+    git tag -l 'v[0-9]*' | sort -V | tail -1
+}
+
+# Compare two semver strings. Returns 0 if $1 > $2.
+version_gt() {
+    local new="$1" old="$2"
+    # Strip leading 'v'
+    new="${new#v}"
+    old="${old#v}"
+
+    # Split into major.minor.patch
+    IFS='.' read -r new_major new_minor new_patch <<< "$new"
+    IFS='.' read -r old_major old_minor old_patch <<< "$old"
+
+    # Default missing components to 0
+    new_major=${new_major:-0}; new_minor=${new_minor:-0}; new_patch=${new_patch:-0}
+    old_major=${old_major:-0}; old_minor=${old_minor:-0}; old_patch=${old_patch:-0}
+
+    if (( new_major > old_major )); then return 0; fi
+    if (( new_major < old_major )); then return 1; fi
+    if (( new_minor > old_minor )); then return 0; fi
+    if (( new_minor < old_minor )); then return 1; fi
+    if (( new_patch > old_patch )); then return 0; fi
+    return 1
+}
+
+# Suggest the next version tag.
+next_version() {
+    local bump="${1:-patch}"
+    local latest="$2"
+    local ver="${latest#v}"
+    IFS='.' read -r major minor patch <<< "$ver"
+    major=${major:-0}; minor=${minor:-0}; patch=${patch:-0}
+
+    case "$bump" in
+        major) echo "v$((major+1)).0.0" ;;
+        minor) echo "v${major}.$((minor+1)).0" ;;
+        patch) echo "v${major}.${minor}.$((patch+1))" ;;
+        *) echo "Unknown bump type: $bump (use major, minor, or patch)" >&2; exit 1 ;;
+    esac
+}
+
+# Install as a git pre-push hook that rejects backward version tags.
+install_hook() {
+    local hook_path
+    hook_path="$(git rev-parse --git-dir)/hooks/pre-push"
+    local script_path
+    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+    cat > "$hook_path" << 'HOOK'
+#!/bin/bash
+# Pre-push hook: reject version tags that regress below the latest tag.
+# Installed by: scripts/check-version-tag --install-hook
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Only check tag pushes
+    if [[ "$local_ref" == refs/tags/v* ]]; then
+        tag="${local_ref#refs/tags/}"
+        latest=$(git tag -l 'v[0-9]*' | sort -V | tail -1)
+        if [ -z "$latest" ]; then
+            continue
+        fi
+
+        new="${tag#v}"
+        old="${latest#v}"
+        IFS='.' read -r new_major new_minor new_patch <<< "$new"
+        IFS='.' read -r old_major old_minor old_patch <<< "$old"
+        new_major=${new_major:-0}; new_minor=${new_minor:-0}; new_patch=${new_patch:-0}
+        old_major=${old_major:-0}; old_minor=${old_minor:-0}; old_patch=${old_patch:-0}
+
+        is_gt=false
+        if (( new_major > old_major )); then is_gt=true;
+        elif (( new_major == old_major && new_minor > old_minor )); then is_gt=true;
+        elif (( new_major == old_major && new_minor == old_minor && new_patch > old_patch )); then is_gt=true;
+        fi
+
+        if [ "$is_gt" = "false" ]; then
+            echo "ERROR: Tag $tag is not greater than latest tag $latest"
+            echo "       Run 'scripts/check-version-tag --next patch' to see the next valid tag."
+            echo "       If your local tags are stale, run: git fetch --tags"
+            exit 1
+        fi
+    fi
+done
+HOOK
+
+    chmod +x "$hook_path"
+    echo "Installed pre-push hook at $hook_path"
+}
+
+# --- Main ---
+
+if [ $# -eq 0 ]; then
+    echo "Usage:"
+    echo "  $0 <tag>              Validate a version tag (e.g., v0.38.0)"
+    echo "  $0 --next [bump]      Suggest next tag (patch|minor|major, default: patch)"
+    echo "  $0 --install-hook     Install git pre-push hook"
+    exit 1
+fi
+
+case "$1" in
+    --install-hook)
+        install_hook
+        exit 0
+        ;;
+    --next)
+        fetch_tags
+        latest=$(latest_tag)
+        if [ -z "$latest" ]; then
+            echo "No existing version tags found. Suggest: v0.1.0"
+            exit 0
+        fi
+        bump="${2:-patch}"
+        suggested=$(next_version "$bump" "$latest")
+        echo "Latest tag: $latest"
+        echo "Next $bump:  $suggested"
+        exit 0
+        ;;
+    v*)
+        # Validate a specific tag
+        new_tag="$1"
+        fetch_tags
+        latest=$(latest_tag)
+
+        if [ -z "$latest" ]; then
+            echo "OK: No existing tags — $new_tag is valid"
+            exit 0
+        fi
+
+        echo "Latest tag: $latest"
+        echo "New tag:    $new_tag"
+
+        if [ "$new_tag" = "$latest" ]; then
+            echo "ERROR: $new_tag already exists"
+            exit 1
+        fi
+
+        if version_gt "$new_tag" "$latest"; then
+            echo "OK: $new_tag > $latest"
+            exit 0
+        else
+            echo "ERROR: $new_tag is NOT greater than $latest — this would be a version regression!"
+            echo ""
+            echo "Suggestions:"
+            echo "  Next patch: $(next_version patch "$latest")"
+            echo "  Next minor: $(next_version minor "$latest")"
+            echo "  Next major: $(next_version major "$latest")"
+            echo ""
+            echo "If your local tags are stale, run: git fetch --tags"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: Tag must start with 'v' (e.g., v0.38.0)"
+        exit 1
+        ;;
+esac
