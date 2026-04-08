@@ -3017,6 +3017,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 
 	newDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
 	orchISO := fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir)
+	orchPIDFile := filepath.Join(cfg.ImagesDir, "orchestrator-new.pid")
 
 	// Step B: Launch new orchestrator if not running
 	newOrchHealthy := isOrchHealthy(goal.NewOrchIP)
@@ -3024,6 +3025,14 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		// Check if there's already a QEMU process for orchestrator-new
 		// by looking for the disk file — if it doesn't exist, we haven't launched yet
 		if !fileExists(newDisk) {
+			// Memory safety check: ensure we have enough RAM for the new orchestrator
+			orchRAMMB := parseRAMMB(cfg.OrchestratorRAM)
+			availMB := getAvailableMemoryMB()
+			reserveMB := 1024 // 1GB buffer (old orch frees RAM after migration)
+			if orchRAMMB > 0 && availMB > 0 && availMB < orchRAMMB+reserveMB {
+				return false, "", fmt.Errorf("insufficient memory for new orchestrator (%dMB available, need %dMB + %dMB reserve)", availMB, orchRAMMB, reserveMB)
+			}
+
 			// Mark old orch as upgrading so health monitor won't restart it after we stop it
 			state.SetNodeStatus("orchestrator", "upgrading")
 
@@ -3082,9 +3091,9 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		// orchestrator hasn't become healthy after 5 minutes, something is wrong.
 		const orchHealthTimeout = 5 * time.Minute
 
-		// Check if QEMU process is still alive
+		// Check if QEMU process is still alive (kill -0 to verify signalable)
 		newPID := findQEMUPID(newDisk)
-		if newPID <= 0 {
+		if newPID <= 0 || !qemu.IsRunning(newPID) {
 			// QEMU died — dump console log and clean up
 			consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
 			if data, err := os.ReadFile(consoleLog); err == nil {
@@ -3097,6 +3106,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			}
 			os.Remove(newDisk)
 			os.Remove(orchISO)
+			os.Remove(orchPIDFile)
 			bridge.DeleteTAP(goal.NewOrchTAP)
 			goal.NewOrchIP = ""
 			goal.NewOrchTAP = ""
@@ -3107,7 +3117,15 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			return false, "", fmt.Errorf("new orchestrator QEMU process died — cleaned up, will retry")
 		}
 
-		if goal.NewOrchLaunchTime != "" {
+		// If launch time is missing (daemon restarted mid-upgrade), backfill it
+		// so the timeout logic below can still fire.
+		if goal.NewOrchLaunchTime == "" {
+			log.Printf("orchestrator-new: launch time missing (daemon restart?), setting to now")
+			goal.NewOrchLaunchTime = time.Now().Format(time.RFC3339)
+			state.Save()
+		}
+
+		{
 			launchTime, _ := time.Parse(time.RFC3339, goal.NewOrchLaunchTime)
 			elapsed := time.Since(launchTime)
 
@@ -3140,6 +3158,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 				qemu.Stop("orchestrator-new", newPID)
 				os.Remove(newDisk)
 				os.Remove(orchISO)
+				os.Remove(orchPIDFile)
 				bridge.DeleteTAP(goal.NewOrchTAP)
 				goal.NewOrchIP = ""
 				goal.NewOrchTAP = ""
@@ -3202,8 +3221,32 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	}
 
 	// Step D: Old orchestrator is gone — finalize swap
-	// Find the PID of the new orchestrator by scanning for its disk
+	// Find the PID of the new orchestrator by scanning for its disk,
+	// then verify it's actually alive with kill -0
 	newPID := findQEMUPID(newDisk)
+	if newPID <= 0 || !qemu.IsRunning(newPID) {
+		// New orchestrator died between Step C and D — clean up and retry
+		consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
+		if data, err := os.ReadFile(consoleLog); err == nil {
+			lines := strings.Split(string(data), "\n")
+			start := 0
+			if len(lines) > 50 {
+				start = len(lines) - 50
+			}
+			log.Printf("orchestrator-new died before finalize — console (last 50 lines):\n%s", strings.Join(lines[start:], "\n"))
+		}
+		os.Remove(newDisk)
+		os.Remove(orchISO)
+		os.Remove(orchPIDFile)
+		bridge.DeleteTAP(goal.NewOrchTAP)
+		goal.NewOrchIP = ""
+		goal.NewOrchTAP = ""
+		goal.NewOrchMAC = ""
+		goal.NewOrchLaunchTime = ""
+		state.SetNodeStatus("orchestrator", "active")
+		state.Save()
+		return false, "", fmt.Errorf("new orchestrator QEMU died before finalize (PID %d) — cleaned up, will retry", newPID)
+	}
 
 	oldDisk := ""
 	oldBridgeIP := ""
