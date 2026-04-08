@@ -28,6 +28,22 @@ const (
 	fixedMAC       = "AA:FC:00:00:00:01"
 )
 
+// goldenPrepMu and goldenPrepLocks serialize golden image conversion per target
+// node so concurrent migrations don't race on qemu-img convert (issue #57).
+var (
+	goldenPrepMu    sync.Mutex
+	goldenPrepLocks = make(map[string]*sync.Mutex)
+)
+
+func goldenPrepLock(target string) *sync.Mutex {
+	goldenPrepMu.Lock()
+	defer goldenPrepMu.Unlock()
+	if goldenPrepLocks[target] == nil {
+		goldenPrepLocks[target] = &sync.Mutex{}
+	}
+	return goldenPrepLocks[target]
+}
+
 // Manager handles VM lifecycle operations.
 type Manager struct {
 	mu   sync.Mutex
@@ -2666,14 +2682,19 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		log.Printf("WARNING: pre-flight health check failed (non-fatal): %v", err)
 	}
 
-	// Pre-flight: ensure target has golden image (including QCOW2 version) + create vmDir
+	// Pre-flight: ensure target has golden image (including QCOW2 version) + create vmDir.
+	// Serialize golden image conversion per target to avoid concurrent qemu-img
+	// write-lock conflicts when multiple VMs migrate simultaneously (issue #57).
 	log.Printf("Migrating QEMU %s to %s: pre-staging", name, targetAddr)
+	goldenPrepLock(targetBridgeIP).Lock()
 	prepCmd := exec.Command("bash", "-c", fmt.Sprintf(
 		"%s ubuntu@%s 'sudo mkdir -p %s && if [ ! -f /var/lib/boxcutter/golden/rootfs.qcow2 ] && [ -f /var/lib/boxcutter/golden/rootfs.ext4 ]; then sudo qemu-img convert -f raw -O qcow2 /var/lib/boxcutter/golden/rootfs.ext4 /var/lib/boxcutter/golden/rootfs.qcow2; fi'",
 		sshOpts, targetBridgeIP, dstVMDir))
 	if out, err := prepCmd.CombinedOutput(); err != nil {
+		goldenPrepLock(targetBridgeIP).Unlock()
 		return nil, fmt.Errorf("prep target: %s: %w", string(out), err)
 	}
+	goldenPrepLock(targetBridgeIP).Unlock()
 
 	// Phase 1: Pre-sync rootfs while VM is running (zero downtime).
 	// This gets the bulk of the disk to the target. After pausing, we only
@@ -2974,15 +2995,19 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 	}
 
 	// For QCOW2 VMs backed by golden, ensure target has the golden QCOW2
-	// (the rootfs.qcow2 uses it as a backing file and won't work without it)
+	// (the rootfs.qcow2 uses it as a backing file and won't work without it).
+	// Serialize per target to avoid concurrent qemu-img write-lock conflicts (issue #57).
 	if DiskFormat(vmDir) == "qcow2" {
+		goldenPrepLock(targetBridgeIP).Lock()
 		ensureCmd := exec.Command("bash", "-c", fmt.Sprintf(
 			"%s ubuntu@%s 'if [ ! -f /var/lib/boxcutter/golden/rootfs.qcow2 ] && [ -f /var/lib/boxcutter/golden/rootfs.ext4 ]; then sudo qemu-img convert -f raw -O qcow2 /var/lib/boxcutter/golden/rootfs.ext4 /var/lib/boxcutter/golden/rootfs.qcow2; fi'",
 			sshOpts, targetBridgeIP))
 		if out, err := ensureCmd.CombinedOutput(); err != nil {
+			goldenPrepLock(targetBridgeIP).Unlock()
 			cleanTarget()
 			return nil, fmt.Errorf("ensure golden qcow2 on target: %s: %w", string(out), err)
 		}
+		goldenPrepLock(targetBridgeIP).Unlock()
 	}
 
 	// Transfer all VM files using tar --sparse (reads only allocated blocks,
