@@ -3020,6 +3020,25 @@ func (m *Manager) LaunchIncomingTCP(name string) (int, int, error) {
 		return 0, 0, fmt.Errorf("VM state not found: %w", err)
 	}
 
+	// If a stale QEMU process from a previous failed migration is still
+	// running, kill it and tear down its networking before proceeding.
+	// The source already rm -rf'd the directory and pre-synced fresh
+	// files, but the old process may still hold TAP/port resources. (Bug #40)
+	if pidData, pidErr := os.ReadFile(filepath.Join(vmDir, "qemu.pid")); pidErr == nil {
+		var oldPid int
+		fmt.Sscanf(strings.TrimSpace(string(pidData)), "%d", &oldPid)
+		if oldPid > 0 {
+			if proc, procErr := os.FindProcess(oldPid); procErr == nil {
+				if killErr := proc.Signal(syscall.Signal(0)); killErr == nil {
+					log.Printf("LaunchIncomingTCP: killing stale QEMU process %d for %s", oldPid, name)
+					proc.Signal(syscall.SIGKILL)
+					proc.Wait()
+				}
+			}
+		}
+	}
+	TeardownTAP(st.TAP, st.Mark)
+
 	// Capacity check using hybrid declared+actual memory check
 	if err := m.checkCapacity(st.RAMMIB); err != nil {
 		capErr := err.(*CapacityError)
@@ -3267,12 +3286,18 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 		return nil, err
 	}
 
-	// Check if a VM with this name already exists (running or stopped)
-	if _, err := LoadVMState(vmDir); err == nil {
+	// Check if a VM with this name already exists
+	if oldSt, err := LoadVMState(vmDir); err == nil {
 		if IsRunning(vmDir) {
 			return nil, fmt.Errorf("VM '%s' already exists and is running", st.Name)
 		}
-		return nil, fmt.Errorf("VM '%s' already exists (stopped)", st.Name)
+		// Stopped VM is stale debris from a previous failed migration.
+		// Clean up dm-snapshot devices and TAP but preserve both vmDir
+		// and shmDir — the current migration has already pre-synced
+		// rootfs + vm.json to vmDir and snapshot files to shmDir. (Bug #40)
+		log.Printf("ImportSnapshot: cleaning stale resources for stopped VM %s", vmDir)
+		CleanupSnapshot(vmDir)
+		TeardownTAP(oldSt.TAP, oldSt.Mark)
 	}
 
 	os.MkdirAll(vmDir, 0755)

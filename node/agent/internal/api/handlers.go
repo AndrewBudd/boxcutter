@@ -483,8 +483,16 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(preflightResp.Body).Decode(&detail)
 		preflightResp.Body.Close()
 		tgtStatus, _ := detail["status"].(string)
-		if tgtStatus == "running" || tgtStatus == "stopped" {
+		if tgtStatus == "running" {
 			break // VM exists and is real — reject below
+		}
+		if tgtStatus == "stopped" {
+			// Stopped VM on target is stale debris from a previous failed
+			// migration — clean it up and proceed. VM names are unique
+			// across the cluster, so the source is authoritative. (Bug #40)
+			log.Printf("Migrate %s: target has stopped copy (stale migration debris), proceeding", name)
+			targetClear = true
+			break
 		}
 		if tgtStatus == "migrating" {
 			// VM is migrating out, wait for cleanup
