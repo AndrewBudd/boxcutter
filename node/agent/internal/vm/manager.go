@@ -2556,8 +2556,14 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	}, nil
 }
 
-// migrateQEMUVM performs a live migration of a running QEMU VM using QMP save/restore.
-// Flow: pre-sync disk → pause → save state → transfer state → restore on target → verify.
+// migrateQEMUVM performs a stop-copy migration of a running QEMU VM.
+// Flow: pre-sync disk → pause → flatten QCOW2 → sync disk → save state → transfer → import on target → verify.
+//
+// Uses QMP state save/restore instead of QEMU's native TCP live migration,
+// because native live migration only transfers RAM — it assumes shared storage.
+// With non-shared local disks, any disk writes between pre-sync and migration
+// completion are lost on the target, causing silent filesystem corruption
+// (exec format errors, broken processes). (Bug #50)
 func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBridgeIP string) (*MigrateResponse, error) {
 	vmDir := VMDir(name)
 	hostname, _ := os.Hostname()
@@ -2584,6 +2590,12 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		fmt.Sprintf("/dev/shm/bc-%s", name), fmt.Sprintf("/dev/shm/bc-%s-mig", name)}
 	cleanCmd := exec.Command("ssh", append(append([]string{}, sshArgs...), append([]string{"ubuntu@" + targetBridgeIP}, cleanArgs...)...)...)
 	cleanCmd.Run()
+
+	cleanTarget := func() {
+		exec.Command("ssh", append(append([]string{}, sshArgs...), append([]string{"ubuntu@" + targetBridgeIP},
+			"sudo", "rm", "-rf", dstVMDir,
+			fmt.Sprintf("/dev/shm/bc-%s", name), fmt.Sprintf("/dev/shm/bc-%s-mig", name))...)...).Run()
+	}
 
 	// Pre-flight: validate target can accept this VM before doing expensive work.
 	// Fail fast before any data transfer — source VM stays running, zero impact.
@@ -2651,7 +2663,9 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		return nil, fmt.Errorf("prep target: %s: %w", string(out), err)
 	}
 
-	// Phase 1: Pre-sync rootfs while VM is running (zero downtime)
+	// Phase 1: Pre-sync rootfs while VM is running (zero downtime).
+	// This gets the bulk of the disk to the target. After pausing, we only
+	// need to flatten (QCOW2) or re-sync (raw) the final dirty state.
 	telem.StartPhase("pre-sync")
 	diskInfo, _ := os.Stat(filepath.Join(vmDir, diskName))
 	diskBytes := int64(0)
@@ -2666,6 +2680,9 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	if _, err := os.Stat(filepath.Join(vmDir, "initrd.img")); err == nil {
 		preSyncFiles += " initrd.img"
 	}
+	if _, err := os.Stat(filepath.Join(vmDir, "mailbox.json")); err == nil {
+		preSyncFiles += " mailbox.json"
+	}
 	preSyncCmd := exec.Command("bash", "-c", fmt.Sprintf(
 		"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
 		vmDir, preSyncFiles, sshOpts, targetBridgeIP, dstVMDir))
@@ -2676,60 +2693,149 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 	}
 	telem.EndPhase("pre-sync", diskBytes)
 
-	// Phase 2: Live migration (VM keeps running, memory streamed incrementally)
-	telem.StartPhase("live-migrate")
+	// Phase 2: Pause → sync final disk state → save QEMU state → transfer → import
+	telem.StartPhase("stop-copy")
 	downtimeStart := time.Now()
 
-	// Ask target to launch QEMU with -incoming tcp
-	launchResp, err := http.Post(
-		fmt.Sprintf("http://%s/api/vms/%s/launch-incoming-tcp", targetAddr, name),
-		"application/json", nil)
+	// Pause the source VM — all pending I/O is flushed, disk is now consistent
+	log.Printf("Migrating QEMU %s: pausing source VM", name)
+	if err := qmpStop(vmDir); err != nil {
+		telem.FailPhase("stop-copy", err)
+		telem.Fail(err)
+		return nil, fmt.Errorf("pausing source VM: %w", err)
+	}
+
+	// On any failure after pause, resume source VM to avoid leaving it hung
+	sourceResumed := false
+	resumeSource := func() {
+		if !sourceResumed {
+			log.Printf("Migrating QEMU %s: resuming source after failed migration", name)
+			qmpCont(vmDir)
+			sourceResumed = true
+		}
+	}
+
+	// Sync final disk state to target. For QCOW2, flatten to remove backing
+	// file dependency — the target's golden image may differ. For raw, re-sync
+	// the full file (it's consistent now that VM is paused).
+	log.Printf("Migrating QEMU %s: syncing final disk state", name)
+	var flattenedQCOW2 string
+	if diskName == "rootfs.qcow2" {
+		flatPath := filepath.Join(vmDir, "rootfs-flat.qcow2")
+		flatCmd := exec.Command("qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
+			filepath.Join(vmDir, "rootfs.qcow2"), flatPath)
+		if out, err := flatCmd.CombinedOutput(); err != nil {
+			resumeSource()
+			cleanTarget()
+			telem.FailPhase("stop-copy", fmt.Errorf("flatten qcow2: %s: %w", string(out), err))
+			telem.Fail(err)
+			return nil, fmt.Errorf("flatten qcow2: %s: %w", string(out), err)
+		}
+		flattenedQCOW2 = flatPath
+		// Transfer flattened file as rootfs.qcow2 on target
+		xferCmd := exec.Command("bash", "-c", fmt.Sprintf(
+			"tar --sparse -cf - -C %s rootfs-flat.qcow2 | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+			vmDir, sshOpts, targetBridgeIP, dstVMDir))
+		if out, err := xferCmd.CombinedOutput(); err != nil {
+			os.Remove(flattenedQCOW2)
+			resumeSource()
+			cleanTarget()
+			telem.FailPhase("stop-copy", fmt.Errorf("disk transfer: %s: %w", string(out), err))
+			telem.Fail(err)
+			return nil, fmt.Errorf("disk transfer: %s: %w", string(out), err)
+		}
+		os.Remove(flattenedQCOW2)
+		// Rename rootfs-flat.qcow2 → rootfs.qcow2 on target
+		renameCmd := exec.Command("ssh", append(append([]string{}, sshArgs...), "ubuntu@"+targetBridgeIP,
+			"sudo", "mv", dstVMDir+"rootfs-flat.qcow2", dstVMDir+"rootfs.qcow2")...)
+		if out, err := renameCmd.CombinedOutput(); err != nil {
+			resumeSource()
+			cleanTarget()
+			telem.FailPhase("stop-copy", fmt.Errorf("rename qcow2: %s: %w", string(out), err))
+			telem.Fail(err)
+			return nil, fmt.Errorf("rename flattened qcow2 on target: %s: %w", string(out), err)
+		}
+	} else {
+		// Raw disk: re-sync the full file now that VM is paused
+		xferCmd := exec.Command("bash", "-c", fmt.Sprintf(
+			"tar --sparse -cf - -C %s %s | %s ubuntu@%s 'sudo tar --sparse -xf - -C %s'",
+			vmDir, diskName, sshOpts, targetBridgeIP, dstVMDir))
+		if out, err := xferCmd.CombinedOutput(); err != nil {
+			resumeSource()
+			cleanTarget()
+			telem.FailPhase("stop-copy", fmt.Errorf("disk sync: %s: %w", string(out), err))
+			telem.Fail(err)
+			return nil, fmt.Errorf("disk sync: %s: %w", string(out), err)
+		}
+	}
+
+	// Save QEMU state (CPU + devices + RAM) to a file
+	log.Printf("Migrating QEMU %s: saving VM state", name)
+	statePath, err := qmpSaveState(vmDir)
 	if err != nil {
-		telem.FailPhase("live-migrate", err)
+		resumeSource()
+		cleanTarget()
+		telem.FailPhase("stop-copy", err)
 		telem.Fail(err)
-		return nil, fmt.Errorf("launch incoming TCP: %w", err)
+		return nil, fmt.Errorf("saving VM state: %w", err)
 	}
-	launchBody, _ := io.ReadAll(launchResp.Body)
-	launchResp.Body.Close()
-	if launchResp.StatusCode >= 300 {
-		launchErr := fmt.Errorf("launch incoming TCP: HTTP %d: %s", launchResp.StatusCode, string(launchBody))
-		telem.FailPhase("live-migrate", launchErr)
-		telem.Fail(launchErr)
-		return nil, launchErr
-	}
-	var launchResult struct {
-		MigratePort int `json:"migrate_port"`
-	}
-	json.Unmarshal(launchBody, &launchResult)
-	if launchResult.MigratePort == 0 {
-		launchErr := fmt.Errorf("target returned no migrate port")
-		telem.FailPhase("live-migrate", launchErr)
-		telem.Fail(launchErr)
-		return nil, launchErr
-	}
-	log.Printf("Migrating QEMU %s: target listening on port %d", name, launchResult.MigratePort)
 
-	// Initiate QEMU native live migration — VM keeps running while pages stream
-	if err := qmpMigrateLive(vmDir, targetBridgeIP, launchResult.MigratePort); err != nil {
-		telem.FailPhase("live-migrate", err)
+	// Transfer state file to target
+	log.Printf("Migrating QEMU %s: transferring state file", name)
+	stateInfo, _ := os.Stat(statePath)
+	stateSize := int64(0)
+	if stateInfo != nil {
+		stateSize = stateInfo.Size()
+	}
+	dstStatePath := filepath.Join(dstVMDir, filepath.Base(statePath))
+	stateXferCmd := exec.Command("bash", "-c", fmt.Sprintf(
+		"cat %s | %s ubuntu@%s 'sudo tee %s > /dev/null'",
+		statePath, sshOpts, targetBridgeIP, dstStatePath))
+	if out, err := stateXferCmd.CombinedOutput(); err != nil {
+		os.Remove(statePath)
+		resumeSource()
+		cleanTarget()
+		telem.FailPhase("stop-copy", fmt.Errorf("state transfer: %s: %w", string(out), err))
 		telem.Fail(err)
-		// Clean up target
-		exec.Command("bash", "-c", fmt.Sprintf(
-			"%s ubuntu@%s 'sudo rm -rf %s'",
-			sshOpts, targetBridgeIP, dstVMDir)).Run()
-		return nil, fmt.Errorf("live migration: %w", err)
+		return nil, fmt.Errorf("state transfer: %s: %w", string(out), err)
 	}
-	telem.EndPhase("live-migrate", int64(st.RAMMIB)*1024*1024)
+	os.Remove(statePath)
 
-	// Transfer vm.json to target (needed for vmid registration)
+	// Re-transfer vm.json so target has latest metadata
 	vmJsonCmd := exec.Command("bash", "-c", fmt.Sprintf(
 		"cat %s | %s ubuntu@%s 'sudo tee %s > /dev/null'",
 		filepath.Join(vmDir, "vm.json"), sshOpts, targetBridgeIP, filepath.Join(dstVMDir, "vm.json")))
 	vmJsonCmd.Run()
 
-	// Verify target is healthy (VM should be running on target now).
-	// Fail fast if the target reports the VM as stopped/not-found — this
-	// means QEMU crashed (e.g., OOM killed) rather than still starting up.
+	// Import state on target — this launches QEMU, loads state, resumes the VM
+	log.Printf("Migrating QEMU %s: importing state on target", name)
+	importBody, _ := json.Marshal(map[string]string{"state_path": dstStatePath})
+	importResp, err := http.Post(
+		fmt.Sprintf("http://%s/api/vms/%s/import-qemu-state", targetAddr, name),
+		"application/json", bytes.NewReader(importBody))
+	if err != nil {
+		resumeSource()
+		cleanTarget()
+		telem.FailPhase("stop-copy", err)
+		telem.Fail(err)
+		return nil, fmt.Errorf("import state on target: %w", err)
+	}
+	importRespBody, _ := io.ReadAll(importResp.Body)
+	importResp.Body.Close()
+	if importResp.StatusCode >= 300 {
+		resumeSource()
+		cleanTarget()
+		importErr := fmt.Errorf("import state on target: HTTP %d: %s", importResp.StatusCode, string(importRespBody))
+		telem.FailPhase("stop-copy", importErr)
+		telem.Fail(importErr)
+		return nil, importErr
+	}
+	telem.EndPhase("stop-copy", diskBytes+stateSize)
+
+	// Target VM is now running — do NOT resume source (would cause split-brain)
+	sourceResumed = true
+
+	// Verify target is healthy
 	telem.StartPhase("verify")
 	verifyClient := &http.Client{Timeout: 10 * time.Second}
 	var verifyOK bool
@@ -2743,9 +2849,8 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 				verifyOK = true
 				break
 			} else if s == "stopped" || s == "not-found" {
-				// QEMU process died — fail fast instead of waiting 60s
 				diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
-				verifyErr := fmt.Errorf("target QEMU process died (status=%s) after live migration%s", s, diag)
+				verifyErr := fmt.Errorf("target QEMU process died (status=%s) after state import%s", s, diag)
 				log.Printf("Migration verify failed (fast) for %s on %s: status=%s%s", name, targetBridgeIP, s, diag)
 				telem.FailPhase("verify", verifyErr)
 				telem.Fail(verifyErr)
@@ -2755,9 +2860,8 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		time.Sleep(2 * time.Second)
 	}
 	if !verifyOK {
-		// Collect diagnostics from target: dmesg OOM kills + QEMU daemon log
 		diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
-		verifyErr := fmt.Errorf("target VM not running after live migration%s", diag)
+		verifyErr := fmt.Errorf("target VM not running after state import%s", diag)
 		log.Printf("Migration verify failed for %s on %s:%s", name, targetBridgeIP, diag)
 		telem.FailPhase("verify", verifyErr)
 		telem.Fail(verifyErr)
@@ -2777,32 +2881,16 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		"cat %s | %s ubuntu@%s 'sudo tee %s/migration.log > /dev/null'",
 		filepath.Join(vmDir, "migration.log"), sshOpts, targetBridgeIP, dstVMDir)).Run()
 
-	// Atomic identity handoff: tell target to register vmid + import mailbox
-	// BEFORE we deregister on source. This ensures zero-gap identity ownership.
-	finalizeClient := &http.Client{Timeout: 30 * time.Second}
-	finalizeResp, finalizeErr := finalizeClient.Post(
-		fmt.Sprintf("http://%s/api/vms/%s/finalize-migration", targetAddr, name),
-		"application/json", nil)
-	if finalizeErr != nil {
-		log.Printf("WARNING: finalize-migration call failed (non-fatal): %v", finalizeErr)
-	} else {
-		finalizeResp.Body.Close()
-		if finalizeResp.StatusCode >= 300 {
-			log.Printf("WARNING: finalize-migration returned %d (non-fatal)", finalizeResp.StatusCode)
-		}
-	}
-
-	// Deregister vmid on source — target now owns the identity
+	// Deregister vmid on source — target already registered during ImportQEMUState
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
 	}
 
 	// Commit: mark migrated, stop source, cleanup
-	// After live migration, source QEMU process has already exited
 	SetMigrated(vmDir, true)
-	m.stopVM(name) // no-op if QEMU already exited after migration
+	m.stopVM(name)
 	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
-	os.RemoveAll(vmDir) // clean up source files
+	os.RemoveAll(vmDir)
 
 	return &MigrateResponse{
 		Name:       name,
@@ -3039,6 +3127,15 @@ func (m *Manager) LaunchIncomingTCP(name string) (int, int, error) {
 	}
 	TeardownTAP(st.TAP, st.Mark)
 
+	// Reallocate mark/TAP on this node — the source node's mark may conflict
+	// with existing VMs on this node. (Bug #50)
+	existingMarks := m.collectExistingMarks()
+	st.Mark = AllocateMark(st.Name, existingMarks)
+	st.TAP = TAPName(st.Name)
+	if err := SaveVMState(vmDir, st); err != nil {
+		return 0, 0, fmt.Errorf("saving updated VM state: %w", err)
+	}
+
 	// Capacity check using hybrid declared+actual memory check
 	if err := m.checkCapacity(st.RAMMIB); err != nil {
 		capErr := err.(*CapacityError)
@@ -3056,7 +3153,7 @@ func (m *Manager) LaunchIncomingTCP(name string) (int, int, error) {
 		}
 	}
 
-	// Set up networking
+	// Set up networking with reallocated mark
 	if err := SetupTAP(st.TAP, st.Mark); err != nil {
 		return 0, 0, fmt.Errorf("setting up TAP: %w", err)
 	}
@@ -3140,6 +3237,15 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		return nil, err
 	}
 
+	// Reallocate mark/TAP on this node — the source node's mark may conflict
+	// with existing VMs on this node. (Bug #50)
+	existingMarks := m.collectExistingMarks()
+	st.Mark = AllocateMark(st.Name, existingMarks)
+	st.TAP = TAPName(st.Name)
+	if err := SaveVMState(vmDir, st); err != nil {
+		return nil, fmt.Errorf("saving updated VM state: %w", err)
+	}
+
 	// Ensure golden QCOW2 exists if this is a QCOW2-backed VM
 	if DiskFormat(vmDir) == "qcow2" {
 		goldenExt4 := m.cfg.Storage.GoldenLocalPath
@@ -3151,7 +3257,7 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 		}
 	}
 
-	// Set up networking
+	// Set up networking with reallocated mark
 	if err := SetupTAP(st.TAP, st.Mark); err != nil {
 		return nil, fmt.Errorf("setting up TAP: %w", err)
 	}
