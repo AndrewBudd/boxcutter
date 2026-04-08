@@ -124,7 +124,8 @@ RUN chmod 755 /usr/local/bin/boxcutter-fetch-metadata && \
 
 # --- Boxcutter tools mount (squashfs on /dev/vdb → /opt/boxcutter/tools) ---
 # Explicit .mount + .automount units (fstab x-systemd.automount doesn't trigger on QEMU VMs).
-# ConditionPathExists=/dev/vdb means VMs without the tools device won't fail.
+# The .automount always sets up the autofs trigger; the .mount uses Requires=dev-vdb.device
+# to wait for the virtio device before mounting.
 # tools.img contains: boxcutter CLI, boxcutter-tapegun daemon, systemd units
 COPY config/opt-boxcutter-tools.mount /etc/systemd/system/opt-boxcutter-tools.mount
 COPY config/opt-boxcutter-tools.automount /etc/systemd/system/opt-boxcutter-tools.automount

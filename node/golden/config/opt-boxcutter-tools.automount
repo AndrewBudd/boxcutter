@@ -1,6 +1,5 @@
 [Unit]
 Description=Automount boxcutter tools squashfs
-ConditionPathExists=/dev/vdb
 
 [Automount]
 Where=/opt/boxcutter/tools
