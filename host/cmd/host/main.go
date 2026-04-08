@@ -213,7 +213,7 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("ORCH_VCPU"); v != "" {
 		fmt.Sscanf(v, "%d", &orchVCPU)
 	}
-	minFreeMB := 8192
+	minFreeMB := 4096
 	if v := os.Getenv("MIN_FREE_MEMORY_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &minFreeMB)
 	}
@@ -1170,21 +1170,18 @@ func canScaleUp(cfg HostConfig, currentNodeCount int) (bool, string) {
 		nodeRAMMB = 12 * 1024 // fallback
 	}
 
-	// Rolling upgrade reserve: after launching this node, there must still be
-	// enough memory to launch ONE MORE node (for rolling upgrades). This ensures
-	// we can always do a rolling upgrade without first draining a node.
-	// Required: availMB - thisNode - upgradeReserve >= MinFreeMemoryMB
-	requiredMB := nodeRAMMB*2 + cfg.MinFreeMemoryMB
+	// After launching this node, we must still have MinFreeMemoryMB free.
+	// No upgrade reserve needed here — upgrades stop the old node first (see
+	// rolling upgrade code which has its own modest 1GB buffer).
+	requiredMB := nodeRAMMB + cfg.MinFreeMemoryMB
 	if availMB < requiredMB {
 		afterLaunchMB := availMB - nodeRAMMB
 		return false, fmt.Sprintf("after launch would have %dMB free (%dMB available - %dMB node), "+
-			"need %dMB reserved for rolling upgrade + %dMB minimum free",
-			afterLaunchMB, availMB, nodeRAMMB, nodeRAMMB, cfg.MinFreeMemoryMB)
+			"need %dMB minimum free",
+			afterLaunchMB, availMB, nodeRAMMB, cfg.MinFreeMemoryMB)
 	}
 
-	// Also enforce MaxNodes. The requiredMB check above already verified we have
-	// enough memory for this node + upgrade reserve + minFree. This check enforces
-	// the configured hard cap.
+	// Also enforce MaxNodes.
 	if cfg.MaxNodes > 0 && currentNodeCount >= cfg.MaxNodes {
 		return false, fmt.Sprintf("at configured maximum of %d nodes", cfg.MaxNodes)
 	}
