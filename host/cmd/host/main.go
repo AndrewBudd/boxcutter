@@ -216,8 +216,11 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("MIN_FREE_MEMORY_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &minFreeMB)
 	}
-	maxVMSizeMB := 8192
-	if v := os.Getenv("MAX_VM_SIZE_MB"); v != "" {
+	maxVMSizeMB := parseRAMMB(nodeRAM) - 2048 // node RAM minus 2G overhead
+	if maxVMSizeMB <= 0 {
+		maxVMSizeMB = 8192 // fallback
+	}
+	if v := os.Getenv("MAX_VM_SIZE"); v != "" {
 		fmt.Sscanf(v, "%d", &maxVMSizeMB)
 	}
 
@@ -252,7 +255,7 @@ func defaultConfig() HostConfig {
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
 		MaxNodes:              0,     // 0 = no hard cap, limited only by host resources
-		MaxVMSizeMB:           maxVMSizeMB, // scale up if no node can fit a VM this large
+		MaxVMSizeMB:           maxVMSizeMB,
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,

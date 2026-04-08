@@ -40,13 +40,117 @@ type Handler struct {
 	migrating       bool
 	migrateDeadline time.Time
 	migrateMu       sync.Mutex
+
+	// MaxVMSizeMB is the largest VM (by RAM in MiB) the cluster can place.
+	// VM creation requests exceeding this are rejected.
+	MaxVMSizeMB int
 }
 
 func NewHandler(database *db.DB) *Handler {
-	h := &Handler{db: database}
+	maxVM := 0
+	if v := os.Getenv("MAX_VM_SIZE"); v != "" {
+		fmt.Sscanf(v, "%d", &maxVM)
+	}
+	h := &Handler{db: database, MaxVMSizeMB: maxVM}
+	h.discoverNodes()
 	go h.healthMonitorLoop()
 	go h.messageDeliveryLoop()
 	return h
+}
+
+// discoverNodes scans the bridge subnet for responsive node agents and
+// registers them in the database. This allows the orchestrator to rebuild
+// its state from scratch on startup (e.g. after an upgrade) without relying
+// on nodes to re-register.
+func (h *Handler) discoverNodes() {
+	subnet := os.Getenv("BRIDGE_SUBNET")
+	if subnet == "" {
+		subnet = "192.168.50"
+	}
+
+	log.Printf("Discovering nodes on %s.0/24 ...", subnet)
+
+	type result struct {
+		ip     string
+		health *node.HealthResponse
+	}
+
+	var mu sync.Mutex
+	var results []result
+	var wg sync.WaitGroup
+
+	// Scan .3 through .254 (skip .1 = host, .2 = orchestrator)
+	for i := 3; i <= 254; i++ {
+		ip := fmt.Sprintf("%s.%d", subnet, i)
+		wg.Add(1)
+		go func(ip string) {
+			defer wg.Done()
+			fc := node.NewFastClient(ip + ":8800")
+			health := fc.Health()
+			if health == nil {
+				return
+			}
+			mu.Lock()
+			results = append(results, result{ip: ip, health: health})
+			mu.Unlock()
+		}(ip)
+	}
+	wg.Wait()
+
+	if len(results) == 0 {
+		log.Printf("Node discovery: no nodes found on subnet %s.0/24", subnet)
+		return
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	for _, r := range results {
+		apiAddr := r.ip + ":8800"
+		nodeID := r.health.Hostname
+		if nodeID == "" {
+			nodeID = r.ip
+		}
+
+		n := &db.Node{
+			ID:            nodeID,
+			TailscaleName: nodeID,
+			BridgeIP:      r.ip,
+			APIAddr:       apiAddr,
+			Status:        "active",
+			RegisteredAt:  now,
+			LastHeartbeat: now,
+		}
+		if err := h.db.RegisterNode(n); err != nil {
+			log.Printf("Node discovery: failed to register %s (%s): %v", nodeID, r.ip, err)
+			continue
+		}
+		log.Printf("Node discovery: registered %s at %s (RAM %d/%d MiB, %d VMs)",
+			nodeID, r.ip, r.health.RAMAllocatedMIB, r.health.RAMTotalMIB, r.health.VMsRunning)
+
+		// Sync VM inventory from node
+		fc := node.NewFastClient(apiAddr)
+		if vmList := fc.ListVMs(); vmList != nil {
+			var dbVMs []db.VM
+			for _, v := range vmList {
+				dbVMs = append(dbVMs, db.VM{
+					Name:   v.Name,
+					NodeID: nodeID,
+					Status: v.Status,
+				})
+			}
+			h.db.SyncNodeVMs(nodeID, dbVMs)
+			log.Printf("Node discovery: synced %d VMs from %s", len(dbVMs), nodeID)
+		}
+
+		// Sync golden image versions
+		if versions := fc.GoldenVersions(); versions != nil {
+			h.db.DeleteGoldenImagesForNode(nodeID)
+			for _, ver := range versions {
+				h.db.UpsertGoldenImage(ver, nodeID, now)
+			}
+		}
+	}
+
+	log.Printf("Node discovery complete: found %d node(s)", len(results))
 }
 
 // isMigrating returns true if this orchestrator is in pre-migrate mode.
@@ -333,6 +437,12 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Disk == "" {
 		req.Disk = "50G"
+	}
+
+	// Reject VMs larger than the cluster's max VM size
+	if h.MaxVMSizeMB > 0 && req.RAMMIB > h.MaxVMSizeMB {
+		http.Error(w, fmt.Sprintf("requested RAM %d MiB exceeds max VM size %d MiB", req.RAMMIB, h.MaxVMSizeMB), http.StatusBadRequest)
+		return
 	}
 
 	// Check if VM already exists
