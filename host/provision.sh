@@ -153,7 +153,7 @@ build_node() {
   cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun" "${TOOLS_STAGE}/bin/boxcutter-tapegun"
   chmod 755 "${TOOLS_STAGE}/bin/boxcutter-tapegun"
   cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun.service" "${TOOLS_STAGE}/etc/systemd/boxcutter-tapegun.service"
-  mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp zstd -quiet
+  mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp gzip -quiet
   echo "  tools.img: $(du -h "${BUILD_DIR}/tools.img" | cut -f1)"
 
   # --- Package payload ---

@@ -2247,8 +2247,18 @@ func pickDrainTarget(state *cluster.State, excludeNodeID string) *cluster.VMEntr
 	var best *cluster.VMEntry
 	var bestFreeRAM float64 = -1
 
+	// During an upgrade, only migrate VMs to nodes running the new image.
+	// Otherwise VMs land on old nodes that will themselves be drained next.
+	var goalImage *cluster.ImageRef
+	if g := state.UpgradeGoal; g != nil {
+		goalImage = g.NodeImage
+	}
+
 	for _, n := range state.Nodes {
 		if n.ID == excludeNodeID || !n.IsActive() || !qemu.IsRunning(n.PID) {
+			continue
+		}
+		if goalImage != nil && !n.MatchesImage(goalImage) {
 			continue
 		}
 		health := queryNodeHealth(n.BridgeIP)
