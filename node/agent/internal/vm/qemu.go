@@ -265,6 +265,63 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 	os.WriteFile(filepath.Join(modulesDir, "kvm.conf"),
 		[]byte("kvm\nkvm_amd\nkvm_intel\n"), 0644)
 
+	// Set up boxcutter tools mount (squashfs on /dev/vdb → /opt/boxcutter/tools).
+	// Firecracker golden images get this from the Dockerfile, but QEMU VMs need
+	// the mount units and symlinks injected during rootfs prep.
+	toolsMountPoint := filepath.Join(mountPoint, "opt", "boxcutter", "tools")
+	os.MkdirAll(toolsMountPoint, 0755)
+
+	// Install systemd mount + automount units for /dev/vdb
+	os.WriteFile(filepath.Join(sysDir, "opt-boxcutter-tools.mount"), []byte(`[Unit]
+Description=Boxcutter tools squashfs (/dev/vdb)
+DefaultDependencies=no
+After=dev-vdb.device
+
+[Mount]
+What=/dev/vdb
+Where=/opt/boxcutter/tools
+Type=squashfs
+Options=ro
+
+[Install]
+WantedBy=local-fs.target
+`), 0644)
+	os.WriteFile(filepath.Join(sysDir, "opt-boxcutter-tools.automount"), []byte(`[Unit]
+Description=Automount boxcutter tools squashfs
+
+[Automount]
+Where=/opt/boxcutter/tools
+TimeoutIdleSec=0
+
+[Install]
+WantedBy=local-fs.target
+`), 0644)
+
+	// Enable automount in local-fs.target
+	localFSWants := filepath.Join(sysDir, "local-fs.target.wants")
+	os.MkdirAll(localFSWants, 0755)
+	os.Symlink("/etc/systemd/system/opt-boxcutter-tools.automount",
+		filepath.Join(localFSWants, "opt-boxcutter-tools.automount"))
+
+	// Symlink binaries and tapegun service (same as golden Dockerfile)
+	usrLocalBin := filepath.Join(mountPoint, "usr", "local", "bin")
+	os.MkdirAll(usrLocalBin, 0755)
+	os.Symlink("/opt/boxcutter/tools/bin/boxcutter", filepath.Join(usrLocalBin, "boxcutter"))
+	os.Symlink("/opt/boxcutter/tools/bin/boxcutter-tapegun", filepath.Join(usrLocalBin, "boxcutter-tapegun"))
+	os.Symlink("/opt/boxcutter/tools/etc/systemd/boxcutter-tapegun.service",
+		filepath.Join(sysDir, "boxcutter-tapegun.service"))
+	multiUserWants := filepath.Join(sysDir, "multi-user.target.wants")
+	os.MkdirAll(multiUserWants, 0755)
+	os.Symlink("/etc/systemd/system/boxcutter-tapegun.service",
+		filepath.Join(multiUserWants, "boxcutter-tapegun.service"))
+
+	// Create Claude Code plugin directory for tapegun-guest plugin
+	claudePluginDir := filepath.Join(mountPoint, "home", "dev", ".claude", "plugins")
+	os.MkdirAll(claudePluginDir, 0755)
+	chroot("chown -R 1000:1000 /home/dev/.claude")
+
+	log.Printf("QEMU VM %s: installed tools mount + tapegun service", st.Name)
+
 	// Configure Tailscale for kernel networking (Firecracker uses userspace)
 	tailscaleDefaults := filepath.Join(mountPoint, "etc", "default", "tailscaled")
 	os.WriteFile(tailscaleDefaults, []byte("PORT=0\nFLAGS=\n"), 0644)
