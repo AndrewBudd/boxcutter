@@ -1,7 +1,6 @@
 [Unit]
 Description=Boxcutter tools squashfs (/dev/vdb)
 DefaultDependencies=no
-Requires=dev-vdb.device
 After=dev-vdb.device
 
 [Mount]
