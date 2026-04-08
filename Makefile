@@ -107,6 +107,15 @@ status:                   ## Show VM status
 clean:                    ## Remove generated images (keeps cloud image download)
 	rm -f .images/*.qcow2 .images/*-cloud-init.iso .images/*.pid .images/*.log
 
+check-tag:                ## Validate version tag (usage: make check-tag TAG=v0.38.0)
+	@bash scripts/check-version-tag $(TAG)
+
+next-tag:                 ## Show next version tag (usage: make next-tag BUMP=patch)
+	@bash scripts/check-version-tag --next $(or $(BUMP),patch)
+
+install-tag-hook:         ## Install git pre-push hook to prevent tag regression
+	@bash scripts/check-version-tag --install-hook
+
 help:                     ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'
