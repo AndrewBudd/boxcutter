@@ -1327,6 +1327,32 @@ func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targ
 		return fmt.Errorf("SCP to target %s: %v\n%s", targetBridgeIP, err, string(out))
 	}
 
+	// Also copy the systemd service file from the peer to ensure KillMode=process
+	// is set. Without this, old nodes still have the default KillMode=control-group,
+	// which sends SIGTERM to ALL processes in the cgroup (including QEMU VMs) on
+	// restart — killing every VM the agent manages.
+	scpSvc := exec.Command("scp", append(sshOpts,
+		"ubuntu@"+peerBridgeIP+":/etc/systemd/system/boxcutter-node.service",
+		"/tmp/boxcutter-node-"+targetNodeID+".service")...)
+	if out, err := scpSvc.CombinedOutput(); err != nil {
+		log.Printf("Deploy %s: service file SCP from peer failed (non-fatal): %v\n%s", targetNodeID, err, string(out))
+	} else {
+		defer os.Remove("/tmp/boxcutter-node-" + targetNodeID + ".service")
+		scpSvcTarget := exec.Command("scp", append(sshOpts,
+			"/tmp/boxcutter-node-"+targetNodeID+".service",
+			"ubuntu@"+targetBridgeIP+":/tmp/boxcutter-node.service")...)
+		if out, err := scpSvcTarget.CombinedOutput(); err != nil {
+			log.Printf("Deploy %s: service file SCP to target failed (non-fatal): %v\n%s", targetNodeID, err, string(out))
+		} else {
+			svcInstall := exec.Command("ssh", append(sshOpts, "ubuntu@"+targetBridgeIP,
+				"sudo", "mv", "/tmp/boxcutter-node.service", "/etc/systemd/system/boxcutter-node.service",
+				"&&", "sudo", "systemctl", "daemon-reload")...)
+			if out, err := svcInstall.CombinedOutput(); err != nil {
+				log.Printf("Deploy %s: service file install failed (non-fatal): %v\n%s", targetNodeID, err, string(out))
+			}
+		}
+	}
+
 	// Install and restart
 	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+targetBridgeIP,
 		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
