@@ -28,6 +28,15 @@ type queuedMessage struct {
 	queuedAt time.Time
 }
 
+// AlertEvent records a state transition for a VM.
+type AlertEvent struct {
+	Timestamp string `json:"timestamp"`
+	VMName    string `json:"name"`
+	Type      string `json:"type"`    // crash, idle, degraded, unhealthy, unresponsive, error, recovery
+	Message   string `json:"message"`
+	Team      string `json:"team,omitempty"`
+}
+
 type Handler struct {
 	db    *db.DB
 	state *state.Store
@@ -45,6 +54,20 @@ type Handler struct {
 	// Work queue: auto-assigns GitHub issues to idle workers
 	workQueue  *queue.Queue
 	dispatcher *queue.Dispatcher
+
+	// Alert state: previous activity status per VM for transition detection
+	prevStatus   map[string]string // vmName → last known activity status
+	prevStatusMu sync.RWMutex
+	prevHealth   map[string]string // vmName → last known health
+	lastReport   map[string]time.Time // vmName → last activity timestamp
+
+	// Alert ring buffer (last 200 events)
+	alerts   []AlertEvent
+	alertsMu sync.RWMutex
+
+	// SSE subscribers
+	sseClients   map[chan AlertEvent]bool
+	sseClientsMu sync.Mutex
 }
 
 func NewHandler(database *db.DB, store *state.Store) *Handler {
@@ -52,11 +75,20 @@ func NewHandler(database *db.DB, store *state.Store) *Handler {
 	if v := os.Getenv("MAX_VM_SIZE"); v != "" {
 		fmt.Sscanf(v, "%d", &maxVM)
 	}
-	h := &Handler{db: database, state: store, MaxVMSizeMB: maxVM}
+	h := &Handler{
+		db:          database,
+		state:       store,
+		MaxVMSizeMB: maxVM,
+		prevStatus:  make(map[string]string),
+		prevHealth:  make(map[string]string),
+		lastReport:  make(map[string]time.Time),
+		sseClients:  make(map[chan AlertEvent]bool),
+	}
 	h.discoverNodes()
 	go h.healthMonitorLoop()
 	go h.messageDeliveryLoop()
 	h.initWorkQueue()
+	go h.alertDetectionLoop()
 	return h
 }
 
@@ -258,6 +290,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/tapegun/activity/{name}", h.handleTapegunVMActivity)
 	mux.HandleFunc("POST /api/tapegun/message/{name}", h.handleTapegunMessage)
 	mux.HandleFunc("POST /api/tapegun/broadcast", h.handleTapegunBroadcast)
+
+	// Dashboard: SSE stream + alerts
+	mux.HandleFunc("GET /api/alerts", h.handleAlerts)
+	mux.HandleFunc("GET /api/alerts/stream", h.handleAlertStream)
 
 	// VM exec
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleVMExec)
@@ -1909,4 +1945,267 @@ func (h *Handler) handleQueueSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"synced": n})
+}
+
+// --- Alert detection and SSE ---
+
+// alertDetectionLoop runs every 15s, fetches activity from all nodes,
+// detects state transitions, and emits alerts.
+func (h *Handler) alertDetectionLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		h.detectAlerts()
+	}
+}
+
+func (h *Handler) detectAlerts() {
+	vms := h.state.ListVMs()
+	if len(vms) == 0 {
+		return
+	}
+
+	// Group VMs by node
+	nodeVMs := make(map[string][]string)
+	for _, v := range vms {
+		nodeVMs[v.NodeID] = append(nodeVMs[v.NodeID], v.Name)
+	}
+
+	// Fetch activity from each node concurrently
+	type nodeResult struct {
+		activities []node.TapegunVMActivity
+	}
+	results := make(chan struct {
+		nodeID string
+		acts   []node.TapegunVMActivity
+	}, len(nodeVMs))
+
+	for nodeID := range nodeVMs {
+		go func(nid string) {
+			n := h.state.GetNode(nid)
+			if n == nil || n.APIAddr == "" {
+				results <- struct {
+					nodeID string
+					acts   []node.TapegunVMActivity
+				}{nid, nil}
+				return
+			}
+			fc := node.NewFastClient(n.APIAddr)
+			acts := fc.GetAllActivity()
+			results <- struct {
+				nodeID string
+				acts   []node.TapegunVMActivity
+			}{nid, acts}
+		}(nodeID)
+	}
+
+	// Build activity map: vmName → activity
+	actByVM := make(map[string]*node.TapegunVMActivity)
+	for range nodeVMs {
+		r := <-results
+		for i := range r.acts {
+			actByVM[r.acts[i].VMID] = &r.acts[i]
+		}
+	}
+
+	now := time.Now()
+	h.prevStatusMu.Lock()
+	defer h.prevStatusMu.Unlock()
+
+	for _, v := range vms {
+		act := actByVM[v.Name]
+
+		// Determine current status
+		curStatus := "unknown"
+		curHealth := "unknown"
+		if act != nil && act.LastActivity != nil {
+			curStatus = act.LastActivity.Status
+			h.lastReport[v.Name] = now
+		}
+
+		// Detect unresponsive: no report for >60s
+		if lastSeen, ok := h.lastReport[v.Name]; ok && now.Sub(lastSeen) > 60*time.Second {
+			if h.prevStatus[v.Name] != "unresponsive" {
+				h.emitAlert(v.Name, "unresponsive", "No activity report for >60s")
+			}
+			curStatus = "unresponsive"
+		}
+
+		// Detect pane content errors
+		if act != nil && act.LastActivity != nil {
+			pane := act.LastActivity.PaneContent
+			if containsError(pane) {
+				if h.prevStatus[v.Name] != "error" {
+					errType := detectErrorType(pane)
+					h.emitAlert(v.Name, "error", errType)
+				}
+				curStatus = "error"
+			}
+		}
+
+		prevSt := h.prevStatus[v.Name]
+		prevHl := h.prevHealth[v.Name]
+
+		// Status transitions
+		if prevSt != "" && prevSt != curStatus {
+			switch {
+			case (prevSt == "active" || prevSt == "idle") && curStatus == "stopped":
+				h.emitAlert(v.Name, "crash", "Agent session lost")
+			case prevSt == "active" && curStatus == "idle":
+				h.emitAlert(v.Name, "idle", "Agent stopped working")
+			case (prevSt == "stopped" || prevSt == "idle" || prevSt == "error" || prevSt == "unresponsive") && curStatus == "active":
+				h.emitAlert(v.Name, "recovery", "Agent resumed working")
+			}
+		}
+
+		// Health transitions
+		if prevHl != "" && prevHl != curHealth && curHealth != "unknown" {
+			switch {
+			case curHealth == "degraded":
+				h.emitAlert(v.Name, "degraded", "Some health checks failing")
+			case curHealth == "unhealthy":
+				h.emitAlert(v.Name, "unhealthy", "VM in bad state")
+			case (prevHl == "degraded" || prevHl == "unhealthy") && curHealth == "healthy":
+				h.emitAlert(v.Name, "recovery", "Health restored")
+			}
+		}
+
+		h.prevStatus[v.Name] = curStatus
+		h.prevHealth[v.Name] = curHealth
+	}
+}
+
+func containsError(pane string) bool {
+	patterns := []string{
+		"401 Unauthorized",
+		"token expired",
+		"FATAL",
+		"Out of memory",
+		"OOMKilled",
+	}
+	for _, p := range patterns {
+		if strings.Contains(pane, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func detectErrorType(pane string) string {
+	if strings.Contains(pane, "401 Unauthorized") || strings.Contains(pane, "token expired") {
+		return "Authentication error detected in pane output"
+	}
+	if strings.Contains(pane, "Out of memory") || strings.Contains(pane, "OOMKilled") {
+		return "Out of memory error detected"
+	}
+	if strings.Contains(pane, "FATAL") {
+		return "Fatal error detected in pane output"
+	}
+	return "Error detected in pane output"
+}
+
+// teamForVM extracts team name from VM name prefix heuristic.
+func teamForVM(name string) string {
+	parts := strings.Split(name, "-")
+	if len(parts) >= 3 {
+		last := parts[len(parts)-1]
+		isNum := len(last) > 0
+		for _, c := range last {
+			if c < '0' || c > '9' {
+				isNum = false
+				break
+			}
+		}
+		if isNum {
+			return strings.Join(parts[:len(parts)-2], "-")
+		}
+	}
+	return ""
+}
+
+func (h *Handler) emitAlert(vmName, alertType, message string) {
+	evt := AlertEvent{
+		Timestamp: time.Now().Format(time.RFC3339),
+		VMName:    vmName,
+		Type:      alertType,
+		Message:   message,
+		Team:      teamForVM(vmName),
+	}
+	log.Printf("ALERT [%s] %s: %s", alertType, vmName, message)
+
+	// Add to ring buffer
+	h.alertsMu.Lock()
+	h.alerts = append(h.alerts, evt)
+	if len(h.alerts) > 200 {
+		h.alerts = h.alerts[len(h.alerts)-200:]
+	}
+	h.alertsMu.Unlock()
+
+	// Broadcast to SSE clients
+	h.sseClientsMu.Lock()
+	for ch := range h.sseClients {
+		select {
+		case ch <- evt:
+		default: // drop if client is slow
+		}
+	}
+	h.sseClientsMu.Unlock()
+}
+
+// handleAlerts returns recent alert events as JSON.
+func (h *Handler) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	h.alertsMu.RLock()
+	alerts := make([]AlertEvent, len(h.alerts))
+	copy(alerts, h.alerts)
+	h.alertsMu.RUnlock()
+	writeJSON(w, alerts)
+}
+
+// handleAlertStream streams alerts via Server-Sent Events.
+func (h *Handler) handleAlertStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	ch := make(chan AlertEvent, 50)
+	h.sseClientsMu.Lock()
+	h.sseClients[ch] = true
+	h.sseClientsMu.Unlock()
+
+	defer func() {
+		h.sseClientsMu.Lock()
+		delete(h.sseClients, ch)
+		h.sseClientsMu.Unlock()
+	}()
+
+	// Send initial heartbeat
+	fmt.Fprintf(w, "event: heartbeat\ndata: {\"timestamp\":%q}\n\n", time.Now().Format(time.RFC3339))
+	flusher.Flush()
+
+	// Heartbeat ticker
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt := <-ch:
+			data, _ := json.Marshal(evt)
+			fmt.Fprintf(w, "event: alert\ndata: %s\n\n", data)
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprintf(w, "event: heartbeat\ndata: {\"timestamp\":%q}\n\n", time.Now().Format(time.RFC3339))
+			flusher.Flush()
+		}
+	}
 }
