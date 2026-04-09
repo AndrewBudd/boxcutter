@@ -2562,6 +2562,10 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
 	}
+	// Issue #49: Target verified running, safe to remove source.
+	// Log explicit reason for every source VM data deletion.
+	log.Printf("Migrating %s: SAFETY — target verified running on %s, removing source data from %s",
+		name, targetBridgeIP, vmDir)
 	SetMigrated(vmDir, true) // mark before cleanup so status is "migrated" not "stopped"
 	m.stopVM(name)
 	CleanupSnapshot(vmDir) // release loop devices / dm-snapshot before removing files
@@ -2885,8 +2889,10 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 				diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
 				verifyErr := fmt.Errorf("target QEMU process died (status=%s) after state import%s", s, diag)
 				log.Printf("Migration verify failed (fast) for %s on %s: status=%s%s", name, targetBridgeIP, s, diag)
+				log.Printf("Migrating QEMU %s: SAFETY — source VM data preserved in %s", name, vmDir)
 				telem.FailPhase("verify", verifyErr)
 				telem.Fail(verifyErr)
+				telem.Write(vmDir)
 				return nil, verifyErr
 			}
 		}
@@ -2896,8 +2902,10 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
 		verifyErr := fmt.Errorf("target VM not running after state import%s", diag)
 		log.Printf("Migration verify failed for %s on %s:%s", name, targetBridgeIP, diag)
+		log.Printf("Migrating QEMU %s: SAFETY — source VM data preserved in %s", name, vmDir)
 		telem.FailPhase("verify", verifyErr)
 		telem.Fail(verifyErr)
+		telem.Write(vmDir)
 		return nil, verifyErr
 	}
 	telem.EndPhase("verify", 0)
@@ -2919,7 +2927,10 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		m.vmid.Deregister(name)
 	}
 
-	// Commit: mark migrated, stop source, cleanup
+	// Issue #49: Commit — target verified running, safe to remove source.
+	// Log explicit reason for every source VM data deletion.
+	log.Printf("Migrating QEMU %s: SAFETY — target verified running on %s, removing source data from %s",
+		name, targetBridgeIP, vmDir)
 	SetMigrated(vmDir, true)
 	m.stopVM(name)
 	os.RemoveAll(filepath.Join("/dev/shm", "bc-"+name+"-mig"))
@@ -3092,15 +3103,18 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 		"sudo", "touch", dstVMDir+".stopped")...)
 	stoppedCmd.Run() // best effort — VM still relocates if this fails
 
-	// Verify target has the VM files before deleting source
+	// Issue #49: Verify target has the VM files before deleting source.
+	// Failed migration must NEVER delete the source copy.
 	verifyCmd := exec.Command("ssh", append(append([]string{}, sshBase...), "ubuntu@"+targetBridgeIP,
 		"test", "-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+"rootfs.qcow2", "-o",
 		"-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+"rootfs.ext4", "-o",
 		"-f", dstVMDir+"vm.json", "-a", "-f", dstVMDir+"cow.img")...)
 	if err := verifyCmd.Run(); err != nil {
+		log.Printf("Relocating %s: SAFETY — target verification failed, source data preserved in %s", name, vmDir)
 		cleanTarget()
 		return nil, fmt.Errorf("target verification failed — source preserved: %w", err)
 	}
+	log.Printf("Relocating %s: target verification passed — VM files confirmed on %s", name, targetBridgeIP)
 
 	// Guard: if VM was started concurrently, abort (don't delete a running VM's files)
 	if IsRunning(vmDir) {
@@ -3108,7 +3122,10 @@ func (m *Manager) relocateStoppedVM(name string, st *VMState, vmDir, dstVMDir, t
 		return nil, fmt.Errorf("VM '%s' was started during relocation — aborting", name)
 	}
 
-	// Clean up source
+	// Issue #49: Target verified, safe to remove source.
+	// Log explicit reason for every source VM data deletion.
+	log.Printf("Relocating %s: SAFETY — target verified on %s, removing source data from %s",
+		name, targetBridgeIP, vmDir)
 	if m.vmid != nil {
 		m.vmid.Deregister(name)
 	}

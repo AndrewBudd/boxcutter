@@ -2321,7 +2321,44 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	}
 
 	// QEMU VMs are now live-migrated (no post-drain start needed).
-	// All VMs migrated and verified — stop the node
+	// All VMs migrated and verified — perform explicit safety check before stopping.
+
+	// Issue #49: VM SAFETY CHECK — verify every VM that was on this node is
+	// accounted for on the target before stopping. This is the last line of
+	// defense against VM data loss during drain/upgrade cycles.
+	safetyClient := &http.Client{Timeout: 10 * time.Second}
+	var unaccountedVMs []string
+	for _, vm := range vms {
+		vmName, ok := vm["name"].(string)
+		if !ok {
+			continue
+		}
+		found := false
+		checkResp, err := safetyClient.Get(
+			fmt.Sprintf("http://%s:8800/api/vms/%s", targetNode.BridgeIP, vmName))
+		if err == nil {
+			var detail map[string]interface{}
+			json.NewDecoder(checkResp.Body).Decode(&detail)
+			checkResp.Body.Close()
+			if status, _ := detail["status"].(string); status == "running" || status == "stopped" {
+				found = true
+			}
+		}
+		if !found {
+			unaccountedVMs = append(unaccountedVMs, vmName)
+		}
+	}
+
+	if len(unaccountedVMs) > 0 {
+		log.Printf("Drain: VM SAFETY CHECK FAILED — %d VM(s) unaccounted for on target %s: %v",
+			len(unaccountedVMs), targetNode.ID, unaccountedVMs)
+		log.Printf("Drain: REFUSING to stop node %s — VMs would be lost", nodeID)
+		state.SetNodeStatus(nodeID, "active")
+		state.Save()
+		return
+	}
+
+	log.Printf("Drain: VM SAFETY CHECK PASSED — all %d VM(s) verified on target %s", len(vms), targetNode.ID)
 
 	// Issue #48: Capture node agent journal logs before stopping, for post-drain debugging.
 	if sshKey := findClusterSSHKey(cfg); sshKey != "" && node.BridgeIP != "" {
