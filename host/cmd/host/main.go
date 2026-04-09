@@ -443,17 +443,23 @@ func runDaemon() {
 // stale PIDs so bootRecover will relaunch VMs from disk rather than skipping
 // them as "already running".
 func reconcileTrackedPIDs(state *cluster.State) {
+	changed := false
 	if state.Orchestrator != nil && state.Orchestrator.PID > 0 {
 		if !isQEMUProcess(state.Orchestrator.PID) {
 			log.Printf("  orchestrator PID %d is stale (not a QEMU process), clearing for relaunch", state.Orchestrator.PID)
 			state.SetPID(state.Orchestrator.ID, 0)
+			changed = true
 		}
 	}
 	for _, node := range state.Nodes {
 		if node.PID > 0 && !isQEMUProcess(node.PID) {
 			log.Printf("  %s PID %d is stale (not a QEMU process), clearing for relaunch", node.ID, node.PID)
 			state.SetPID(node.ID, 0)
+			changed = true
 		}
+	}
+	if changed {
+		state.Save()
 	}
 }
 
