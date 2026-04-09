@@ -43,8 +43,17 @@ func NewGitHubTokenMinter(cfg *config.GitHubConfig, policies []config.Policy) (*
 		return nil, nil
 	}
 
+	if cfg.PrivateKeyPath == "" {
+		return nil, fmt.Errorf("github.private_key_path is required when github is configured")
+	}
+
 	data, err := os.ReadFile(cfg.PrivateKeyPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// PEM file not yet provisioned — return nil so vmid starts
+			// without GitHub support rather than crashing.
+			return nil, nil
+		}
 		return nil, fmt.Errorf("reading GitHub App private key: %w", err)
 	}
 
@@ -56,6 +65,14 @@ func NewGitHubTokenMinter(cfg *config.GitHubConfig, policies []config.Policy) (*
 	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("parsing GitHub App RSA key: %w", err)
+	}
+
+	if cfg.AppID == 0 {
+		return nil, fmt.Errorf("github.app_id is required when github is configured")
+	}
+
+	if cfg.InstallationID == 0 {
+		return nil, fmt.Errorf("github.installation_id is required when github is configured")
 	}
 
 	return &GitHubTokenMinter{

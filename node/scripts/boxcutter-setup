@@ -35,8 +35,8 @@ REQUIRED_SECRETS=(
   "authorized-keys"
 )
 
-# Check if GitHub is enabled
-GITHUB_ENABLED=$(yaml_val "enabled" "$CONFIG" | head -1)
+# Check if GitHub is enabled (extract from github.enabled, not just any "enabled" key)
+GITHUB_ENABLED=$(awk '/^github:/{found=1; next} found && /^\S/{found=0} found && !/^[ \t]*#/ && /enabled:/{print $2; exit}' "$CONFIG")
 if [ "$GITHUB_ENABLED" = "true" ]; then
   REQUIRED_SECRETS+=("github-app.pem")
 fi
@@ -130,11 +130,13 @@ EOF
 
 # Append GitHub App config if enabled
 if [ "$GITHUB_ENABLED" = "true" ]; then
-  APP_ID=$(yaml_val "app_id" "$CONFIG")
-  # Extract first installation ID (vmid uses a single default installation_id)
-  INSTALL_ID=$(awk '/installation_ids:/,/^[^ ]/' "$CONFIG" | grep -E '^\s*-\s' | head -1 | sed 's/.*-\s*//')
+  APP_ID=$(awk '/^github:/{found=1; next} found && /^\S/{found=0} found && !/^[ \t]*#/ && /app_id:/{print $2; exit}' "$CONFIG")
+  INSTALL_ID=$(awk '/^github:/{found=1; next} found && /^\S/{found=0} found && !/^[ \t]*#/ && /installation_id:/{print $2; exit}' "$CONFIG")
 
   if [ -n "$APP_ID" ] && [ -f "${SECRETS_DIR}/github-app.pem" ]; then
+    if [ -z "$INSTALL_ID" ]; then
+      echo "  WARNING: github.installation_id not set in ${CONFIG} — GitHub token minting may fail"
+    fi
     cat >> "$VMID_CONFIG" <<EOF
 
 github:
@@ -142,7 +144,14 @@ github:
   private_key_path: ${SECRETS_DIR}/github-app.pem
   installation_id: ${INSTALL_ID}
 EOF
-    echo "  vmid config: GitHub App enabled (app_id: ${APP_ID})"
+    echo "  vmid config: GitHub App enabled (app_id: ${APP_ID}, installation_id: ${INSTALL_ID:-<unset>})"
+  else
+    if [ -z "$APP_ID" ]; then
+      echo "  WARNING: github.enabled=true but github.app_id not set in ${CONFIG}"
+    fi
+    if [ ! -f "${SECRETS_DIR}/github-app.pem" ]; then
+      echo "  WARNING: github.enabled=true but ${SECRETS_DIR}/github-app.pem not found"
+    fi
   fi
 else
   echo "  vmid config: GitHub App disabled"
