@@ -998,6 +998,167 @@ func TestUpgrade_InsufficientMemoryGoalPreservedVsAutoAbortGoalCleared(t *testin
 	}
 }
 
+// --- Issue #128: orphan detection vs upgrade replacement nodes ---
+
+func TestCleanupOrphanNodes_SkipsDrainTarget(t *testing.T) {
+	// During an upgrade, the replacement node (DrainTargetNodeID) has 0 VMs
+	// because migrations are in-flight. cleanupOrphanNodes must NOT remove it.
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	state := &cluster.State{}
+	state.SetPath(path)
+	state.Nodes = []cluster.VMEntry{
+		{ID: "node-1", Status: "draining", BridgeIP: "192.168.50.3", ImageDigest: "sha256:old"},
+		{ID: "node-2", Status: "active", BridgeIP: "192.168.50.4", ImageDigest: "sha256:new"},
+	}
+	state.SetUpgradeGoal(&cluster.UpgradeGoal{
+		VMType:            "node",
+		Tag:               "v2",
+		DrainTargetNodeID: "node-2",
+		NodeImage:         &cluster.ImageRef{Digest: "sha256:new"},
+	})
+	state.Save()
+
+	cfg := HostConfig{}
+	cleaned := cleanupOrphanNodes(cfg, state)
+
+	// node-2 must survive — it's the drain target
+	if containsStr(cleaned, "node-2") {
+		t.Fatal("node-2 (drain target) was removed — this is the #128 bug")
+	}
+	found := false
+	for _, n := range state.Nodes {
+		if n.ID == "node-2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("node-2 should still be in state after cleanup")
+	}
+}
+
+func TestCleanupOrphanNodes_SkipsDeployedNode(t *testing.T) {
+	// The DeployedNodeID is the replacement node that received the latest
+	// agent binary but hasn't started receiving VMs yet.
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	state := &cluster.State{}
+	state.SetPath(path)
+	state.Nodes = []cluster.VMEntry{
+		{ID: "node-1", Status: "active", BridgeIP: "192.168.50.3", ImageDigest: "sha256:old"},
+		{ID: "node-2", Status: "active", BridgeIP: "192.168.50.4", ImageDigest: "sha256:new"},
+	}
+	state.SetUpgradeGoal(&cluster.UpgradeGoal{
+		VMType:         "node",
+		Tag:            "v2",
+		DeployedNodeID: "node-2",
+		NodeImage:      &cluster.ImageRef{Digest: "sha256:new"},
+	})
+	state.Save()
+
+	cfg := HostConfig{}
+	cleaned := cleanupOrphanNodes(cfg, state)
+
+	if containsStr(cleaned, "node-2") {
+		t.Fatal("node-2 (deployed replacement) was removed — should be protected")
+	}
+}
+
+func TestCleanupOrphanNodes_SkipsActiveNodesDuringDrain(t *testing.T) {
+	// When any node has status "draining", active nodes with 0 VMs should
+	// be protected — they may be the drain target even without explicit
+	// DrainTargetNodeID (e.g. manual drain, or non-upgrade drain).
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	state := &cluster.State{}
+	state.SetPath(path)
+	state.Nodes = []cluster.VMEntry{
+		{ID: "node-1", Status: "draining", BridgeIP: "192.168.50.3"},
+		{ID: "node-2", Status: "active", BridgeIP: "192.168.50.4"},
+		{ID: "node-3", Status: "active", BridgeIP: "192.168.50.5"},
+	}
+	state.Save()
+
+	cfg := HostConfig{}
+	cleaned := cleanupOrphanNodes(cfg, state)
+
+	// Neither active node should be removed while a drain is in progress
+	if containsStr(cleaned, "node-2") || containsStr(cleaned, "node-3") {
+		t.Fatalf("active nodes removed during drain: %v", cleaned)
+	}
+}
+
+func TestCleanupOrphanNodes_RemovesWhenNoUpgrade(t *testing.T) {
+	// Without an upgrade goal or draining node, orphan nodes with 0 VMs
+	// should still be cleaned up normally.
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	state := &cluster.State{}
+	state.SetPath(path)
+	state.Nodes = []cluster.VMEntry{
+		{ID: "node-1", Status: "active", BridgeIP: "192.168.50.3"},
+		{ID: "node-2", Status: "active", BridgeIP: "192.168.50.4"},
+		{ID: "node-3", Status: "active", BridgeIP: "192.168.50.5"},
+	}
+	state.Save()
+
+	cfg := HostConfig{}
+	cleaned := cleanupOrphanNodes(cfg, state)
+
+	// With no upgrade, no drain, and PID=0 (not running), nodes with 0 VMs
+	// should be cleaned up (keeping at least 1)
+	if len(cleaned) == 0 {
+		t.Fatal("expected some orphan nodes to be cleaned up when no upgrade is active")
+	}
+	if len(state.Nodes) < 1 {
+		t.Fatal("should always keep at least 1 node")
+	}
+}
+
+func TestCleanupOrphanNodes_UpgradeCancelDuringDrain(t *testing.T) {
+	// Reproduces issue #128: upgrade-cancel fires cleanupOrphanNodes while
+	// drainNode is running on a separate goroutine. The replacement node
+	// (DrainTargetNodeID) has 0 VMs because migrations are in-flight.
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	state := &cluster.State{}
+	state.SetPath(path)
+	state.Nodes = []cluster.VMEntry{
+		{ID: "old-node", Status: "draining", BridgeIP: "192.168.50.3", ImageDigest: "sha256:old"},
+		{ID: "new-node", Status: "active", BridgeIP: "192.168.50.4", ImageDigest: "sha256:new"},
+	}
+	state.SetUpgradeGoal(&cluster.UpgradeGoal{
+		VMType:            "node",
+		Tag:               "v2",
+		DrainTargetNodeID: "new-node",
+		DeployedNodeID:    "new-node",
+		NodeImage:         &cluster.ImageRef{Digest: "sha256:new"},
+	})
+	state.Save()
+
+	cfg := HostConfig{}
+	cleaned := cleanupOrphanNodes(cfg, state)
+
+	// The replacement node MUST survive — this is the #128 fix
+	if containsStr(cleaned, "new-node") {
+		t.Fatal("REGRESSION #128: replacement node killed during upgrade drain")
+	}
+	// new-node must still be in state
+	found := false
+	for _, n := range state.Nodes {
+		if n.ID == "new-node" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("new-node (replacement) should still be in state")
+	}
+}
+
+func containsStr(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 // SetPath sets the path for state persistence (for testing)
 func init() {
 	// Ensure the cluster package has helper methods we need
