@@ -218,6 +218,19 @@ type StatusReport struct {
 	Status    string `json:"status"`
 }
 
+// HealthReport mirrors the registry type for JSON decoding.
+type HealthReport struct {
+	Timestamp    string            `json:"timestamp"`
+	Health       string            `json:"health"`
+	HealthChecks map[string]bool   `json:"health_checks"`
+	Details      map[string]string `json:"details,omitempty"`
+}
+
+// IsHealthy returns true if the health status is "healthy".
+func (h *HealthReport) IsHealthy() bool {
+	return h != nil && h.Health == "healthy"
+}
+
 // VMActivitySummary mirrors the registry type.
 type VMActivitySummary struct {
 	VMID            string          `json:"vm_id"`
@@ -240,6 +253,24 @@ func (c *Client) GetVMActivity(vmID string) (*ActivityReport, error) {
 		return nil, fmt.Errorf("vmid get activity: status %d", resp.StatusCode)
 	}
 	var report ActivityReport
+	json.NewDecoder(resp.Body).Decode(&report)
+	return &report, nil
+}
+
+// GetVMHealth returns a VM's latest health report.
+func (c *Client) GetVMHealth(vmID string) (*HealthReport, error) {
+	resp, err := c.http.Get("http://localhost/internal/vms/" + vmID + "/health")
+	if err != nil {
+		return nil, fmt.Errorf("vmid get health: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("vmid get health: status %d", resp.StatusCode)
+	}
+	var report HealthReport
 	json.NewDecoder(resp.Body).Decode(&report)
 	return &report, nil
 }

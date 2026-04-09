@@ -2536,6 +2536,42 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		targetClient.Do(destroyReq)
 		return nil, fmt.Errorf("target VM not healthy — rolled back to source")
 	}
+
+	// --- Phase 3b: Wait for in-VM health agent to report healthy ---
+	telem.StartPhase("guest-health")
+	log.Printf("Migrating %s: waiting for guest health report...", name)
+	guestHealthy := false
+	for i := 0; i < 30; i++ { // up to ~60 seconds (2s intervals × 30)
+		if i > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		healthResp, err := targetClient.Get(fmt.Sprintf("http://%s/api/vms/%s/health", targetAddr, name))
+		if err != nil {
+			continue
+		}
+		var health struct {
+			Health string `json:"health"`
+		}
+		json.NewDecoder(healthResp.Body).Decode(&health)
+		healthResp.Body.Close()
+		if health.Health == "healthy" {
+			guestHealthy = true
+			break
+		} else if health.Health == "unhealthy" {
+			log.Printf("Migrating %s: guest reported unhealthy, rolling back", name)
+			break
+		}
+		// "degraded", empty, or null — keep polling
+	}
+	telem.EndPhase("guest-health", 0)
+
+	if !guestHealthy {
+		rollback("guest VM not healthy after migration")
+		destroyReq, _ := http.NewRequest("DELETE", fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name), nil)
+		targetClient.Do(destroyReq)
+		return nil, fmt.Errorf("guest VM not healthy — rolled back to source")
+	}
+
 	telem.EndPhase("verify", 0)
 	log.Printf("Migrating %s: target verified healthy in %s", name, time.Since(verifyStart).Round(time.Millisecond))
 
@@ -2909,6 +2945,42 @@ func (m *Manager) migrateQEMUVM(name string, st *VMState, targetAddr, targetBrid
 		return nil, verifyErr
 	}
 	telem.EndPhase("verify", 0)
+
+	// Wait for in-VM health agent to report healthy
+	telem.StartPhase("guest-health")
+	log.Printf("Migrating QEMU %s: waiting for guest health report...", name)
+	guestHealthy := false
+	for i := 0; i < 30; i++ { // up to ~60 seconds
+		if i > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		healthResp, err := verifyClient.Get(fmt.Sprintf("http://%s/api/vms/%s/health", targetAddr, name))
+		if err != nil {
+			continue
+		}
+		var health struct {
+			Health string `json:"health"`
+		}
+		json.NewDecoder(healthResp.Body).Decode(&health)
+		healthResp.Body.Close()
+		if health.Health == "healthy" {
+			guestHealthy = true
+			break
+		} else if health.Health == "unhealthy" {
+			log.Printf("Migrating QEMU %s: guest reported unhealthy", name)
+			break
+		}
+	}
+	telem.EndPhase("guest-health", 0)
+
+	if !guestHealthy {
+		diag := collectTargetDiagnostics(sshOpts, targetBridgeIP, dstVMDir)
+		healthErr := fmt.Errorf("guest VM not healthy after QEMU migration%s", diag)
+		log.Printf("Migration guest-health failed for %s on %s:%s", name, targetBridgeIP, diag)
+		telem.FailPhase("guest-health", healthErr)
+		telem.Fail(healthErr)
+		return nil, healthErr
+	}
 
 	downtime := time.Since(downtimeStart)
 	telem.Complete(downtime.Milliseconds())
@@ -3749,6 +3821,18 @@ func (m *Manager) ImportVM(st *VMState) (*CreateResponse, error) {
 	}
 
 	return m.startVM(st, nil)
+}
+
+// GetHealth returns a VM's latest in-VM health report.
+func (m *Manager) GetHealth(name string) (*vmid.HealthReport, error) {
+	if m.vmid == nil {
+		return nil, fmt.Errorf("vmid client not configured")
+	}
+	vmDir := VMDir(name)
+	if _, err := LoadVMState(vmDir); err != nil {
+		return nil, fmt.Errorf("VM '%s' not found", name)
+	}
+	return m.vmid.GetVMHealth(name)
 }
 
 // GetActivity returns a VM's latest tapegun activity report.

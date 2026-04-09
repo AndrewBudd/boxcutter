@@ -20,6 +20,19 @@ type StatusReport struct {
 	Status    string    `json:"status"` // last assistant message or summary
 }
 
+// HealthReport is a periodic health check from the in-VM agent.
+type HealthReport struct {
+	Timestamp    time.Time         `json:"timestamp"`
+	Health       string            `json:"health"` // "healthy", "degraded", or "unhealthy"
+	HealthChecks map[string]bool   `json:"health_checks"`
+	Details      map[string]string `json:"details,omitempty"`
+}
+
+// IsHealthy returns true if the health status is "healthy".
+func (h *HealthReport) IsHealthy() bool {
+	return h != nil && h.Health == "healthy"
+}
+
 // MailboxMessage is a VM-to-VM message stored in the recipient's mailbox.
 type MailboxMessage struct {
 	ID        string     `json:"id"`
@@ -66,6 +79,7 @@ type VMRecord struct {
 
 	LastActivity *ActivityReport   `json:"last_activity,omitempty"`
 	LastStatus   *StatusReport    `json:"last_status,omitempty"`
+	LastHealth   *HealthReport    `json:"last_health,omitempty"`
 	Inbox        []*Message       `json:"inbox,omitempty"`
 	Mailbox      []*MailboxMessage `json:"mailbox,omitempty"`
 }
@@ -134,6 +148,11 @@ func (r *VMRecord) SetActivity(report *ActivityReport) {
 // SetStatus replaces the VM's latest self-reported Claude Code status.
 func (r *VMRecord) SetStatus(status *StatusReport) {
 	r.LastStatus = status
+}
+
+// SetHealth replaces the VM's latest health report.
+func (r *VMRecord) SetHealth(report *HealthReport) {
+	r.LastHealth = report
 }
 
 // PushMessage appends a message to the VM's inbox.
@@ -325,6 +344,29 @@ func (r *Registry) SetStatus(vmID string, status *StatusReport) bool {
 	}
 	rec.SetStatus(status)
 	return true
+}
+
+// SetHealth updates a VM's health report under the registry lock.
+func (r *Registry) SetHealth(vmID string, report *HealthReport) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.SetHealth(report)
+	return true
+}
+
+// GetHealth returns a VM's last health report.
+func (r *Registry) GetHealth(vmID string) (*HealthReport, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	return rec.LastHealth, true
 }
 
 // PushMessage adds a message to a VM's inbox under the registry lock.
