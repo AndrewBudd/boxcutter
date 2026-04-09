@@ -97,6 +97,43 @@ RUN apt-get remove -y gcc libc6-dev && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
+# --- GitHub CLI ---
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update -qq && apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Dev tools: mise, Node.js, Ruby ---
+# Ruby builds from source and requires build-essential + dev libraries.
+# gcc was removed earlier (only needed for NSS/vsock compilation), so reinstall here.
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      build-essential libssl-dev libreadline-dev zlib1g-dev libyaml-dev libffi-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    su - dev -c 'curl -fsSL https://mise.run | sh' && \
+    su - dev -c '~/.local/bin/mise use -g node@22' && \
+    su - dev -c '~/.local/bin/mise use -g ruby@3.2' && \
+    apt-get remove -y build-essential libssl-dev libreadline-dev zlib1g-dev libyaml-dev libffi-dev && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Claude Code (native installer) ---
+RUN su - dev -c 'curl -fsSL https://claude.ai/install.sh | bash'
+
+# --- PATH: ensure ~/.local/bin and mise shims are available for non-interactive SSH ---
+# .bashrc has a guard that exits early for non-interactive shells. The PATH export
+# must be inserted BEFORE this guard (line 2) so non-interactive SSH commands like
+# "ssh vm 'gh pr list'" can find tools. mise activate goes at the end (interactive only).
+RUN sed -i '2i export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' \
+      /home/dev/.bashrc && \
+    printf 'eval "$($HOME/.local/bin/mise activate bash)"\n' \
+      >> /home/dev/.bashrc && \
+    printf 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"\n' \
+      >> /home/dev/.profile && \
+    chown 1000:1000 /home/dev/.bashrc /home/dev/.profile
+
 # --- SSH: accept any username's keys via AuthorizedKeysCommand ---
 COPY config/auth-keys-any /usr/local/bin/auth-keys-any
 COPY config/boxcutter-sshd.conf /etc/ssh/sshd_config.d/boxcutter.conf
