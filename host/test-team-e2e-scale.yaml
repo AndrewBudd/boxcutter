@@ -1,0 +1,31 @@
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: test-team
+  labels:
+    project: boxcutter
+    test: e2e
+spec:
+  defaults:
+    type: firecracker
+    ram: 4G
+    vcpu: 2
+    mode: normal
+    repos:
+      - AndrewBudd/boxcutter
+
+  agents:
+    - name: lead
+      ram: 4G
+      vcpu: 2
+      persona:
+        role: test-lead
+        instructions: |
+          You are the test lead. Respond to any message with "LEAD READY".
+
+    - name: worker
+      replicas: 3
+      persona:
+        role: test-worker
+        instructions: |
+          You are a test worker. Respond to any message with "WORKER READY".
