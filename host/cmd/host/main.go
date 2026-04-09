@@ -414,7 +414,22 @@ func runDaemon() {
 	// 7. Start auto-scaler
 	go autoScaleLoop(cfg, state)
 
-	// 8. Resume any interrupted upgrade in background
+	// 8. Clean up orphaned orchestrator-new from pre-simplification upgrades.
+	// Prior versions launched a second orchestrator at a temp IP ("orchestrator-new").
+	// If the daemon was upgraded mid-orchestrator-upgrade, that process is orphaned.
+	oldOrchNewDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
+	if fileExists(oldOrchNewDisk) {
+		log.Printf("WARNING: found orphaned orchestrator-new disk %s from prior upgrade — cleaning up", oldOrchNewDisk)
+		if pid := findQEMUPID(oldOrchNewDisk); pid > 0 {
+			qemu.Stop("orchestrator-new", pid)
+		}
+		os.Remove(oldOrchNewDisk)
+		os.Remove(fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir))
+		os.Remove(filepath.Join(cfg.ImagesDir, "orchestrator-new.pid"))
+		bridge.DeleteTAP("tap-orch-new")
+	}
+
+	// 9. Resume any interrupted upgrade in background
 	if state.UpgradeGoal != nil {
 		log.Printf("Found incomplete upgrade goal: %s (tag: %s)", state.UpgradeGoal.VMType, state.UpgradeGoal.Tag)
 		// The startAPI function handles the upgrade lifecycle (mutex, cancel channel).
@@ -3411,7 +3426,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			// Memory safety check
 			orchRAMMB := parseRAMMB(cfg.OrchestratorRAM)
 			availMB := getAvailableMemoryMB()
-			reserveMB := 512
+			reserveMB := 1024
 			if orchRAMMB > 0 && availMB > 0 && availMB < orchRAMMB+reserveMB {
 				return false, "", fmt.Errorf("insufficient memory for new orchestrator (%dMB available, need %dMB + %dMB reserve)", availMB, orchRAMMB, reserveMB)
 			}
