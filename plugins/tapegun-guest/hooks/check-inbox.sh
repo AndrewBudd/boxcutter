@@ -1,6 +1,7 @@
 #!/bin/bash
 # Check the tapegun inbox for new messages and notify Claude if any are present.
-# Runs as a PostToolUse hook after Bash commands.
+# Runs as a PostToolUse hook after Bash commands and on UserPromptSubmit
+# so idle workers pick up messages when the user submits a prompt.
 
 INBOX="/home/dev/.tapegun/inbox.json"
 MARKER="/home/dev/.tapegun/.last-notified"
