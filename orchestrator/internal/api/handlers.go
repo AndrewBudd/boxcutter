@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AndrewBudd/boxcutter/orchestrator/internal/collab"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/db"
 	orchmqtt "github.com/AndrewBudd/boxcutter/orchestrator/internal/mqtt"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/node"
@@ -72,6 +73,9 @@ type Handler struct {
 	// Token usage metrics per VM
 	vmMetrics   map[string]*VMMetrics
 	vmMetricsMu sync.RWMutex
+
+	// Cross-agent collaboration hub
+	collabHub *collab.Hub
 }
 
 // VMMetrics stores token usage and utilization data for a single VM.
@@ -127,11 +131,13 @@ func NewHandler(database *db.DB, store *state.Store) *Handler {
 		sseClients:  make(map[chan AlertEvent]bool),
 		vmMetrics:   make(map[string]*VMMetrics),
 	}
+	h.collabHub = collab.NewHub()
 	h.discoverNodes()
 	go h.healthMonitorLoop()
 	go h.messageDeliveryLoop()
 	h.initWorkQueue()
 	go h.alertDetectionLoop()
+	go h.conflictDetectionLoop()
 	return h
 }
 
@@ -353,6 +359,15 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// Dashboard: SSE stream + alerts
 	mux.HandleFunc("GET /api/alerts", h.handleAlerts)
 	mux.HandleFunc("GET /api/alerts/stream", h.handleAlertStream)
+
+	// Team collaboration
+	mux.HandleFunc("POST /api/team/{team}/message", h.handleTeamMessage)
+	mux.HandleFunc("GET /api/team/{team}/messages", h.handleTeamMessages)
+	mux.HandleFunc("POST /api/team/{team}/files", h.handleTeamReportFiles)
+	mux.HandleFunc("GET /api/team/{team}/files", h.handleTeamGetFiles)
+	mux.HandleFunc("GET /api/team/{team}/conflicts", h.handleTeamConflicts)
+	mux.HandleFunc("POST /api/team/{team}/scratchpad", h.handleTeamScratchpadAppend)
+	mux.HandleFunc("GET /api/team/{team}/scratchpad", h.handleTeamScratchpadGet)
 
 	// Work queue
 	mux.HandleFunc("GET /api/queue", h.handleQueueList)
@@ -2311,4 +2326,176 @@ func (h *Handler) handleMetricsUpdate(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	writeJSON(w, m)
+}
+
+// --- Team collaboration ---
+
+func (h *Handler) handleTeamMessage(w http.ResponseWriter, r *http.Request) {
+	team := r.PathValue("team")
+
+	var msg collab.TeamMessage
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	msg.Team = team
+	if msg.Type == "" {
+		msg.Type = "notification"
+	}
+
+	h.collabHub.SendMessage(&msg)
+
+	// If targeted, also deliver immediately via tapegun inbox
+	if msg.To != "" {
+		h.deliverTeamMessage(&msg)
+	} else {
+		// Broadcast: deliver to all team members
+		vms := h.state.ListVMsByLabel("team", team)
+		for _, v := range vms {
+			msgCopy := msg
+			msgCopy.To = v.Name
+			h.deliverTeamMessage(&msgCopy)
+		}
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]string{"status": "sent", "id": msg.ID})
+}
+
+func (h *Handler) deliverTeamMessage(msg *collab.TeamMessage) {
+	v := h.state.GetVM(msg.To)
+	if v == nil {
+		return
+	}
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
+		return
+	}
+
+	body := fmt.Sprintf("[%s] from %s: %s", strings.ToUpper(msg.Type), msg.From, msg.Body)
+	if msg.Subject != "" {
+		body = fmt.Sprintf("[%s] from %s — %s\n%s", strings.ToUpper(msg.Type), msg.From, msg.Subject, msg.Body)
+	}
+
+	tapegunMsg := node.TapegunMessage{
+		ID:       msg.ID,
+		From:     "team:" + msg.From,
+		Body:     body,
+		Priority: "normal",
+	}
+
+	nc := node.NewClient(n.APIAddr)
+	if err := nc.SendTapegunMessage(msg.To, &tapegunMsg); err != nil {
+		h.queueMessage(msg.To, tapegunMsg)
+	}
+}
+
+func (h *Handler) handleTeamMessages(w http.ResponseWriter, r *http.Request) {
+	team := r.PathValue("team")
+	agentVM := r.URL.Query().Get("agent")
+
+	if agentVM != "" {
+		msgs := h.collabHub.PendingMessages(team, agentVM)
+		writeJSON(w, msgs)
+	} else {
+		msgs := h.collabHub.ListMessages(team)
+		writeJSON(w, msgs)
+	}
+}
+
+func (h *Handler) handleTeamReportFiles(w http.ResponseWriter, r *http.Request) {
+	team := r.PathValue("team")
+
+	var report collab.FileReport
+	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	report.Team = team
+
+	h.collabHub.ReportFiles(&report)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) handleTeamGetFiles(w http.ResponseWriter, r *http.Request) {
+	team := r.PathValue("team")
+	files := h.collabHub.GetFiles(team)
+	writeJSON(w, files)
+}
+
+func (h *Handler) handleTeamConflicts(w http.ResponseWriter, r *http.Request) {
+	team := r.PathValue("team")
+	conflicts := h.collabHub.DetectConflicts(team)
+	writeJSON(w, conflicts)
+}
+
+func (h *Handler) handleTeamScratchpadAppend(w http.ResponseWriter, r *http.Request) {
+	team := r.PathValue("team")
+
+	var entry collab.ScratchpadEntry
+	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	h.collabHub.AppendScratchpad(team, &entry)
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, entry)
+}
+
+func (h *Handler) handleTeamScratchpadGet(w http.ResponseWriter, r *http.Request) {
+	team := r.PathValue("team")
+	entries := h.collabHub.GetScratchpad(team)
+	writeJSON(w, entries)
+}
+
+// conflictDetectionLoop periodically checks for file overlaps and alerts agents.
+func (h *Handler) conflictDetectionLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Track which conflicts we've already alerted about
+	alerted := make(map[string]time.Time)
+
+	for range ticker.C {
+		// Find all teams
+		teams := make(map[string]bool)
+		for _, v := range h.state.ListVMs() {
+			if t := v.Labels["team"]; t != "" {
+				teams[t] = true
+			}
+		}
+
+		for team := range teams {
+			conflicts := h.collabHub.DetectConflicts(team)
+			for _, c := range conflicts {
+				key := c.File + "|" + c.AgentA + "|" + c.AgentB
+				if lastAlert, ok := alerted[key]; ok && time.Since(lastAlert) < 5*time.Minute {
+					continue // don't re-alert within 5 minutes
+				}
+				alerted[key] = time.Now()
+
+				// Alert both agents
+				for _, agent := range []string{c.AgentA, c.AgentB} {
+					alertMsg := collab.FormatConflictAlert(c, agent)
+					h.collabHub.SendMessage(&collab.TeamMessage{
+						From:    "conflict-detector",
+						To:      agent,
+						Team:    team,
+						Type:    "conflict_alert",
+						Subject: "File conflict: " + c.File,
+						Body:    alertMsg,
+					})
+				}
+				log.Printf("collab: conflict detected on %s between %s and %s", c.File, c.AgentA, c.AgentB)
+			}
+		}
+
+		// Clean old alert entries
+		for key, ts := range alerted {
+			if time.Since(ts) > 10*time.Minute {
+				delete(alerted, key)
+			}
+		}
+	}
 }
