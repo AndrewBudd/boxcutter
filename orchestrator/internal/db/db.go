@@ -10,6 +10,28 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Node is used by the scheduler package for node selection.
+// Runtime node state is managed by the state package, not SQLite.
+type Node struct {
+	ID            string `json:"id"`
+	TailscaleName string `json:"tailscale_name"`
+	TailscaleIP   string `json:"tailscale_ip"`
+	BridgeIP      string `json:"bridge_ip"`
+	APIAddr       string `json:"api_addr"`
+	Status        string `json:"status"`
+	RegisteredAt  string `json:"registered_at"`
+	LastHeartbeat string `json:"last_heartbeat"`
+
+	// Transient fields — populated at runtime from node health, not stored
+	RAMTotalMIB     int `json:"ram_total_mib,omitempty"`
+	RAMAllocatedMIB int `json:"ram_allocated_mib,omitempty"`
+	RAMAvailableMIB int `json:"ram_available_mib,omitempty"`
+	DiskTotalMB     int `json:"disk_total_mb,omitempty"`
+	DiskUsedMB      int `json:"disk_used_mb,omitempty"`
+	DiskVMsMB       int `json:"disk_vms_mb,omitempty"`
+	VMsRunning      int `json:"vms_running,omitempty"`
+}
+
 type DB struct {
 	conn *sql.DB
 }
@@ -22,7 +44,6 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
-	// WAL mode for concurrent reads
 	conn.Exec("PRAGMA journal_mode=WAL")
 	conn.Exec("PRAGMA foreign_keys=ON")
 
@@ -41,30 +62,6 @@ func (db *DB) Close() error {
 
 func (db *DB) migrate() error {
 	schema := `
-	CREATE TABLE IF NOT EXISTS nodes (
-		id TEXT PRIMARY KEY,
-		tailscale_name TEXT NOT NULL,
-		tailscale_ip TEXT,
-		bridge_ip TEXT,
-		api_addr TEXT NOT NULL,
-		status TEXT NOT NULL DEFAULT 'active',
-		registered_at TEXT NOT NULL,
-		last_heartbeat TEXT
-	);
-
-	CREATE TABLE IF NOT EXISTS vms (
-		name TEXT PRIMARY KEY,
-		node_id TEXT NOT NULL REFERENCES nodes(id),
-		status TEXT DEFAULT 'running'
-	);
-
-	CREATE TABLE IF NOT EXISTS golden_images (
-		version TEXT NOT NULL,
-		node_id TEXT NOT NULL REFERENCES nodes(id),
-		discovered_at TEXT NOT NULL,
-		PRIMARY KEY (version, node_id)
-	);
-
 	CREATE TABLE IF NOT EXISTS golden_config (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL
@@ -79,277 +76,7 @@ func (db *DB) migrate() error {
 	`
 
 	_, err := db.conn.Exec(schema)
-	if err != nil {
-		return err
-	}
-
-	// Migrate: add bridge_ip column if it doesn't exist (for existing databases)
-	db.conn.Exec(`ALTER TABLE nodes ADD COLUMN bridge_ip TEXT`)
-
-	// Migrate: drop old columns from vms if they exist (sqlite doesn't support DROP COLUMN before 3.35)
-	// Instead, just ignore old columns — the new queries only select name, node_id, status
-	return nil
-}
-
-// --- Node operations ---
-
-type Node struct {
-	ID            string `json:"id"`
-	TailscaleName string `json:"tailscale_name"`
-	TailscaleIP   string `json:"tailscale_ip"`
-	BridgeIP      string `json:"bridge_ip"`
-	APIAddr       string `json:"api_addr"`
-	Status        string `json:"status"`
-	RegisteredAt  string `json:"registered_at"`
-	LastHeartbeat string `json:"last_heartbeat"`
-
-	// Transient fields — populated at runtime from node health, not stored in DB
-	RAMTotalMIB     int `json:"ram_total_mib,omitempty"`
-	RAMAllocatedMIB int `json:"ram_allocated_mib,omitempty"`
-	RAMAvailableMIB int `json:"ram_available_mib,omitempty"`
-	DiskTotalMB     int `json:"disk_total_mb,omitempty"`
-	DiskUsedMB      int `json:"disk_used_mb,omitempty"`
-	DiskVMsMB       int `json:"disk_vms_mb,omitempty"`
-	VMsRunning      int `json:"vms_running,omitempty"`
-}
-
-func (db *DB) RegisterNode(n *Node) error {
-	_, err := db.conn.Exec(`
-		INSERT INTO nodes (id, tailscale_name, tailscale_ip, bridge_ip, api_addr, status, registered_at, last_heartbeat)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			tailscale_ip=excluded.tailscale_ip,
-			bridge_ip=excluded.bridge_ip,
-			api_addr=excluded.api_addr,
-			status=excluded.status,
-			last_heartbeat=excluded.last_heartbeat`,
-		n.ID, n.TailscaleName, n.TailscaleIP, n.BridgeIP, n.APIAddr, n.Status,
-		n.RegisteredAt, n.LastHeartbeat,
-	)
 	return err
-}
-
-func (db *DB) UpdateNodeHeartbeat(id, lastHeartbeat string) error {
-	_, err := db.conn.Exec(`UPDATE nodes SET last_heartbeat=? WHERE id=?`, lastHeartbeat, id)
-	return err
-}
-
-func (db *DB) SetNodeStatus(id, status string) error {
-	_, err := db.conn.Exec(`UPDATE nodes SET status=? WHERE id=?`, status, id)
-	return err
-}
-
-func (db *DB) GetNode(id string) (*Node, error) {
-	row := db.conn.QueryRow(`SELECT id, tailscale_name, COALESCE(tailscale_ip,''), COALESCE(bridge_ip,''), api_addr, status, registered_at, COALESCE(last_heartbeat,'') FROM nodes WHERE id=?`, id)
-	var n Node
-	err := row.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.BridgeIP, &n.APIAddr, &n.Status,
-		&n.RegisteredAt, &n.LastHeartbeat)
-	if err != nil {
-		return nil, err
-	}
-	return &n, nil
-}
-
-func (db *DB) ListNodes() ([]*Node, error) {
-	rows, err := db.conn.Query(`SELECT id, tailscale_name, COALESCE(tailscale_ip,''), COALESCE(bridge_ip,''), api_addr, status, registered_at, COALESCE(last_heartbeat,'') FROM nodes ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var nodes []*Node
-	for rows.Next() {
-		var n Node
-		if err := rows.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.BridgeIP, &n.APIAddr, &n.Status,
-			&n.RegisteredAt, &n.LastHeartbeat); err != nil {
-			continue
-		}
-		nodes = append(nodes, &n)
-	}
-	return nodes, nil
-}
-
-func (db *DB) DeleteNode(id string) error {
-	_, err := db.conn.Exec(`DELETE FROM nodes WHERE id=?`, id)
-	return err
-}
-
-// ActiveNodes returns nodes with status "active".
-func (db *DB) ActiveNodes() ([]*Node, error) {
-	rows, err := db.conn.Query(`SELECT id, tailscale_name, COALESCE(tailscale_ip,''), COALESCE(bridge_ip,''), api_addr, status, registered_at, COALESCE(last_heartbeat,'') FROM nodes WHERE status='active' ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var nodes []*Node
-	for rows.Next() {
-		var n Node
-		if err := rows.Scan(&n.ID, &n.TailscaleName, &n.TailscaleIP, &n.BridgeIP, &n.APIAddr, &n.Status,
-			&n.RegisteredAt, &n.LastHeartbeat); err != nil {
-			continue
-		}
-		nodes = append(nodes, &n)
-	}
-	return nodes, nil
-}
-
-// --- VM operations ---
-// The orchestrator only tracks (name, node_id, status).
-// All detail (vcpu, ram, disk, tailscale_ip, etc.) lives on the node.
-
-type VM struct {
-	Name   string `json:"name"`
-	NodeID string `json:"node_id"`
-	Status string `json:"status"`
-}
-
-func (db *DB) CreateVM(v *VM) error {
-	_, err := db.conn.Exec(`INSERT INTO vms (name, node_id, status) VALUES (?, ?, ?)`,
-		v.Name, v.NodeID, v.Status)
-	return err
-}
-
-func (db *DB) UpdateVMStatus(name, status string) error {
-	_, err := db.conn.Exec(`UPDATE vms SET status=? WHERE name=?`, status, name)
-	return err
-}
-
-func (db *DB) UpdateVMNode(name, nodeID string) error {
-	_, err := db.conn.Exec(`UPDATE vms SET node_id=? WHERE name=?`, nodeID, name)
-	return err
-}
-
-func (db *DB) GetVM(name string) (*VM, error) {
-	row := db.conn.QueryRow(`SELECT name, node_id, status FROM vms WHERE name=?`, name)
-	var v VM
-	err := row.Scan(&v.Name, &v.NodeID, &v.Status)
-	if err != nil {
-		return nil, err
-	}
-	return &v, nil
-}
-
-func (db *DB) ListVMs() ([]*VM, error) {
-	rows, err := db.conn.Query(`SELECT name, node_id, status FROM vms ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var vms []*VM
-	for rows.Next() {
-		var v VM
-		if err := rows.Scan(&v.Name, &v.NodeID, &v.Status); err != nil {
-			continue
-		}
-		vms = append(vms, &v)
-	}
-	return vms, nil
-}
-
-func (db *DB) ListVMsByNode(nodeID string) ([]*VM, error) {
-	rows, err := db.conn.Query(`SELECT name, node_id, status FROM vms WHERE node_id=? ORDER BY name`, nodeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var vms []*VM
-	for rows.Next() {
-		var v VM
-		if err := rows.Scan(&v.Name, &v.NodeID, &v.Status); err != nil {
-			continue
-		}
-		vms = append(vms, &v)
-	}
-	return vms, nil
-}
-
-func (db *DB) DeleteVM(name string) error {
-	_, err := db.conn.Exec(`DELETE FROM vms WHERE name=?`, name)
-	return err
-}
-
-// --- Golden image operations ---
-
-type GoldenImage struct {
-	Version      string `json:"version"`
-	NodeID       string `json:"node_id"`
-	DiscoveredAt string `json:"discovered_at"`
-}
-
-func (db *DB) UpsertGoldenImage(version, nodeID, discoveredAt string) error {
-	_, err := db.conn.Exec(`
-		INSERT INTO golden_images (version, node_id, discovered_at)
-		VALUES (?, ?, ?)
-		ON CONFLICT(version, node_id) DO UPDATE SET discovered_at=excluded.discovered_at`,
-		version, nodeID, discoveredAt)
-	return err
-}
-
-func (db *DB) ListGoldenImages() ([]*GoldenImage, error) {
-	rows, err := db.conn.Query(`SELECT version, node_id, discovered_at FROM golden_images ORDER BY version, node_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var images []*GoldenImage
-	for rows.Next() {
-		var g GoldenImage
-		if rows.Scan(&g.Version, &g.NodeID, &g.DiscoveredAt) == nil {
-			images = append(images, &g)
-		}
-	}
-	return images, nil
-}
-
-func (db *DB) DeleteGoldenImagesForNode(nodeID string) error {
-	_, err := db.conn.Exec(`DELETE FROM golden_images WHERE node_id=?`, nodeID)
-	return err
-}
-
-// SyncNodeVMs replaces the VM records for a node with the given list.
-// This reconciles the orchestrator's view with reality on the node.
-func (db *DB) SyncNodeVMs(nodeID string, vms []VM) error {
-	tx, err := db.conn.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Delete VMs for this node that aren't in the new list
-	names := make(map[string]bool)
-	for _, v := range vms {
-		names[v.Name] = true
-	}
-
-	rows, err := tx.Query(`SELECT name FROM vms WHERE node_id=?`, nodeID)
-	if err != nil {
-		return err
-	}
-	var existing []string
-	for rows.Next() {
-		var name string
-		rows.Scan(&name)
-		existing = append(existing, name)
-	}
-	rows.Close()
-
-	for _, name := range existing {
-		if !names[name] {
-			tx.Exec(`DELETE FROM vms WHERE name=? AND node_id=?`, name, nodeID)
-		}
-	}
-
-	// Upsert current VMs
-	for _, v := range vms {
-		tx.Exec(`INSERT INTO vms (name, node_id, status) VALUES (?, ?, ?)
-			ON CONFLICT(name) DO UPDATE SET node_id=excluded.node_id, status=excluded.status`,
-			v.Name, nodeID, v.Status)
-	}
-
-	return tx.Commit()
 }
 
 // --- Golden config operations ---

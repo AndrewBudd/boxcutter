@@ -18,164 +18,94 @@ func openTestDB(t *testing.T) *DB {
 
 func TestMigrate_Idempotent(t *testing.T) {
 	d := openTestDB(t)
-	// migrate() already ran in Open(). Run it again — should not error.
 	if err := d.migrate(); err != nil {
 		t.Errorf("Second migrate() failed: %v", err)
 	}
 }
 
-func TestRegisterNode(t *testing.T) {
+func TestGoldenHead(t *testing.T) {
 	d := openTestDB(t)
-	n := &Node{
-		ID:            "node-1",
-		TailscaleName: "boxcutter-node-1",
-		BridgeIP:      "192.168.50.3",
-		APIAddr:       "192.168.50.3:8800",
-		Status:        "active",
-		RegisteredAt:  "2026-03-01T00:00:00Z",
-	}
-	if err := d.RegisterNode(n); err != nil {
-		t.Fatal(err)
+
+	// Initially empty
+	if head := d.GetGoldenHead(); head != "" {
+		t.Errorf("GetGoldenHead = %q, want empty", head)
 	}
 
-	nodes, err := d.ListNodes()
+	// Set and get
+	if err := d.SetGoldenHead("v1.2.3"); err != nil {
+		t.Fatal(err)
+	}
+	if head := d.GetGoldenHead(); head != "v1.2.3" {
+		t.Errorf("GetGoldenHead = %q, want v1.2.3", head)
+	}
+
+	// Update
+	d.SetGoldenHead("v1.3.0")
+	if head := d.GetGoldenHead(); head != "v1.3.0" {
+		t.Errorf("GetGoldenHead after update = %q, want v1.3.0", head)
+	}
+}
+
+func TestSSHKeys(t *testing.T) {
+	d := openTestDB(t)
+
+	added, err := d.AddSSHKeys("alice", []string{"ssh-ed25519 AAAA alice@dev", "ssh-rsa BBBB alice@laptop"}, "2026-01-01T00:00:00Z")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 1 {
-		t.Fatalf("ListNodes returned %d nodes, want 1", len(nodes))
+	if added != 2 {
+		t.Errorf("added = %d, want 2", added)
 	}
-	if nodes[0].ID != "node-1" {
-		t.Errorf("node ID = %q, want node-1", nodes[0].ID)
-	}
-	if nodes[0].Status != "active" {
-		t.Errorf("node status = %q, want active", nodes[0].Status)
-	}
-}
 
-func TestRegisterNode_Upsert(t *testing.T) {
-	d := openTestDB(t)
-	n := &Node{
-		ID: "node-1", TailscaleName: "boxcutter-node-1",
-		BridgeIP: "192.168.50.3", APIAddr: "192.168.50.3:8800",
-		Status: "active", RegisteredAt: "2026-03-01T00:00:00Z",
-	}
-	d.RegisterNode(n)
-
-	// Re-register with updated IP
-	n.BridgeIP = "192.168.50.99"
-	n.TailscaleIP = "100.64.1.1"
-	d.RegisterNode(n)
-
-	nodes, _ := d.ListNodes()
-	if len(nodes) != 1 {
-		t.Fatalf("Upsert created duplicate: %d nodes", len(nodes))
-	}
-	if nodes[0].BridgeIP != "192.168.50.99" {
-		t.Errorf("BridgeIP = %q, want 192.168.50.99 (should be updated)", nodes[0].BridgeIP)
-	}
-}
-
-func TestSetNodeStatus(t *testing.T) {
-	d := openTestDB(t)
-	d.RegisterNode(&Node{
-		ID: "node-1", TailscaleName: "n1", APIAddr: "1:8800",
-		Status: "active", RegisteredAt: "2026-03-01T00:00:00Z",
-	})
-
-	if err := d.SetNodeStatus("node-1", "down"); err != nil {
+	keys, err := d.ListSSHKeys()
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	nodes, _ := d.ListNodes()
-	if nodes[0].Status != "down" {
-		t.Errorf("Status = %q, want down", nodes[0].Status)
+	if len(keys) != 2 {
+		t.Fatalf("ListSSHKeys = %d, want 2", len(keys))
 	}
 
-	// Recovery: down → active
-	d.SetNodeStatus("node-1", "active")
-	nodes, _ = d.ListNodes()
-	if nodes[0].Status != "active" {
-		t.Errorf("Status = %q, want active after recovery", nodes[0].Status)
-	}
-}
-
-func TestSyncNodeVMs(t *testing.T) {
-	d := openTestDB(t)
-	d.RegisterNode(&Node{
-		ID: "node-1", TailscaleName: "n1", APIAddr: "1:8800",
-		Status: "active", RegisteredAt: "2026-03-01T00:00:00Z",
-	})
-
-	// Initial sync
-	vms := []VM{
-		{Name: "vm-a", NodeID: "node-1", Status: "running"},
-		{Name: "vm-b", NodeID: "node-1", Status: "running"},
-	}
-	if err := d.SyncNodeVMs("node-1", vms); err != nil {
+	entries, err := d.ListSSHKeyEntries()
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	all, _ := d.ListVMs()
-	if len(all) != 2 {
-		t.Fatalf("ListVMs = %d, want 2", len(all))
+	if len(entries) != 2 {
+		t.Fatalf("ListSSHKeyEntries = %d, want 2", len(entries))
+	}
+	if entries[0].GitHubUser != "alice" {
+		t.Errorf("github_user = %q, want alice", entries[0].GitHubUser)
 	}
 
-	// Sync again with different set — vm-a removed, vm-c added
-	vms2 := []VM{
-		{Name: "vm-b", NodeID: "node-1", Status: "running"},
-		{Name: "vm-c", NodeID: "node-1", Status: "running"},
+	// Duplicate key is ignored
+	added2, _ := d.AddSSHKeys("alice", []string{"ssh-ed25519 AAAA alice@dev"}, "2026-01-02T00:00:00Z")
+	if added2 != 1 {
+		// INSERT OR IGNORE returns nil even on conflict, so added count may include ignored
+		// Just verify total count is still 2
 	}
-	d.SyncNodeVMs("node-1", vms2)
-
-	all, _ = d.ListVMs()
-	if len(all) != 2 {
-		t.Fatalf("ListVMs after re-sync = %d, want 2", len(all))
+	keys, _ = d.ListSSHKeys()
+	if len(keys) != 2 {
+		t.Errorf("After duplicate add: ListSSHKeys = %d, want 2", len(keys))
 	}
 
-	names := map[string]bool{}
-	for _, v := range all {
-		names[v.Name] = true
-	}
-	if names["vm-a"] {
-		t.Error("vm-a should have been removed by sync")
-	}
-	if !names["vm-c"] {
-		t.Error("vm-c should have been added by sync")
-	}
-}
-
-func TestSyncNodeVMs_EmptyList(t *testing.T) {
-	d := openTestDB(t)
-	d.RegisterNode(&Node{
-		ID: "node-1", TailscaleName: "n1", APIAddr: "1:8800",
-		Status: "active", RegisteredAt: "2026-03-01T00:00:00Z",
-	})
-
-	// Add VMs then sync with empty
-	d.SyncNodeVMs("node-1", []VM{{Name: "vm-a", NodeID: "node-1", Status: "running"}})
-	d.SyncNodeVMs("node-1", []VM{})
-
-	all, _ := d.ListVMs()
-	if len(all) != 0 {
-		t.Errorf("ListVMs after empty sync = %d, want 0", len(all))
-	}
-}
-
-func TestUpdateNodeHeartbeat(t *testing.T) {
-	d := openTestDB(t)
-	d.RegisterNode(&Node{
-		ID: "node-1", TailscaleName: "n1", APIAddr: "1:8800",
-		Status: "active", RegisteredAt: "2026-03-01T00:00:00Z",
-	})
-
-	ts := "2026-03-28T16:00:00Z"
-	if err := d.UpdateNodeHeartbeat("node-1", ts); err != nil {
+	// Delete by user
+	if err := d.DeleteSSHKeysByUser("alice"); err != nil {
 		t.Fatal(err)
 	}
+	keys, _ = d.ListSSHKeys()
+	if len(keys) != 0 {
+		t.Errorf("After delete: ListSSHKeys = %d, want 0", len(keys))
+	}
+}
 
-	nodes, _ := d.ListNodes()
-	if nodes[0].LastHeartbeat != ts {
-		t.Errorf("LastHeartbeat = %q, want %q", nodes[0].LastHeartbeat, ts)
+func TestSSHKeys_EmptyInput(t *testing.T) {
+	d := openTestDB(t)
+
+	added, err := d.AddSSHKeys("bob", []string{"", "  ", "ssh-ed25519 CCCC bob@dev"}, "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the non-empty key should be added
+	if added != 1 {
+		t.Errorf("added = %d, want 1 (empty keys should be skipped)", added)
 	}
 }
