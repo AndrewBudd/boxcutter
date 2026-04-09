@@ -98,10 +98,7 @@ type UpgradeGoal struct {
 	// Used to detect stuck golden image builds and time out.
 	GoldenWaitStart string `json:"golden_wait_start,omitempty"`
 
-	// Orchestrator upgrade: temp bridge IP/TAP/MAC for new orchestrator
-	NewOrchIP         string `json:"new_orch_ip,omitempty"`
-	NewOrchTAP        string `json:"new_orch_tap,omitempty"`
-	NewOrchMAC        string `json:"new_orch_mac,omitempty"`
+	// Orchestrator upgrade: tracks when new orchestrator was launched (for health timeout)
 	NewOrchLaunchTime string `json:"new_orch_launch_time,omitempty"`
 
 	CreatedAt string `json:"created_at"`
