@@ -2626,11 +2626,19 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 		safetyClient := &http.Client{Timeout: 5 * time.Second}
 		safetyResp, safetyErr := safetyClient.Get(fmt.Sprintf("http://%s:8800/api/vms", node.BridgeIP))
 		if safetyErr == nil {
-			var remainingVMs []interface{}
-			json.NewDecoder(safetyResp.Body).Decode(&remainingVMs)
-			safetyResp.Body.Close()
-			if len(remainingVMs) > 0 {
-				log.Printf("Drain: ABORTING stop of %s — node still has %d VM(s) after drain", nodeID, len(remainingVMs))
+			if safetyResp.StatusCode == http.StatusOK {
+				var remainingVMs []interface{}
+				json.NewDecoder(safetyResp.Body).Decode(&remainingVMs)
+				safetyResp.Body.Close()
+				if len(remainingVMs) > 0 {
+					log.Printf("Drain: ABORTING stop of %s — node still has %d VM(s) after drain", nodeID, len(remainingVMs))
+					state.SetNodeStatus(nodeID, "active")
+					state.Save()
+					return
+				}
+			} else {
+				safetyResp.Body.Close()
+				log.Printf("Drain: safety check on %s returned HTTP %d — aborting stop to be safe", nodeID, safetyResp.StatusCode)
 				state.SetNodeStatus(nodeID, "active")
 				state.Save()
 				return
