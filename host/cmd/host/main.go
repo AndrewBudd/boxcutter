@@ -65,6 +65,7 @@ type HostConfig struct {
 	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
 	MaxNodes              int           // Hard cap on node count (0 = limited only by resources)
 	MaxVMSizeMB           int           // Headroom: scale up if no node has this much free RAM (MiB)
+	MemPressureThresholdPct int         // Actual memory usage % that triggers proactive drain (default 90)
 
 	// Bootstrap bundle (secrets + config)
 	BundleDir string // Path to ~/.boxcutter/ bundle directory
@@ -223,6 +224,10 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("MAX_VM_SIZE"); v != "" {
 		fmt.Sscanf(v, "%d", &maxVMSizeMB)
 	}
+	memPressurePct := 90
+	if v := os.Getenv("MEM_PRESSURE_THRESHOLD_PCT"); v != "" {
+		fmt.Sscanf(v, "%d", &memPressurePct)
+	}
 
 	return HostConfig{
 		ClusterPrefix:      clusterPrefix,
@@ -254,8 +259,9 @@ func defaultConfig() HostConfig {
 		MinFreeMemoryMB:       minFreeMB,
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
-		MaxNodes:              0,     // 0 = no hard cap, limited only by host resources
-		MaxVMSizeMB:           maxVMSizeMB,
+		MaxNodes:                0,     // 0 = no hard cap, limited only by host resources
+		MaxVMSizeMB:             maxVMSizeMB,
+		MemPressureThresholdPct: memPressurePct,
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
 		GitHubAppID:          3020803,
@@ -865,16 +871,17 @@ func checkServiceHealth(client *http.Client, name, url string, sh *serviceHealth
 
 // nodeCapacity holds per-node capacity info collected during a poll.
 type nodeCapacity struct {
-	nodeID       string
-	bridgeIP     string
-	totalRAM     int
-	usedRAM      int
-	freeRAM      int
-	totalVCPU    int
-	usedVCPU     int
-	diskTotalMB  int
-	diskUsedMB   int
-	vmsRunning   int
+	nodeID          string
+	bridgeIP        string
+	totalRAM        int
+	usedRAM         int
+	freeRAM         int
+	ramAvailableMiB int // actual available memory from /proc/meminfo (MemAvailable)
+	totalVCPU       int
+	usedVCPU        int
+	diskTotalMB     int
+	diskUsedMB      int
+	vmsRunning      int
 }
 
 // scaleDownCandidate evaluates whether to scale down and returns the node ID to drain.
@@ -929,6 +936,31 @@ func scaleDownCandidate(nodes []nodeCapacity, totalRAM, usedRAM, scaleDownPct, s
 }
 
 // autoScaleLoop polls nodes for capacity and scales up/down.
+// memPressureCandidate finds the node under the most actual memory pressure.
+// Returns the node ID and actual usage percentage, or ("", 0) if no node
+// exceeds the threshold. Uses ram_available_mib (kernel MemAvailable) which
+// accounts for page cache, slab, and other reclaimable memory — more accurate
+// than (total - allocated) for detecting real OOM risk.
+func memPressureCandidate(nodes []nodeCapacity, thresholdPct int) (string, int) {
+	var worstID string
+	worstAvail := -1
+	worstPct := 0
+	for _, nc := range nodes {
+		if nc.totalRAM <= 0 || nc.ramAvailableMiB <= 0 {
+			continue
+		}
+		usedPct := ((nc.totalRAM - nc.ramAvailableMiB) * 100) / nc.totalRAM
+		if usedPct >= thresholdPct {
+			if worstAvail < 0 || nc.ramAvailableMiB < worstAvail {
+				worstID = nc.nodeID
+				worstAvail = nc.ramAvailableMiB
+				worstPct = usedPct
+			}
+		}
+	}
+	return worstID, worstPct
+}
+
 func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 	// Wait for VMs to boot before polling
 	time.Sleep(30 * time.Second)
@@ -985,6 +1017,9 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 			if v, ok := health["ram_free_mib"].(float64); ok {
 				nc.freeRAM = int(v)
 			}
+			if v, ok := health["ram_available_mib"].(float64); ok {
+				nc.ramAvailableMiB = int(v)
+			}
 			if v, ok := health["disk_total_mb"].(float64); ok {
 				nc.diskTotalMB = int(v)
 				totalDiskMB += int(v)
@@ -1013,8 +1048,13 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 		if totalDiskMB > 0 {
 			diskPct = (usedDiskMB * 100) / totalDiskMB
 		}
-		log.Printf("Capacity: RAM %d/%d MiB (%d%%), CPU %d/%d vCPU (%d%%), Disk %d/%dMB (%d%%), %d VMs across %d nodes",
-			usedRAM, totalRAM, usedPct, usedVCPU, totalVCPU, cpuPct, usedDiskMB, totalDiskMB, diskPct, totalVMs, len(nodes))
+		// Compute cluster-wide actual memory available
+		totalAvailRAM := 0
+		for _, nc := range nodes {
+			totalAvailRAM += nc.ramAvailableMiB
+		}
+		log.Printf("Capacity: RAM %d/%d MiB declared (%d%%), actual available %d MiB, CPU %d/%d vCPU (%d%%), Disk %d/%dMB (%d%%), %d VMs across %d nodes",
+			usedRAM, totalRAM, usedPct, totalAvailRAM, usedVCPU, totalVCPU, cpuPct, usedDiskMB, totalDiskMB, diskPct, totalVMs, len(nodes))
 
 		// Enforce cooldown between scale events
 		if time.Since(lastScaleEvent) < cfg.ScaleCooldown {
@@ -1042,6 +1082,27 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 				scaleUpReason = fmt.Sprintf("headroom: largest free %d MiB < max VM size %d MiB", largestFree, cfg.MaxVMSizeMB)
 			}
 		}
+
+		// Issue #52: Check actual memory pressure on each node.
+		// When a node's actual available memory is below the threshold,
+		// it's at risk of OOM — trigger scale-up and proactive drain.
+		pressuredNodeID, pressuredPct := memPressureCandidate(nodes, cfg.MemPressureThresholdPct)
+		var memPressureNode *nodeCapacity
+		if pressuredNodeID != "" {
+			for i := range nodes {
+				if nodes[i].nodeID == pressuredNodeID {
+					memPressureNode = &nodes[i]
+					break
+				}
+			}
+			log.Printf("WARNING: node %s actual memory pressure: %d%% used (%d MiB available of %d MiB total, declared %d MiB)",
+				pressuredNodeID, pressuredPct, memPressureNode.ramAvailableMiB, memPressureNode.totalRAM, memPressureNode.usedRAM)
+			if scaleUpReason == "" {
+				scaleUpReason = fmt.Sprintf("memory pressure: node %s at %d%% actual usage (%d MiB available)",
+					pressuredNodeID, pressuredPct, memPressureNode.ramAvailableMiB)
+			}
+		}
+
 		if scaleUpReason != "" {
 			log.Printf("Capacity pressure (%s), checking if scale-up is possible...", scaleUpReason)
 			ok, reason := canScaleUp(cfg, state.NodeCount())
@@ -1051,6 +1112,20 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 				lastScaleEvent = time.Now()
 			} else {
 				log.Printf("Cannot scale up: %s", reason)
+			}
+
+			// Issue #52: Proactive drain — if a node is under actual memory
+			// pressure and there's at least one other active node to receive
+			// VMs, drain the pressured node to prevent OOM kills.
+			if memPressureNode != nil && len(nodes) > 1 {
+				pressuredNodeID := memPressureNode.nodeID
+				n := state.GetNode(pressuredNodeID)
+				if n != nil && n.IsActive() {
+					log.Printf("Memory pressure drain: initiating drain of %s (actual available: %d MiB)",
+						pressuredNodeID, memPressureNode.ramAvailableMiB)
+					go drainNode(cfg, state, pressuredNodeID)
+					lastScaleEvent = time.Now()
+				}
 			}
 		} else if candidateID := scaleDownCandidate(nodes, totalRAM, usedRAM, cfg.ScaleDownThresholdPct, cfg.ScaleUpThresholdPct); candidateID != "" {
 			// Find the candidate's info for logging
