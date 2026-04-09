@@ -67,13 +67,36 @@ type VMActivitySummary struct {
 	PendingMessages int             `json:"pending_messages"`
 }
 
-// AgentConfig is the boot agent specification for a VM.
-// It tells the in-VM agent what persona to assume, which repos to clone,
-// and any flags to pass to Claude Code.
+// PersonaConfig describes the persona files and instructions for the in-VM agent.
+type PersonaConfig struct {
+	Role         string `json:"role,omitempty"`         // e.g., "backend-eng", "security-reviewer"
+	ClaudeMD     string `json:"claude_md,omitempty"`    // contents of persona CLAUDE.md
+	Instructions string `json:"instructions,omitempty"` // additional instructions for the agent
+}
+
+// VMConfigInfo describes the VM resource configuration requested by the team spec.
+type VMConfigInfo struct {
+	VMType string `json:"vm_type,omitempty"` // "firecracker" or "qemu"
+	CPUs   int    `json:"cpus,omitempty"`
+	MemMB  int    `json:"mem_mb,omitempty"`
+	DiskGB int    `json:"disk_gb,omitempty"`
+}
+
+// AgentConfig is the boot agent specification for a VM, derived from the
+// declarative team YAML. It tells the in-VM agent what persona to assume,
+// which repos to clone, what tapegun sequences to run, and access policy.
 type AgentConfig struct {
-	Persona string            `json:"persona,omitempty"`  // e.g., "backend-eng", "security-reviewer"
-	Repos   []string          `json:"repos,omitempty"`    // repos to clone on boot
-	Flags   map[string]string `json:"flags,omitempty"`    // arbitrary key-value flags for the agent
+	Team             string            `json:"team,omitempty"`               // team name from team YAML
+	Agent            string            `json:"agent,omitempty"`              // agent name within the team
+	ReplicaIndex     int               `json:"replica_index,omitempty"`      // replica index for scaled agents
+	Persona          *PersonaConfig    `json:"persona,omitempty"`            // persona configuration
+	Repos            []string          `json:"repos,omitempty"`              // repos to clone on boot
+	Tapegun          []string          `json:"tapegun,omitempty"`            // tapegun sequences to run on boot
+	Access           []string          `json:"access,omitempty"`             // access policy entries
+	Authorized       bool              `json:"authorized,omitempty"`         // whether the VM is pre-authorized
+	VMConfig         *VMConfigInfo     `json:"vm_config,omitempty"`          // requested VM resource configuration
+	Labels           map[string]string `json:"labels,omitempty"`             // labels for the VM
+	TeamPersonaFiles []string          `json:"team_persona_files,omitempty"` // team-level persona file paths
 }
 
 type VMRecord struct {
