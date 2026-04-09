@@ -12,6 +12,7 @@ import (
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/config"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/db"
 	orchmqtt "github.com/AndrewBudd/boxcutter/orchestrator/internal/mqtt"
+	"github.com/AndrewBudd/boxcutter/orchestrator/internal/state"
 )
 
 func main() {
@@ -29,12 +30,15 @@ func main() {
 		cfg.DB.Path = *dbPath
 	}
 
-	// Open database
+	// Open database (only for SSH keys and golden config)
 	database, err := db.Open(cfg.DB.Path)
 	if err != nil {
 		log.Fatalf("opening database: %v", err)
 	}
 	defer database.Close()
+
+	// In-memory state store (nodes, VMs, golden images — rebuilt on startup)
+	store := state.New()
 
 	// MQTT client
 	mqttClient, err := orchmqtt.Connect(orchmqtt.Config{
@@ -48,7 +52,7 @@ func main() {
 
 	// HTTP API
 	mux := http.NewServeMux()
-	handler := api.NewHandler(database)
+	handler := api.NewHandler(database, store)
 	handler.SetMQTT(mqttClient)
 	handler.Register(mux)
 
@@ -58,8 +62,8 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Orchestrator listening on %s", *listenAddr)
-		log.Printf("Database: %s", cfg.DB.Path)
+		log.Printf("Orchestrator listening on %s (stateless mode)", *listenAddr)
+		log.Printf("Database: %s (SSH keys + golden config only)", cfg.DB.Path)
 		if err := server.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("HTTP server: %v", err)
 		}

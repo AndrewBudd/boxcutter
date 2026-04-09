@@ -17,41 +17,36 @@ import (
 	orchmqtt "github.com/AndrewBudd/boxcutter/orchestrator/internal/mqtt"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/node"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/scheduler"
+	"github.com/AndrewBudd/boxcutter/orchestrator/internal/state"
 )
 
 // queuedMessage is a tapegun message waiting for delivery to a migrating VM.
 type queuedMessage struct {
-	vmName    string
-	msg       node.TapegunMessage
-	queuedAt  time.Time
+	vmName   string
+	msg      node.TapegunMessage
+	queuedAt time.Time
 }
 
 type Handler struct {
-	db   *db.DB
-	mqtt *orchmqtt.Client
+	db    *db.DB
+	state *state.Store
+	mqtt  *orchmqtt.Client
 
 	// Tapegun message queue: messages for VMs that are temporarily unreachable
 	// (e.g., during migration). Background goroutine retries delivery.
 	msgQueue   []queuedMessage
 	msgQueueMu sync.Mutex
 
-	// Migration state: when preparing for migration, mutating requests are rejected.
-	// Auto-expires after migrateDeadline to prevent permanent lockout if migration fails.
-	migrating       bool
-	migrateDeadline time.Time
-	migrateMu       sync.Mutex
-
 	// MaxVMSizeMB is the largest VM (by RAM in MiB) the cluster can place.
-	// VM creation requests exceeding this are rejected.
 	MaxVMSizeMB int
 }
 
-func NewHandler(database *db.DB) *Handler {
+func NewHandler(database *db.DB, store *state.Store) *Handler {
 	maxVM := 0
 	if v := os.Getenv("MAX_VM_SIZE"); v != "" {
 		fmt.Sscanf(v, "%d", &maxVM)
 	}
-	h := &Handler{db: database, MaxVMSizeMB: maxVM}
+	h := &Handler{db: database, state: store, MaxVMSizeMB: maxVM}
 	h.discoverNodes()
 	go h.healthMonitorLoop()
 	go h.messageDeliveryLoop()
@@ -59,9 +54,8 @@ func NewHandler(database *db.DB) *Handler {
 }
 
 // discoverNodes scans the bridge subnet for responsive node agents and
-// registers them in the database. This allows the orchestrator to rebuild
-// its state from scratch on startup (e.g. after an upgrade) without relying
-// on nodes to re-register.
+// registers them in the in-memory store. This allows the orchestrator to
+// rebuild its state from scratch on startup without any persistent state.
 func (h *Handler) discoverNodes() {
 	subnet := os.Getenv("BRIDGE_SUBNET")
 	if subnet == "" {
@@ -110,77 +104,48 @@ func (h *Handler) discoverNodes() {
 			nodeID = r.ip
 		}
 
-		n := &db.Node{
+		n := &state.Node{
 			ID:            nodeID,
 			TailscaleName: nodeID,
 			BridgeIP:      r.ip,
 			APIAddr:       apiAddr,
 			Status:        "active",
-			RegisteredAt:  now,
-			LastHeartbeat: now,
+			DiscoveredAt:  now,
+			LastSeen:      now,
 		}
-		if err := h.db.RegisterNode(n); err != nil {
-			log.Printf("Node discovery: failed to register %s (%s): %v", nodeID, r.ip, err)
-			continue
-		}
+		h.state.SetNode(n)
 		log.Printf("Node discovery: registered %s at %s (RAM %d/%d MiB, %d VMs)",
 			nodeID, r.ip, r.health.RAMAllocatedMIB, r.health.RAMTotalMIB, r.health.VMsRunning)
 
 		// Sync VM inventory from node
 		fc := node.NewFastClient(apiAddr)
 		if vmList := fc.ListVMs(); vmList != nil {
-			var dbVMs []db.VM
+			var stateVMs []state.VM
 			for _, v := range vmList {
-				dbVMs = append(dbVMs, db.VM{
+				stateVMs = append(stateVMs, state.VM{
 					Name:   v.Name,
 					NodeID: nodeID,
 					Status: v.Status,
 				})
 			}
-			h.db.SyncNodeVMs(nodeID, dbVMs)
-			log.Printf("Node discovery: synced %d VMs from %s", len(dbVMs), nodeID)
+			h.state.SyncNodeVMs(nodeID, stateVMs)
+			log.Printf("Node discovery: synced %d VMs from %s", len(stateVMs), nodeID)
 		}
 
 		// Sync golden image versions
 		if versions := fc.GoldenVersions(); versions != nil {
-			h.db.DeleteGoldenImagesForNode(nodeID)
-			for _, ver := range versions {
-				h.db.UpsertGoldenImage(ver, nodeID, now)
-			}
+			h.state.SetGoldenImages(nodeID, versions)
 		}
 	}
 
 	log.Printf("Node discovery complete: found %d node(s)", len(results))
 }
 
-// isMigrating returns true if this orchestrator is in pre-migrate mode.
-// Automatically expires the migration state after the deadline.
-func (h *Handler) isMigrating() bool {
-	h.migrateMu.Lock()
-	defer h.migrateMu.Unlock()
-	if h.migrating && time.Now().After(h.migrateDeadline) {
-		log.Printf("Migration mode expired (deadline passed), reverting to active")
-		h.migrating = false
-	}
-	return h.migrating
-}
-
-// migrationGuard wraps a handler to reject requests when migrating.
-func (h *Handler) migrationGuard(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if h.isMigrating() {
-			http.Error(w, "orchestrator is preparing for migration, please retry shortly", http.StatusServiceUnavailable)
-			return
-		}
-		next(w, r)
-	}
-}
-
 // SetMQTT sets the MQTT client for publishing golden head updates.
 func (h *Handler) SetMQTT(mc *orchmqtt.Client) {
 	h.mqtt = mc
 
-	// On connect, publish the current golden head (if any) — non-blocking
+	// On connect, publish the current golden head (if any)
 	if mc != nil {
 		go func() {
 			head := h.db.GetGoldenHead()
@@ -200,12 +165,8 @@ func (h *Handler) healthMonitorLoop() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		nodes, err := h.db.ListNodes()
-		if err != nil {
-			continue
-		}
+		nodes := h.state.ListNodes()
 		for _, n := range nodes {
-			// Skip retired/draining nodes — only check active and down
 			if n.Status != "active" && n.Status != "down" {
 				continue
 			}
@@ -214,35 +175,32 @@ func (h *Handler) healthMonitorLoop() {
 			if health == nil {
 				if n.Status == "active" {
 					log.Printf("Node %s: unreachable, marking down", n.ID)
-					h.db.SetNodeStatus(n.ID, "down")
+					h.state.SetNodeStatus(n.ID, "down")
 				}
 				continue
 			}
 			if n.Status == "down" {
 				log.Printf("Node %s: back up, marking active", n.ID)
-				h.db.SetNodeStatus(n.ID, "active")
+				h.state.SetNodeStatus(n.ID, "active")
 			}
+			h.state.UpdateNodeLastSeen(n.ID)
 
 			// Sync VM inventory from node
 			if vmList := fc.ListVMs(); vmList != nil {
-				var dbVMs []db.VM
+				var stateVMs []state.VM
 				for _, v := range vmList {
-					dbVMs = append(dbVMs, db.VM{
+					stateVMs = append(stateVMs, state.VM{
 						Name:   v.Name,
 						NodeID: n.ID,
 						Status: v.Status,
 					})
 				}
-				h.db.SyncNodeVMs(n.ID, dbVMs)
+				h.state.SyncNodeVMs(n.ID, stateVMs)
 			}
 
 			// Sync golden image versions from node
 			if versions := fc.GoldenVersions(); versions != nil {
-				now := time.Now().Format(time.RFC3339)
-				h.db.DeleteGoldenImagesForNode(n.ID)
-				for _, ver := range versions {
-					h.db.UpsertGoldenImage(ver, n.ID, now)
-				}
+				h.state.SetGoldenImages(n.ID, versions)
 			}
 		}
 	}
@@ -255,32 +213,27 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/nodes", h.handleNodeList)
 	mux.HandleFunc("GET /api/nodes/{id}", h.handleNodeGet)
 
-	// VM management (mutating endpoints guarded during migration)
-	mux.HandleFunc("POST /api/vms", h.migrationGuard(h.handleVMCreate))
+	// VM management
+	mux.HandleFunc("POST /api/vms", h.handleVMCreate)
 	mux.HandleFunc("GET /api/vms", h.handleVMList)
 	mux.HandleFunc("GET /api/vms/{name}", h.handleVMGet)
 	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleVMLogs)
 	mux.HandleFunc("PATCH /api/vms/{name}", h.handleVMUpdate)
-	mux.HandleFunc("DELETE /api/vms/{name}", h.migrationGuard(h.handleVMDestroy))
-	mux.HandleFunc("POST /api/vms/{name}/stop", h.migrationGuard(h.handleVMStop))
-	mux.HandleFunc("POST /api/vms/{name}/start", h.migrationGuard(h.handleVMStart))
-	mux.HandleFunc("POST /api/vms/{name}/copy", h.migrationGuard(h.handleVMCopy))
-	mux.HandleFunc("POST /api/vms/{name}/repos", h.migrationGuard(h.handleVMAddRepo))
-	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.migrationGuard(h.handleVMRemoveRepo))
+	mux.HandleFunc("DELETE /api/vms/{name}", h.handleVMDestroy)
+	mux.HandleFunc("POST /api/vms/{name}/stop", h.handleVMStop)
+	mux.HandleFunc("POST /api/vms/{name}/start", h.handleVMStart)
+	mux.HandleFunc("POST /api/vms/{name}/copy", h.handleVMCopy)
+	mux.HandleFunc("POST /api/vms/{name}/repos", h.handleVMAddRepo)
+	mux.HandleFunc("DELETE /api/vms/{name}/repos/{repo...}", h.handleVMRemoveRepo)
 	mux.HandleFunc("GET /api/vms/{name}/repos", h.handleVMListRepos)
-	mux.HandleFunc("POST /api/vms/{name}/projects", h.migrationGuard(h.handleVMAddProject))
-	mux.HandleFunc("DELETE /api/vms/{name}/projects/{project...}", h.migrationGuard(h.handleVMRemoveProject))
+	mux.HandleFunc("POST /api/vms/{name}/projects", h.handleVMAddProject)
+	mux.HandleFunc("DELETE /api/vms/{name}/projects/{project...}", h.handleVMRemoveProject)
 	mux.HandleFunc("GET /api/vms/{name}/projects", h.handleVMListProjects)
 
 	// Golden images
 	mux.HandleFunc("GET /api/golden", h.handleGoldenList)
 	mux.HandleFunc("GET /api/golden/head", h.handleGoldenGetHead)
 	mux.HandleFunc("POST /api/golden/head", h.handleGoldenSetHead)
-
-	// Migration (self-migration for orchestrator upgrades)
-	mux.HandleFunc("POST /api/migrate", h.handleMigrate)
-	mux.HandleFunc("POST /api/prepare-migrate", h.handlePrepareMigrate)
-	mux.HandleFunc("POST /api/shutdown", h.handleShutdown)
 
 	// SSH keys
 	mux.HandleFunc("POST /api/keys/add", h.handleAddKeys)
@@ -311,7 +264,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 // --- Node handlers ---
 
 func (h *Handler) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
-	var n db.Node
+	var n state.Node
 	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
@@ -323,15 +276,13 @@ func (h *Handler) handleNodeRegister(w http.ResponseWriter, r *http.Request) {
 	if n.Status == "" {
 		n.Status = "active"
 	}
-	if n.RegisteredAt == "" {
-		n.RegisteredAt = time.Now().Format(time.RFC3339)
+	now := time.Now().Format(time.RFC3339)
+	if n.DiscoveredAt == "" {
+		n.DiscoveredAt = now
 	}
-	n.LastHeartbeat = time.Now().Format(time.RFC3339)
+	n.LastSeen = now
 
-	if err := h.db.RegisterNode(&n); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	h.state.SetNode(&n)
 
 	log.Printf("Node registered: %s (%s)", n.ID, n.TailscaleName)
 	w.WriteHeader(http.StatusCreated)
@@ -344,19 +295,12 @@ func (h *Handler) handleNodeHeartbeat(w http.ResponseWriter, r *http.Request) {
 		id = extractPathSegment(r.URL.Path, "/api/nodes/", "/heartbeat")
 	}
 
-	if err := h.db.UpdateNodeHeartbeat(id, time.Now().Format(time.RFC3339)); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	h.state.UpdateNodeLastSeen(id)
 	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 func (h *Handler) handleNodeList(w http.ResponseWriter, r *http.Request) {
-	nodes, err := h.db.ListNodes()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	nodes := h.state.ListNodes()
 
 	// Enrich with real-time health from each node (fast timeout, parallel)
 	var wg sync.WaitGroup
@@ -389,8 +333,8 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		id = extractName(r.URL.Path, "/api/nodes/")
 	}
-	n, err := h.db.GetNode(id)
-	if err != nil {
+	n := h.state.GetNode(id)
+	if n == nil {
 		http.Error(w, "node not found", http.StatusNotFound)
 		return
 	}
@@ -401,16 +345,35 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 
 type vmCreateRequest struct {
 	Name             string   `json:"name"`
-	Type             string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
-	Description      string   `json:"description,omitempty"` // user-provided description
+	Type             string   `json:"type,omitempty"`
+	Description      string   `json:"description,omitempty"`
 	VCPU             int      `json:"vcpu,omitempty"`
 	RAMMIB           int      `json:"ram_mib,omitempty"`
 	Disk             string   `json:"disk,omitempty"`
 	CloneURL         string   `json:"clone_url,omitempty"`
 	CloneURLs        []string `json:"clone_urls,omitempty"`
 	Mode             string   `json:"mode,omitempty"`
-	NodeID           string   `json:"node_id,omitempty"` // optional: pin to specific node
+	NodeID           string   `json:"node_id,omitempty"`
 	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
+}
+
+// nodeToScheduler converts a state.Node to the db.Node type used by the scheduler.
+func nodeToScheduler(n *state.Node) *db.Node {
+	return &db.Node{
+		ID:              n.ID,
+		TailscaleName:   n.TailscaleName,
+		TailscaleIP:     n.TailscaleIP,
+		BridgeIP:        n.BridgeIP,
+		APIAddr:         n.APIAddr,
+		Status:          n.Status,
+		RAMTotalMIB:     n.RAMTotalMIB,
+		RAMAllocatedMIB: n.RAMAllocatedMIB,
+		RAMAvailableMIB: n.RAMAvailableMIB,
+		DiskTotalMB:     n.DiskTotalMB,
+		DiskUsedMB:      n.DiskUsedMB,
+		DiskVMsMB:       n.DiskVMsMB,
+		VMsRunning:      n.VMsRunning,
+	}
 }
 
 func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
@@ -421,7 +384,6 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Name == "" {
-		// Generate a name
 		out, err := exec.Command("boxcutter-names", "generate").Output()
 		if err != nil {
 			http.Error(w, "failed to generate name", http.StatusInternalServerError)
@@ -439,14 +401,13 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		req.Disk = "50G"
 	}
 
-	// Reject VMs larger than the cluster's max VM size
 	if h.MaxVMSizeMB > 0 && req.RAMMIB > h.MaxVMSizeMB {
 		http.Error(w, fmt.Sprintf("requested RAM %d MiB exceeds max VM size %d MiB", req.RAMMIB, h.MaxVMSizeMB), http.StatusBadRequest)
 		return
 	}
 
 	// Check if VM already exists
-	if _, err := h.db.GetVM(req.Name); err == nil {
+	if v := h.state.GetVM(req.Name); v != nil {
 		http.Error(w, fmt.Sprintf("VM '%s' already exists", req.Name), http.StatusConflict)
 		return
 	}
@@ -457,31 +418,32 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 	// Build candidate node list
 	var candidates []*db.Node
 	if req.NodeID != "" {
-		targetNode, err := h.db.GetNode(req.NodeID)
-		if err != nil {
+		targetNode := h.state.GetNode(req.NodeID)
+		if targetNode == nil {
 			http.Error(w, "specified node not found", http.StatusBadRequest)
 			return
 		}
-		candidates = []*db.Node{targetNode}
+		candidates = []*db.Node{nodeToScheduler(targetNode)}
 	} else {
-		nodes, err := h.db.ActiveNodes()
-		if err != nil || len(nodes) == 0 {
+		activeNodes := h.state.ActiveNodes()
+		if len(activeNodes) == 0 {
 			http.Error(w, "no active nodes", http.StatusServiceUnavailable)
 			return
 		}
 		// Query real-time health and filter reachable nodes
-		for _, n := range nodes {
+		for _, n := range activeNodes {
 			fc := node.NewFastClient(n.APIAddr)
 			if health := fc.Health(); health != nil {
 				if !health.GoldenReady {
 					log.Printf("Scheduling: node %s has no golden image, skipping", n.ID)
 					continue
 				}
-				n.RAMAllocatedMIB = health.RAMAllocatedMIB
-				n.RAMAvailableMIB = health.RAMAvailableMIB
-				n.VMsRunning = health.VMsRunning
-				n.RAMTotalMIB = health.RAMTotalMIB
-				candidates = append(candidates, n)
+				sn := nodeToScheduler(n)
+				sn.RAMAllocatedMIB = health.RAMAllocatedMIB
+				sn.RAMAvailableMIB = health.RAMAvailableMIB
+				sn.VMsRunning = health.VMsRunning
+				sn.RAMTotalMIB = health.RAMTotalMIB
+				candidates = append(candidates, sn)
 			} else {
 				log.Printf("Scheduling: node %s unreachable, skipping", n.ID)
 			}
@@ -490,13 +452,11 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no reachable nodes", http.StatusServiceUnavailable)
 			return
 		}
-		// Sort by most free RAM
 		sorted, err := scheduler.PickNode(candidates, req.RAMMIB)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		// Put the best candidate first, keep the rest as fallbacks
 		var reordered []*db.Node
 		reordered = append(reordered, sorted)
 		for _, c := range candidates {
@@ -550,8 +510,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("Create on %s failed: %v", candidate.ID, err)
 			emitProgress("retry", fmt.Sprintf("%s failed: %v", candidate.TailscaleName, err))
-			// Mark node as down if it's a connection error
-			h.db.SetNodeStatus(candidate.ID, "down")
+			h.state.SetNodeStatus(candidate.ID, "down")
 			continue
 		}
 		nodeResp = resp
@@ -568,8 +527,8 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record in DB — only name, node, status
-	h.db.CreateVM(&db.VM{
+	// Record in state
+	h.state.SetVM(&state.VM{
 		Name:   nodeResp.Name,
 		NodeID: targetNode.ID,
 		Status: nodeResp.Status,
@@ -577,7 +536,6 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("VM created: %s on node %s", nodeResp.Name, targetNode.ID)
 
-	// Final ready event — include details from node response
 	ready, _ := json.Marshal(map[string]interface{}{
 		"phase":        "ready",
 		"name":         nodeResp.Name,
@@ -611,14 +569,10 @@ type vmListEntry struct {
 }
 
 func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
-	vms, err := h.db.ListVMs()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	vms := h.state.ListVMs()
 
 	// Group VMs by node so we make one request per node
-	nodeVMs := make(map[string][]*db.VM)
+	nodeVMs := make(map[string][]*state.VM)
 	for _, v := range vms {
 		nodeVMs[v.NodeID] = append(nodeVMs[v.NodeID], v)
 	}
@@ -626,15 +580,15 @@ func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
 	// Fetch details from each node in parallel
 	type nodeResult struct {
 		nodeID string
-		vms    map[string]*node.VMDetail // name -> detail
+		vms    map[string]*node.VMDetail
 	}
 	results := make(chan nodeResult, len(nodeVMs))
 
 	for nodeID := range nodeVMs {
 		go func(nid string) {
 			nr := nodeResult{nodeID: nid, vms: make(map[string]*node.VMDetail)}
-			n, err := h.db.GetNode(nid)
-			if err != nil || n.APIAddr == "" {
+			n := h.state.GetNode(nid)
+			if n == nil || n.APIAddr == "" {
 				results <- nr
 				return
 			}
@@ -647,17 +601,15 @@ func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
 		}(nodeID)
 	}
 
-	// Collect results
 	detailsByNode := make(map[string]map[string]*node.VMDetail)
 	for range nodeVMs {
 		nr := <-results
 		detailsByNode[nr.nodeID] = nr.vms
 	}
 
-	// Build response
 	var entries []vmListEntry
 	for _, v := range vms {
-		n, _ := h.db.GetNode(v.NodeID)
+		n := h.state.GetNode(v.NodeID)
 		nodeName := v.NodeID
 		if n != nil {
 			nodeName = n.TailscaleName
@@ -670,7 +622,6 @@ func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
 			Status:   v.Status,
 		}
 
-		// Enrich with node detail if available
 		if nodeDetail, ok := detailsByNode[v.NodeID]; ok {
 			if detail, ok := nodeDetail[v.Name]; ok {
 				entry.Type = detail.Type
@@ -680,7 +631,7 @@ func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
 				entry.VCPU = detail.VCPU
 				entry.RAMMIB = detail.RAMMIB
 				entry.Disk = detail.Disk
-				entry.Status = detail.Status // node's view is authoritative
+				entry.Status = detail.Status
 			}
 		}
 
@@ -695,13 +646,13 @@ func (h *Handler) handleVMGet(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = extractName(r.URL.Path, "/api/vms/")
 	}
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
 
-	n, _ := h.db.GetNode(vm.NodeID)
+	n := h.state.GetNode(vm.NodeID)
 	result := map[string]interface{}{
 		"name":    vm.Name,
 		"node_id": vm.NodeID,
@@ -710,7 +661,6 @@ func (h *Handler) handleVMGet(w http.ResponseWriter, r *http.Request) {
 	if n != nil {
 		result["node_name"] = n.TailscaleName
 
-		// Try to get details from node
 		fc := node.NewFastClient(n.APIAddr)
 		if detail := fc.GetVM(name); detail != nil {
 			result["tailscale_ip"] = detail.TailscaleIP
@@ -732,19 +682,18 @@ func (h *Handler) handleVMLogs(w http.ResponseWriter, r *http.Request) {
 		name = strings.TrimSuffix(name, "/logs")
 	}
 
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
 
-	n, err := h.db.GetNode(vm.NodeID)
-	if err != nil || n == nil {
+	n := h.state.GetNode(vm.NodeID)
+	if n == nil {
 		http.Error(w, "node not found", http.StatusNotFound)
 		return
 	}
 
-	// Proxy to the node agent's logs endpoint
 	lines := r.URL.Query().Get("lines")
 	url := fmt.Sprintf("http://%s/api/vms/%s/logs", n.APIAddr, name)
 	if lines != "" {
@@ -770,19 +719,18 @@ func (h *Handler) handleVMUpdate(w http.ResponseWriter, r *http.Request) {
 		name = extractName(r.URL.Path, "/api/vms/")
 	}
 
-	vmRec, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
 
-	n, err := h.db.GetNode(vmRec.NodeID)
-	if err != nil || n == nil {
+	n := h.state.GetNode(vm.NodeID)
+	if n == nil {
 		http.Error(w, "node not found", http.StatusNotFound)
 		return
 	}
 
-	// Proxy PATCH to the node agent
 	body, _ := io.ReadAll(r.Body)
 	url := fmt.Sprintf("http://%s/api/vms/%s", n.APIAddr, name)
 	req, _ := http.NewRequest("PATCH", url, bytes.NewReader(body))
@@ -807,27 +755,23 @@ func (h *Handler) handleVMDestroy(w http.ResponseWriter, r *http.Request) {
 		name = extractName(r.URL.Path, "/api/vms/")
 	}
 
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
 
-	// Mark as destroying first
-	h.db.UpdateVMStatus(name, "destroying")
+	h.state.UpdateVMStatus(name, "destroying")
 
-	// Tell node to destroy
-	n, _ := h.db.GetNode(vm.NodeID)
+	n := h.state.GetNode(vm.NodeID)
 	if n != nil {
 		client := node.NewClient(n.APIAddr)
 		if err := client.Destroy(name); err != nil {
-			log.Printf("Node destroy failed for %s: %v (cleaning up DB record anyway)", name, err)
+			log.Printf("Node destroy failed for %s: %v (cleaning up state anyway)", name, err)
 		}
 	}
 
-	// Always remove from DB — a stale record is worse than a phantom VM on a node,
-	// and the health monitor's SyncNodeVMs will catch any real orphans.
-	h.db.DeleteVM(name)
+	h.state.DeleteVM(name)
 	log.Printf("VM destroyed: %s", name)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -838,13 +782,13 @@ func (h *Handler) handleVMStop(w http.ResponseWriter, r *http.Request) {
 		name = extractPathSegment(r.URL.Path, "/api/vms/", "/stop")
 	}
 
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
 
-	n, _ := h.db.GetNode(vm.NodeID)
+	n := h.state.GetNode(vm.NodeID)
 	if n == nil {
 		http.Error(w, "node not found", http.StatusInternalServerError)
 		return
@@ -856,7 +800,7 @@ func (h *Handler) handleVMStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db.UpdateVMStatus(name, "stopped")
+	h.state.UpdateVMStatus(name, "stopped")
 	writeJSON(w, map[string]string{"status": "stopped"})
 }
 
@@ -866,13 +810,13 @@ func (h *Handler) handleVMStart(w http.ResponseWriter, r *http.Request) {
 		name = extractPathSegment(r.URL.Path, "/api/vms/", "/start")
 	}
 
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
 
-	n, _ := h.db.GetNode(vm.NodeID)
+	n := h.state.GetNode(vm.NodeID)
 	if n == nil {
 		http.Error(w, "node not found", http.StatusInternalServerError)
 		return
@@ -885,7 +829,7 @@ func (h *Handler) handleVMStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db.UpdateVMStatus(name, "running")
+	h.state.UpdateVMStatus(name, "running")
 	writeJSON(w, resp)
 }
 
@@ -903,7 +847,6 @@ func (h *Handler) handleVMCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate name if not provided
 	if req.DstName == "" {
 		out, err := exec.Command("boxcutter-names", "generate").Output()
 		if err != nil {
@@ -913,26 +856,23 @@ func (h *Handler) handleVMCopy(w http.ResponseWriter, r *http.Request) {
 		req.DstName = strings.TrimSpace(string(out))
 	}
 
-	// Check if destination already exists
-	if _, err := h.db.GetVM(req.DstName); err == nil {
+	if v := h.state.GetVM(req.DstName); v != nil {
 		http.Error(w, fmt.Sprintf("VM '%s' already exists", req.DstName), http.StatusConflict)
 		return
 	}
 
-	// Find the source VM's node
-	srcVM, err := h.db.GetVM(srcName)
-	if err != nil {
+	srcVM := h.state.GetVM(srcName)
+	if srcVM == nil {
 		http.Error(w, "source VM not found", http.StatusNotFound)
 		return
 	}
 
-	n, _ := h.db.GetNode(srcVM.NodeID)
+	n := h.state.GetNode(srcVM.NodeID)
 	if n == nil {
 		http.Error(w, "source node not found", http.StatusInternalServerError)
 		return
 	}
 
-	// Stream progress
 	flusher, canFlush := w.(http.Flusher)
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -956,8 +896,7 @@ func (h *Handler) handleVMCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record new VM in DB
-	h.db.CreateVM(&db.VM{
+	h.state.SetVM(&state.VM{
 		Name:   nodeResp.Name,
 		NodeID: srcVM.NodeID,
 		Status: nodeResp.Status,
@@ -986,8 +925,8 @@ func (h *Handler) handleVMAddRepo(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = extractPathSegment(r.URL.Path, "/api/vms/", "/repos")
 	}
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
@@ -998,7 +937,7 @@ func (h *Handler) handleVMAddRepo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "repo is required", http.StatusBadRequest)
 		return
 	}
-	n, _ := h.db.GetNode(vm.NodeID)
+	n := h.state.GetNode(vm.NodeID)
 	if n == nil {
 		http.Error(w, "node not found", http.StatusInternalServerError)
 		return
@@ -1015,12 +954,12 @@ func (h *Handler) handleVMAddRepo(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleVMRemoveRepo(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	repo := r.PathValue("repo")
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	n, _ := h.db.GetNode(vm.NodeID)
+	n := h.state.GetNode(vm.NodeID)
 	if n == nil {
 		http.Error(w, "node not found", http.StatusInternalServerError)
 		return
@@ -1039,12 +978,12 @@ func (h *Handler) handleVMListRepos(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = extractName(r.URL.Path, "/api/vms/")
 	}
-	vm, err := h.db.GetVM(name)
-	if err != nil {
+	vm := h.state.GetVM(name)
+	if vm == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	n, _ := h.db.GetNode(vm.NodeID)
+	n := h.state.GetNode(vm.NodeID)
 	if n == nil {
 		http.Error(w, "node not found", http.StatusInternalServerError)
 		return
@@ -1067,12 +1006,12 @@ func (h *Handler) handleVMAddProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "project is required", http.StatusBadRequest)
 		return
 	}
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	n, _ := h.db.GetNode(v.NodeID)
+	n := h.state.GetNode(v.NodeID)
 	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
@@ -1089,12 +1028,12 @@ func (h *Handler) handleVMAddProject(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleVMRemoveProject(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	project := r.PathValue("project")
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	n, _ := h.db.GetNode(v.NodeID)
+	n := h.state.GetNode(v.NodeID)
 	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
@@ -1110,12 +1049,12 @@ func (h *Handler) handleVMRemoveProject(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) handleVMListProjects(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "VM not found", http.StatusNotFound)
 		return
 	}
-	n, _ := h.db.GetNode(v.NodeID)
+	n := h.state.GetNode(v.NodeID)
 	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
@@ -1132,27 +1071,21 @@ func (h *Handler) handleVMListProjects(w http.ResponseWriter, r *http.Request) {
 // --- Golden images ---
 
 type goldenListEntry struct {
-	Version  string   `json:"version"`
-	Nodes    []string `json:"nodes"`
+	Version string   `json:"version"`
+	Nodes   []string `json:"nodes"`
 }
 
 func (h *Handler) handleGoldenList(w http.ResponseWriter, r *http.Request) {
-	images, err := h.db.ListGoldenImages()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	images := h.state.ListGoldenImages()
 
-	// Group by version
 	versionNodes := make(map[string][]string)
 	var order []string
 	for _, img := range images {
 		if _, seen := versionNodes[img.Version]; !seen {
 			order = append(order, img.Version)
 		}
-		// Resolve node name
 		nodeName := img.NodeID
-		if n, err := h.db.GetNode(img.NodeID); err == nil {
+		if n := h.state.GetNode(img.NodeID); n != nil {
 			nodeName = n.TailscaleName
 		}
 		versionNodes[img.Version] = append(versionNodes[img.Version], nodeName)
@@ -1193,7 +1126,6 @@ func (h *Handler) handleGoldenSetHead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish to MQTT so nodes get notified
 	if h.mqtt != nil {
 		if err := h.mqtt.PublishGoldenHead(req.Version); err != nil {
 			log.Printf("mqtt: failed to publish golden head: %v", err)
@@ -1204,159 +1136,15 @@ func (h *Handler) handleGoldenSetHead(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"version": req.Version, "status": "ok"})
 }
 
-// --- Migration (orchestrator self-migration) ---
-
-// handleMigrate is called on the NEW orchestrator by the control plane.
-// It drives the entire migration from the old orchestrator.
-func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SourceAddr string `json:"source_addr"` // e.g., "192.168.50.2:8801"
-		SourceIP   string `json:"source_ip"`   // e.g., "192.168.50.2"
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return
-	}
-	if req.SourceAddr == "" || req.SourceIP == "" {
-		http.Error(w, "source_addr and source_ip are required", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("Migration: starting from source %s", req.SourceAddr)
-
-	sourceURL := "http://" + req.SourceAddr
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	// 1. Tell old orchestrator to prepare for migration
-	log.Printf("Migration: sending prepare-migrate to %s", req.SourceAddr)
-	resp, err := client.Post(sourceURL+"/api/prepare-migrate", "application/json", nil)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("prepare-migrate failed: %v", err), http.StatusBadGateway)
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		http.Error(w, fmt.Sprintf("prepare-migrate returned %d", resp.StatusCode), http.StatusBadGateway)
-		return
-	}
-
-	// 2. rsync the database from old orchestrator
-	log.Printf("Migration: rsyncing database from %s", req.SourceIP)
-	dbPath := "/var/lib/boxcutter/orchestrator.db"
-
-	sshOpts := "ssh -i /etc/boxcutter/secrets/cluster-ssh.key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-	rsyncCmd := exec.Command("rsync", "-az", "--timeout=30", "-e", sshOpts,
-		fmt.Sprintf("ubuntu@%s:%s", req.SourceIP, dbPath),
-		dbPath+".migrated")
-	rsyncCmd.Stdout = os.Stdout
-	rsyncCmd.Stderr = os.Stderr
-	if err := rsyncCmd.Run(); err != nil {
-		http.Error(w, fmt.Sprintf("rsync db failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// 3. Tell old orchestrator to shut down (logs out of Tailscale first)
-	log.Printf("Migration: sending shutdown to %s", req.SourceAddr)
-	resp, err = client.Post(sourceURL+"/api/shutdown", "application/json", nil)
-	if err != nil {
-		log.Printf("Migration: shutdown request failed (continuing): %v", err)
-	} else {
-		resp.Body.Close()
-	}
-
-	// 4. Wait for old orchestrator to become unreachable
-	log.Printf("Migration: waiting for old orchestrator to stop...")
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := client.Get(sourceURL + "/healthz")
-		if err != nil {
-			break // unreachable = good
-		}
-		resp.Body.Close()
-		time.Sleep(2 * time.Second)
-	}
-
-	// 5. Activate the migrated database
-	log.Printf("Migration: activating migrated database")
-	os.Rename(dbPath+".migrated", dbPath)
-
-	// 6. Ensure Tailscale hostname is correct. Cloud-init may have joined as
-	// "boxcutter-2" if old orch was still running. Now that old orch has logged
-	// out, reclaim the "boxcutter" hostname. If not yet on Tailscale, join fresh.
-	log.Printf("Migration: ensuring Tailscale identity")
-	if out, err := exec.Command("tailscale", "status", "--json").CombinedOutput(); err == nil && strings.Contains(string(out), `"Self"`) {
-		// Already on Tailscale — just fix hostname
-		exec.Command("tailscale", "set", "--hostname=boxcutter").Run()
-		log.Printf("Migration: Tailscale hostname set to boxcutter")
-	} else {
-		// Not on Tailscale — join with authkey
-		tsKeyFile := "/etc/boxcutter/secrets/tailscale-orch-authkey"
-		if _, err := os.Stat(tsKeyFile); err != nil {
-			tsKeyFile = "/etc/boxcutter/secrets/tailscale-node-authkey"
-		}
-		if tsKey, err := os.ReadFile(tsKeyFile); err == nil {
-			key := strings.TrimSpace(string(tsKey))
-			if out, err := exec.Command("tailscale", "up", "--authkey="+key, "--hostname=boxcutter").CombinedOutput(); err != nil {
-				log.Printf("Migration: tailscale up failed: %s %v", string(out), err)
-			} else {
-				log.Printf("Migration: Tailscale joined as boxcutter")
-			}
-		} else {
-			log.Printf("Migration: no Tailscale authkey found, skipping")
-		}
-	}
-
-	// 7. Restart our own orchestrator service to pick up the new DB
-	log.Printf("Migration: restarting orchestrator service")
-	exec.Command("systemctl", "restart", "boxcutter-orchestrator").Run()
-
-	log.Printf("Migration: complete")
-	writeJSON(w, map[string]string{"status": "migrated"})
-}
-
-// handlePrepareMigrate is called on the OLD orchestrator by the new one.
-// It stops accepting new work and prepares for state transfer.
-func (h *Handler) handlePrepareMigrate(w http.ResponseWriter, r *http.Request) {
-	const migrationTimeout = 5 * time.Minute
-
-	h.migrateMu.Lock()
-	h.migrating = true
-	h.migrateDeadline = time.Now().Add(migrationTimeout)
-	h.migrateMu.Unlock()
-
-	log.Printf("Prepare-migrate: entering migration mode (expires in %v), new requests will be rejected", migrationTimeout)
-
-	writeJSON(w, map[string]string{
-		"status":  "ready",
-		"db_path": "/var/lib/boxcutter/orchestrator.db",
-	})
-}
-
-// handleShutdown is called on the OLD orchestrator by the new one.
-// It gracefully shuts down the VM.
-func (h *Handler) handleShutdown(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Shutdown: received shutdown request, powering off in 2 seconds")
-	writeJSON(w, map[string]string{"status": "shutting_down"})
-
-	go func() {
-		time.Sleep(2 * time.Second)
-		// Release Tailscale hostname so the replacement VM can claim it
-		exec.Command("tailscale", "logout").Run()
-		time.Sleep(1 * time.Second)
-		exec.Command("shutdown", "-h", "now").Run()
-	}()
-}
-
 // --- Health ---
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
-	nodes, _ := h.db.ListNodes()
-	vms, _ := h.db.ListVMs()
+	nodes := h.state.ListNodes()
+	vms := h.state.ListVMs()
 
 	var activeNodes int
 	var totalRAM, allocRAM int
 
-	// Query real-time health from active nodes
 	var wg sync.WaitGroup
 	type healthResult struct {
 		ramTotal int
@@ -1473,40 +1261,34 @@ func extractPathSegment(path, prefix, suffix string) string {
 // --- Tapegun handlers ---
 
 type tapegunActivityEntry struct {
-	Name        string                       `json:"name"`
-	NodeID      string                       `json:"node_id"`
-	NodeName    string                       `json:"node_name"`
-	VMStatus    string                       `json:"vm_status"`
-	Activity    *node.TapegunActivityReport  `json:"activity,omitempty"`
-	AgentStatus *node.TapegunStatusReport    `json:"agent_status,omitempty"`
-	PendingMsgs int                          `json:"pending_messages"`
+	Name        string                      `json:"name"`
+	NodeID      string                      `json:"node_id"`
+	NodeName    string                      `json:"node_name"`
+	VMStatus    string                      `json:"vm_status"`
+	Activity    *node.TapegunActivityReport `json:"activity,omitempty"`
+	AgentStatus *node.TapegunStatusReport   `json:"agent_status,omitempty"`
+	PendingMsgs int                         `json:"pending_messages"`
 }
 
 func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) {
-	vms, err := h.db.ListVMs()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	vms := h.state.ListVMs()
 
-	// Group VMs by node
-	nodeVMs := make(map[string][]*db.VM)
+	nodeVMs := make(map[string][]*state.VM)
 	for _, v := range vms {
 		nodeVMs[v.NodeID] = append(nodeVMs[v.NodeID], v)
 	}
 
-	// Fan out to each node
 	type nodeResult struct {
 		nodeID   string
-		activity map[string]*node.TapegunVMActivity // vmid -> activity
+		activity map[string]*node.TapegunVMActivity
 	}
 	results := make(chan nodeResult, len(nodeVMs))
 
 	for nodeID := range nodeVMs {
 		go func(nid string) {
 			nr := nodeResult{nodeID: nid, activity: make(map[string]*node.TapegunVMActivity)}
-			n, err := h.db.GetNode(nid)
-			if err != nil || n.APIAddr == "" {
+			n := h.state.GetNode(nid)
+			if n == nil || n.APIAddr == "" {
 				results <- nr
 				return
 			}
@@ -1519,17 +1301,15 @@ func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) 
 		}(nodeID)
 	}
 
-	// Collect
 	activityByNode := make(map[string]map[string]*node.TapegunVMActivity)
 	for range nodeVMs {
 		nr := <-results
 		activityByNode[nr.nodeID] = nr.activity
 	}
 
-	// Build response
 	var entries []tapegunActivityEntry
 	for _, v := range vms {
-		n, _ := h.db.GetNode(v.NodeID)
+		n := h.state.GetNode(v.NodeID)
 		nodeName := v.NodeID
 		if n != nil {
 			nodeName = n.TailscaleName
@@ -1562,14 +1342,14 @@ func (h *Handler) handleTapegunVMActivity(w http.ResponseWriter, r *http.Request
 		name = extractName(r.URL.Path, "/api/tapegun/activity/")
 	}
 
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
 
-	n, err := h.db.GetNode(v.NodeID)
-	if err != nil || n.APIAddr == "" {
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
 	}
@@ -1595,7 +1375,6 @@ func (h *Handler) handleTapegunVMActivity(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// VM exists but no activity data yet
 	nodeName := v.NodeID
 	if n != nil {
 		nodeName = n.TailscaleName
@@ -1626,15 +1405,14 @@ func (h *Handler) handleTapegunMessage(w http.ResponseWriter, r *http.Request) {
 		msg.CreatedAt = time.Now().Format(time.RFC3339)
 	}
 
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
 
-	n, err := h.db.GetNode(v.NodeID)
-	if err != nil || n.APIAddr == "" {
-		// Node unreachable — queue for retry (VM may be migrating)
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
 		h.queueMessage(name, msg)
 		w.WriteHeader(http.StatusAccepted)
 		writeJSON(w, map[string]string{"status": "queued", "message_id": msg.ID, "reason": "node unavailable"})
@@ -1643,7 +1421,6 @@ func (h *Handler) handleTapegunMessage(w http.ResponseWriter, r *http.Request) {
 
 	nc := node.NewClient(n.APIAddr)
 	if err := nc.SendTapegunMessage(name, &msg); err != nil {
-		// Delivery failed — queue for retry (VM may be migrating between nodes)
 		h.queueMessage(name, msg)
 		w.WriteHeader(http.StatusAccepted)
 		writeJSON(w, map[string]string{"status": "queued", "message_id": msg.ID, "reason": "delivery failed, will retry"})
@@ -1660,7 +1437,7 @@ func (h *Handler) handleTapegunBroadcast(w http.ResponseWriter, r *http.Request)
 		From     string `json:"from"`
 		Priority string `json:"priority"`
 		SendKeys bool   `json:"send_keys,omitempty"`
-		Filter   string `json:"filter,omitempty"` // optional: "running", "stopped"
+		Filter   string `json:"filter,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -1674,11 +1451,7 @@ func (h *Handler) handleTapegunBroadcast(w http.ResponseWriter, r *http.Request)
 		req.Priority = "normal"
 	}
 
-	vms, err := h.db.ListVMs()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	vms := h.state.ListVMs()
 
 	var sent []string
 	var failed []string
@@ -1688,8 +1461,8 @@ func (h *Handler) handleTapegunBroadcast(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 
-		n, err := h.db.GetNode(v.NodeID)
-		if err != nil || n.APIAddr == "" {
+		n := h.state.GetNode(v.NodeID)
+		if n == nil || n.APIAddr == "" {
 			failed = append(failed, v.Name)
 			continue
 		}
@@ -1731,14 +1504,14 @@ func (h *Handler) handleVMExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
 
-	n, err := h.db.GetNode(v.NodeID)
-	if err != nil || n.APIAddr == "" {
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
 	}
@@ -1761,13 +1534,13 @@ func (h *Handler) handleVMCopyTo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
-	n, err := h.db.GetNode(v.NodeID)
-	if err != nil || n.APIAddr == "" {
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
 	}
@@ -1788,13 +1561,13 @@ func (h *Handler) handleVMCopyFrom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
-	n, err := h.db.GetNode(v.NodeID)
-	if err != nil || n.APIAddr == "" {
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
 	}
@@ -1814,14 +1587,14 @@ func (h *Handler) handleVMLocation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v, err := h.db.GetVM(name)
-	if err != nil {
+	v := h.state.GetVM(name)
+	if v == nil {
 		http.Error(w, "vm not found", http.StatusNotFound)
 		return
 	}
 
-	n, err := h.db.GetNode(v.NodeID)
-	if err != nil || n.APIAddr == "" {
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
 		http.Error(w, "node not available", http.StatusServiceUnavailable)
 		return
 	}
@@ -1837,7 +1610,6 @@ func (h *Handler) handleVMLocation(w http.ResponseWriter, r *http.Request) {
 
 const messageQueueTTL = 30 * time.Minute
 
-// queueMessage adds a message to the retry queue for later delivery.
 func (h *Handler) queueMessage(vmName string, msg node.TapegunMessage) {
 	h.msgQueueMu.Lock()
 	defer h.msgQueueMu.Unlock()
@@ -1849,8 +1621,6 @@ func (h *Handler) queueMessage(vmName string, msg node.TapegunMessage) {
 	log.Printf("tapegun: queued message %s for VM %s (queue size: %d)", msg.ID, vmName, len(h.msgQueue))
 }
 
-// messageDeliveryLoop periodically attempts to deliver queued messages
-// and expires messages older than the TTL.
 func (h *Handler) messageDeliveryLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -1862,7 +1632,6 @@ func (h *Handler) messageDeliveryLoop() {
 			continue
 		}
 
-		// Copy queue and clear — we'll re-queue failures
 		pending := make([]queuedMessage, len(h.msgQueue))
 		copy(pending, h.msgQueue)
 		h.msgQueue = h.msgQueue[:0]
@@ -1870,21 +1639,19 @@ func (h *Handler) messageDeliveryLoop() {
 
 		var requeue []queuedMessage
 		for _, qm := range pending {
-			// Expire old messages
 			if time.Since(qm.queuedAt) > messageQueueTTL {
 				log.Printf("tapegun: expired queued message %s for VM %s (age: %s)",
 					qm.msg.ID, qm.vmName, time.Since(qm.queuedAt).Round(time.Second))
 				continue
 			}
 
-			// Try to deliver
-			v, err := h.db.GetVM(qm.vmName)
-			if err != nil {
+			v := h.state.GetVM(qm.vmName)
+			if v == nil {
 				requeue = append(requeue, qm)
 				continue
 			}
-			n, err := h.db.GetNode(v.NodeID)
-			if err != nil || n.APIAddr == "" {
+			n := h.state.GetNode(v.NodeID)
+			if n == nil || n.APIAddr == "" {
 				requeue = append(requeue, qm)
 				continue
 			}
