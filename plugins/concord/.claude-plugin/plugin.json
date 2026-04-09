@@ -1,0 +1,8 @@
+{
+  "name": "concord",
+  "description": "Run Concord workflows on Boxcutter VMs. Creates ephemeral worker VMs, deploys tasks via cp-to, executes steps via exec, and retrieves results via cp-from. No direct VM-to-VM networking required — all communication is mediated through the Boxcutter orchestrator.",
+  "author": {
+    "name": "Andrew Budd",
+    "email": "andrewbudd@github.com"
+  }
+}
