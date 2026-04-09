@@ -471,6 +471,49 @@ check_ci_status() {
     fi
 }
 
+# --- Token usage metrics state ---
+METRICS_POLL_COUNTER=0
+
+# --- Token usage collection ---
+# Reads the active Claude Code session JSONL and computes token totals.
+# Posts to metadata service every 5 minutes (every 60th poll cycle).
+compute_token_usage() {
+    local project_dir="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
+    [ ! -d "$project_dir" ] && return
+
+    # Find the session dir matching the project path
+    local safe_path
+    safe_path=$(echo "$project_dir" | sed 's|/|-|g; s|^-||')
+    local session_dir="${HOME}/.claude/projects/${safe_path}"
+    [ ! -d "$session_dir" ] && return
+
+    # Find the most recent session file
+    local session_file
+    session_file=$(ls -t "$session_dir"/*.jsonl 2>/dev/null | head -1)
+    [ -z "$session_file" ] && return
+
+    # Compute totals with jq
+    local stats
+    stats=$(jq -s '
+        [.[] | select(.type=="assistant" and .message.usage)] |
+        {
+            api_calls: length,
+            input_tokens: ([.[].message.usage.input_tokens // 0] | add),
+            cache_read_tokens: ([.[].message.usage.cache_read_input_tokens // 0] | add),
+            cache_create_tokens: ([.[].message.usage.cache_creation_input_tokens // 0] | add),
+            output_tokens: ([.[].message.usage.output_tokens // 0] | add),
+            model: (if length > 0 then .[0].message.model // "unknown" else "unknown" end)
+        }
+    ' "$session_file" 2>/dev/null)
+    [ -z "$stats" ] && return
+
+    # POST to metadata service
+    curl -sf -X POST "${METADATA}/tapegun/metrics" \
+        -H "Content-Type: application/json" \
+        -d "$stats" \
+        --max-time 5 2>/dev/null || true
+}
+
 while true; do
     # --- Post health ---
     HEALTH_PAYLOAD=$(run_health_checks)
@@ -544,6 +587,12 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
     CI_POLL_COUNTER=$((CI_POLL_COUNTER + 1))
     if [ $((CI_POLL_COUNTER % 6)) -eq 0 ] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
         check_ci_status
+    fi
+
+    # --- Token usage metrics (every 5min = every 60th cycle) ---
+    METRICS_POLL_COUNTER=$((METRICS_POLL_COUNTER + 1))
+    if [ $((METRICS_POLL_COUNTER % 60)) -eq 0 ] && command -v jq >/dev/null 2>&1; then
+        compute_token_usage
     fi
 
     # --- Crash detection & auto-restart ---

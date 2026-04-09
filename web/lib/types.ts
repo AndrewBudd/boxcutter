@@ -41,6 +41,19 @@ export interface Node {
   last_heartbeat: string
 }
 
+export interface VMMetrics {
+  name: string
+  team?: string
+  api_calls: number
+  input_tokens: number
+  cache_read_tokens: number
+  cache_create_tokens: number
+  output_tokens: number
+  model: string
+  estimated_cost_usd: number
+  last_updated?: string
+}
+
 export interface AlertEvent {
   timestamp: string
   name: string

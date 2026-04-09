@@ -903,6 +903,7 @@ Subcommands:
   export <name>       Export running team as YAML
   destroy <name>      Destroy all VMs for a team
   list                List active teams
+  metrics <name>      Show token usage and cost per agent
   status <name>       Show status of team VMs`)
 		return 1
 	}
@@ -918,6 +919,8 @@ Subcommands:
 		return h.teamDestroy(args[1:])
 	case "list":
 		return h.teamList(args[1:])
+	case "metrics":
+		return h.teamMetrics(args[1:])
 	case "status":
 		return h.teamStatus(args[1:])
 	default:
@@ -1538,6 +1541,109 @@ func (h *Handler) teamList(_ []string) int {
 	return 0
 }
 
+func (h *Handler) teamMetrics(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team metrics <team-name>\n")
+		return 1
+	}
+	teamName := args[0]
+
+	// Fetch metrics
+	resp, err := h.get("/api/metrics")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error fetching metrics: %v\n", err)
+		return 1
+	}
+
+	var allMetrics []map[string]interface{}
+	json.Unmarshal(resp, &allMetrics)
+
+	// Filter to this team
+	prefix := teamName + "-"
+	var teamMetrics []map[string]interface{}
+	var totalCost float64
+	var totalOutput int
+	for _, m := range allMetrics {
+		name, _ := m["name"].(string)
+		if strings.HasPrefix(name, prefix) {
+			teamMetrics = append(teamMetrics, m)
+			if cost, ok := m["estimated_cost_usd"].(float64); ok {
+				totalCost += cost
+			}
+			if out, ok := m["output_tokens"].(float64); ok {
+				totalOutput += int(out)
+			}
+		}
+	}
+
+	// Also fetch activity for utilization info
+	actResp, _ := h.get("/api/tapegun/activity")
+	actByName := make(map[string]string)
+	if actResp != nil {
+		var acts []map[string]interface{}
+		json.Unmarshal(actResp, &acts)
+		for _, a := range acts {
+			name, _ := a["name"].(string)
+			status := "unknown"
+			if act, ok := a["activity"].(map[string]interface{}); ok {
+				if s, ok := act["status"].(string); ok {
+					status = s
+				}
+			}
+			actByName[name] = status
+		}
+	}
+
+	fmt.Printf("Team: %s | Cost: $%.2f | Output tokens: %s\n\n",
+		teamName, totalCost, formatTokens(totalOutput))
+
+	fmt.Printf("%-30s  %-8s  %-10s  %-12s  %-8s  %s\n",
+		"AGENT", "STATUS", "API CALLS", "TOKENS(OUT)", "COST", "MODEL")
+
+	if len(teamMetrics) == 0 {
+		// No metrics yet — show VMs from activity data
+		for name, status := range actByName {
+			if strings.HasPrefix(name, prefix) {
+				fmt.Printf("%-30s  %-8s  %-10s  %-12s  %-8s  %s\n",
+					name, status, "-", "-", "-", "-")
+			}
+		}
+		if totalOutput == 0 {
+			fmt.Println("\nNo token metrics collected yet. Metrics update every 5 minutes.")
+		}
+	} else {
+		for _, m := range teamMetrics {
+			name, _ := m["name"].(string)
+			apiCalls, _ := m["api_calls"].(float64)
+			outTokens, _ := m["output_tokens"].(float64)
+			cost, _ := m["estimated_cost_usd"].(float64)
+			model, _ := m["model"].(string)
+			status := actByName[name]
+			if status == "" {
+				status = "unknown"
+			}
+			if model == "" {
+				model = "-"
+			}
+
+			fmt.Printf("%-30s  %-8s  %-10.0f  %-12s  $%-7.2f  %s\n",
+				name, status, apiCalls, formatTokens(int(outTokens)), cost, model)
+		}
+	}
+
+	return 0
+}
+
+func formatTokens(n int) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	}
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1e3)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
 func (h *Handler) teamStatus(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team status <team-name>\n")
@@ -1648,6 +1754,7 @@ Commands:
   team export <name>      Export running team as YAML
   team destroy <name>     Destroy all VMs for a team
   team list               List active teams
+  team metrics <name>     Show token usage and cost per agent
   team status <name>      Show status of team VMs
   help                    Show this help
 
