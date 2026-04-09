@@ -132,6 +132,11 @@ if [ "$VM_TYPE" = "node" ]; then
   cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun" "${TOOLS_STAGE}/bin/boxcutter-tapegun"
   chmod 755 "${TOOLS_STAGE}/bin/boxcutter-tapegun"
   cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun.service" "${TOOLS_STAGE}/etc/systemd/boxcutter-tapegun.service"
+  if [ -d "${REPO_DIR}/plugins/tapegun-guest" ]; then
+    mkdir -p "${TOOLS_STAGE}/plugins"
+    cp -r "${REPO_DIR}/plugins/tapegun-guest" "${TOOLS_STAGE}/plugins/tapegun-guest"
+    echo "  tapegun-guest plugin included"
+  fi
   mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp gzip -quiet
   echo "  tools.img: $(du -h "${BUILD_DIR}/tools.img" | cut -f1)"
 else
