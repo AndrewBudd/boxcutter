@@ -88,17 +88,18 @@ type ProgressFunc func(phase, message string)
 
 // CreateRequest is the API input for creating a VM.
 type CreateRequest struct {
-	Name             string   `json:"name"`
-	Type             string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
-	Description      string   `json:"description,omitempty"` // user-provided description
-	VCPU             int      `json:"vcpu,omitempty"`
-	RAMMIB           int      `json:"ram_mib,omitempty"`
-	Disk             string   `json:"disk,omitempty"`
-	CloneURL         string   `json:"clone_url,omitempty"`
-	CloneURLs        []string `json:"clone_urls,omitempty"`
-	Mode             string   `json:"mode,omitempty"`
-	AuthorizedKeys   []string `json:"authorized_keys,omitempty"`
-	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
+	Name             string          `json:"name"`
+	Type             string          `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
+	Description      string          `json:"description,omitempty"` // user-provided description
+	VCPU             int             `json:"vcpu,omitempty"`
+	RAMMIB           int             `json:"ram_mib,omitempty"`
+	Disk             string          `json:"disk,omitempty"`
+	CloneURL         string          `json:"clone_url,omitempty"`
+	CloneURLs        []string        `json:"clone_urls,omitempty"`
+	Mode             string          `json:"mode,omitempty"`
+	AuthorizedKeys   []string        `json:"authorized_keys,omitempty"`
+	TailscaleAuthkey string          `json:"tailscale_authkey,omitempty"`
+	AgentConfig      json.RawMessage `json:"agent_config,omitempty"`
 
 	progressFn ProgressFunc `json:"-"`
 }
@@ -229,6 +230,7 @@ func (m *Manager) createSetup(req *CreateRequest) (*VMState, error) {
 			GitHubRepos:      githubRepos,
 			GoldenVer:        goldenVer,
 			TailscaleAuthkey: req.TailscaleAuthkey,
+			AgentConfig:      req.AgentConfig,
 		}
 		if err := SaveVMState(vmDir, st); err != nil {
 			os.RemoveAll(vmDir)
@@ -407,6 +409,7 @@ func (m *Manager) postStartVM(st *VMState, resp *CreateResponse, progress Progre
 			Mode:        st.Mode,
 			GitHubRepo:  st.GitHubRepo,
 			GitHubRepos: st.AllGitHubRepos(),
+			AgentConfig: st.AgentConfig,
 		})
 	}
 
@@ -1375,6 +1378,7 @@ func (m *Manager) registerWithVMID(st *VMState) {
 		Mode:        st.Mode,
 		GitHubRepo:  st.GitHubRepo,
 		GitHubRepos: st.AllGitHubRepos(),
+		AgentConfig: st.AgentConfig,
 	})
 }
 
@@ -1400,6 +1404,7 @@ func (m *Manager) EnsureVMIDRegistered(name string) error {
 		Mode:        st.Mode,
 		GitHubRepo:  st.GitHubRepo,
 		GitHubRepos: st.AllGitHubRepos(),
+		AgentConfig: st.AgentConfig,
 	})
 }
 
@@ -3356,6 +3361,7 @@ func (m *Manager) FinalizeMigration(name string) error {
 			Mode:        st.Mode,
 			GitHubRepo:  st.GitHubRepo,
 			GitHubRepos: st.AllGitHubRepos(),
+			AgentConfig: st.AgentConfig,
 		})
 		log.Printf("FinalizeMigration: registered %s with vmid (mark=%d)", name, st.Mark)
 	}
@@ -3497,6 +3503,7 @@ func (m *Manager) ImportQEMUState(name, statePath string) (*CreateResponse, erro
 			Mode:        st.Mode,
 			GitHubRepo:  st.GitHubRepo,
 			GitHubRepos: st.AllGitHubRepos(),
+			AgentConfig: st.AgentConfig,
 		})
 		// Import mailbox after registration
 		m.importMailboxFromFile(st.Name, VMDir(st.Name))
@@ -3733,6 +3740,7 @@ func (m *Manager) ImportSnapshot(st *VMState) (*CreateResponse, error) {
 			Mode:        st.Mode,
 			GitHubRepo:  st.GitHubRepo,
 			GitHubRepos: st.AllGitHubRepos(),
+			AgentConfig: st.AgentConfig,
 		})
 		// Import mailbox after registration
 		m.importMailboxFromFile(st.Name, VMDir(st.Name))
