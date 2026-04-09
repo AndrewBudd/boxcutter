@@ -307,13 +307,16 @@ EOSETTINGS
 
         # Install tapegun-guest plugin so inbox, stop notifications, and
         # status reporting hooks are active in the Claude Code session.
+        # Prefer tools.img copy (updated without golden rebuild) over baked-in copy.
+        PLUGIN_SRC="/opt/boxcutter/tools/plugins/tapegun-guest"
         PLUGIN_DIR="$HOME/.claude/plugins/tapegun-guest"
-        if [ -d "$PLUGIN_DIR" ]; then
-            tmux send-keys -t main "claude plugin install $PLUGIN_DIR 2>/dev/null" Enter
-            sleep 2
-            echo "tapegun: installed tapegun-guest plugin"
-        else
-            echo "tapegun: WARNING: plugin not found at $PLUGIN_DIR"
+        if [ -d "$PLUGIN_SRC" ]; then
+            mkdir -p "$HOME/.claude/plugins"
+            rm -rf "$PLUGIN_DIR"
+            cp -r "$PLUGIN_SRC" "$PLUGIN_DIR"
+            echo "tapegun: installed tapegun-guest plugin from tools.img"
+        elif [ ! -d "$PLUGIN_DIR" ]; then
+            echo "tapegun: WARNING: plugin not found at $PLUGIN_SRC or $PLUGIN_DIR"
         fi
 
         # Start Claude Code

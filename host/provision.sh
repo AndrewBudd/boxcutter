@@ -153,6 +153,11 @@ build_node() {
   cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun" "${TOOLS_STAGE}/bin/boxcutter-tapegun"
   chmod 755 "${TOOLS_STAGE}/bin/boxcutter-tapegun"
   cp "${REPO_DIR}/node/golden/config/boxcutter-tapegun.service" "${TOOLS_STAGE}/etc/systemd/boxcutter-tapegun.service"
+  # Include tapegun-guest plugin so updates ship via tools.img (no golden rebuild)
+  if [ -d "${REPO_DIR}/plugins/tapegun-guest" ]; then
+    mkdir -p "${TOOLS_STAGE}/plugins"
+    cp -r "${REPO_DIR}/plugins/tapegun-guest" "${TOOLS_STAGE}/plugins/tapegun-guest"
+  fi
   mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp gzip -quiet
   echo "  tools.img: $(du -h "${BUILD_DIR}/tools.img" | cut -f1)"
 
