@@ -157,6 +157,15 @@ else
   echo "  vmid config: GitHub App disabled"
 fi
 
+# Append Claude Code credentials path if the secret exists
+if [ -f "${SECRETS_DIR}/claude-credentials.json" ]; then
+  # Insert into the metadata: section (before the blank line after ca_cert_path)
+  sed -i "/ca_cert_path:/a\\  claude_credentials_path: ${SECRETS_DIR}/claude-credentials.json" "$VMID_CONFIG"
+  echo "  vmid config: Claude Code credentials enabled"
+else
+  echo "  vmid config: Claude Code credentials not found (skipping)"
+fi
+
 # --- Cluster SSH key: inter-node SSH for migration ---
 
 if [ -f "${SECRETS_DIR}/cluster-ssh.key" ]; then

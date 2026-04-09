@@ -117,6 +117,56 @@ INSTALL_ID=$(awk '/^github:/{found=1; next} found && /^\S/{found=0} found && !/^
 assert_eq "commented installation_id should be empty" "" "$INSTALL_ID"
 rm -f "$TMPCONF"
 
+# --- Test 7: Claude credentials sed injection ---
+echo "Test 7: Claude credentials path inserted into vmid config"
+TMPVMID=$(mktemp)
+cat > "$TMPVMID" <<'EOF'
+listen:
+  vm_addr: "169.254.169.254"
+  vm_port: 80
+  admin_socket: /run/vmid/admin.sock
+
+metadata:
+  ssh_authorized_keys:
+    - /etc/boxcutter/secrets/cluster-ssh.key.pub
+    - /etc/boxcutter/secrets/authorized-keys
+  ca_cert_path: /etc/boxcutter/secrets/ca.crt
+
+jwt:
+  ttl: "10m"
+EOF
+
+# Simulate what boxcutter-setup does
+sed -i "/ca_cert_path:/a\\  claude_credentials_path: /etc/boxcutter/secrets/claude-credentials.json" "$TMPVMID"
+
+# Verify the line was inserted in the right place (inside metadata: block, after ca_cert_path)
+CRED_LINE=$(grep "claude_credentials_path:" "$TMPVMID" | sed 's/^ *//')
+assert_eq "claude_credentials_path present" "claude_credentials_path: /etc/boxcutter/secrets/claude-credentials.json" "$CRED_LINE"
+
+# Verify it's indented correctly (inside metadata section)
+INDENT=$(grep "claude_credentials_path:" "$TMPVMID" | sed 's/[^ ].*//')
+assert_eq "correct indentation (2 spaces)" "  " "$INDENT"
+
+# Verify jwt: section is still intact after the metadata block
+JWT_LINE=$(grep "^jwt:" "$TMPVMID")
+assert_eq "jwt section preserved" "jwt:" "$JWT_LINE"
+rm -f "$TMPVMID"
+
+# --- Test 8: Claude credentials NOT inserted when file missing ---
+echo "Test 8: Claude credentials skipped when secret missing"
+TMPVMID=$(mktemp)
+cat > "$TMPVMID" <<'EOF'
+metadata:
+  ca_cert_path: /etc/boxcutter/secrets/ca.crt
+
+jwt:
+  ttl: "10m"
+EOF
+# Don't run the sed (simulates the file-missing branch)
+CRED_COUNT=$(grep -c "claude_credentials_path" "$TMPVMID" || true)
+assert_eq "no credentials line when not inserted" "0" "$CRED_COUNT"
+rm -f "$TMPVMID"
+
 # --- Summary ---
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

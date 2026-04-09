@@ -56,3 +56,15 @@ if curl -sf "${METADATA}/metadata/boxcutter-ssh-key" > /tmp/boxcutter-vm-ssh.key
 else
   echo "metadata: VM SSH key not available (skipping)"
 fi
+
+# Fetch Claude Code credentials (OAuth refresh token)
+if curl -sf "${METADATA}/metadata/claude-credentials" > /tmp/claude-credentials.json 2>/dev/null; then
+  mkdir -p /home/dev/.claude
+  mv /tmp/claude-credentials.json /home/dev/.claude/.credentials.json
+  chown -R 1000:1000 /home/dev/.claude
+  chmod 700 /home/dev/.claude
+  chmod 600 /home/dev/.claude/.credentials.json
+  echo "metadata: Claude Code credentials installed"
+else
+  echo "metadata: Claude Code credentials not available (skipping)"
+fi
