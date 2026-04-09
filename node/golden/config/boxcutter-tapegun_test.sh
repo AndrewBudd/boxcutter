@@ -148,6 +148,26 @@ EXISTING=$(cat "$SETTINGS_FILE" | grep -o '"existing"' | head -1)
 assert_eq "Existing settings.json not overwritten" '"existing"' "$EXISTING"
 
 echo ""
+echo "=== Test 6: send_keys no_enter jq parsing ==="
+
+# Test that jq correctly extracts no_enter field
+MSG_WITH_ENTER='[{"body":"echo hello","send_keys":true,"no_enter":false}]'
+NO_ENTER_VAL=$(echo "$MSG_WITH_ENTER" | jq -c '.[] | select(.send_keys == true)' | jq -r '.no_enter // false')
+assert_eq "no_enter=false parsed correctly" "false" "$NO_ENTER_VAL"
+
+MSG_NO_ENTER='[{"body":"partial text","send_keys":true,"no_enter":true}]'
+NO_ENTER_VAL2=$(echo "$MSG_NO_ENTER" | jq -c '.[] | select(.send_keys == true)' | jq -r '.no_enter // false')
+assert_eq "no_enter=true parsed correctly" "true" "$NO_ENTER_VAL2"
+
+MSG_MISSING='[{"body":"echo hi","send_keys":true}]'
+NO_ENTER_VAL3=$(echo "$MSG_MISSING" | jq -c '.[] | select(.send_keys == true)' | jq -r '.no_enter // false')
+assert_eq "missing no_enter defaults to false" "false" "$NO_ENTER_VAL3"
+
+# Test body extraction
+BODY=$(echo "$MSG_WITH_ENTER" | jq -c '.[] | select(.send_keys == true)' | jq -r '.body')
+assert_eq "body extracted correctly" "echo hello" "$BODY"
+
+echo ""
 echo "=== Results ==="
 echo "Passed: $PASS"
 echo "Failed: $FAIL"

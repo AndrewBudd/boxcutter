@@ -236,11 +236,19 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
         fi
         chmod 644 "$INBOX_FILE"
 
-        # Inject send_keys messages into tmux
+        # Inject send_keys messages into tmux.
+        # By default, Enter is sent after the text (auto-submit).
+        # Messages with no_enter=true paste text without pressing Enter.
         if command -v jq >/dev/null 2>&1 && $TMUX_CMD has-session 2>/dev/null; then
-            echo "$MSGS" | jq -r '.[] | select(.send_keys == true or .priority == "urgent") | .body' | while IFS= read -r line; do
+            echo "$MSGS" | jq -c '.[] | select(.send_keys == true or .priority == "urgent")' | while IFS= read -r msg_obj; do
+                line=$(echo "$msg_obj" | jq -r '.body')
+                no_enter=$(echo "$msg_obj" | jq -r '.no_enter // false')
                 if [ -n "$line" ]; then
-                    $TMUX_CMD send-keys -t 0 "$line" Enter
+                    if [ "$no_enter" = "true" ]; then
+                        $TMUX_CMD send-keys -t 0 "$line"
+                    else
+                        $TMUX_CMD send-keys -t 0 "$line" Enter
+                    fi
                 fi
             done
         fi

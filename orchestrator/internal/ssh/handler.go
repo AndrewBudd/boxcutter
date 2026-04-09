@@ -919,8 +919,8 @@ Commands:
   tapegun activity [name] Monitor VM activity (all or specific)
   tapegun send <name> <msg>
                           Send a message to a VM's inbox
-  tapegun sendkeys <name> <cmd>
-                          Inject a command into a VM's tmux pane
+  tapegun sendkeys [--no-enter] <name> <cmd>
+                          Inject a command into a VM's tmux pane (auto-submits with Enter)
   tapegun broadcast <msg> Broadcast to all running VMs
   exec <name> <cmd>       Run a command on a VM
   cp-to <name> <src> <dst>
@@ -1078,11 +1078,22 @@ Usage: ssh <host> tapegun <command> [args]
 
 	case "sendkeys":
 		if len(args) < 3 {
-			fmt.Println("Usage: ssh <host> tapegun sendkeys <vm-name> <command>")
+			fmt.Println("Usage: ssh <host> tapegun sendkeys [--no-enter] <vm-name> <command>")
 			return 1
 		}
-		msg := strings.Join(args[2:], " ")
-		return h.tapegunSend(args[1], msg, true)
+		// Parse --no-enter flag
+		noEnter := false
+		sendkeysArgs := args[1:]
+		if len(sendkeysArgs) > 0 && sendkeysArgs[0] == "--no-enter" {
+			noEnter = true
+			sendkeysArgs = sendkeysArgs[1:]
+		}
+		if len(sendkeysArgs) < 2 {
+			fmt.Println("Usage: ssh <host> tapegun sendkeys [--no-enter] <vm-name> <command>")
+			return 1
+		}
+		msg := strings.Join(sendkeysArgs[1:], " ")
+		return h.tapegunSend(sendkeysArgs[0], msg, true, noEnter)
 
 	case "broadcast":
 		if len(args) < 2 {
@@ -1234,12 +1245,15 @@ func (h *Handler) tapegunWait(name string) int {
 	}
 }
 
-func (h *Handler) tapegunSend(name, body string, sendKeys bool) int {
+func (h *Handler) tapegunSend(name, body string, sendKeys bool, noEnter ...bool) int {
 	msg := map[string]interface{}{
 		"body":      body,
 		"from":      "ssh-user",
 		"priority":  "normal",
 		"send_keys": sendKeys,
+	}
+	if len(noEnter) > 0 && noEnter[0] {
+		msg["no_enter"] = true
 	}
 
 	resp, err := h.post("/api/tapegun/message/"+name, msg)
