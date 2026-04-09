@@ -60,7 +60,7 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
-// Conn returns the underlying *sql.DB for use by other packages.
+// Conn returns the underlying *sql.DB for use by other packages (e.g., queue).
 func (db *DB) Conn() *sql.DB {
 	return db.conn
 }
@@ -77,6 +77,25 @@ func (db *DB) migrate() error {
 		github_user TEXT NOT NULL,
 		public_key TEXT NOT NULL UNIQUE,
 		added_at TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS work_queue (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		source TEXT NOT NULL DEFAULT 'github',
+		source_ref TEXT NOT NULL UNIQUE,
+		title TEXT NOT NULL,
+		body TEXT NOT NULL DEFAULT '',
+		priority INTEGER NOT NULL DEFAULT 0,
+		labels TEXT NOT NULL DEFAULT '',
+		team TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'queued',
+		assigned_to TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		assigned_at TEXT NOT NULL DEFAULT '',
+		completed_at TEXT NOT NULL DEFAULT '',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		max_attempts INTEGER NOT NULL DEFAULT 3
 	);
 	`
 

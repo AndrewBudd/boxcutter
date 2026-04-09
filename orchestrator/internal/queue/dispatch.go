@@ -4,79 +4,80 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/AndrewBudd/boxcutter/orchestrator/internal/node"
+	"github.com/AndrewBudd/boxcutter/orchestrator/internal/state"
 )
 
-// IdleWorker represents a VM that is idle and available for work.
-type IdleWorker struct {
-	Name   string
-	NodeID string
-	Team   string
-}
-
-// IdleWorkerFn is a callback that returns the currently idle workers.
-type IdleWorkerFn func() []IdleWorker
-
-// AssignFn is a callback that delivers a work assignment to a VM via tapegun inbox.
-type AssignFn func(vmName string, messageBody string) error
-
-// Dispatcher runs the queue dispatch and GitHub sync loops.
+// Dispatcher runs background loops that sync GitHub issues, assign work to
+// idle workers, detect timeouts, and check for completions.
 type Dispatcher struct {
-	queue       *Queue
-	getIdle     IdleWorkerFn
-	assignToVM  AssignFn
-	stopCh      chan struct{}
+	queue  *Queue
+	state  *state.Store
+	repo   string
+	label  string
+	stopCh chan struct{}
 }
 
-// NewDispatcher creates a dispatcher wired to the queue and callback functions.
-func NewDispatcher(q *Queue, getIdle IdleWorkerFn, assign AssignFn) *Dispatcher {
+// NewDispatcher creates a Dispatcher. Call Start() to begin background loops.
+func NewDispatcher(q *Queue, st *state.Store, repo, label string) *Dispatcher {
 	return &Dispatcher{
-		queue:      q,
-		getIdle:    getIdle,
-		assignToVM: assign,
-		stopCh:     make(chan struct{}),
+		queue:  q,
+		state:  st,
+		repo:   repo,
+		label:  label,
+		stopCh: make(chan struct{}),
 	}
 }
 
-// Start launches the background sync and dispatch loops.
+// Queue returns the underlying Queue for direct access (API handlers).
+func (d *Dispatcher) Queue() *Queue {
+	return d.queue
+}
+
+// Start launches the four background loops.
 func (d *Dispatcher) Start() {
 	go d.syncLoop()
 	go d.assignLoop()
 	go d.timeoutLoop()
 	go d.completionLoop()
-	log.Printf("queue: dispatcher started (sync=%s, assign=%s, timeout=%dm)",
-		d.queue.cfg.PollInterval, d.queue.cfg.AssignInterval, d.queue.cfg.TimeoutMinutes)
 }
 
-// Stop signals the dispatcher to stop.
+// Stop signals all loops to exit.
 func (d *Dispatcher) Stop() {
 	close(d.stopCh)
 }
 
-// syncLoop periodically fetches new GitHub issues.
+// syncLoop periodically fetches labeled GitHub issues and enqueues new ones.
 func (d *Dispatcher) syncLoop() {
 	// Initial sync on startup
-	d.queue.SyncGitHubIssues()
+	if n, err := SyncFromGitHub(d.queue, d.repo, d.label); err == nil && n > 0 {
+		log.Printf("Work queue: synced %d new issues from GitHub", n)
+	}
 
-	ticker := time.NewTicker(d.queue.cfg.PollInterval)
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-d.stopCh:
 			return
 		case <-ticker.C:
-			if _, err := d.queue.SyncGitHubIssues(); err != nil {
-				log.Printf("queue: sync error: %v", err)
+			n, err := SyncFromGitHub(d.queue, d.repo, d.label)
+			if err != nil {
+				log.Printf("Work queue sync error: %v", err)
+				continue
+			}
+			if n > 0 {
+				log.Printf("Work queue: synced %d new issues from GitHub", n)
 			}
 		}
 	}
 }
 
-// assignLoop checks for idle workers and assigns queued items to them.
+// assignLoop checks for idle workers and assigns the highest-priority queued item.
 func (d *Dispatcher) assignLoop() {
-	ticker := time.NewTicker(d.queue.cfg.AssignInterval)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-d.stopCh:
@@ -88,62 +89,114 @@ func (d *Dispatcher) assignLoop() {
 }
 
 func (d *Dispatcher) tryAssign() {
-	idleWorkers := d.getIdle()
-	if len(idleWorkers) == 0 {
+	queued, err := d.queue.ListByStatus(StatusQueued)
+	if err != nil || len(queued) == 0 {
 		return
 	}
 
-	for _, worker := range idleWorkers {
-		// Skip if this worker already has an assigned task
-		if existing := d.queue.AssignedTo(worker.Name); existing != nil {
+	// Find an idle worker
+	idle := d.findIdleWorker()
+	if idle == "" {
+		return
+	}
+
+	item := queued[0] // highest priority
+	if err := d.queue.Assign(item.ID, idle); err != nil {
+		log.Printf("Work queue: assign %d to %s failed: %v", item.ID, idle, err)
+		return
+	}
+
+	// Deliver assignment via tapegun inbox
+	d.sendAssignment(idle, item)
+	log.Printf("Work queue: assigned %s (%s) to %s", item.SourceRef, item.Title, idle)
+}
+
+// findIdleWorker returns the name of an idle worker VM, or "" if none.
+func (d *Dispatcher) findIdleWorker() string {
+	vms := d.state.ListVMs()
+	for _, vm := range vms {
+		if vm.Status != "running" {
 			continue
 		}
-
-		item := d.queue.NextQueued(worker.Team)
-		if item == nil {
-			return // no more work
-		}
-
-		if err := d.queue.Assign(item.ID, worker.Name); err != nil {
-			log.Printf("queue: assign error: %v", err)
+		n := d.state.GetNode(vm.NodeID)
+		if n == nil || n.APIAddr == "" {
 			continue
 		}
-
-		msg := FormatAssignmentMessage(item)
-		if err := d.assignToVM(worker.Name, msg); err != nil {
-			log.Printf("queue: failed to deliver assignment to %s: %v", worker.Name, err)
-			// Re-enqueue on delivery failure
-			d.queue.Reassign(item.ID)
-			continue
+		fc := node.NewFastClient(n.APIAddr)
+		acts := fc.GetAllActivity()
+		for _, act := range acts {
+			if act.VMID == vm.Name && act.LastActivity != nil &&
+				act.LastActivity.Status == "idle" && act.PendingMessages == 0 {
+				return vm.Name
+			}
 		}
+	}
+	return ""
+}
 
-		log.Printf("queue: assigned %s (%s) to %s", item.SourceRef, item.Title, worker.Name)
+// sendAssignment delivers a work assignment to a VM via tapegun inbox.
+func (d *Dispatcher) sendAssignment(vmName string, item *WorkItem) {
+	vm := d.state.GetVM(vmName)
+	if vm == nil {
+		return
+	}
+	n := d.state.GetNode(vm.NodeID)
+	if n == nil || n.APIAddr == "" {
+		return
+	}
+
+	body := fmt.Sprintf("TASK ASSIGNMENT\nIssue: %s\nTitle: %s\nPriority: %d\n\n%s\n\nPlease work on this issue. When done, create a PR and close the issue.",
+		item.SourceRef, item.Title, item.Priority, item.Body)
+
+	msg := &node.TapegunMessage{
+		ID:       fmt.Sprintf("wq-%d-%d", item.ID, time.Now().UnixNano()),
+		From:     "work-queue",
+		Body:     body,
+		Priority: "normal",
+	}
+
+	client := node.NewClient(n.APIAddr)
+	if err := client.SendTapegunMessage(vmName, msg); err != nil {
+		log.Printf("Work queue: failed to send assignment to %s: %v", vmName, err)
 	}
 }
 
-// timeoutLoop checks for stale assignments and re-enqueues them.
+// timeoutLoop checks for stale assignments and re-queues or fails them.
 func (d *Dispatcher) timeoutLoop() {
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-d.stopCh:
 			return
 		case <-ticker.C:
-			timedOut := d.queue.TimeoutStale()
-			for _, item := range timedOut {
-				log.Printf("queue: assignment timed out: %s (was assigned to %s)", item.Title, item.AssignedTo)
-			}
+			d.checkTimeouts()
 		}
 	}
 }
 
-// completionLoop checks if assigned items' GitHub issues have been closed.
+func (d *Dispatcher) checkTimeouts() {
+	stale, err := d.queue.StaleAssignments(30 * time.Minute)
+	if err != nil {
+		log.Printf("Work queue: timeout check error: %v", err)
+		return
+	}
+	for _, item := range stale {
+		if item.Attempts >= item.MaxAttempts {
+			d.queue.Fail(item.ID)
+			log.Printf("Work queue: item %d (%s) failed after %d attempts", item.ID, item.SourceRef, item.Attempts)
+		} else {
+			d.queue.Reassign(item.ID)
+			log.Printf("Work queue: item %d (%s) timed out, re-queued (attempt %d/%d)",
+				item.ID, item.SourceRef, item.Attempts, item.MaxAttempts)
+		}
+	}
+}
+
+// completionLoop checks if assigned items have been completed (issue closed).
 func (d *Dispatcher) completionLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-d.stopCh:
@@ -155,57 +208,21 @@ func (d *Dispatcher) completionLoop() {
 }
 
 func (d *Dispatcher) checkCompletions() {
-	assigned := d.queue.List("assigned")
+	assigned, err := d.queue.ListByStatus(StatusAssigned)
+	if err != nil {
+		return
+	}
 	for _, item := range assigned {
-		if item.Source != "github-issue" || item.SourceRef == "" {
+		if item.Source != "github" {
 			continue
 		}
-		repo, number, ok := ParseIssueRef(item.SourceRef)
+		repo, number, ok := ParseIssueNumber(item.SourceRef)
 		if !ok {
 			continue
 		}
-		if CheckIssueClosed(repo, number) {
+		if IsIssueClosed(repo, number) {
 			d.queue.Complete(item.ID)
-			log.Printf("queue: auto-completed %s (%s) — issue closed", item.ID, item.SourceRef)
+			log.Printf("Work queue: item %d (%s) completed — issue closed", item.ID, item.SourceRef)
 		}
 	}
-}
-
-// Stats returns queue statistics.
-func (d *Dispatcher) Stats() QueueStats {
-	items := d.queue.List("")
-	var stats QueueStats
-	for _, item := range items {
-		switch item.Status {
-		case "queued":
-			stats.Queued++
-		case "assigned":
-			stats.Assigned++
-			age := time.Since(*item.AssignedAt)
-			if age > stats.OldestAssignment {
-				stats.OldestAssignment = age
-			}
-		case "completed":
-			stats.Completed++
-		case "failed":
-			stats.Failed++
-		}
-	}
-	stats.Total = len(items)
-	return stats
-}
-
-// QueueStats is a summary of queue state.
-type QueueStats struct {
-	Total            int           `json:"total"`
-	Queued           int           `json:"queued"`
-	Assigned         int           `json:"assigned"`
-	Completed        int           `json:"completed"`
-	Failed           int           `json:"failed"`
-	OldestAssignment time.Duration `json:"oldest_assignment"`
-}
-
-func (s QueueStats) String() string {
-	return fmt.Sprintf("total=%d queued=%d assigned=%d completed=%d failed=%d",
-		s.Total, s.Queued, s.Assigned, s.Completed, s.Failed)
 }
