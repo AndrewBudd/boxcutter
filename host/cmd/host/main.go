@@ -493,13 +493,16 @@ func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
 			if existing != nil {
 				// Entry exists but PID changed — update it
 				log.Printf("  Discovered orphaned node %s (PID %d, disk %s) — recovering", vmEntry.ID, pid, vmEntry.Disk)
-				state.AddNode(*vmEntry)
-				discovered++
 			} else {
-				// Unknown QEMU process not in cluster state — kill it (ghost from failed cleanup)
-				log.Printf("  Found unknown QEMU process %s (PID %d) not in cluster state — killing ghost", vmEntry.ID, pid)
-				qemu.Stop(vmEntry.ID, pid)
+				// Unknown QEMU process not in cluster state — adopt it.
+				// These are likely live nodes whose state wasn't persisted
+				// (e.g. upgrade reconciler updated in-memory state but
+				// crashed before flushing cluster.json). Killing them would
+				// destroy any VMs running on the node. See issue #85.
+				log.Printf("  Found unknown QEMU node %s (PID %d, disk %s) not in cluster state — adopting", vmEntry.ID, pid, vmEntry.Disk)
 			}
+			state.AddNode(*vmEntry)
+			discovered++
 		}
 	}
 
@@ -617,6 +620,7 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 					log.Printf("WARNING: orchestrator launch failed: %v", err)
 				} else {
 					state.SetPID(orch.ID, pid)
+					state.Save()
 				}
 			}
 		}
@@ -661,6 +665,9 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 		}
 		state.RemoveNode(sn.id)
 	}
+	if len(cleanNodes) > 0 {
+		state.Save()
+	}
 
 	// Launch nodes (skip those being drained/upgraded)
 	for _, node := range state.Nodes {
@@ -695,10 +702,9 @@ func bootRecover(cfg HostConfig, state *cluster.State) {
 			log.Printf("WARNING: node %s launch failed: %v", node.ID, err)
 		} else {
 			state.SetPID(node.ID, pid)
+			state.Save()
 		}
 	}
-
-	state.Save()
 
 	// Resume interrupted drains in the background. These goroutines will
 	// re-enter drainNode() which now handles the "already draining" case
