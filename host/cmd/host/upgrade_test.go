@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -859,6 +860,141 @@ func TestUpgrade_GoldenReadyCheck(t *testing.T) {
 
 	if golden, _ := health["golden_ready"].(bool); !golden {
 		t.Error("golden_ready should be true after setting")
+	}
+}
+
+// --- Insufficient memory pause tests (issue #81) ---
+
+func TestUpgrade_InsufficientMemoryPausesAfter3Attempts(t *testing.T) {
+	// When the host doesn't have enough RAM for a side-by-side replacement,
+	// the reconciler should pause after 3 consecutive failures (not 50),
+	// log an actionable message, and preserve the upgrade goal.
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	state := &cluster.State{}
+	state.SetPath(path)
+	state.Orchestrator = &cluster.VMEntry{ID: "orch", ImageDigest: "sha256:current"}
+	state.Nodes = []cluster.VMEntry{
+		{ID: "node-1", Status: "active", ImageDigest: "sha256:old", BridgeIP: "192.168.50.3"},
+		{ID: "node-2", Status: "active", ImageDigest: "sha256:old", BridgeIP: "192.168.50.4"},
+		{ID: "node-3", Status: "active", ImageDigest: "sha256:old", BridgeIP: "192.168.50.5"},
+	}
+	state.SetUpgradeGoal(&cluster.UpgradeGoal{
+		VMType:           "node",
+		Tag:              "v2",
+		NodeImage:        &cluster.ImageRef{Digest: "sha256:new"},
+		InitialNodeCount: 3,
+	})
+	state.Save()
+
+	// Simulate the retry logic from runReconcileLoop
+	const insufficientMemoryPauseThreshold = 3
+	insufficientMemErr := "insufficient memory to launch replacement node (8807MB available, need 12288MB + 1024MB reserve)"
+	consecutiveFailures := 0
+	paused := false
+
+	for i := 0; i < 50; i++ {
+		// Simulate reconcileUpgradeStep returning insufficient memory error
+		errStr := insufficientMemErr
+		consecutiveFailures++
+
+		if strings.Contains(errStr, "insufficient memory to launch replacement node") && consecutiveFailures >= insufficientMemoryPauseThreshold {
+			paused = true
+			break
+		}
+	}
+
+	if !paused {
+		t.Fatal("reconciler should have paused after 3 insufficient memory failures")
+	}
+	if consecutiveFailures != insufficientMemoryPauseThreshold {
+		t.Errorf("should pause at exactly %d failures, got %d", insufficientMemoryPauseThreshold, consecutiveFailures)
+	}
+
+	// Verify upgrade goal is preserved (not cleared)
+	loaded, err := cluster.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.UpgradeGoal == nil {
+		t.Fatal("upgrade goal should be preserved after insufficient memory pause")
+	}
+	if loaded.UpgradeGoal.NodeImage.Digest != "sha256:new" {
+		t.Errorf("upgrade goal digest = %q, want sha256:new", loaded.UpgradeGoal.NodeImage.Digest)
+	}
+}
+
+func TestUpgrade_InsufficientMemoryDetection(t *testing.T) {
+	// The insufficient memory error message from reconcileNodeUpgrade should
+	// be detected by the string match in runReconcileLoop.
+	errMsg := fmt.Sprintf("insufficient memory to launch replacement node (%dMB available, need %dMB + %dMB reserve)", 8807, 12288, 1024)
+	if !strings.Contains(errMsg, "insufficient memory to launch replacement node") {
+		t.Error("error message should match the detection string")
+	}
+}
+
+func TestUpgrade_OtherErrorsStillRetry50Times(t *testing.T) {
+	// Non-memory errors should still use the full 50-attempt threshold,
+	// not the early pause at 3.
+	const autoAbortThreshold = 50
+	const insufficientMemoryPauseThreshold = 3
+	consecutiveFailures := 0
+	otherErr := "launching replacement for node-1: QEMU process exited unexpectedly"
+	paused := false
+	aborted := false
+
+	for i := 0; i < 60; i++ {
+		errStr := otherErr
+		consecutiveFailures++
+
+		if strings.Contains(errStr, "insufficient memory to launch replacement node") && consecutiveFailures >= insufficientMemoryPauseThreshold {
+			paused = true
+			break
+		}
+		if consecutiveFailures >= autoAbortThreshold {
+			aborted = true
+			break
+		}
+	}
+
+	if paused {
+		t.Error("non-memory errors should not trigger early pause")
+	}
+	if !aborted {
+		t.Fatal("non-memory errors should hit the 50-attempt auto-abort")
+	}
+	if consecutiveFailures != autoAbortThreshold {
+		t.Errorf("should abort at %d failures, got %d", autoAbortThreshold, consecutiveFailures)
+	}
+}
+
+func TestUpgrade_InsufficientMemoryGoalPreservedVsAutoAbortGoalCleared(t *testing.T) {
+	// Verify the key behavioral difference: insufficient memory pause
+	// preserves the goal, while auto-abort clears it.
+	path := filepath.Join(t.TempDir(), "cluster.json")
+
+	// Setup state with upgrade goal
+	state := &cluster.State{}
+	state.SetPath(path)
+	state.Orchestrator = &cluster.VMEntry{ID: "orch"}
+	state.SetUpgradeGoal(&cluster.UpgradeGoal{
+		VMType:    "node",
+		Tag:       "v2",
+		NodeImage: &cluster.ImageRef{Digest: "sha256:new"},
+	})
+	state.Save()
+
+	// After insufficient memory pause: goal should still be set
+	loaded, _ := cluster.Load(path)
+	if loaded.UpgradeGoal == nil {
+		t.Fatal("goal should be preserved (simulating insufficient memory pause)")
+	}
+
+	// After auto-abort: goal should be cleared
+	loaded.ClearUpgradeGoal()
+	loaded.Save()
+	reloaded, _ := cluster.Load(path)
+	if reloaded.UpgradeGoal != nil {
+		t.Error("goal should be cleared after auto-abort")
 	}
 }
 

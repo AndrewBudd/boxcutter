@@ -3134,6 +3134,7 @@ func cliUpgradeCancel(cfg HostConfig) {
 // until the goal is satisfied, cancelled, or auto-aborted after too many failures.
 func runReconcileLoop(cfg HostConfig, state *cluster.State, cancelCh chan struct{}) {
 	const autoAbortThreshold = 50 // ~4 minutes at 5s interval
+	const insufficientMemoryPauseThreshold = 3
 	consecutiveFailures := 0
 	lastErr := ""
 
@@ -3156,6 +3157,17 @@ func runReconcileLoop(cfg HostConfig, state *cluster.State, cancelCh chan struct
 			} else {
 				consecutiveFailures = 1
 				lastErr = errStr
+			}
+
+			// Detect insufficient memory early — no point retrying 50 times
+			// when the host simply can't fit a replacement node.
+			if strings.Contains(errStr, "insufficient memory to launch replacement node") && consecutiveFailures >= insufficientMemoryPauseThreshold {
+				log.Printf("Upgrade paused: insufficient host RAM for side-by-side node upgrade (%d attempts).", consecutiveFailures)
+				log.Printf("Suggestion: stop some guest VMs to free memory, then re-run 'boxcutter-host upgrade' to resume.")
+				log.Printf("The upgrade goal is preserved — the upgrade will resume automatically once memory is available.")
+				// Keep the upgrade goal set so retry is easy after user intervention.
+				// Do NOT call state.ClearUpgradeGoal().
+				return
 			}
 
 			if consecutiveFailures >= autoAbortThreshold {
