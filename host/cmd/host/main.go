@@ -1506,29 +1506,33 @@ func addNode(cfg HostConfig, state *cluster.State) {
 	}()
 }
 
-// getNodeRunningVMs queries the node agent health endpoint and returns the number
-// of running VMs. Returns 0 if the agent is unreachable or the response can't be parsed.
+// getNodeRunningVMs queries a node agent's health endpoint and returns the
+// number of running VMs. Returns -1 if the node is unreachable or returns
+// an error, so callers can distinguish "0 VMs" from "unknown".
 func getNodeRunningVMs(bridgeIP string) int {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", bridgeIP))
 	if err != nil {
-		return 0
+		return -1
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return -1
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0
+		return -1
 	}
 	var health map[string]interface{}
 	if err := json.Unmarshal(body, &health); err != nil {
-		return 0
+		return -1
 	}
 	if v, ok := health["vms_running"]; ok {
 		if n, ok := v.(float64); ok {
 			return int(n)
 		}
 	}
-	return 0
+	return -1
 }
 
 // waitForNodeVMs waits for the node agent to become healthy AND report at least
@@ -1636,8 +1640,12 @@ func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targ
 		}
 	}
 
-	// Record pre-restart VM count so we can wait for them to come back
+	// Record pre-restart VM count so we can wait for them to come back.
+	// Clamp to 0 if unreachable (-1) — waitForNodeVMs just checks >= N.
 	preRestartVMs := getNodeRunningVMs(targetBridgeIP)
+	if preRestartVMs < 0 {
+		preRestartVMs = 0
+	}
 	log.Printf("Deploy %s: %d VMs running before restart", targetNodeID, preRestartVMs)
 
 	// Install and restart
@@ -1738,8 +1746,12 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 		}
 	}
 
-	// Record pre-restart VM count so we can wait for them to come back
+	// Record pre-restart VM count so we can wait for them to come back.
+	// Clamp to 0 if unreachable (-1) — waitForNodeVMs just checks >= N.
 	preRestartVMs := getNodeRunningVMs(bridgeIP)
+	if preRestartVMs < 0 {
+		preRestartVMs = 0
+	}
 	log.Printf("Deploy %s: %d VMs running before restart", nodeID, preRestartVMs)
 
 	// Install and restart
@@ -3461,6 +3473,10 @@ func leastLoadedOldNode(state *cluster.State, goal *cluster.UpgradeGoal) *cluste
 			continue // skip upgraded or non-active nodes
 		}
 		vms := getNodeRunningVMs(n.BridgeIP)
+		if vms < 0 {
+			log.Printf("leastLoadedOldNode: skipping %s — unreachable", n.ID)
+			continue // skip unreachable nodes (review feedback PR #139)
+		}
 		if vms < bestVMs {
 			bestVMs = vms
 			cp := n
