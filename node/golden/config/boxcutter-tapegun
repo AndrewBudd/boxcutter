@@ -23,24 +23,27 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT
 
-# --- Auto-start Claude Code under tmux (opt-in via config) ---
+# --- Auto-start Claude Code under tmux ---
+# Enabled by default (issue #62). Override via config file or metadata labels.
 # Config file: /home/dev/.tapegun/config
-# AUTOSTART_CLAUDE=true
+# AUTOSTART_CLAUDE=false  # set to false to disable
 # CLAUDE_FLAGS="--dangerously-skip-permissions"
 # CLAUDE_RESUME=false
 # CLAUDE_WORKING_DIR="/home/dev/project"
-AUTOSTART_CLAUDE=false
+AUTOSTART_CLAUDE=true
 CLAUDE_FLAGS="--dangerously-skip-permissions"
 CLAUDE_RESUME=false
-CLAUDE_WORKING_DIR=""
+CLAUDE_WORKING_DIR="/home/dev/project"
 
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
 fi
 
-# Also check metadata labels for autostart config
+# Also check metadata labels for autostart config (labels override defaults)
 LABELS=$(curl -sf --max-time 2 "${METADATA}/identity" 2>/dev/null | jq -r '.labels // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
-if echo "$LABELS" | grep -q "tapegun.autostart=true"; then
+if echo "$LABELS" | grep -q "tapegun.autostart=false"; then
+    AUTOSTART_CLAUDE=false
+elif echo "$LABELS" | grep -q "tapegun.autostart=true"; then
     AUTOSTART_CLAUDE=true
 fi
 if echo "$LABELS" | grep -q "tapegun.resume=true"; then
@@ -50,12 +53,49 @@ fi
 if [ "$AUTOSTART_CLAUDE" = "true" ]; then
     echo "tapegun: auto-starting Claude Code under tmux"
 
+    # Pre-trust the working directory so Claude doesn't prompt on first launch.
+    # The --dangerously-skip-permissions flag handles tool permissions, but
+    # Claude still prompts to trust the project directory on first use.
+    if [ -n "$CLAUDE_WORKING_DIR" ]; then
+        TRUST_DIR="$HOME/.claude"
+        mkdir -p "$TRUST_DIR"
+        # Write settings that pre-trust the working directory
+        SETTINGS_FILE="$TRUST_DIR/settings.json"
+        if [ ! -f "$SETTINGS_FILE" ]; then
+            cat > "$SETTINGS_FILE" <<EOSETTINGS
+{
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "trustedDirectories": [
+    "$CLAUDE_WORKING_DIR"
+  ]
+}
+EOSETTINGS
+            echo "tapegun: pre-trusted directory $CLAUDE_WORKING_DIR"
+        fi
+    fi
+
     # Create tmux session if not exists
     if ! tmux has-session -t main 2>/dev/null; then
         tmux new-session -d -s main
         sleep 1
 
-        # Change to working directory if specified
+        # Ensure PATH includes ~/.local/bin (where claude is installed via mise)
+        tmux send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
+        sleep 0.5
+
+        # Wait for working directory to appear (repo clone may still be in progress).
+        # Polls every 2s for up to 30s, then proceeds without it.
+        if [ -n "$CLAUDE_WORKING_DIR" ] && [ ! -d "$CLAUDE_WORKING_DIR" ]; then
+            echo "tapegun: waiting for $CLAUDE_WORKING_DIR to appear..."
+            for _i in $(seq 1 15); do
+                [ -d "$CLAUDE_WORKING_DIR" ] && break
+                sleep 2
+            done
+        fi
+
         if [ -n "$CLAUDE_WORKING_DIR" ] && [ -d "$CLAUDE_WORKING_DIR" ]; then
             tmux send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
             sleep 0.5
