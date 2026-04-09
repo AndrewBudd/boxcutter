@@ -19,17 +19,9 @@ if [ -z "$token" ]; then
     exit 1
 fi
 
-# Write the token so gh CLI picks it up
-export GH_TOKEN="$token"
-
-# Also persist for non-interactive use
-mkdir -p "$HOME/.config/gh"
-cat > "$HOME/.config/gh/hosts.yml" <<EOF
-github.com:
-    oauth_token: $token
-    user: x-access-token
-    git_protocol: https
-EOF
+# Authenticate the gh CLI so `gh auth status` works and all gh
+# commands (pr create, issue list, etc.) pick up the token.
+echo "$token" | gh auth login --with-token
 
 # Update git credential helper so HTTPS git operations use the fresh token
 git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password='"$token"'"; }; f'
