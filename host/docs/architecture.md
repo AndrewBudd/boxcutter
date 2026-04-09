@@ -154,11 +154,10 @@ Rolling upgrades use a **reconciliation loop** (Kubernetes controller pattern), 
 
 **Orchestrator upgrade flow** (per reconcile step):
 1. Pull image if not cached
-2. Assign temp bridge IP → observe: `NewOrchIP` set in goal?
-3. Launch new orchestrator on temp IP → observe: disk + QEMU process exist?
+2. Stop old orchestrator → observe: old PID stopped?
+3. Launch new orchestrator at same IP (.2) → observe: disk + QEMU process exist?
 4. Wait for health → observe: `GET /healthz` returns 200?
-5. Trigger migration (new pulls DB + Tailscale state from old) → observe: old PID stopped?
-6. Finalize swap → update `state.Orchestrator`, clean up
+5. Finalize → update `state.Orchestrator`, clean up old disk
 
 **Crash recovery is free**: on daemon restart, if `UpgradeGoal` exists in `cluster.json`, the reconciler starts a background loop. It re-observes reality (which VMs exist, their versions, health status) and resumes from wherever the crash left off. No separate recovery code path.
 

@@ -3374,45 +3374,52 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 }
 
 // reconcileOrchUpgrade handles one step of orchestrator upgrade.
+// Strategy: stop old orchestrator, launch new one at the same IP/TAP.
 func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.UpgradeGoal) (done bool, action string, err error) {
 	oldOrch := state.Orchestrator
 
-	// Step A: Assign temp IP if not yet set
-	if goal.NewOrchIP == "" {
-		newNum := state.NextNodeNum() + 100
-		newOctet := cfg.NodeIPOffset + newNum
-		goal.NewOrchIP = fmt.Sprintf("%s.%d", cfg.NodeSubnet, newOctet)
-		goal.NewOrchTAP = "tap-orch-new"
-		goal.NewOrchMAC = fmt.Sprintf("52:54:00:00:01:%02x", newOctet%256)
+	orchDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
+	orchISO := fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir)
+	orchPIDFile := filepath.Join(cfg.ImagesDir, "orchestrator.pid")
+
+	orchIP := cfg.OrchestratorIP
+	orchTAP := cfg.OrchestratorTAP
+	orchMAC := cfg.OrchestratorMAC
+
+	// Step A: Stop old orchestrator if still running
+	if oldOrch != nil && qemu.IsRunning(oldOrch.PID) {
+		// Mark as upgrading so health monitor won't restart it
+		state.SetNodeStatus("orchestrator", "upgrading")
 		state.Save()
-		return false, fmt.Sprintf("Assigned temp IP %s for new orchestrator", goal.NewOrchIP), nil
+
+		// Logout tailscale before killing to release the node identity
+		sshKey := findClusterSSHKey(cfg)
+		if sshKey != "" {
+			exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+				"-o", "ConnectTimeout=5", "-i", sshKey, fmt.Sprintf("ubuntu@%s", oldOrch.BridgeIP),
+				"sudo tailscale logout").Run()
+		}
+		time.Sleep(2 * time.Second)
+		qemu.Stop("orchestrator", oldOrch.PID)
+		return false, "Stopped old orchestrator for upgrade", nil
 	}
 
-	newDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
-	orchISO := fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir)
-	orchPIDFile := filepath.Join(cfg.ImagesDir, "orchestrator-new.pid")
-
-	// Step B: Launch new orchestrator if not running
-	newOrchHealthy := isOrchHealthy(goal.NewOrchIP)
-	if !newOrchHealthy {
-		// Check if there's already a QEMU process for orchestrator-new
-		// by looking for the disk file — if it doesn't exist, we haven't launched yet
-		if !fileExists(newDisk) {
-			// Memory safety check: ensure we have enough RAM for the new orchestrator
+	// Step B: Launch new orchestrator at the canonical IP if not running
+	orchHealthy := isOrchHealthy(orchIP)
+	if !orchHealthy {
+		if !fileExists(orchDisk) {
+			// Memory safety check
 			orchRAMMB := parseRAMMB(cfg.OrchestratorRAM)
 			availMB := getAvailableMemoryMB()
-			reserveMB := 1024 // 1GB buffer (old orch frees RAM after migration)
+			reserveMB := 512
 			if orchRAMMB > 0 && availMB > 0 && availMB < orchRAMMB+reserveMB {
 				return false, "", fmt.Errorf("insufficient memory for new orchestrator (%dMB available, need %dMB + %dMB reserve)", availMB, orchRAMMB, reserveMB)
 			}
 
-			// Mark old orch as upgrading so health monitor won't restart it after we stop it
-			state.SetNodeStatus("orchestrator", "upgrading")
-
-			// Generate cloud-init ISO
+			// Generate cloud-init ISO with the canonical IP/MAC
 			if err := generateCloudInitISOWithOutput(cfg, "orchestrator", "", orchISO,
-				"CLOUD_INIT_IP="+goal.NewOrchIP,
-				"CLOUD_INIT_MAC="+goal.NewOrchMAC,
+				"CLOUD_INIT_IP="+orchIP,
+				"CLOUD_INIT_MAC="+orchMAC,
 			); err != nil {
 				state.SetNodeStatus("orchestrator", "active")
 				state.Save()
@@ -3420,7 +3427,7 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			}
 
 			// Create disk
-			if err := createCOWDisk(goal.OrchBasePath, newDisk, cfg.OrchestratorDisk); err != nil {
+			if err := createCOWDisk(goal.OrchBasePath, orchDisk, cfg.OrchestratorDisk); err != nil {
 				state.SetNodeStatus("orchestrator", "active")
 				state.Save()
 				return false, "", fmt.Errorf("creating orchestrator disk: %w", err)
@@ -3431,24 +3438,24 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			if currentUser != nil {
 				username = currentUser.Username
 			}
-			if err := bridge.EnsureTAP(goal.NewOrchTAP, cfg.BridgeDevice, username); err != nil {
-				os.Remove(newDisk)
+			if err := bridge.EnsureTAP(orchTAP, cfg.BridgeDevice, username); err != nil {
+				os.Remove(orchDisk)
 				state.SetNodeStatus("orchestrator", "active")
 				state.Save()
 				return false, "", fmt.Errorf("creating TAP: %w", err)
 			}
 
 			pid, err := qemu.Launch(qemu.VMConfig{
-				Name: "orchestrator-new",
+				Name: "orchestrator",
 				VCPU: cfg.OrchestratorVCPU,
 				RAM:  cfg.OrchestratorRAM,
-				Disk: newDisk,
+				Disk: orchDisk,
 				ISO:  orchISO,
-				TAP:  goal.NewOrchTAP,
-				MAC:  goal.NewOrchMAC,
+				TAP:  orchTAP,
+				MAC:  orchMAC,
 			}, cfg.ImagesDir)
 			if err != nil {
-				os.Remove(newDisk)
+				os.Remove(orchDisk)
 				state.SetNodeStatus("orchestrator", "active")
 				state.Save()
 				return false, "", fmt.Errorf("launching new orchestrator: %w", err)
@@ -3456,34 +3463,27 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			_ = pid
 			goal.NewOrchLaunchTime = time.Now().Format(time.RFC3339)
 			state.Save()
-			return false, fmt.Sprintf("Launched new orchestrator at %s", goal.NewOrchIP), nil
+			return false, fmt.Sprintf("Launched new orchestrator at %s", orchIP), nil
 		}
 
 		// Disk exists but not healthy yet — check QEMU liveness and timeout.
-		// Cloud-init + systemd boot typically takes 30-90 seconds. If the
-		// orchestrator hasn't become healthy after 5 minutes, something is wrong.
 		const orchHealthTimeout = 5 * time.Minute
 
-		// Check if QEMU process is still alive (kill -0 to verify signalable)
-		newPID := findQEMUPID(newDisk)
+		newPID := findQEMUPID(orchDisk)
 		if newPID <= 0 || !qemu.IsRunning(newPID) {
 			// QEMU died — dump console log and clean up
-			consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
+			consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-console.log")
 			if data, err := os.ReadFile(consoleLog); err == nil {
 				lines := strings.Split(string(data), "\n")
 				start := 0
 				if len(lines) > 30 {
 					start = len(lines) - 30
 				}
-				log.Printf("orchestrator-new console (last 30 lines):\n%s", strings.Join(lines[start:], "\n"))
+				log.Printf("orchestrator upgrade: console (last 30 lines):\n%s", strings.Join(lines[start:], "\n"))
 			}
-			os.Remove(newDisk)
+			os.Remove(orchDisk)
 			os.Remove(orchISO)
 			os.Remove(orchPIDFile)
-			bridge.DeleteTAP(goal.NewOrchTAP)
-			goal.NewOrchIP = ""
-			goal.NewOrchTAP = ""
-			goal.NewOrchMAC = ""
 			goal.NewOrchLaunchTime = ""
 			state.SetNodeStatus("orchestrator", "active")
 			state.Save()
@@ -3491,130 +3491,69 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 		}
 
 		// If launch time is missing (daemon restarted mid-upgrade), backfill it
-		// so the timeout logic below can still fire.
 		if goal.NewOrchLaunchTime == "" {
-			log.Printf("orchestrator-new: launch time missing (daemon restart?), setting to now")
+			log.Printf("orchestrator upgrade: launch time missing (daemon restart?), setting to now")
 			goal.NewOrchLaunchTime = time.Now().Format(time.RFC3339)
 			state.Save()
 		}
 
-		{
-			launchTime, _ := time.Parse(time.RFC3339, goal.NewOrchLaunchTime)
-			elapsed := time.Since(launchTime)
+		launchTime, _ := time.Parse(time.RFC3339, goal.NewOrchLaunchTime)
+		elapsed := time.Since(launchTime)
 
-			// Log diagnostics periodically (every ~30s based on 5s reconcile interval)
-			if !launchTime.IsZero() && int(elapsed.Seconds())%30 < 6 && elapsed > 30*time.Second {
-				consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
-				if data, err := os.ReadFile(consoleLog); err == nil {
-					lines := strings.Split(string(data), "\n")
-					start := 0
-					if len(lines) > 10 {
-						start = len(lines) - 10
-					}
-					log.Printf("orchestrator-new (PID %d, %s elapsed) console tail:\n%s",
-						newPID, elapsed.Round(time.Second), strings.Join(lines[start:], "\n"))
+		// Log diagnostics periodically (every ~30s based on 5s reconcile interval)
+		if !launchTime.IsZero() && int(elapsed.Seconds())%30 < 6 && elapsed > 30*time.Second {
+			consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-console.log")
+			if data, err := os.ReadFile(consoleLog); err == nil {
+				lines := strings.Split(string(data), "\n")
+				start := 0
+				if len(lines) > 10 {
+					start = len(lines) - 10
 				}
-			}
-
-			if !launchTime.IsZero() && elapsed > orchHealthTimeout {
-				// Clean up the failed new orchestrator
-				failedIP := goal.NewOrchIP
-				consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
-				if data, err := os.ReadFile(consoleLog); err == nil {
-					lines := strings.Split(string(data), "\n")
-					start := 0
-					if len(lines) > 50 {
-						start = len(lines) - 50
-					}
-					log.Printf("orchestrator-new FAILED — console log (last 50 lines):\n%s", strings.Join(lines[start:], "\n"))
-				}
-				qemu.Stop("orchestrator-new", newPID)
-				os.Remove(newDisk)
-				os.Remove(orchISO)
-				os.Remove(orchPIDFile)
-				bridge.DeleteTAP(goal.NewOrchTAP)
-				goal.NewOrchIP = ""
-				goal.NewOrchTAP = ""
-				goal.NewOrchMAC = ""
-				goal.NewOrchLaunchTime = ""
-				state.SetNodeStatus("orchestrator", "active")
-				state.Save()
-				return false, "", fmt.Errorf("new orchestrator at %s did not become healthy within %s — cleaned up, will retry",
-					failedIP, orchHealthTimeout)
+				log.Printf("orchestrator upgrade (PID %d, %s elapsed) console tail:\n%s",
+					newPID, elapsed.Round(time.Second), strings.Join(lines[start:], "\n"))
 			}
 		}
 
-		return false, fmt.Sprintf("Waiting for new orchestrator at %s to become healthy (PID %d)", goal.NewOrchIP, newPID), nil
+		if !launchTime.IsZero() && elapsed > orchHealthTimeout {
+			consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-console.log")
+			if data, err := os.ReadFile(consoleLog); err == nil {
+				lines := strings.Split(string(data), "\n")
+				start := 0
+				if len(lines) > 50 {
+					start = len(lines) - 50
+				}
+				log.Printf("orchestrator upgrade FAILED — console log (last 50 lines):\n%s", strings.Join(lines[start:], "\n"))
+			}
+			qemu.Stop("orchestrator", newPID)
+			os.Remove(orchDisk)
+			os.Remove(orchISO)
+			os.Remove(orchPIDFile)
+			goal.NewOrchLaunchTime = ""
+			state.SetNodeStatus("orchestrator", "active")
+			state.Save()
+			return false, "", fmt.Errorf("new orchestrator at %s did not become healthy within %s — cleaned up, will retry",
+				orchIP, orchHealthTimeout)
+		}
+
+		return false, fmt.Sprintf("Waiting for new orchestrator at %s to become healthy (PID %d)", orchIP, newPID), nil
 	}
 
-	// Step C: New orchestrator is healthy — trigger migration if old is still running
-	if oldOrch != nil && qemu.IsRunning(oldOrch.PID) {
-		migrateReq := map[string]string{
-			"source_addr": fmt.Sprintf("%s:8801", oldOrch.BridgeIP),
-			"source_ip":   oldOrch.BridgeIP,
-		}
-		migrateData, _ := json.Marshal(migrateReq)
-
-		client := &http.Client{Timeout: 5 * time.Minute}
-		resp, err := client.Post(
-			fmt.Sprintf("http://%s:8801/api/migrate", goal.NewOrchIP),
-			"application/json",
-			bytes.NewReader(migrateData),
-		)
-		if err != nil {
-			return false, "", fmt.Errorf("migration request failed: %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(resp.Body)
-			return false, "", fmt.Errorf("migration failed (HTTP %d): %s", resp.StatusCode, string(body))
-		}
-
-		// Wait for old orchestrator to stop
-		deadline := time.Now().Add(60 * time.Second)
-		for time.Now().Before(deadline) {
-			if !qemu.IsRunning(oldOrch.PID) {
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-		if qemu.IsRunning(oldOrch.PID) {
-			sshKey := findClusterSSHKey(cfg)
-			if sshKey != "" {
-				exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
-					"-o", "ConnectTimeout=5", "-i", sshKey, fmt.Sprintf("ubuntu@%s", oldOrch.BridgeIP),
-					"sudo tailscale logout").Run()
-			}
-			time.Sleep(2 * time.Second)
-			qemu.Stop("orchestrator", oldOrch.PID)
-		}
-
-		return false, "Migration complete, old orchestrator stopped", nil
-	}
-
-	// Step D: Old orchestrator is gone — finalize swap
-	// Find the PID of the new orchestrator by scanning for its disk,
-	// then verify it's actually alive with kill -0
-	newPID := findQEMUPID(newDisk)
+	// Step C: New orchestrator is healthy — finalize
+	newPID := findQEMUPID(orchDisk)
 	if newPID <= 0 || !qemu.IsRunning(newPID) {
-		// New orchestrator died between Step C and D — clean up and retry
-		consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-new-console.log")
+		// New orchestrator died — clean up and retry
+		consoleLog := filepath.Join(cfg.ImagesDir, "orchestrator-console.log")
 		if data, err := os.ReadFile(consoleLog); err == nil {
 			lines := strings.Split(string(data), "\n")
 			start := 0
 			if len(lines) > 50 {
 				start = len(lines) - 50
 			}
-			log.Printf("orchestrator-new died before finalize — console (last 50 lines):\n%s", strings.Join(lines[start:], "\n"))
+			log.Printf("orchestrator upgrade: died before finalize — console (last 50 lines):\n%s", strings.Join(lines[start:], "\n"))
 		}
-		os.Remove(newDisk)
+		os.Remove(orchDisk)
 		os.Remove(orchISO)
 		os.Remove(orchPIDFile)
-		bridge.DeleteTAP(goal.NewOrchTAP)
-		goal.NewOrchIP = ""
-		goal.NewOrchTAP = ""
-		goal.NewOrchMAC = ""
 		goal.NewOrchLaunchTime = ""
 		state.SetNodeStatus("orchestrator", "active")
 		state.Save()
@@ -3622,72 +3561,28 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	}
 
 	oldDisk := ""
-	oldBridgeIP := ""
-	oldTAP := ""
 	if oldOrch != nil {
 		oldDisk = oldOrch.Disk
-		oldBridgeIP = oldOrch.BridgeIP
-		oldTAP = oldOrch.TAP
-	}
-
-	// Reconfigure new orchestrator to use old IP so nodes can find it
-	finalTAP := goal.NewOrchTAP
-	finalIP := goal.NewOrchIP
-	finalMAC := goal.NewOrchMAC // MAC stays as assigned (QEMU-level)
-	if oldBridgeIP != "" && oldBridgeIP != goal.NewOrchIP {
-		sshKey := findClusterSSHKey(cfg)
-		if sshKey != "" {
-			// Change the VM's IP from temp (.105) to the original (.2)
-			// Add the old IP as a secondary address on the orchestrator's interface.
-			// This lets nodes reach the orch at the original IP.
-			// We don't remove the temp IP — having both is fine.
-			addCmd := fmt.Sprintf("sudo ip addr add %s/24 dev ens3 2>/dev/null || sudo ip addr add %s/24 dev eth0 2>/dev/null || true",
-				oldBridgeIP, oldBridgeIP)
-			log.Printf("Reassigning orchestrator IP: adding %s to new orch at %s", oldBridgeIP, goal.NewOrchIP)
-			out, sshErr := exec.Command("ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
-				"-o", "ConnectTimeout=10", "-i", sshKey, fmt.Sprintf("ubuntu@%s", goal.NewOrchIP),
-				addCmd).CombinedOutput()
-			if sshErr != nil {
-				log.Printf("IP reassignment SSH error: %v output: %s", sshErr, string(out))
-			} else {
-				// SSH succeeded — trust that ip addr add worked
-				finalIP = oldBridgeIP
-				log.Printf("Orchestrator IP reassigned to %s", oldBridgeIP)
-			}
-			// Give the IP a moment to propagate
-			time.Sleep(2 * time.Second)
-		}
-	}
-	// Clean up TAPs: remove old, rename new
-	if oldTAP != "" && oldTAP != goal.NewOrchTAP {
-		exec.Command("ip", "link", "del", oldTAP).Run()
-		if err := exec.Command("ip", "link", "set", goal.NewOrchTAP, "name", oldTAP).Run(); err == nil {
-			finalTAP = oldTAP
-		}
 	}
 
 	state.SetOrchestrator(cluster.VMEntry{
 		ID:           "orchestrator",
-		BridgeIP:     finalIP,
-		Disk:         newDisk,
+		BridgeIP:     orchIP,
+		Disk:         orchDisk,
 		ISO:          orchISO,
 		PID:          newPID,
 		VCPU:         cfg.OrchestratorVCPU,
 		RAM:          cfg.OrchestratorRAM,
-		TAP:          finalTAP,
-		MAC:          finalMAC,
+		TAP:          orchTAP,
+		MAC:          orchMAC,
 		ImageVersion: goal.OrchImage.Version,
 		ImageCommit:  goal.OrchImage.Commit,
 		ImageDigest:  goal.OrchImage.Digest,
 	})
-	// Clear orch-specific fields from goal
-	goal.NewOrchIP = ""
-	goal.NewOrchTAP = ""
-	goal.NewOrchMAC = ""
 	goal.NewOrchLaunchTime = ""
 	state.Save()
 
-	if oldDisk != "" && oldDisk != newDisk {
+	if oldDisk != "" && oldDisk != orchDisk {
 		os.Remove(oldDisk)
 	}
 
