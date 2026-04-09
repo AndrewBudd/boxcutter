@@ -3,12 +3,22 @@
 # Periodically captures tmux pane content and posts it to the metadata service.
 # Checks for incoming messages and writes them to the inbox file.
 # Messages with send_keys=true are also injected into tmux.
+#
+# Setup phase (issue #94): reads agent-config from metadata and realizes the
+# workspace (repo wait, persona files, Claude Code settings) before launching
+# Claude Code.  This replaces the former boxcutter-boot-agent service — tapegun
+# is the single agent supervisor.
 
 METADATA="http://169.254.169.254"
 INBOX_DIR="/home/dev/.tapegun"
 INBOX_FILE="${INBOX_DIR}/inbox.json"
 CONFIG_FILE="${INBOX_DIR}/config"
 POLL_INTERVAL=5
+
+HOME_DIR="/home/dev"
+PROJECT_DIR="${HOME_DIR}/project"
+CLAUDE_DIR="${HOME_DIR}/.claude"
+SETUP_STAMP="${HOME_DIR}/.tapegun-setup-done"
 
 mkdir -p "$INBOX_DIR"
 
@@ -49,6 +59,200 @@ fi
 if echo "$LABELS" | grep -q "tapegun.resume=true"; then
     CLAUDE_RESUME=true
 fi
+
+# =============================================================================
+# Setup phase: read agent-config from metadata, realize workspace.
+# Runs once per boot (idempotent via stamp file).  On 404/empty config the
+# phase is skipped and tapegun falls through to existing behaviour.
+# =============================================================================
+
+log() { echo "tapegun: $*"; }
+
+setup_git_credentials() {
+    local resp token
+    resp=$(curl -sf --max-time 5 "${METADATA}/token/github" 2>/dev/null || echo "")
+    token=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null)
+    if [ -n "$token" ]; then
+        git config --global credential.helper \
+            '!f() { echo "username=x-access-token"; echo "password='"$token"'"; }; f'
+        log "git credentials configured"
+    else
+        log "WARNING: no GitHub token available, clones may fail"
+    fi
+}
+
+clone_repo() {
+    local repo="$1" target_dir="$2"
+    if [ -d "$target_dir/.git" ]; then
+        log "repo $repo already cloned at $target_dir, pulling latest"
+        git -C "$target_dir" pull --ff-only 2>/dev/null || true
+        return 0
+    fi
+    log "cloning $repo -> $target_dir"
+    mkdir -p "$(dirname "$target_dir")"
+    if git clone "https://github.com/${repo}.git" "$target_dir" 2>&1; then
+        git -C "$target_dir" remote set-url origin "https://github.com/${repo}.git"
+        log "cloned $repo"
+    else
+        log "WARNING: failed to clone $repo"
+        return 1
+    fi
+}
+
+install_persona() {
+    local working_dir="$1"
+    local persona_claude_md="$2"
+    local persona_instructions="$3"
+    local team_persona_files="$4"
+
+    [ ! -d "$working_dir" ] && return
+
+    local personas_dir="${working_dir}/.claude/personas"
+
+    # Install persona file from repo path (e.g. ".claude/personas/dev.md")
+    if [ -n "$persona_claude_md" ]; then
+        local src="${working_dir}/${persona_claude_md}"
+        if [ -f "$src" ]; then
+            # Append inline instructions to the persona file if provided
+            if [ -n "$persona_instructions" ]; then
+                printf '\n\n## Additional Instructions\n\n%s\n' "$persona_instructions" >> "$src"
+                log "appended inline instructions to $persona_claude_md"
+            fi
+            log "persona file verified at $persona_claude_md"
+        else
+            # Persona file doesn't exist yet — create it at the specified path
+            mkdir -p "$(dirname "$src")"
+            if [ -n "$persona_instructions" ]; then
+                printf '# Agent Instructions\n\n%s\n' "$persona_instructions" > "$src"
+            else
+                touch "$src"
+            fi
+            log "created persona file at $persona_claude_md"
+        fi
+    elif [ -n "$persona_instructions" ]; then
+        # No persona file path — create a default persona file
+        mkdir -p "$personas_dir"
+        printf '# Agent Instructions\n\n%s\n' "$persona_instructions" > "${personas_dir}/agent.md"
+        log "created default persona at .claude/personas/agent.md"
+    fi
+
+    # Remove other agents' persona files (only files listed in team_persona_files)
+    if [ -n "$team_persona_files" ]; then
+        echo "$team_persona_files" | while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            # Skip this agent's own persona file
+            [ "$file" = "$persona_claude_md" ] && continue
+            local target="${working_dir}/${file}"
+            if [ -f "$target" ]; then
+                rm "$target"
+                log "removed other agent's persona: $file"
+            fi
+        done
+    fi
+}
+
+setup_workspace() {
+    # Idempotency: skip if already completed this boot
+    if [ -f "$SETUP_STAMP" ]; then
+        log "setup already completed this boot, skipping"
+        return 0
+    fi
+
+    # Fetch agent config
+    local agent_config
+    agent_config=$(curl -sf --max-time 5 "${METADATA}/metadata/agent-config" 2>/dev/null || echo "")
+    if [ -z "$agent_config" ] || [ "$agent_config" = "null" ] || [ "$agent_config" = "{}" ]; then
+        log "no agent-config available, using defaults"
+        touch "$SETUP_STAMP"
+        return 0
+    fi
+
+    log "agent config received"
+
+    # Parse config fields
+    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files
+    repos=$(echo "$agent_config" | jq -r '.repos // [] | .[]' 2>/dev/null)
+    persona_claude_md=$(echo "$agent_config" | jq -r '.persona.claude_md // empty' 2>/dev/null)
+    persona_instructions=$(echo "$agent_config" | jq -r '.persona.instructions // empty' 2>/dev/null)
+    claude_flags=$(echo "$agent_config" | jq -r '.claude_flags // empty' 2>/dev/null)
+    claude_resume=$(echo "$agent_config" | jq -r '.claude_resume // empty' 2>/dev/null)
+    working_dir=$(echo "$agent_config" | jq -r '.working_dir // empty' 2>/dev/null)
+    team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
+
+    local repo_count
+    repo_count=$(echo "$repos" | grep -c . || true)
+
+    # Clone repos if specified
+    if [ "$repo_count" -gt 0 ]; then
+        setup_git_credentials
+
+        if [ "$repo_count" -eq 1 ]; then
+            local repo
+            repo=$(echo "$repos" | head -1)
+            clone_repo "$repo" "$PROJECT_DIR"
+            [ -z "$working_dir" ] && working_dir="$PROJECT_DIR"
+        else
+            local first_repo=""
+            while IFS= read -r repo; do
+                [ -z "$repo" ] && continue
+                local repo_name
+                repo_name=$(basename "$repo")
+                clone_repo "$repo" "${HOME_DIR}/projects/${repo_name}"
+                [ -z "$first_repo" ] && first_repo="${HOME_DIR}/projects/${repo_name}"
+            done <<< "$repos"
+            if [ -n "$first_repo" ] && [ ! -e "$PROJECT_DIR" ]; then
+                ln -sf "$first_repo" "$PROJECT_DIR"
+                log "symlinked ~/project -> $first_repo"
+            fi
+            [ -z "$working_dir" ] && working_dir="$first_repo"
+        fi
+    fi
+
+    # Wait for working directory (repo clone may be in progress from orchestrator)
+    local target_dir="${working_dir:-$PROJECT_DIR}"
+    if [ -n "$target_dir" ] && [ ! -d "$target_dir" ]; then
+        log "waiting for $target_dir to appear..."
+        for _i in $(seq 1 30); do
+            [ -d "$target_dir" ] && break
+            sleep 2
+        done
+    fi
+
+    # Install persona files at .claude/personas/ path
+    install_persona "$target_dir" "$persona_claude_md" "$persona_instructions" "$team_persona_files"
+
+    # Update tapegun config variables for Claude Code launch
+    [ -n "$claude_flags" ] && CLAUDE_FLAGS="$claude_flags"
+    [ -n "$claude_resume" ] && CLAUDE_RESUME="$claude_resume"
+    [ -n "$working_dir" ] && CLAUDE_WORKING_DIR="$working_dir"
+
+    # Pre-trust the working directory
+    local settings_file="${CLAUDE_DIR}/settings.json"
+    mkdir -p "$CLAUDE_DIR"
+    if [ ! -f "$settings_file" ]; then
+        cat > "$settings_file" <<EOSETTINGS
+{
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "trustedDirectories": [
+    "${working_dir:-$PROJECT_DIR}"
+  ]
+}
+EOSETTINGS
+        log "pre-trusted directory ${working_dir:-$PROJECT_DIR}"
+    fi
+
+    touch "$SETUP_STAMP"
+    log "workspace setup complete"
+}
+
+setup_workspace
+
+# =============================================================================
+# Claude Code auto-start
+# =============================================================================
 
 if [ "$AUTOSTART_CLAUDE" = "true" ]; then
     echo "tapegun: auto-starting Claude Code under tmux"
@@ -134,7 +338,7 @@ done
 
 echo "tapegun: daemon started (poll every ${POLL_INTERVAL}s)"
 
-# tmux command — runs as the dev user (service runs as User=dev)
+# tmux command -- runs as the dev user (service runs as User=dev)
 TMUX_CMD="tmux"
 
 # --- Health check function ---
@@ -167,7 +371,7 @@ run_health_checks() {
         disk=true
     fi
 
-    # Check 5: key services running (ssh, tapegun — tapegun is us, so just ssh)
+    # Check 5: key services running (ssh, tapegun -- tapegun is us, so just ssh)
     if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
         services=true
     fi
@@ -212,7 +416,7 @@ while true; do
         else
             STATUS="idle"
         fi
-        # Build JSON payload — use jq for safe escaping
+        # Build JSON payload -- use jq for safe escaping
         if command -v jq >/dev/null 2>&1; then
             PAYLOAD=$(jq -n \
                 --arg content "$PANE_CONTENT" \
