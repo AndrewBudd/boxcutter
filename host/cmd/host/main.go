@@ -26,6 +26,7 @@ import (
 	"github.com/AndrewBudd/boxcutter/host/internal/cluster"
 	"github.com/AndrewBudd/boxcutter/host/internal/oci"
 	"github.com/AndrewBudd/boxcutter/host/internal/qemu"
+	"github.com/AndrewBudd/boxcutter/host/internal/team"
 )
 
 // version is set at build time via -ldflags "-X main.version=..."
@@ -348,6 +349,8 @@ func main() {
 		cliRecover()
 	case "self-update":
 		cliSelfUpdate()
+	case "team":
+		cliTeam()
 	default:
 		fmt.Fprintf(os.Stderr, "Usage: boxcutter-host <command>\n\n")
 		fmt.Fprintf(os.Stderr, "Commands:\n")
@@ -364,6 +367,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  remove-node <id>             Remove a node entry (kills QEMU if running)\n")
 		fmt.Fprintf(os.Stderr, "  list-orphans                 Show nodes with 0 VMs (cleanup candidates)\n")
 		fmt.Fprintf(os.Stderr, "  cleanup-nodes                Remove all orphan nodes\n")
+		fmt.Fprintf(os.Stderr, "  team apply -f team.yaml      Create/update team from YAML spec\n")
+		fmt.Fprintf(os.Stderr, "  team destroy -f team.yaml    Destroy all VMs defined in team spec\n")
+		fmt.Fprintf(os.Stderr, "  team list                    List active teams\n")
+		fmt.Fprintf(os.Stderr, "  team status -f team.yaml     Show status of team VMs\n")
 		os.Exit(1)
 	}
 }
@@ -5086,4 +5093,205 @@ func runBootstrap() {
 	}
 
 	log.Printf("Bootstrap complete. State saved to %s", cfg.StatePath)
+}
+
+// cliTeam handles the "team" subcommand family.
+func cliTeam() {
+	if len(os.Args) < 3 {
+		teamUsage()
+	}
+
+	subcmd := os.Args[2]
+	switch subcmd {
+	case "apply":
+		teamApply()
+	case "destroy":
+		teamDestroy()
+	case "list":
+		teamList()
+	case "status":
+		teamStatus()
+	default:
+		teamUsage()
+	}
+}
+
+func teamUsage() {
+	fmt.Fprintf(os.Stderr, "Usage: boxcutter-host team <subcommand>\n\n")
+	fmt.Fprintf(os.Stderr, "Subcommands:\n")
+	fmt.Fprintf(os.Stderr, "  apply   -f team.yaml   Create or update team to match spec\n")
+	fmt.Fprintf(os.Stderr, "  destroy -f team.yaml   Destroy all VMs defined in team spec\n")
+	fmt.Fprintf(os.Stderr, "  list                   List active teams\n")
+	fmt.Fprintf(os.Stderr, "  status  -f team.yaml   Show status of team VMs\n")
+	os.Exit(1)
+}
+
+func teamParseFile() *team.TeamSpec {
+	filePath := ""
+	for i := 3; i < len(os.Args); i++ {
+		if os.Args[i] == "-f" && i+1 < len(os.Args) {
+			filePath = os.Args[i+1]
+			break
+		}
+	}
+	if filePath == "" {
+		fmt.Fprintf(os.Stderr, "Error: -f <file> is required\n")
+		os.Exit(1)
+	}
+	ts, err := team.LoadFile(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	return ts
+}
+
+func teamApply() {
+	ts := teamParseFile()
+	agents := ts.Resolve()
+
+	fmt.Printf("Team: %s\n", ts.Metadata.Name)
+	fmt.Printf("Agents: %d definitions → %d VMs\n\n", len(ts.Spec.Agents), len(agents))
+
+	cfg := defaultConfig()
+	state, _ := cluster.Load(cfg.StatePath)
+
+	// Build set of existing VM names from orchestrator
+	existing := make(map[string]bool)
+	orchAddr := ""
+	if state != nil && state.Orchestrator != nil {
+		orchAddr = fmt.Sprintf("http://%s:8801", state.Orchestrator.BridgeIP)
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(orchAddr + "/api/vms")
+		if err == nil {
+			var vms []map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&vms)
+			resp.Body.Close()
+			for _, vm := range vms {
+				if name, ok := vm["name"].(string); ok {
+					existing[name] = true
+				}
+			}
+		}
+	}
+
+	for _, a := range agents {
+		action := "create"
+		if existing[a.VMName] {
+			action = "ok (exists)"
+		}
+		fmt.Printf("  %-8s %s  [%s vcpu=%d ram=%s disk=%s mode=%s]\n",
+			action, a.VMName, a.Type, a.VCPU, a.RAM, a.Disk, a.Mode)
+		if a.Persona != nil && a.Persona.Role != "" {
+			fmt.Printf("           persona: %s\n", a.Persona.Role)
+		}
+		if len(a.Repos) > 0 {
+			fmt.Printf("           repos: %s\n", strings.Join(a.Repos, ", "))
+		}
+		if len(a.Access) > 0 {
+			fmt.Printf("           access: %s\n", strings.Join(a.Access, ", "))
+		}
+	}
+
+	if orchAddr == "" {
+		fmt.Println("\n⚠ Orchestrator not available — dry-run only (no VMs created)")
+	} else {
+		fmt.Println("\n[dry-run] No VMs created yet — reconciliation not implemented")
+	}
+}
+
+func teamDestroy() {
+	ts := teamParseFile()
+	agents := ts.Resolve()
+
+	fmt.Printf("Team: %s\n", ts.Metadata.Name)
+	fmt.Printf("Would destroy %d VMs:\n\n", len(agents))
+
+	for _, a := range agents {
+		fmt.Printf("  destroy  %s\n", a.VMName)
+	}
+
+	fmt.Println("\n[dry-run] No VMs destroyed — reconciliation not implemented")
+}
+
+func teamList() {
+	cfg := defaultConfig()
+	state, err := cluster.Load(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading state: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Discover teams by scanning VM names for the {team}-{agent}-{N} pattern
+	teams := make(map[string]int)
+	orchAddr := ""
+	if state.Orchestrator != nil {
+		orchAddr = fmt.Sprintf("http://%s:8801", state.Orchestrator.BridgeIP)
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(orchAddr + "/api/vms")
+		if err == nil {
+			var vms []map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&vms)
+			resp.Body.Close()
+			for _, vm := range vms {
+				name, _ := vm["name"].(string)
+				// Heuristic: team VMs are named {team}-{agent}-{N}
+				parts := strings.Split(name, "-")
+				if len(parts) >= 3 {
+					// Last part should be a number (replica index)
+					if _, err := strconv.Atoi(parts[len(parts)-1]); err == nil {
+						teamName := strings.Join(parts[:len(parts)-2], "-")
+						teams[teamName]++
+					}
+				}
+			}
+		}
+	}
+
+	if len(teams) == 0 {
+		fmt.Println("No teams found")
+		return
+	}
+
+	fmt.Printf("%-30s  VMs\n", "TEAM")
+	for name, count := range teams {
+		fmt.Printf("%-30s  %d\n", name, count)
+	}
+}
+
+func teamStatus() {
+	ts := teamParseFile()
+	agents := ts.Resolve()
+
+	cfg := defaultConfig()
+	state, _ := cluster.Load(cfg.StatePath)
+
+	// Query orchestrator for VM status
+	vmStatus := make(map[string]string)
+	if state != nil && state.Orchestrator != nil {
+		orchAddr := fmt.Sprintf("http://%s:8801", state.Orchestrator.BridgeIP)
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(orchAddr + "/api/vms")
+		if err == nil {
+			var vms []map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&vms)
+			resp.Body.Close()
+			for _, vm := range vms {
+				name, _ := vm["name"].(string)
+				status, _ := vm["status"].(string)
+				vmStatus[name] = status
+			}
+		}
+	}
+
+	fmt.Printf("Team: %s\n\n", ts.Metadata.Name)
+	fmt.Printf("%-40s  %-12s  %-6s  %-5s  %s\n", "VM", "STATUS", "TYPE", "VCPU", "RAM")
+	for _, a := range agents {
+		status := "missing"
+		if s, ok := vmStatus[a.VMName]; ok {
+			status = s
+		}
+		fmt.Printf("%-40s  %-12s  %-6s  %-5d  %s\n",
+			a.VMName, status, a.Type, a.VCPU, a.RAM)
+	}
 }
