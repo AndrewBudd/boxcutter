@@ -237,6 +237,46 @@ func TestVMCreate_ExceedsMaxSize(t *testing.T) {
 	}
 }
 
+func TestVMCreate_WithinMaxSize(t *testing.T) {
+	h, _ := newTestHandler(t)
+	h.MaxVMSizeMB = 8192
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	// 4096 < 8192 max, so the size check should pass.
+	// It will fail at "no active nodes" (503) — not at size rejection (400).
+	body := `{"name":"small-vm","vcpu":2,"ram_mib":4096}`
+	req := httptest.NewRequest("POST", "/api/vms", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("status = 400 (size rejected), but 4096 < 8192 max — should have passed size check")
+	}
+	// Expect 503 (no active nodes), not 400
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (no active nodes)", w.Code)
+	}
+}
+
+func TestVMCreate_MaxSizeZeroDisabled(t *testing.T) {
+	h, _ := newTestHandler(t)
+	h.MaxVMSizeMB = 0 // disabled
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	// With max size disabled, even a huge VM should pass the size check.
+	body := `{"name":"huge-vm","vcpu":2,"ram_mib":65536}`
+	req := httptest.NewRequest("POST", "/api/vms", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// Should reach "no active nodes" (503), not size rejection (400)
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("status = 400 (size rejected), but MaxVMSizeMB=0 should disable the check")
+	}
+}
+
 func TestVMCreate_Duplicate(t *testing.T) {
 	h, store := newTestHandler(t)
 	mux := http.NewServeMux()

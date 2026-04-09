@@ -65,8 +65,9 @@ type HostConfig struct {
 	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
 	MinNodes              int           // Minimum node count for migration headroom (default 3)
 	MaxNodes              int           // Hard cap on node count (0 = limited only by resources)
-	MaxVMSizeMB           int           // Headroom: scale up if no node has this much free RAM (MiB)
-	MemPressureThresholdPct int         // Actual memory usage % that triggers proactive drain (default 90)
+	HeadroomPct             int           // Headroom percentage: max VM size = node RAM * this / 100
+	MaxVMSizeMB             int           // Computed: max placeable VM size in MiB (derived from HeadroomPct)
+	MemPressureThresholdPct int           // Actual memory usage % that triggers proactive drain (default 90)
 
 	// Bootstrap bundle (secrets + config)
 	BundleDir string // Path to ~/.boxcutter/ bundle directory
@@ -214,16 +215,17 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("ORCH_VCPU"); v != "" {
 		fmt.Sscanf(v, "%d", &orchVCPU)
 	}
-	minFreeMB := 8192
+	minFreeMB := 4096
 	if v := os.Getenv("MIN_FREE_MEMORY_MB"); v != "" {
 		fmt.Sscanf(v, "%d", &minFreeMB)
 	}
-	maxVMSizeMB := parseRAMMB(nodeRAM) - 2048 // node RAM minus 2G overhead
+	headroomPct := 80
+	if v := os.Getenv("HEADROOM_PCT"); v != "" {
+		fmt.Sscanf(v, "%d", &headroomPct)
+	}
+	maxVMSizeMB := parseRAMMB(nodeRAM) * headroomPct / 100
 	if maxVMSizeMB <= 0 {
 		maxVMSizeMB = 8192 // fallback
-	}
-	if v := os.Getenv("MAX_VM_SIZE"); v != "" {
-		fmt.Sscanf(v, "%d", &maxVMSizeMB)
 	}
 	memPressurePct := 90
 	if v := os.Getenv("MEM_PRESSURE_THRESHOLD_PCT"); v != "" {
@@ -266,7 +268,8 @@ func defaultConfig() HostConfig {
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
 		MinNodes:                minNodes, // minimum 3 nodes for migration headroom during upgrades
 		MaxNodes:                0,     // 0 = no hard cap, limited only by host resources
-		MaxVMSizeMB:             maxVMSizeMB,
+		HeadroomPct:             headroomPct,
+		MaxVMSizeMB:             maxVMSizeMB, // nodeRAM * headroomPct / 100
 		MemPressureThresholdPct: memPressurePct,
 		OCIRegistry:         oci.DefaultRegistry,
 		OCIRepository:       oci.DefaultRepository,
@@ -1272,21 +1275,18 @@ func canScaleUp(cfg HostConfig, currentNodeCount int) (bool, string) {
 		nodeRAMMB = 12 * 1024 // fallback
 	}
 
-	// Rolling upgrade reserve: after launching this node, there must still be
-	// enough memory to launch ONE MORE node (for rolling upgrades). This ensures
-	// we can always do a rolling upgrade without first draining a node.
-	// Required: availMB - thisNode - upgradeReserve >= MinFreeMemoryMB
-	requiredMB := nodeRAMMB*2 + cfg.MinFreeMemoryMB
+	// After launching this node, we must still have MinFreeMemoryMB free.
+	// No upgrade reserve needed here — upgrades stop the old node first (see
+	// rolling upgrade code which has its own modest 1GB buffer).
+	requiredMB := nodeRAMMB + cfg.MinFreeMemoryMB
 	if availMB < requiredMB {
 		afterLaunchMB := availMB - nodeRAMMB
 		return false, fmt.Sprintf("after launch would have %dMB free (%dMB available - %dMB node), "+
-			"need %dMB reserved for rolling upgrade + %dMB minimum free",
-			afterLaunchMB, availMB, nodeRAMMB, nodeRAMMB, cfg.MinFreeMemoryMB)
+			"need %dMB minimum free",
+			afterLaunchMB, availMB, nodeRAMMB, cfg.MinFreeMemoryMB)
 	}
 
-	// Also enforce MaxNodes. The requiredMB check above already verified we have
-	// enough memory for this node + upgrade reserve + minFree. This check enforces
-	// the configured hard cap.
+	// Also enforce MaxNodes.
 	if cfg.MaxNodes > 0 && currentNodeCount >= cfg.MaxNodes {
 		return false, fmt.Sprintf("at configured maximum of %d nodes", cfg.MaxNodes)
 	}
