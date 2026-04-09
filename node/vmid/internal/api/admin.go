@@ -43,20 +43,25 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /internal/vms/{id}/inbox", h.handleGetInbox)
 	mux.HandleFunc("GET /internal/tapegun/activity", h.handleAllActivity)
 
+	// Agent config
+	mux.HandleFunc("PUT /internal/vms/{id}/agent-config", h.handleSetAgentConfig)
+	mux.HandleFunc("GET /internal/vms/{id}/agent-config", h.handleGetAgentConfig)
+
 	// VM-to-VM mailbox (used by node agent for relay + migration)
 	mux.HandleFunc("POST /internal/vms/{id}/mailbox", h.handlePushMailbox)
 	mux.HandleFunc("GET /internal/vms/{id}/mailbox", h.handleExportMailbox)
 }
 
 type registerRequest struct {
-	VMID        string            `json:"vm_id"`
-	VMType      string            `json:"vm_type,omitempty"`
-	IP          string            `json:"ip"`
-	Mark        int               `json:"mark"`
-	Mode        string            `json:"mode"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	GitHubRepo  string            `json:"github_repo,omitempty"`
-	GitHubRepos []string          `json:"github_repos,omitempty"`
+	VMID        string                `json:"vm_id"`
+	VMType      string                `json:"vm_type,omitempty"`
+	IP          string                `json:"ip"`
+	Mark        int                   `json:"mark"`
+	Mode        string                `json:"mode"`
+	Labels      map[string]string     `json:"labels,omitempty"`
+	GitHubRepo  string                `json:"github_repo,omitempty"`
+	GitHubRepos []string              `json:"github_repos,omitempty"`
+	AgentConfig *registry.AgentConfig `json:"agent_config,omitempty"`
 }
 
 func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +87,7 @@ func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		Labels:      req.Labels,
 		GitHubRepo:  req.GitHubRepo,
 		GitHubRepos: req.GitHubRepos,
+		AgentConfig: req.AgentConfig,
 	}
 	h.reg.Register(rec)
 
@@ -381,6 +387,39 @@ func (h *AdminHandler) handleExportMailbox(w http.ResponseWriter, r *http.Reques
 		msgs = []*registry.MailboxMessage{}
 	}
 	writeJSON(w, msgs)
+}
+
+func (h *AdminHandler) handleSetAgentConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	var cfg registry.AgentConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !h.reg.SetAgentConfig(id, &cfg) {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *AdminHandler) handleGetAgentConfig(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+	cfg, ok := h.reg.GetAgentConfig(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	if cfg == nil {
+		cfg = &registry.AgentConfig{}
+	}
+	writeJSON(w, cfg)
 }
 
 func extractPathID(path, prefix string) string {

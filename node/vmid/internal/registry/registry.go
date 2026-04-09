@@ -67,6 +67,38 @@ type VMActivitySummary struct {
 	PendingMessages int             `json:"pending_messages"`
 }
 
+// PersonaConfig describes the persona files and instructions for the in-VM agent.
+type PersonaConfig struct {
+	Role         string `json:"role,omitempty"`         // e.g., "backend-eng", "security-reviewer"
+	ClaudeMD     string `json:"claude_md,omitempty"`    // contents of persona CLAUDE.md
+	Instructions string `json:"instructions,omitempty"` // additional instructions for the agent
+}
+
+// VMConfigInfo describes the VM resource configuration requested by the team spec.
+type VMConfigInfo struct {
+	VMType string `json:"vm_type,omitempty"` // "firecracker" or "qemu"
+	CPUs   int    `json:"cpus,omitempty"`
+	MemMB  int    `json:"mem_mb,omitempty"`
+	DiskGB int    `json:"disk_gb,omitempty"`
+}
+
+// AgentConfig is the boot agent specification for a VM, derived from the
+// declarative team YAML. It tells the in-VM agent what persona to assume,
+// which repos to clone, what tapegun sequences to run, and access policy.
+type AgentConfig struct {
+	Team             string            `json:"team,omitempty"`               // team name from team YAML
+	Agent            string            `json:"agent,omitempty"`              // agent name within the team
+	ReplicaIndex     int               `json:"replica_index,omitempty"`      // replica index for scaled agents
+	Persona          *PersonaConfig    `json:"persona,omitempty"`            // persona configuration
+	Repos            []string          `json:"repos,omitempty"`              // repos to clone on boot
+	Tapegun          []string          `json:"tapegun,omitempty"`            // tapegun sequences to run on boot
+	Access           []string          `json:"access,omitempty"`             // access policy entries
+	Authorized       bool              `json:"authorized,omitempty"`         // whether the VM is pre-authorized
+	VMConfig         *VMConfigInfo     `json:"vm_config,omitempty"`          // requested VM resource configuration
+	Labels           map[string]string `json:"labels,omitempty"`             // labels for the VM
+	TeamPersonaFiles []string          `json:"team_persona_files,omitempty"` // team-level persona file paths
+}
+
 type VMRecord struct {
 	VMID        string            `json:"vm_id"`
 	VMType      string            `json:"vm_type,omitempty"` // "firecracker" or "qemu"
@@ -77,6 +109,8 @@ type VMRecord struct {
 	GitHubRepo     string            `json:"github_repo,omitempty"`     // backwards compat
 	GitHubRepos    []string          `json:"github_repos,omitempty"`    // all repos
 	GitHubProjects []string          `json:"github_projects,omitempty"` // authorized projects
+
+	AgentConfig  *AgentConfig     `json:"agent_config,omitempty"`
 
 	LastActivity *ActivityReport   `json:"last_activity,omitempty"`
 	LastStatus   *StatusReport    `json:"last_status,omitempty"`
@@ -357,6 +391,29 @@ func (r *Registry) SetHealth(vmID string, report *HealthReport) bool {
 	}
 	rec.SetHealth(report)
 	return true
+}
+
+// SetAgentConfig updates a VM's agent configuration under the registry lock.
+func (r *Registry) SetAgentConfig(vmID string, cfg *AgentConfig) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.AgentConfig = cfg
+	return true
+}
+
+// GetAgentConfig returns a VM's agent configuration.
+func (r *Registry) GetAgentConfig(vmID string) (*AgentConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	return rec.AgentConfig, true
 }
 
 // GetHealth returns a VM's last health report.

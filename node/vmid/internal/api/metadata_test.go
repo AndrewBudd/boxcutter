@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/config"
+	"github.com/AndrewBudd/boxcutter/node/vmid/internal/registry"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/sentinel"
 )
 
@@ -15,6 +16,7 @@ func newTestMetadataHandler(t *testing.T, metadata config.MetadataFilesConfig) *
 	t.Helper()
 	return &MetadataHandler{
 		sentinel: sentinel.NewStore(),
+		reg:      registry.New(),
 		metadata: metadata,
 	}
 }

@@ -104,7 +104,7 @@ func main() {
 
 	// VM-facing server (listens on the metadata IP)
 	vmMux := http.NewServeMux()
-	metaHandler := api.NewMetadataHandler(jwtIssuer, githubMinter, sentinelStore, cfg.Metadata)
+	metaHandler := api.NewMetadataHandler(jwtIssuer, githubMinter, sentinelStore, reg, cfg.Metadata)
 	metaHandler.Register(vmMux)
 	tapegunHandler := api.NewTapegunHandler(reg)
 	tapegunHandler.Register(vmMux)
