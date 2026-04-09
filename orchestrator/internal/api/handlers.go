@@ -16,6 +16,7 @@ import (
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/db"
 	orchmqtt "github.com/AndrewBudd/boxcutter/orchestrator/internal/mqtt"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/node"
+	"github.com/AndrewBudd/boxcutter/orchestrator/internal/queue"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/scheduler"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/state"
 )
@@ -40,6 +41,10 @@ type Handler struct {
 	// MaxVMSizeMB is the largest VM (by RAM in MiB) the cluster can place.
 	// VM creation requests exceeding this are rejected.
 	MaxVMSizeMB int
+
+	// Work queue: auto-assigns GitHub issues to idle workers
+	workQueue  *queue.Queue
+	dispatcher *queue.Dispatcher
 }
 
 func NewHandler(database *db.DB, store *state.Store) *Handler {
@@ -51,6 +56,7 @@ func NewHandler(database *db.DB, store *state.Store) *Handler {
 	h.discoverNodes()
 	go h.healthMonitorLoop()
 	go h.messageDeliveryLoop()
+	h.initWorkQueue()
 	return h
 }
 
@@ -260,6 +266,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 	// VM-to-VM messaging: lookup which node a VM is on
 	mux.HandleFunc("GET /api/vms/{name}/location", h.handleVMLocation)
+
+	// Work queue
+	mux.HandleFunc("GET /api/queue", h.handleQueueList)
+	mux.HandleFunc("POST /api/queue", h.handleQueueAdd)
+	mux.HandleFunc("GET /api/queue/stats", h.handleQueueStats)
+	mux.HandleFunc("POST /api/queue/{id}/complete", h.handleQueueComplete)
+	mux.HandleFunc("POST /api/queue/{id}/reassign", h.handleQueueReassign)
+	mux.HandleFunc("POST /api/queue/sync", h.handleQueueSync)
 }
 
 // --- Node handlers ---
@@ -1676,4 +1690,221 @@ func (h *Handler) messageDeliveryLoop() {
 			h.msgQueueMu.Unlock()
 		}
 	}
+}
+
+// --- Work queue ---
+
+func (h *Handler) initWorkQueue() {
+	repo := os.Getenv("QUEUE_REPO")
+	label := os.Getenv("QUEUE_LABEL")
+	if label == "" {
+		label = "ready"
+	}
+
+	cfg := queue.QueueConfig{
+		Repo:           repo,
+		Label:          label,
+		PollInterval:   60 * time.Second,
+		AssignInterval: 15 * time.Second,
+		TimeoutMinutes: 30,
+		PriorityLabels: map[string]int{
+			"p0-critical": 0,
+			"p1-high":     1,
+			"bug":         1,
+			"p2-medium":   2,
+			"feature":     3,
+			"p3-low":      3,
+		},
+	}
+
+	q := queue.New(h.db.Conn(), cfg)
+	if err := q.Migrate(); err != nil {
+		log.Printf("queue: migration failed: %v", err)
+		return
+	}
+
+	h.workQueue = q
+	h.dispatcher = queue.NewDispatcher(q, h.getIdleWorkers, h.assignWorkToVM)
+
+	if repo != "" {
+		h.dispatcher.Start()
+		log.Printf("queue: started dispatcher (repo=%s, label=%s)", repo, label)
+	} else {
+		log.Printf("queue: no QUEUE_REPO set, dispatcher not started (manual mode only)")
+	}
+}
+
+// getIdleWorkers returns VMs whose tapegun status is "idle" and have no assigned work.
+func (h *Handler) getIdleWorkers() []queue.IdleWorker {
+	vms := h.state.ListVMs()
+
+	nodeVMs := make(map[string][]*state.VM)
+	for _, v := range vms {
+		if v.Status != "running" {
+			continue
+		}
+		nodeVMs[v.NodeID] = append(nodeVMs[v.NodeID], v)
+	}
+
+	type nodeResult struct {
+		nodeID   string
+		activity map[string]*node.TapegunVMActivity
+	}
+	results := make(chan nodeResult, len(nodeVMs))
+
+	for nodeID := range nodeVMs {
+		go func(nid string) {
+			nr := nodeResult{nodeID: nid, activity: make(map[string]*node.TapegunVMActivity)}
+			n := h.state.GetNode(nid)
+			if n == nil || n.APIAddr == "" {
+				results <- nr
+				return
+			}
+			fc := node.NewFastClient(n.APIAddr)
+			activities := fc.GetAllActivity()
+			for i := range activities {
+				nr.activity[activities[i].VMID] = &activities[i]
+			}
+			results <- nr
+		}(nodeID)
+	}
+
+	activityByNode := make(map[string]map[string]*node.TapegunVMActivity)
+	for range nodeVMs {
+		nr := <-results
+		activityByNode[nr.nodeID] = nr.activity
+	}
+
+	var idle []queue.IdleWorker
+	for _, v := range vms {
+		if v.Status != "running" {
+			continue
+		}
+		nodeAct, ok := activityByNode[v.NodeID]
+		if !ok {
+			continue
+		}
+		act, ok := nodeAct[v.Name]
+		if !ok {
+			continue
+		}
+		if act.LastStatus != nil && act.LastStatus.Status == "idle" {
+			team := v.Labels["team"]
+			idle = append(idle, queue.IdleWorker{
+				Name:   v.Name,
+				NodeID: v.NodeID,
+				Team:   team,
+			})
+		}
+	}
+	return idle
+}
+
+// assignWorkToVM delivers a work assignment to a VM via tapegun inbox message.
+func (h *Handler) assignWorkToVM(vmName, messageBody string) error {
+	v := h.state.GetVM(vmName)
+	if v == nil {
+		return fmt.Errorf("vm %s not found", vmName)
+	}
+	n := h.state.GetNode(v.NodeID)
+	if n == nil || n.APIAddr == "" {
+		return fmt.Errorf("node for %s not reachable", vmName)
+	}
+
+	msg := node.TapegunMessage{
+		ID:       fmt.Sprintf("wq-%d", time.Now().UnixNano()),
+		From:     "work-queue",
+		Body:     messageBody,
+		Priority: "normal",
+		SendKeys: false,
+	}
+
+	nc := node.NewClient(n.APIAddr)
+	return nc.SendTapegunMessage(vmName, &msg)
+}
+
+func (h *Handler) handleQueueList(w http.ResponseWriter, r *http.Request) {
+	if h.workQueue == nil {
+		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	statusFilter := r.URL.Query().Get("status")
+	items := h.workQueue.List(statusFilter)
+	writeJSON(w, items)
+}
+
+func (h *Handler) handleQueueAdd(w http.ResponseWriter, r *http.Request) {
+	if h.workQueue == nil {
+		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var item queue.WorkItem
+	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if item.Title == "" {
+		http.Error(w, "title is required", http.StatusBadRequest)
+		return
+	}
+	if item.Source == "" {
+		item.Source = "manual"
+	}
+
+	if err := h.workQueue.Enqueue(&item); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, item)
+}
+
+func (h *Handler) handleQueueStats(w http.ResponseWriter, r *http.Request) {
+	if h.workQueue == nil || h.dispatcher == nil {
+		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	stats := h.dispatcher.Stats()
+	writeJSON(w, stats)
+}
+
+func (h *Handler) handleQueueComplete(w http.ResponseWriter, r *http.Request) {
+	if h.workQueue == nil {
+		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if err := h.workQueue.Complete(id); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "completed", "id": id})
+}
+
+func (h *Handler) handleQueueReassign(w http.ResponseWriter, r *http.Request) {
+	if h.workQueue == nil {
+		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if err := h.workQueue.Reassign(id); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "reassigned", "id": id})
+}
+
+func (h *Handler) handleQueueSync(w http.ResponseWriter, r *http.Request) {
+	if h.workQueue == nil {
+		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	n, err := h.workQueue.SyncGitHubIssues()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"synced": n})
 }
