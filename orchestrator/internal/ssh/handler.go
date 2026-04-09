@@ -897,6 +897,7 @@ func (h *Handler) cmdTeam(args []string) int {
 
 Subcommands:
   apply -f -          Create/update team from YAML (reads stdin)
+  diff -f -           Show what would change (dry-run)
   destroy <name>      Destroy all VMs for a team
   list                List active teams
   status <name>       Show status of team VMs`)
@@ -906,6 +907,8 @@ Subcommands:
 	switch args[0] {
 	case "apply":
 		return h.teamApply(args[1:])
+	case "diff":
+		return h.teamDiff(args[1:])
 	case "destroy":
 		return h.teamDestroy(args[1:])
 	case "list":
@@ -1054,6 +1057,146 @@ func (h *Handler) teamApply(args []string) int {
 	}
 
 	fmt.Printf("\nResult: %d created, %d existing, %d destroyed\n", created, len(existing), destroyed)
+	return 0
+}
+
+func (h *Handler) teamDiff(args []string) int {
+	// Parse -f flag — same stdin-only pattern as apply
+	file := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-f" && i+1 < len(args) {
+			file = args[i+1]
+			i++
+		}
+	}
+	if file == "" {
+		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team diff -f -\n")
+		fmt.Fprintf(os.Stderr, "  Reads team YAML from stdin. Pipe with: cat team.yaml | ssh <host> team diff -f -\n")
+		return 1
+	}
+
+	var data []byte
+	var err error
+	if file == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: only -f - (stdin) is supported.\n")
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+		return 1
+	}
+
+	ts, err := team.Parse(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	agents := ts.Resolve()
+
+	// Fetch live VMs
+	resp, err := h.get("/api/vms")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing VMs: %v\n", err)
+		return 1
+	}
+	var liveVMs []map[string]interface{}
+	json.Unmarshal(resp, &liveVMs)
+
+	liveByName := make(map[string]map[string]interface{})
+	for _, vm := range liveVMs {
+		if name, ok := vm["name"].(string); ok {
+			liveByName[name] = vm
+		}
+	}
+
+	// Build wanted set
+	wantVMs := make(map[string]bool)
+	for _, a := range agents {
+		wantVMs[a.VMName] = true
+	}
+
+	// Compute diff for each desired agent
+	nOK, nCreate, nUpdate, nDestroy := 0, 0, 0, 0
+
+	fmt.Printf("Team: %s\n", ts.Metadata.Name)
+	fmt.Printf("Agents: %d definitions → %d VMs\n\n", len(ts.Spec.Agents), len(agents))
+
+	for _, a := range agents {
+		live, exists := liveByName[a.VMName]
+		if !exists {
+			fmt.Printf("  + create   %-35s  %s vcpu=%d ram=%s disk=%s mode=%s\n",
+				a.VMName, a.Type, a.VCPU, a.RAM, a.Disk, a.Mode)
+			nCreate++
+			continue
+		}
+
+		// Compare config fields
+		var diffs []string
+
+		liveVCPU, _ := live["vcpu"].(float64)
+		if int(liveVCPU) != a.VCPU && liveVCPU > 0 {
+			diffs = append(diffs, fmt.Sprintf("vcpu: %d → %d", int(liveVCPU), a.VCPU))
+		}
+
+		liveRAM, _ := live["ram_mib"].(float64)
+		wantRAM := a.RAMMiB()
+		if int(liveRAM) != wantRAM && liveRAM > 0 {
+			diffs = append(diffs, fmt.Sprintf("ram: %dM → %dM", int(liveRAM), wantRAM))
+		}
+
+		liveDisk, _ := live["disk"].(string)
+		if liveDisk != "" && liveDisk != a.Disk {
+			diffs = append(diffs, fmt.Sprintf("disk: %s → %s", liveDisk, a.Disk))
+		}
+
+		liveType, _ := live["type"].(string)
+		if liveType == "" {
+			liveType = "firecracker"
+		}
+		if liveType != a.Type {
+			diffs = append(diffs, fmt.Sprintf("type: %s → %s", liveType, a.Type))
+		}
+
+		liveMode, _ := live["mode"].(string)
+		if liveMode == "" {
+			liveMode = "normal"
+		}
+		if liveMode != a.Mode {
+			diffs = append(diffs, fmt.Sprintf("mode: %s → %s", liveMode, a.Mode))
+		}
+
+		if len(diffs) > 0 {
+			fmt.Printf("  ~ update   %-35s  %s\n", a.VMName, strings.Join(diffs, ", "))
+			nUpdate++
+		} else {
+			fmt.Printf("    ok       %s\n", a.VMName)
+			nOK++
+		}
+	}
+
+	// Find team VMs to destroy (scale-down)
+	prefix := ts.Metadata.Name + "-"
+	var toDestroy []string
+	for _, vm := range liveVMs {
+		name, _ := vm["name"].(string)
+		if strings.HasPrefix(name, prefix) && !wantVMs[name] {
+			toDestroy = append(toDestroy, name)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(toDestroy)))
+
+	for _, name := range toDestroy {
+		fmt.Printf("  - destroy  %s\n", name)
+		nDestroy++
+	}
+
+	fmt.Printf("\nSummary: %d ok, %d to create, %d to update, %d to destroy\n", nOK, nCreate, nUpdate, nDestroy)
+	if nCreate == 0 && nUpdate == 0 && nDestroy == 0 {
+		fmt.Println("No changes needed.")
+	}
 	return 0
 }
 
@@ -1267,6 +1410,7 @@ Commands:
   cp-from <name> <src> <dst>
                           Copy a file out of a VM (use - for stdout)
   team apply -f -         Create/update team from YAML (stdin)
+  team diff -f -          Show what apply would change (dry-run)
   team destroy <name>     Destroy all VMs for a team
   team list               List active teams
   team status <name>      Show status of team VMs
