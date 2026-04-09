@@ -469,5 +469,35 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
         fi
     fi
 
+    # --- Crash detection & auto-restart ---
+    # If autostart is enabled, ensure tmux session and Claude Code stay alive.
+    if [ "$AUTOSTART_CLAUDE" = "true" ]; then
+        if ! $TMUX_CMD has-session -t main 2>/dev/null; then
+            # Session gone entirely — recreate and relaunch
+            echo "tapegun: tmux session 'main' gone, restarting"
+            $TMUX_CMD new-session -d -s main
+            sleep 1
+            $TMUX_CMD send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
+            sleep 0.5
+            if [ -n "$CLAUDE_WORKING_DIR" ] && [ -d "$CLAUDE_WORKING_DIR" ]; then
+                $TMUX_CMD send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
+                sleep 0.5
+            fi
+            CLAUDE_CMD="claude"
+            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+            [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
+            $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
+            echo "tapegun: Claude Code restarted (session recreated)"
+        elif ! pgrep -f 'claude' -u "$(id -u)" >/dev/null 2>&1; then
+            # Session exists but Claude Code process died — relaunch in existing session
+            echo "tapegun: Claude Code process not found, restarting"
+            CLAUDE_CMD="claude"
+            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+            [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
+            $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
+            echo "tapegun: Claude Code restarted (in existing session)"
+        fi
+    fi
+
     sleep "$POLL_INTERVAL"
 done
