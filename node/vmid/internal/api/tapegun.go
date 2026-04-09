@@ -21,6 +21,7 @@ func NewTapegunHandler(reg *registry.Registry) *TapegunHandler {
 func (h *TapegunHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /tapegun/activity", h.handlePostActivity)
 	mux.HandleFunc("POST /tapegun/status", h.handlePostStatus)
+	mux.HandleFunc("POST /tapegun/health", h.handlePostHealth)
 	mux.HandleFunc("GET /tapegun/inbox", h.handleGetInbox)
 	mux.HandleFunc("POST /tapegun/inbox/ack", h.handleAckInbox)
 }
@@ -64,6 +65,26 @@ func (h *TapegunHandler) handlePostStatus(w http.ResponseWriter, r *http.Request
 		Timestamp: time.Now(),
 		Status:    req.Status,
 	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *TapegunHandler) handlePostHealth(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+
+	var report registry.HealthReport
+	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if report.Timestamp.IsZero() {
+		report.Timestamp = time.Now()
+	}
+
+	h.reg.SetHealth(rec.VMID, &report)
 	w.WriteHeader(http.StatusNoContent)
 }
 

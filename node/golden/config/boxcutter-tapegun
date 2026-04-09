@@ -86,7 +86,73 @@ echo "tapegun: daemon started (poll every ${POLL_INTERVAL}s)"
 # tmux command — runs as the dev user (service runs as User=dev)
 TMUX_CMD="tmux"
 
+# --- Health check function ---
+run_health_checks() {
+    local binary_exec=false
+    local network=false
+    local metadata=false
+    local disk=false
+    local services=false
+    local health="unhealthy"
+    local details=""
+
+    # Check 1: binary execution
+    if /bin/true 2>/dev/null; then
+        binary_exec=true
+    fi
+
+    # Check 2: network connectivity (gateway)
+    if ping -c1 -W2 10.0.0.1 >/dev/null 2>&1; then
+        network=true
+    fi
+
+    # Check 3: metadata service reachable
+    if curl -sf --max-time 2 "${METADATA}/identity" >/dev/null 2>&1; then
+        metadata=true
+    fi
+
+    # Check 4: disk readable
+    if test -r /etc/os-release 2>/dev/null; then
+        disk=true
+    fi
+
+    # Check 5: key services running (ssh, tapegun — tapegun is us, so just ssh)
+    if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+        services=true
+    fi
+
+    # Determine overall health
+    if $binary_exec && $network && $metadata && $disk && $services; then
+        health="healthy"
+    elif $binary_exec && $disk; then
+        health="degraded"
+    fi
+
+    # Build JSON
+    if command -v jq >/dev/null 2>&1; then
+        jq -n \
+            --arg health "$health" \
+            --argjson binary_exec "$binary_exec" \
+            --argjson network "$network" \
+            --argjson metadata "$metadata" \
+            --argjson disk "$disk" \
+            --argjson services "$services" \
+            '{health: $health, health_checks: {binary_exec: $binary_exec, network: $network, metadata: $metadata, disk: $disk, services: $services}}'
+    else
+        cat <<EOJSON
+{"health":"${health}","health_checks":{"binary_exec":${binary_exec},"network":${network},"metadata":${metadata},"disk":${disk},"services":${services}}}
+EOJSON
+    fi
+}
+
 while true; do
+    # --- Post health ---
+    HEALTH_PAYLOAD=$(run_health_checks)
+    curl -sf -X POST "${METADATA}/tapegun/health" \
+        -H "Content-Type: application/json" \
+        -d "$HEALTH_PAYLOAD" \
+        2>/dev/null || true
+
     # --- Post activity ---
     if $TMUX_CMD has-session 2>/dev/null; then
         PANE_CONTENT=$($TMUX_CMD capture-pane -p -t 0 2>/dev/null | tail -50)

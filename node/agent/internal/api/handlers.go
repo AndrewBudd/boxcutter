@@ -83,6 +83,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/mailbox", h.handlePushMailbox)
 
 	// Tapegun endpoints
+	mux.HandleFunc("GET /api/vms/{name}/health", h.handleGetHealth)
 	mux.HandleFunc("GET /api/vms/{name}/activity", h.handleGetActivity)
 	mux.HandleFunc("POST /api/vms/{name}/inbox", h.handlePostInbox)
 	mux.HandleFunc("GET /api/tapegun/activity", h.handleTapegunActivity)
@@ -889,6 +890,19 @@ func extractStopStartName(path string) string {
 		return path[:i]
 	}
 	return path
+}
+
+func (h *Handler) handleGetHealth(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractStopStartName(r.URL.Path)
+	}
+	health, err := h.mgr.GetHealth(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, health)
 }
 
 func (h *Handler) handleGetActivity(w http.ResponseWriter, r *http.Request) {
