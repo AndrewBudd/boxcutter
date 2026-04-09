@@ -6,7 +6,9 @@ import (
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/db"
 )
 
-func TestPickNode_MostFreeRAM(t *testing.T) {
+func TestPickNode_SpreadsToLeastLoaded(t *testing.T) {
+	// n1: 65% utilization (4000/12288 free), n2: 16% utilization (10288/12288 free)
+	// Both can fit VM, both below 80% — pick n2 (most free)
 	nodes := []*db.Node{
 		{ID: "n1", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 8000},
 		{ID: "n2", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 2000},
@@ -17,7 +19,40 @@ func TestPickNode_MostFreeRAM(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n.ID != "n2" {
-		t.Errorf("PickNode = %s, want n2 (most free RAM)", n.ID)
+		t.Errorf("PickNode = %s, want n2 (least loaded)", n.ID)
+	}
+}
+
+func TestPickNode_PrefersCoolOverHot(t *testing.T) {
+	// n1: 90% util, 1288 free (hot, but has capacity)
+	// n2: 50% util, 6144 free (cool)
+	// n3: 95% util, 614 free (hot, insufficient)
+	nodes := []*db.Node{
+		{ID: "n1", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 11000},
+		{ID: "n2", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 6144},
+		{ID: "n3", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 11674},
+	}
+	n, err := PickNode(nodes, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ID != "n2" {
+		t.Errorf("PickNode = %s, want n2 (cool node preferred over hot n1)", n.ID)
+	}
+}
+
+func TestPickNode_UsesHotNodeWhenNoCool(t *testing.T) {
+	// Both nodes above 80% — pick the one with more free RAM
+	nodes := []*db.Node{
+		{ID: "n1", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 10500}, // 85% used, 1788 free
+		{ID: "n2", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 10000}, // 81% used, 2288 free
+	}
+	n, err := PickNode(nodes, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ID != "n2" {
+		t.Errorf("PickNode = %s, want n2 (more free RAM among hot nodes)", n.ID)
 	}
 }
 
@@ -118,5 +153,61 @@ func TestPickNode_FallsBackToDeclaredWhenNoAvailable(t *testing.T) {
 	}
 	if n.ID != "n2" {
 		t.Errorf("PickNode = %s, want n2 (most declared free RAM)", n.ID)
+	}
+}
+
+func TestPickNode_HeadroomThreshold(t *testing.T) {
+	// n1: exactly at 80% (2457/12288 free) — should be considered "hot"
+	// n2: at 79% (2580/12288 free) — should be considered "cool"
+	nodes := []*db.Node{
+		{ID: "n1", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 9831}, // 80% used
+		{ID: "n2", Status: "active", RAMTotalMIB: 12288, RAMAllocatedMIB: 9708}, // 79% used
+	}
+	n, err := PickNode(nodes, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ID != "n2" {
+		t.Errorf("PickNode = %s, want n2 (below headroom threshold)", n.ID)
+	}
+}
+
+func TestPickNode_ThreeNodeSpread(t *testing.T) {
+	// Simulates the OOM scenario from the issue: 3 nodes, ensure VMs spread
+	// n1: heavy load (90%), n2: empty, n3: moderate (40%)
+	// Should pick n2 (most free, below headroom)
+	nodes := []*db.Node{
+		{ID: "n1", Status: "active", RAMTotalMIB: 12000, RAMAllocatedMIB: 10800}, // 90%
+		{ID: "n2", Status: "active", RAMTotalMIB: 12000, RAMAllocatedMIB: 0},     // 0%
+		{ID: "n3", Status: "active", RAMTotalMIB: 12000, RAMAllocatedMIB: 4800},  // 40%
+	}
+	n, err := PickNode(nodes, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.ID != "n2" {
+		t.Errorf("PickNode = %s, want n2 (empty node for spread)", n.ID)
+	}
+}
+
+func TestUtilizationPercent(t *testing.T) {
+	tests := []struct {
+		name string
+		node *db.Node
+		want int
+	}{
+		{"empty node", &db.Node{RAMTotalMIB: 12288, RAMAllocatedMIB: 0}, 0},
+		{"half loaded", &db.Node{RAMTotalMIB: 12288, RAMAllocatedMIB: 6144}, 50},
+		{"fully loaded", &db.Node{RAMTotalMIB: 12288, RAMAllocatedMIB: 12288}, 100},
+		{"zero total", &db.Node{RAMTotalMIB: 0}, 100},
+		{"with available", &db.Node{RAMTotalMIB: 12288, RAMAvailableMIB: 3072}, 75},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := utilizationPercent(tt.node)
+			if got != tt.want {
+				t.Errorf("utilizationPercent() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
