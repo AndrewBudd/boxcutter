@@ -1,6 +1,6 @@
 [Unit]
 Description=Tapegun agent communication daemon
-After=network-online.target boxcutter-metadata.service boxcutter-boot-agent.service opt-boxcutter-tools.automount
+After=network-online.target boxcutter-metadata.service opt-boxcutter-tools.automount
 Wants=network-online.target
 Requires=opt-boxcutter-tools.automount
 
