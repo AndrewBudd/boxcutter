@@ -1437,6 +1437,7 @@ func (h *Handler) handleTapegunBroadcast(w http.ResponseWriter, r *http.Request)
 		From     string `json:"from"`
 		Priority string `json:"priority"`
 		SendKeys bool   `json:"send_keys,omitempty"`
+		NoEnter  bool   `json:"no_enter,omitempty"`
 		Filter   string `json:"filter,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1473,6 +1474,7 @@ func (h *Handler) handleTapegunBroadcast(w http.ResponseWriter, r *http.Request)
 			Body:      req.Body,
 			Priority:  req.Priority,
 			SendKeys:  req.SendKeys,
+			NoEnter:   req.NoEnter,
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
 

@@ -54,6 +54,7 @@ type Message struct {
 	Body      string     `json:"body"`
 	Priority  string     `json:"priority"`
 	SendKeys  bool       `json:"send_keys,omitempty"`
+	NoEnter   bool       `json:"no_enter,omitempty"` // send_keys without pressing Enter (paste-only)
 	CreatedAt time.Time  `json:"created_at"`
 	ReadAt    *time.Time `json:"read_at,omitempty"`
 }
