@@ -101,6 +101,17 @@ EOSETTINGS
             sleep 0.5
         fi
 
+        # Install tapegun-guest plugin so inbox, stop notifications, and
+        # status reporting hooks are active in the Claude Code session.
+        PLUGIN_DIR="$HOME/.claude/plugins/tapegun-guest"
+        if [ -d "$PLUGIN_DIR" ]; then
+            tmux send-keys -t main "claude plugin install $PLUGIN_DIR 2>/dev/null" Enter
+            sleep 2
+            echo "tapegun: installed tapegun-guest plugin"
+        else
+            echo "tapegun: WARNING: plugin not found at $PLUGIN_DIR"
+        fi
+
         # Start Claude Code
         CLAUDE_CMD="claude"
         [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
