@@ -75,6 +75,12 @@ mkdir -p "${WORK}/mnt/etc/systemd/system/local-fs.target.wants"
 ln -sf /etc/systemd/system/opt-boxcutter-tools.automount \
   "${WORK}/mnt/etc/systemd/system/local-fs.target.wants/opt-boxcutter-tools.automount"
 ln -sf /opt/boxcutter/tools/bin/boxcutter "${WORK}/mnt/usr/local/bin/boxcutter"
+ln -sf /opt/boxcutter/tools/bin/boxcutter-tapegun "${WORK}/mnt/usr/local/bin/boxcutter-tapegun"
+ln -sf /opt/boxcutter/tools/etc/systemd/boxcutter-tapegun.service \
+  "${WORK}/mnt/etc/systemd/system/boxcutter-tapegun.service"
+mkdir -p "${WORK}/mnt/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/boxcutter-tapegun.service \
+  "${WORK}/mnt/etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service"
 
 # --- Set hostname from kernel ip= parameter ---
 cat > "${WORK}/mnt/etc/systemd/system/set-hostname.service" << 'SVCEOF'
