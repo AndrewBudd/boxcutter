@@ -1,0 +1,15 @@
+[Unit]
+Description=Boot agent — realize workspace from metadata agent-config
+After=network-online.target boxcutter-metadata.service
+Wants=network-online.target
+Before=boxcutter-tapegun.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=dev
+Group=dev
+ExecStart=/usr/local/bin/boxcutter-boot-agent
+
+[Install]
+WantedBy=multi-user.target

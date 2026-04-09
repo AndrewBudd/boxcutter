@@ -1,0 +1,242 @@
+#!/bin/bash
+# Boot agent — reads agent config from the metadata service and realizes
+# the workspace before Claude Code starts.
+#
+# Responsibilities:
+#   1. Wait for metadata service
+#   2. Fetch /metadata/agent-config (JSON with repos, persona, claude flags)
+#   3. Clone specified repos into ~/project (or ~/projects/ for multi-repo)
+#   4. Copy persona CLAUDE.md to the project root
+#   5. Write tapegun config to control Claude Code flags
+#
+# Runs as a oneshot service between boxcutter-metadata and boxcutter-tapegun.
+# Issue #94: foundation for declarative team configuration.
+
+set -euo pipefail
+
+METADATA="http://169.254.169.254"
+MAX_RETRIES=30
+RETRY_INTERVAL=1
+HOME_DIR="/home/dev"
+PROJECT_DIR="${HOME_DIR}/project"
+PROJECTS_DIR="${HOME_DIR}/projects"
+TAPEGUN_CONFIG="${HOME_DIR}/.tapegun/config"
+CLAUDE_DIR="${HOME_DIR}/.claude"
+BOOT_AGENT_STAMP="${HOME_DIR}/.boot-agent-done"
+
+log() { echo "boot-agent: $*"; }
+
+# Idempotency: skip if already completed this boot.
+# The stamp file lives on the ephemeral rootfs, so it's cleared on reboot.
+if [ -f "$BOOT_AGENT_STAMP" ]; then
+    log "already completed this boot, skipping"
+    exit 0
+fi
+
+# --- 1. Wait for metadata service ---
+log "waiting for metadata service..."
+for i in $(seq 1 $MAX_RETRIES); do
+    if curl -sf -o /dev/null --max-time 2 "${METADATA}/identity" 2>/dev/null; then
+        break
+    fi
+    if [ "$i" -eq "$MAX_RETRIES" ]; then
+        log "metadata service not reachable after ${MAX_RETRIES}s"
+        exit 1
+    fi
+    sleep $RETRY_INTERVAL
+done
+
+# --- 2. Fetch agent config ---
+AGENT_CONFIG=$(curl -sf --max-time 5 "${METADATA}/metadata/agent-config" 2>/dev/null || echo "")
+if [ -z "$AGENT_CONFIG" ] || [ "$AGENT_CONFIG" = "null" ] || [ "$AGENT_CONFIG" = "{}" ]; then
+    log "no agent-config available, using defaults"
+    touch "$BOOT_AGENT_STAMP"
+    exit 0
+fi
+
+log "agent config received"
+
+# Parse config fields with jq
+REPOS=$(echo "$AGENT_CONFIG" | jq -r '.repos // [] | .[]' 2>/dev/null)
+PERSONA_CLAUDE_MD=$(echo "$AGENT_CONFIG" | jq -r '.persona.claude_md // empty' 2>/dev/null)
+PERSONA_INSTRUCTIONS=$(echo "$AGENT_CONFIG" | jq -r '.persona.instructions // empty' 2>/dev/null)
+PERSONA_ROLE=$(echo "$AGENT_CONFIG" | jq -r '.persona.role // empty' 2>/dev/null)
+CLAUDE_FLAGS=$(echo "$AGENT_CONFIG" | jq -r '.claude_flags // empty' 2>/dev/null)
+CLAUDE_RESUME=$(echo "$AGENT_CONFIG" | jq -r '.claude_resume // empty' 2>/dev/null)
+WORKING_DIR=$(echo "$AGENT_CONFIG" | jq -r '.working_dir // empty' 2>/dev/null)
+
+# --- 3. Clone repos ---
+# Uses the git credential helper set up by gh-token-refresh (or fetches a
+# fresh token from the metadata service if the helper isn't ready yet).
+setup_git_credentials() {
+    # Fetch a GitHub token from vmid for HTTPS cloning
+    local resp token
+    resp=$(curl -sf --max-time 5 "${METADATA}/token/github" 2>/dev/null || echo "")
+    token=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null)
+    if [ -n "$token" ]; then
+        git config --global credential.helper \
+            '!f() { echo "username=x-access-token"; echo "password='"$token"'"; }; f'
+        log "git credentials configured"
+    else
+        log "WARNING: no GitHub token available, clones may fail"
+    fi
+}
+
+clone_repo() {
+    local repo="$1" target_dir="$2"
+    if [ -d "$target_dir/.git" ]; then
+        log "repo $repo already cloned at $target_dir, pulling latest"
+        git -C "$target_dir" pull --ff-only 2>/dev/null || true
+        return 0
+    fi
+    log "cloning $repo → $target_dir"
+    mkdir -p "$(dirname "$target_dir")"
+    if git clone "https://github.com/${repo}.git" "$target_dir" 2>&1; then
+        # Strip token from remote URL for safety
+        git -C "$target_dir" remote set-url origin "https://github.com/${repo}.git"
+        log "cloned $repo"
+    else
+        log "WARNING: failed to clone $repo"
+        return 1
+    fi
+}
+
+REPO_COUNT=$(echo "$REPOS" | grep -c . || true)
+
+if [ "$REPO_COUNT" -gt 0 ]; then
+    setup_git_credentials
+
+    if [ "$REPO_COUNT" -eq 1 ]; then
+        # Single repo: clone to ~/project (backward compat)
+        REPO=$(echo "$REPOS" | head -1)
+        clone_repo "$REPO" "$PROJECT_DIR"
+        [ -z "$WORKING_DIR" ] && WORKING_DIR="$PROJECT_DIR"
+    else
+        # Multiple repos: clone to ~/projects/<name>, symlink ~/project → first
+        FIRST_REPO=""
+        while IFS= read -r REPO; do
+            [ -z "$REPO" ] && continue
+            REPO_NAME=$(basename "$REPO")
+            clone_repo "$REPO" "${PROJECTS_DIR}/${REPO_NAME}"
+            [ -z "$FIRST_REPO" ] && FIRST_REPO="${PROJECTS_DIR}/${REPO_NAME}"
+        done <<< "$REPOS"
+        # Symlink ~/project to first repo for compatibility
+        if [ -n "$FIRST_REPO" ] && [ ! -e "$PROJECT_DIR" ]; then
+            ln -sf "$FIRST_REPO" "$PROJECT_DIR"
+            log "symlinked ~/project → $FIRST_REPO"
+        fi
+        [ -z "$WORKING_DIR" ] && WORKING_DIR="$FIRST_REPO"
+    fi
+
+    chown -R 1000:1000 "$PROJECTS_DIR" 2>/dev/null || true
+    chown -R 1000:1000 "$PROJECT_DIR" 2>/dev/null || true
+fi
+
+# --- 4. Persona: CLAUDE.md ---
+# Two sources for persona content:
+#   a) claude_md: path within the first repo (e.g., ".claude/personas/dev.md")
+#   b) instructions: inline text from the agent-config JSON
+# Both get written to WORKING_DIR/CLAUDE.md (appended if both present).
+
+install_persona() {
+    local target_dir="${WORKING_DIR:-$PROJECT_DIR}"
+    [ ! -d "$target_dir" ] && return
+
+    local persona_file="${target_dir}/CLAUDE.md"
+    local wrote=false
+
+    # Source a): file from the repo
+    if [ -n "$PERSONA_CLAUDE_MD" ]; then
+        local src="${target_dir}/${PERSONA_CLAUDE_MD}"
+        if [ -f "$src" ]; then
+            # Prepend persona file before any existing CLAUDE.md
+            if [ -f "$persona_file" ]; then
+                local existing
+                existing=$(cat "$persona_file")
+                {
+                    cat "$src"
+                    printf '\n\n'
+                    echo "$existing"
+                } > "$persona_file"
+            else
+                cp "$src" "$persona_file"
+            fi
+            log "persona CLAUDE.md installed from $PERSONA_CLAUDE_MD"
+            wrote=true
+        else
+            log "WARNING: persona file not found: $src"
+        fi
+    fi
+
+    # Source b): inline instructions
+    if [ -n "$PERSONA_INSTRUCTIONS" ]; then
+        if [ "$wrote" = true ]; then
+            printf '\n\n# Agent Instructions\n\n%s\n' "$PERSONA_INSTRUCTIONS" >> "$persona_file"
+        else
+            {
+                printf '# Agent Instructions\n\n%s\n' "$PERSONA_INSTRUCTIONS"
+                # Preserve existing CLAUDE.md content if any
+                if [ -f "$persona_file" ]; then
+                    printf '\n\n'
+                    cat "$persona_file"
+                fi
+            } > "${persona_file}.tmp"
+            mv "${persona_file}.tmp" "$persona_file"
+        fi
+        log "persona instructions appended to CLAUDE.md"
+    fi
+
+    if [ -f "$persona_file" ]; then
+        chown 1000:1000 "$persona_file"
+    fi
+}
+
+install_persona
+
+# --- 5. Configure Claude Code flags ---
+# Write tapegun config file so boxcutter-tapegun picks up the right flags
+# when it auto-starts Claude Code.
+configure_claude() {
+    mkdir -p "$(dirname "$TAPEGUN_CONFIG")"
+
+    local flags="${CLAUDE_FLAGS:-"--dangerously-skip-permissions"}"
+    local resume="${CLAUDE_RESUME:-false}"
+    local workdir="${WORKING_DIR:-$PROJECT_DIR}"
+
+    cat > "$TAPEGUN_CONFIG" <<EOCONFIG
+# Generated by boxcutter-boot-agent (issue #94)
+# Do not edit — this file is overwritten on each boot.
+AUTOSTART_CLAUDE=true
+CLAUDE_FLAGS="$flags"
+CLAUDE_RESUME=$resume
+CLAUDE_WORKING_DIR="$workdir"
+EOCONFIG
+
+    chown 1000:1000 "$TAPEGUN_CONFIG"
+    log "tapegun config written (flags: $flags, resume: $resume, workdir: $workdir)"
+
+    # Pre-trust the working directory
+    local settings_file="${CLAUDE_DIR}/settings.json"
+    mkdir -p "$CLAUDE_DIR"
+    if [ ! -f "$settings_file" ]; then
+        cat > "$settings_file" <<EOSETTINGS
+{
+  "permissions": {
+    "allow": [],
+    "deny": []
+  },
+  "trustedDirectories": [
+    "$workdir"
+  ]
+}
+EOSETTINGS
+        chown -R 1000:1000 "$CLAUDE_DIR"
+        log "pre-trusted directory $workdir"
+    fi
+}
+
+configure_claude
+
+# --- Done ---
+touch "$BOOT_AGENT_STAMP"
+log "workspace realized successfully"

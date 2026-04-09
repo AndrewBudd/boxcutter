@@ -159,6 +159,13 @@ RUN chmod 755 /usr/local/bin/boxcutter-fetch-metadata && \
     ln -sf /etc/systemd/system/boxcutter-metadata.service \
       /etc/systemd/system/multi-user.target.wants/boxcutter-metadata.service
 
+# --- Boot agent (realize workspace from metadata agent-config, issue #94) ---
+COPY config/boxcutter-boot-agent /usr/local/bin/boxcutter-boot-agent
+COPY config/boxcutter-boot-agent.service /etc/systemd/system/boxcutter-boot-agent.service
+RUN chmod 755 /usr/local/bin/boxcutter-boot-agent && \
+    ln -sf /etc/systemd/system/boxcutter-boot-agent.service \
+      /etc/systemd/system/multi-user.target.wants/boxcutter-boot-agent.service
+
 # --- Boxcutter tools mount (squashfs on /dev/vdb → /opt/boxcutter/tools) ---
 # Explicit .mount + .automount units (fstab x-systemd.automount doesn't trigger on QEMU VMs).
 # The .automount always sets up the autofs trigger; the .mount uses After=dev-vdb.device
