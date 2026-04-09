@@ -89,13 +89,17 @@ func main() {
 		log.Fatalf("initializing JWT issuer: %v", err)
 	}
 
-	// GitHub token minter (optional)
+	// GitHub token minter (optional — vmid starts without it if credentials are missing)
 	githubMinter, err := token.NewGitHubTokenMinter(cfg.GitHub, cfg.Policies)
 	if err != nil {
-		log.Fatalf("initializing GitHub token minter: %v", err)
+		log.Printf("WARNING: GitHub token minting disabled: %v", err)
+		log.Printf("WARNING: /token/github endpoint will return 404 until credentials are configured and vmid is restarted")
+		githubMinter = nil
 	}
 	if githubMinter != nil {
 		log.Println("GitHub App integration enabled")
+	} else if cfg.GitHub != nil {
+		log.Println("GitHub App configured but not active (check credentials)")
 	}
 
 	// VM-facing server (listens on the metadata IP)
