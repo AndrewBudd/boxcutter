@@ -426,8 +426,47 @@ func runDaemon() {
 	// Wait for shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	log.Println("boxcutter-host shutting down")
+	received := <-sig
+	log.Printf("boxcutter-host shutting down (signal: %v)", received)
+
+	// Flush cluster state so it survives binary upgrades and service restarts.
+	if err := state.Save(); err != nil {
+		log.Printf("WARNING: failed to save cluster state on shutdown: %v", err)
+	} else {
+		log.Println("Cluster state saved to disk")
+	}
+}
+
+// reconcileTrackedPIDs verifies that PIDs in cluster state still belong to the
+// expected QEMU processes. After a host restart or binary upgrade, a saved PID
+// may no longer exist or may have been reused by an unrelated process. Clear
+// stale PIDs so bootRecover will relaunch VMs from disk rather than skipping
+// them as "already running".
+func reconcileTrackedPIDs(state *cluster.State) {
+	if state.Orchestrator != nil && state.Orchestrator.PID > 0 {
+		if !isQEMUProcess(state.Orchestrator.PID) {
+			log.Printf("  orchestrator PID %d is stale (not a QEMU process), clearing for relaunch", state.Orchestrator.PID)
+			state.SetPID(state.Orchestrator.ID, 0)
+		}
+	}
+	for _, node := range state.Nodes {
+		if node.PID > 0 && !isQEMUProcess(node.PID) {
+			log.Printf("  %s PID %d is stale (not a QEMU process), clearing for relaunch", node.ID, node.PID)
+			state.SetPID(node.ID, 0)
+		}
+	}
+}
+
+// isQEMUProcess checks whether the given PID is a running qemu-system process
+// by inspecting /proc/<pid>/cmdline. Returns false if the process doesn't exist
+// or is not QEMU.
+func isQEMUProcess(pid int) bool {
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(string(cmdline), "\x00")
+	return len(args) > 0 && strings.HasSuffix(args[0], "qemu-system-x86_64")
 }
 
 // discoverOrphanedVMs scans /proc for running qemu-system-x86_64 processes
@@ -584,7 +623,11 @@ func parseQEMUArgs(args []string, pid int, cfg HostConfig) *cluster.VMEntry {
 }
 
 func bootRecover(cfg HostConfig, state *cluster.State) {
-	// First, discover any running QEMU VMs not tracked in state
+	// Reconcile tracked PIDs: verify each PID is actually a QEMU process,
+	// not a reused PID from another process after a host restart.
+	reconcileTrackedPIDs(state)
+
+	// Then discover any running QEMU VMs not tracked in state
 	discoverOrphanedVMs(cfg, state)
 
 	currentUser, _ := user.Current()
