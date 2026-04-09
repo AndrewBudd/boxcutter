@@ -86,6 +86,79 @@ func TestMultipleVMsDifferentMarks(t *testing.T) {
 	}
 }
 
+func TestAgentConfig_SetAndGet(t *testing.T) {
+	r := New()
+	r.Register(&VMRecord{VMID: "vm-1", IP: "10.0.0.2", Mark: 100})
+
+	cfg := &AgentConfig{
+		Persona: "backend-eng",
+		Repos:   []string{"org/repo1", "org/repo2"},
+		Flags:   map[string]string{"verbose": "true"},
+	}
+	if !r.SetAgentConfig("vm-1", cfg) {
+		t.Fatal("SetAgentConfig returned false")
+	}
+
+	got, ok := r.GetAgentConfig("vm-1")
+	if !ok {
+		t.Fatal("GetAgentConfig returned false")
+	}
+	if got.Persona != "backend-eng" {
+		t.Fatalf("Persona = %q, want %q", got.Persona, "backend-eng")
+	}
+	if len(got.Repos) != 2 || got.Repos[0] != "org/repo1" {
+		t.Fatalf("Repos = %v, want [org/repo1 org/repo2]", got.Repos)
+	}
+	if got.Flags["verbose"] != "true" {
+		t.Fatalf("Flags = %v, want verbose=true", got.Flags)
+	}
+}
+
+func TestAgentConfig_NotFound(t *testing.T) {
+	r := New()
+	_, ok := r.GetAgentConfig("nonexistent")
+	if ok {
+		t.Fatal("GetAgentConfig should return false for unknown VM")
+	}
+	if r.SetAgentConfig("nonexistent", &AgentConfig{Persona: "x"}) {
+		t.Fatal("SetAgentConfig should return false for unknown VM")
+	}
+}
+
+func TestAgentConfig_NilByDefault(t *testing.T) {
+	r := New()
+	r.Register(&VMRecord{VMID: "vm-1", IP: "10.0.0.2", Mark: 100})
+
+	cfg, ok := r.GetAgentConfig("vm-1")
+	if !ok {
+		t.Fatal("GetAgentConfig returned false for registered VM")
+	}
+	if cfg != nil {
+		t.Fatalf("AgentConfig should be nil by default, got %v", cfg)
+	}
+}
+
+func TestAgentConfig_SetAtRegistration(t *testing.T) {
+	r := New()
+	r.Register(&VMRecord{
+		VMID: "vm-1",
+		IP:   "10.0.0.2",
+		Mark: 100,
+		AgentConfig: &AgentConfig{
+			Persona: "security-reviewer",
+			Repos:   []string{"org/sec-tools"},
+		},
+	})
+
+	cfg, ok := r.GetAgentConfig("vm-1")
+	if !ok || cfg == nil {
+		t.Fatal("AgentConfig should be set from registration")
+	}
+	if cfg.Persona != "security-reviewer" {
+		t.Fatalf("Persona = %q, want %q", cfg.Persona, "security-reviewer")
+	}
+}
+
 func TestZeroMarkNotIndexed(t *testing.T) {
 	r := New()
 

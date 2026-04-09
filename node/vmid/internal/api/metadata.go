@@ -8,6 +8,7 @@ import (
 
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/config"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/middleware"
+	"github.com/AndrewBudd/boxcutter/node/vmid/internal/registry"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/sentinel"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/token"
 )
@@ -16,11 +17,12 @@ type MetadataHandler struct {
 	jwt      *token.JWTIssuer
 	github   *token.GitHubTokenMinter
 	sentinel *sentinel.Store
+	reg      *registry.Registry
 	metadata config.MetadataFilesConfig
 }
 
-func NewMetadataHandler(jwt *token.JWTIssuer, github *token.GitHubTokenMinter, sentinel *sentinel.Store, metadata config.MetadataFilesConfig) *MetadataHandler {
-	return &MetadataHandler{jwt: jwt, github: github, sentinel: sentinel, metadata: metadata}
+func NewMetadataHandler(jwt *token.JWTIssuer, github *token.GitHubTokenMinter, sentinel *sentinel.Store, reg *registry.Registry, metadata config.MetadataFilesConfig) *MetadataHandler {
+	return &MetadataHandler{jwt: jwt, github: github, sentinel: sentinel, reg: reg, metadata: metadata}
 }
 
 func (h *MetadataHandler) Register(mux *http.ServeMux) {
@@ -32,6 +34,7 @@ func (h *MetadataHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /metadata/ca-cert", h.handleCACert)
 	mux.HandleFunc("GET /metadata/boxcutter-ssh-key", h.handleVMSSHKey)
 	mux.HandleFunc("GET /metadata/claude-credentials", h.handleClaudeCredentials)
+	mux.HandleFunc("GET /metadata/agent-config", h.handleAgentConfig)
 	// Metadata-style root
 	mux.HandleFunc("GET /", h.handleRoot)
 }
@@ -59,6 +62,7 @@ func (h *MetadataHandler) handleRoot(w http.ResponseWriter, r *http.Request) {
 			"ca_cert":            "/metadata/ca-cert",
 			"boxcutter_ssh_key":  "/metadata/boxcutter-ssh-key",
 			"claude_credentials": "/metadata/claude-credentials",
+			"agent_config":       "/metadata/agent-config",
 		},
 	})
 }
@@ -217,6 +221,22 @@ func (h *MetadataHandler) handleClaudeCredentials(w http.ResponseWriter, r *http
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(data)
+}
+
+// handleAgentConfig returns the boot agent configuration for the requesting VM.
+func (h *MetadataHandler) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+	cfg, _ := h.reg.GetAgentConfig(rec.VMID)
+	if cfg == nil {
+		// Return empty config rather than 404 — the VM exists but has no
+		// agent config set yet. The boot agent can use defaults.
+		cfg = &registry.AgentConfig{}
+	}
+	writeJSON(w, cfg)
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

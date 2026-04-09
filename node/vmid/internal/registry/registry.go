@@ -67,6 +67,15 @@ type VMActivitySummary struct {
 	PendingMessages int             `json:"pending_messages"`
 }
 
+// AgentConfig is the boot agent specification for a VM.
+// It tells the in-VM agent what persona to assume, which repos to clone,
+// and any flags to pass to Claude Code.
+type AgentConfig struct {
+	Persona string            `json:"persona,omitempty"`  // e.g., "backend-eng", "security-reviewer"
+	Repos   []string          `json:"repos,omitempty"`    // repos to clone on boot
+	Flags   map[string]string `json:"flags,omitempty"`    // arbitrary key-value flags for the agent
+}
+
 type VMRecord struct {
 	VMID        string            `json:"vm_id"`
 	VMType      string            `json:"vm_type,omitempty"` // "firecracker" or "qemu"
@@ -77,6 +86,8 @@ type VMRecord struct {
 	GitHubRepo     string            `json:"github_repo,omitempty"`     // backwards compat
 	GitHubRepos    []string          `json:"github_repos,omitempty"`    // all repos
 	GitHubProjects []string          `json:"github_projects,omitempty"` // authorized projects
+
+	AgentConfig  *AgentConfig     `json:"agent_config,omitempty"`
 
 	LastActivity *ActivityReport   `json:"last_activity,omitempty"`
 	LastStatus   *StatusReport    `json:"last_status,omitempty"`
@@ -357,6 +368,29 @@ func (r *Registry) SetHealth(vmID string, report *HealthReport) bool {
 	}
 	rec.SetHealth(report)
 	return true
+}
+
+// SetAgentConfig updates a VM's agent configuration under the registry lock.
+func (r *Registry) SetAgentConfig(vmID string, cfg *AgentConfig) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.AgentConfig = cfg
+	return true
+}
+
+// GetAgentConfig returns a VM's agent configuration.
+func (r *Registry) GetAgentConfig(vmID string) (*AgentConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	return rec.AgentConfig, true
 }
 
 // GetHealth returns a VM's last health report.
