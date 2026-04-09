@@ -2195,6 +2195,35 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 		return m.relocateStoppedVM(name, st, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey)
 	}
 
+	// --- Running Firecracker VM: snapshot-based migration with stop+relocate fallback ---
+	// If snapshot migration fails (e.g., guest health check flaky, snapshot error),
+	// fall back to stopping the VM and relocating files — same pattern as QEMU VMs.
+	// Without this fallback, FC migration failures during drain leave VMs stuck on
+	// the source or (worse) destroyed on both sides. (Issue #82)
+	resp, err := m.migrateFCSnapshot(name, st, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey)
+	if err == nil {
+		return resp, nil
+	}
+	log.Printf("FC snapshot migration failed for %s: %v — falling back to stop+relocate", name, err)
+	// Only fall back if the source VM is still present (rollback may have
+	// committed to the target and deleted source in the split-brain case).
+	if _, statErr := os.Stat(filepath.Join(vmDir, "vm.json")); statErr != nil {
+		// Source was deleted by rollback (committed to target) — do not
+		// attempt stop+relocate. Return the original error.
+		return nil, err
+	}
+	if IsRunning(vmDir) {
+		if stopErr := m.stopVM(name); stopErr != nil {
+			return nil, fmt.Errorf("fallback stop failed after FC snapshot error: %w", stopErr)
+		}
+	}
+	st, _ = LoadVMState(vmDir)
+	return m.relocateStoppedVM(name, st, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey)
+}
+
+// migrateFCSnapshot performs a Firecracker snapshot-based migration.
+// Pre-syncs rootfs, pauses, snapshots, transfers snapshot, imports on target, verifies.
+func (m *Manager) migrateFCSnapshot(name string, st *VMState, vmDir, dstVMDir, targetAddr, targetBridgeIP, clusterKey string) (*MigrateResponse, error) {
 	hostname, _ := os.Hostname()
 	telem := NewMigrationTelemetry(name, hostname, targetBridgeIP, "firecracker", st.RAMMIB)
 	// Note: telem.Write() called explicitly before vmDir cleanup, not via defer
@@ -2532,8 +2561,11 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	if !targetHealthy {
 		rollback("target VM not healthy after 60s")
-		destroyReq, _ := http.NewRequest("DELETE", fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name), nil)
-		targetClient.Do(destroyReq)
+		// Do NOT destroy the target here — rollback() already handles both
+		// cases: if the target has a running copy, rollback commits to it
+		// (deletes source); otherwise rollback resumes the source and cleans
+		// the target. A redundant DELETE would destroy the target after
+		// rollback committed to it, losing the VM on both sides. (Issue #82)
 		return nil, fmt.Errorf("target VM not healthy — rolled back to source")
 	}
 
@@ -2567,8 +2599,8 @@ func (m *Manager) MigrateVM(name, targetAddr, targetBridgeIP string) (*MigrateRe
 
 	if !guestHealthy {
 		rollback("guest VM not healthy after migration")
-		destroyReq, _ := http.NewRequest("DELETE", fmt.Sprintf("http://%s/api/vms/%s", targetAddr, name), nil)
-		targetClient.Do(destroyReq)
+		// Do NOT destroy the target here — same rationale as the verify
+		// check above. Rollback already handles cleanup. (Issue #82)
 		return nil, fmt.Errorf("guest VM not healthy — rolled back to source")
 	}
 
