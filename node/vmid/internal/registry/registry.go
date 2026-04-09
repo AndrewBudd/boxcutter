@@ -99,6 +99,18 @@ type AgentConfig struct {
 	TeamPersonaFiles []string          `json:"team_persona_files,omitempty"` // team-level persona file paths
 }
 
+// CheckpointData holds a session checkpoint for conversation persistence.
+// The session JSONL is stored as a file on disk (too large for in-memory registry);
+// this struct tracks metadata and the file path.
+type CheckpointData struct {
+	SessionID  string `json:"session_id"`
+	GitBranch  string `json:"git_branch,omitempty"`
+	GitStash   string `json:"git_stash,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	SizeBytes  int    `json:"size_bytes,omitempty"`
+	FilePath   string `json:"-"` // internal: path to session JSONL on disk
+}
+
 type VMRecord struct {
 	VMID        string            `json:"vm_id"`
 	VMType      string            `json:"vm_type,omitempty"` // "firecracker" or "qemu"
@@ -112,11 +124,12 @@ type VMRecord struct {
 
 	AgentConfig  *AgentConfig     `json:"agent_config,omitempty"`
 
-	LastActivity *ActivityReport   `json:"last_activity,omitempty"`
-	LastStatus   *StatusReport    `json:"last_status,omitempty"`
-	LastHealth   *HealthReport    `json:"last_health,omitempty"`
-	Inbox        []*Message       `json:"inbox,omitempty"`
-	Mailbox      []*MailboxMessage `json:"mailbox,omitempty"`
+	LastActivity   *ActivityReport   `json:"last_activity,omitempty"`
+	LastStatus     *StatusReport     `json:"last_status,omitempty"`
+	LastHealth     *HealthReport     `json:"last_health,omitempty"`
+	LastCheckpoint *CheckpointData   `json:"last_checkpoint,omitempty"`
+	Inbox          []*Message        `json:"inbox,omitempty"`
+	Mailbox        []*MailboxMessage `json:"mailbox,omitempty"`
 }
 
 // AllGitHubRepos returns the list of repos, falling back to single GitHubRepo.
@@ -414,6 +427,29 @@ func (r *Registry) GetAgentConfig(vmID string) (*AgentConfig, bool) {
 		return nil, false
 	}
 	return rec.AgentConfig, true
+}
+
+// SetCheckpoint stores a session checkpoint for a VM.
+func (r *Registry) SetCheckpoint(vmID string, cp *CheckpointData) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.LastCheckpoint = cp
+	return true
+}
+
+// GetCheckpoint returns a VM's last session checkpoint.
+func (r *Registry) GetCheckpoint(vmID string) (*CheckpointData, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	return rec.LastCheckpoint, true
 }
 
 // GetHealth returns a VM's last health report.

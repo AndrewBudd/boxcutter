@@ -63,6 +63,7 @@ func (h *MetadataHandler) handleRoot(w http.ResponseWriter, r *http.Request) {
 			"boxcutter_ssh_key":  "/metadata/boxcutter-ssh-key",
 			"claude_credentials": "/metadata/claude-credentials",
 			"agent_config":       "/metadata/agent-config",
+			"checkpoint":         "/tapegun/checkpoint",
 		},
 	})
 }
