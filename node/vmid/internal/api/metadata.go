@@ -31,6 +31,7 @@ func (h *MetadataHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /metadata/ssh-keys", h.handleSSHKeys)
 	mux.HandleFunc("GET /metadata/ca-cert", h.handleCACert)
 	mux.HandleFunc("GET /metadata/boxcutter-ssh-key", h.handleVMSSHKey)
+	mux.HandleFunc("GET /metadata/claude-credentials", h.handleClaudeCredentials)
 	// Metadata-style root
 	mux.HandleFunc("GET /", h.handleRoot)
 }
@@ -50,13 +51,14 @@ func (h *MetadataHandler) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"ip":     rec.IP,
 		"labels": rec.Labels,
 		"endpoints": map[string]string{
-			"identity":         "/identity",
-			"token":            "/token",
-			"github":           "/token/github",
-			"jwks":             "/.well-known/jwks.json",
-			"ssh_keys":         "/metadata/ssh-keys",
-			"ca_cert":          "/metadata/ca-cert",
-			"boxcutter_ssh_key": "/metadata/boxcutter-ssh-key",
+			"identity":           "/identity",
+			"token":              "/token",
+			"github":             "/token/github",
+			"jwks":               "/.well-known/jwks.json",
+			"ssh_keys":           "/metadata/ssh-keys",
+			"ca_cert":            "/metadata/ca-cert",
+			"boxcutter_ssh_key":  "/metadata/boxcutter-ssh-key",
+			"claude_credentials": "/metadata/claude-credentials",
 		},
 	})
 }
@@ -193,6 +195,27 @@ func (h *MetadataHandler) handleCACert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Write(data)
+}
+
+// HandleClaudeCredentials is the exported version for use outside the identity middleware.
+func (h *MetadataHandler) HandleClaudeCredentials(w http.ResponseWriter, r *http.Request) {
+	h.handleClaudeCredentials(w, r)
+}
+
+// handleClaudeCredentials returns Claude Code OAuth credentials (refresh token).
+// This is NOT behind identity middleware — VMs fetch this at boot.
+func (h *MetadataHandler) handleClaudeCredentials(w http.ResponseWriter, r *http.Request) {
+	if h.metadata.ClaudeCredentialsPath == "" {
+		http.Error(w, "Claude credentials not configured", http.StatusNotFound)
+		return
+	}
+	data, err := os.ReadFile(h.metadata.ClaudeCredentialsPath)
+	if err != nil {
+		http.Error(w, "Claude credentials not available", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
 	w.Write(data)
 }
 

@@ -24,10 +24,11 @@ type ListenConfig struct {
 }
 
 type MetadataFilesConfig struct {
-	SSHAuthorizedKeys []string `yaml:"ssh_authorized_keys"`
-	CACertPath        string   `yaml:"ca_cert_path"`
-	VMSSHKeyPath      string   `yaml:"vm_ssh_key_path"`
-	NodeAgentURL      string   `yaml:"node_agent_url"`
+	SSHAuthorizedKeys    []string `yaml:"ssh_authorized_keys"`
+	CACertPath           string   `yaml:"ca_cert_path"`
+	VMSSHKeyPath         string   `yaml:"vm_ssh_key_path"`
+	NodeAgentURL         string   `yaml:"node_agent_url"`
+	ClaudeCredentialsPath string  `yaml:"claude_credentials_path"`
 }
 
 type JWTConfig struct {

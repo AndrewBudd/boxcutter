@@ -40,6 +40,12 @@ github:
   # installation_id: 789012
   # private_key_path: /etc/boxcutter/secrets/github-app.pem
 
+# Claude Code (optional — auto-provisions OAuth credentials in VMs)
+# Place your .credentials.json file at ~/.boxcutter/secrets/claude-credentials.json
+# VMs will fetch it from the metadata service on boot and write to ~/.claude/.credentials.json
+# claude:
+#   credentials_path: /etc/boxcutter/secrets/claude-credentials.json
+
 # JWT (vmid token signing)
 jwt:
   # ECDSA P-256 key for signing JWT tokens issued by vmid.
