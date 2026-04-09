@@ -80,7 +80,13 @@ echo "=== Test 8: gcc removed after compilation ==="
 assert_contains "gcc removed" "$DOCKERFILE" "apt-get remove.*gcc"
 
 echo ""
-echo "=== Test 9: Build order (gh and Claude after gcc removal) ==="
+echo "=== Test 9: Ruby build dependencies ==="
+assert_contains "build-essential reinstalled for Ruby" "$DOCKERFILE" "build-essential.*libssl-dev.*libreadline-dev"
+assert_contains "build deps cleaned after mise install" "$DOCKERFILE" "apt-get remove.*build-essential"
+assert_contains "PATH inserted early in .bashrc (sed -i 2i)" "$DOCKERFILE" "sed -i.*2i.*PATH"
+
+echo ""
+echo "=== Test 10: Build order (gh and Claude after gcc removal) ==="
 # gh CLI and Claude Code should be installed after gcc is removed (no compile needed)
 GCC_LINE=$(grep -n "apt-get remove.*gcc" "$DOCKERFILE" | head -1 | cut -d: -f1)
 GH_LINE=$(grep -n "GitHub CLI" "$DOCKERFILE" | head -1 | cut -d: -f1)
