@@ -91,18 +91,13 @@ func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Merge labels from agent_config into VM labels
-	if len(req.AgentConfig) > 0 {
-		var ac struct {
-			Labels map[string]string `json:"labels"`
+	if req.AgentConfig != nil && len(req.AgentConfig.Labels) > 0 {
+		if rec.Labels == nil {
+			rec.Labels = make(map[string]string)
 		}
-		if json.Unmarshal(req.AgentConfig, &ac) == nil && len(ac.Labels) > 0 {
-			if rec.Labels == nil {
-				rec.Labels = make(map[string]string)
-			}
-			for k, v := range ac.Labels {
-				if _, exists := rec.Labels[k]; !exists {
-					rec.Labels[k] = v
-				}
+		for k, v := range req.AgentConfig.Labels {
+			if _, exists := rec.Labels[k]; !exists {
+				rec.Labels[k] = v
 			}
 		}
 	}
