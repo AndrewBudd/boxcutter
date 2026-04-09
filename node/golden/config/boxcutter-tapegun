@@ -400,6 +400,77 @@ EOJSON
     fi
 }
 
+# --- CI status polling state ---
+LAST_CI_STATE=""
+CI_POLL_COUNTER=0
+CI_FIX_ATTEMPTS=0
+CI_MAX_FIX_ATTEMPTS=3
+CI_ESCALATED=""
+
+# --- CI status check function ---
+# Polls GitHub CI status for the current branch's open PR.
+# Notifies agent via tapegun inbox on state changes only.
+check_ci_status() {
+    local project_dir="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
+    [ ! -d "$project_dir/.git" ] && return
+
+    # Detect current branch's open PR
+    local pr_num
+    pr_num=$(cd "$project_dir" && gh pr view --json number -q '.number' 2>/dev/null)
+    [ -z "$pr_num" ] && return
+
+    # Check CI status
+    local checks
+    checks=$(cd "$project_dir" && gh pr checks "$pr_num" --json name,state,bucket 2>/dev/null)
+    [ -z "$checks" ] && return
+
+    # Count by bucket
+    local pass fail pending
+    pass=$(echo "$checks" | jq '[.[] | select(.bucket=="pass")] | length')
+    fail=$(echo "$checks" | jq '[.[] | select(.bucket=="fail")] | length')
+    pending=$(echo "$checks" | jq '[.[] | select(.bucket=="pending")] | length')
+
+    # Only notify on state changes
+    local state_key="${pr_num}-${pass}-${fail}-${pending}"
+    [ "$state_key" = "$LAST_CI_STATE" ] && return
+    LAST_CI_STATE="$state_key"
+
+    if [ "$fail" -gt 0 ]; then
+        CI_FIX_ATTEMPTS=$((CI_FIX_ATTEMPTS + 1))
+        local failed_names
+        failed_names=$(echo "$checks" | jq -r '.[] | select(.bucket=="fail") | .name' | head -5)
+
+        if [ "$CI_FIX_ATTEMPTS" -gt "$CI_MAX_FIX_ATTEMPTS" ] && [ "$CI_ESCALATED" != "$pr_num" ]; then
+            # Circuit breaker: escalate to eng-manager
+            CI_ESCALATED="$pr_num"
+            curl -sf -X POST "${METADATA}/tapegun/inbox" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg pr "$pr_num" --arg names "$failed_names" --arg attempts "$CI_FIX_ATTEMPTS" \
+                    '{from: "ci-watcher", body: ("CI FAILED " + $attempts + " times on PR #" + $pr + ". Failed checks:\n" + $names + "\n\nThis has exceeded the fix attempt limit. Escalating to eng-manager."), priority: "urgent", send_keys: false}')" \
+                2>/dev/null || true
+            echo "tapegun: CI failed $CI_FIX_ATTEMPTS times on PR #$pr_num — escalated"
+        else
+            curl -sf -X POST "${METADATA}/tapegun/inbox" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg pr "$pr_num" --arg names "$failed_names" \
+                    '{from: "ci-watcher", body: ("CI FAILED on PR #" + $pr + "\nFailed checks:\n" + $names + "\n\nRun: gh run view --log-failed to see error details. Fix the issue and push."), priority: "urgent", send_keys: false}')" \
+                2>/dev/null || true
+            echo "tapegun: CI failed on PR #$pr_num (attempt $CI_FIX_ATTEMPTS)"
+        fi
+
+    elif [ "$pending" -eq 0 ] && [ "$pass" -gt 0 ] && [ "$fail" -eq 0 ]; then
+        # All checks passed — reset fix counter
+        CI_FIX_ATTEMPTS=0
+        CI_ESCALATED=""
+        curl -sf -X POST "${METADATA}/tapegun/inbox" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg pr "$pr_num" --arg count "$pass" \
+                '{from: "ci-watcher", body: ("CI PASSED on PR #" + $pr + " — all " + $count + " checks passed. PR is ready for review."), priority: "normal", send_keys: false}')" \
+            2>/dev/null || true
+        echo "tapegun: CI passed on PR #$pr_num ($pass checks)"
+    fi
+}
+
 while true; do
     # --- Post health ---
     HEALTH_PAYLOAD=$(run_health_checks)
@@ -467,6 +538,12 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
                 fi
             done
         fi
+    fi
+
+    # --- CI status polling (every 30s = every 6th cycle) ---
+    CI_POLL_COUNTER=$((CI_POLL_COUNTER + 1))
+    if [ $((CI_POLL_COUNTER % 6)) -eq 0 ] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        check_ci_status
     fi
 
     # --- Crash detection & auto-restart ---
