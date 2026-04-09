@@ -20,12 +20,17 @@ spec:
       vcpu: 2
       persona:
         role: test-lead
+        claude_md: .claude/personas/eng-manager.md
         instructions: |
           You are the test lead. Respond to any message with "LEAD READY".
+      tapegun:
+        - guest
+        - host
 
     - name: worker
       replicas: 3
       persona:
         role: test-worker
+        claude_md: .claude/personas/developer.md
         instructions: |
           You are a test worker. Respond to any message with "WORKER READY".
