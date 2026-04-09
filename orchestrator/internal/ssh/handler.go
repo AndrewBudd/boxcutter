@@ -898,6 +898,7 @@ func (h *Handler) cmdTeam(args []string) int {
 Subcommands:
   apply -f -          Create/update team from YAML (reads stdin)
   diff -f -           Show what would change (dry-run)
+  export <name>       Export running team as YAML
   destroy <name>      Destroy all VMs for a team
   list                List active teams
   status <name>       Show status of team VMs`)
@@ -909,6 +910,8 @@ Subcommands:
 		return h.teamApply(args[1:])
 	case "diff":
 		return h.teamDiff(args[1:])
+	case "export":
+		return h.teamExport(args[1:])
 	case "destroy":
 		return h.teamDestroy(args[1:])
 	case "list":
@@ -1200,6 +1203,235 @@ func (h *Handler) teamDiff(args []string) int {
 	return 0
 }
 
+func (h *Handler) teamExport(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team export <team-name>\n")
+		return 1
+	}
+	teamName := args[0]
+
+	resp, err := h.get("/api/vms")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing VMs: %v\n", err)
+		return 1
+	}
+
+	var vms []map[string]interface{}
+	json.Unmarshal(resp, &vms)
+
+	// Collect team VMs by name prefix
+	prefix := teamName + "-"
+	type vmInfo struct {
+		name      string
+		agent     string
+		replica   int
+		vmType    string
+		vcpu      int
+		ramMIB    int
+		disk      string
+		mode      string
+		desc      string
+		role      string
+	}
+
+	var teamVMs []vmInfo
+	for _, vm := range vms {
+		name, _ := vm["name"].(string)
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+
+		// Parse: {team}-{agent}-{N}
+		suffix := name[len(prefix):]
+		parts := strings.Split(suffix, "-")
+		if len(parts) < 2 {
+			continue
+		}
+		replicaStr := parts[len(parts)-1]
+		replica := 0
+		for _, c := range replicaStr {
+			if c >= '0' && c <= '9' {
+				replica = replica*10 + int(c-'0')
+			}
+		}
+		agentName := strings.Join(parts[:len(parts)-1], "-")
+
+		vmType, _ := vm["type"].(string)
+		vcpu, _ := vm["vcpu"].(float64)
+		ramMIB, _ := vm["ram_mib"].(float64)
+		disk, _ := vm["disk"].(string)
+		mode, _ := vm["mode"].(string)
+		desc, _ := vm["description"].(string)
+
+		// Check labels for role
+		role := ""
+		if labels, ok := vm["labels"].(map[string]interface{}); ok {
+			if r, ok := labels["role"].(string); ok {
+				role = r
+			}
+		}
+
+		if vmType == "" {
+			vmType = "firecracker"
+		}
+		if mode == "" {
+			mode = "normal"
+		}
+		if disk == "" {
+			disk = "50G"
+		}
+
+		teamVMs = append(teamVMs, vmInfo{
+			name:    name,
+			agent:   agentName,
+			replica: replica,
+			vmType:  vmType,
+			vcpu:    int(vcpu),
+			ramMIB:  int(ramMIB),
+			disk:    disk,
+			mode:    mode,
+			desc:    desc,
+			role:    role,
+		})
+	}
+
+	if len(teamVMs) == 0 {
+		fmt.Fprintf(os.Stderr, "No VMs found for team %q\n", teamName)
+		return 1
+	}
+
+	// Group by agent name → count replicas and extract config
+	type agentInfo struct {
+		name     string
+		replicas int
+		vmType   string
+		vcpu     int
+		ramMIB   int
+		disk     string
+		mode     string
+		desc     string
+		role     string
+	}
+	agentMap := make(map[string]*agentInfo)
+	var agentOrder []string
+	for _, vm := range teamVMs {
+		ai, exists := agentMap[vm.agent]
+		if !exists {
+			ai = &agentInfo{
+				name:   vm.agent,
+				vmType: vm.vmType,
+				vcpu:   vm.vcpu,
+				ramMIB: vm.ramMIB,
+				disk:   vm.disk,
+				mode:   vm.mode,
+				desc:   vm.desc,
+				role:   vm.role,
+			}
+			agentMap[vm.agent] = ai
+			agentOrder = append(agentOrder, vm.agent)
+		}
+		ai.replicas++
+	}
+
+	// Compute defaults: most common values across agents
+	typeCounts := make(map[string]int)
+	vcpuCounts := make(map[int]int)
+	ramCounts := make(map[int]int)
+	diskCounts := make(map[string]int)
+	modeCounts := make(map[string]int)
+	for _, ai := range agentMap {
+		typeCounts[ai.vmType]++
+		vcpuCounts[ai.vcpu]++
+		ramCounts[ai.ramMIB]++
+		diskCounts[ai.disk]++
+		modeCounts[ai.mode]++
+	}
+	defType := maxKey(typeCounts)
+	defVCPU := maxKeyInt(vcpuCounts)
+	defRAM := maxKeyInt(ramCounts)
+	defDisk := maxKey(diskCounts)
+	defMode := maxKey(modeCounts)
+
+	// Emit YAML
+	fmt.Printf("apiVersion: boxcutter/v1\nkind: Team\nmetadata:\n  name: %s\nspec:\n", teamName)
+
+	// Defaults
+	fmt.Printf("  defaults:\n")
+	fmt.Printf("    type: %s\n", defType)
+	fmt.Printf("    vcpu: %d\n", defVCPU)
+	fmt.Printf("    ram: %s\n", formatRAMMiB(defRAM))
+	fmt.Printf("    disk: %s\n", defDisk)
+	fmt.Printf("    mode: %s\n", defMode)
+
+	// Agents
+	fmt.Printf("\n  agents:\n")
+	for _, name := range agentOrder {
+		ai := agentMap[name]
+		fmt.Printf("    - name: %s\n", ai.name)
+		if ai.replicas > 1 {
+			fmt.Printf("      replicas: %d\n", ai.replicas)
+		}
+		// Only emit fields that differ from defaults
+		if ai.vmType != defType {
+			fmt.Printf("      type: %s\n", ai.vmType)
+		}
+		if ai.vcpu != defVCPU {
+			fmt.Printf("      vcpu: %d\n", ai.vcpu)
+		}
+		if ai.ramMIB != defRAM {
+			fmt.Printf("      ram: %s\n", formatRAMMiB(ai.ramMIB))
+		}
+		if ai.disk != defDisk {
+			fmt.Printf("      disk: %s\n", ai.disk)
+		}
+		if ai.mode != defMode {
+			fmt.Printf("      mode: %s\n", ai.mode)
+		}
+		if ai.desc != "" {
+			fmt.Printf("      description: %q\n", ai.desc)
+		}
+		if ai.role != "" {
+			fmt.Printf("      persona:\n        role: %s\n", ai.role)
+		}
+	}
+
+	return 0
+}
+
+// maxKey returns the key with the highest count from a string→int map.
+func maxKey(m map[string]int) string {
+	best := ""
+	bestN := 0
+	for k, n := range m {
+		if n > bestN {
+			best = k
+			bestN = n
+		}
+	}
+	return best
+}
+
+// maxKeyInt returns the int key with the highest count.
+func maxKeyInt(m map[int]int) int {
+	best := 0
+	bestN := 0
+	for k, n := range m {
+		if n > bestN {
+			best = k
+			bestN = n
+		}
+	}
+	return best
+}
+
+// formatRAMMiB converts MiB to human-readable (e.g. 4096 → "4G", 512 → "512M").
+func formatRAMMiB(mib int) string {
+	if mib > 0 && mib%1024 == 0 {
+		return fmt.Sprintf("%dG", mib/1024)
+	}
+	return fmt.Sprintf("%dM", mib)
+}
+
 func (h *Handler) teamDestroy(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team destroy <team-name>\n")
@@ -1411,6 +1643,7 @@ Commands:
                           Copy a file out of a VM (use - for stdout)
   team apply -f -         Create/update team from YAML (stdin)
   team diff -f -          Show what apply would change (dry-run)
+  team export <name>      Export running team as YAML
   team destroy <name>     Destroy all VMs for a team
   team list               List active teams
   team status <name>      Show status of team VMs

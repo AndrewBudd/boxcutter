@@ -559,17 +559,18 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 
 // vmListEntry is the enriched VM info returned by the list endpoint.
 type vmListEntry struct {
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Description string `json:"description,omitempty"`
-	NodeID      string `json:"node_id"`
-	NodeName    string `json:"node_name"`
-	TailscaleIP string `json:"tailscale_ip"`
-	Mode        string `json:"mode"`
-	VCPU        int    `json:"vcpu"`
-	RAMMIB      int    `json:"ram_mib"`
-	Disk        string `json:"disk"`
-	Status      string `json:"status"`
+	Name        string            `json:"name"`
+	Type        string            `json:"type"`
+	Description string            `json:"description,omitempty"`
+	NodeID      string            `json:"node_id"`
+	NodeName    string            `json:"node_name"`
+	TailscaleIP string            `json:"tailscale_ip"`
+	Mode        string            `json:"mode"`
+	VCPU        int               `json:"vcpu"`
+	RAMMIB      int               `json:"ram_mib"`
+	Disk        string            `json:"disk"`
+	Status      string            `json:"status"`
+	Labels      map[string]string `json:"labels,omitempty"`
 }
 
 func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
@@ -624,6 +625,7 @@ func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
 			NodeID:   v.NodeID,
 			NodeName: nodeName,
 			Status:   v.Status,
+			Labels:   v.Labels,
 		}
 
 		if nodeDetail, ok := detailsByNode[v.NodeID]; ok {
