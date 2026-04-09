@@ -350,6 +350,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// VM-to-VM messaging: lookup which node a VM is on
 	mux.HandleFunc("GET /api/vms/{name}/location", h.handleVMLocation)
 
+	// Dashboard: SSE stream + alerts
+	mux.HandleFunc("GET /api/alerts", h.handleAlerts)
+	mux.HandleFunc("GET /api/alerts/stream", h.handleAlertStream)
+
 	// Work queue
 	mux.HandleFunc("GET /api/queue", h.handleQueueList)
 	mux.HandleFunc("POST /api/queue", h.handleQueueAdd)
@@ -2020,9 +2024,6 @@ func (h *Handler) detectAlerts() {
 	}
 
 	// Fetch activity from each node concurrently
-	type nodeResult struct {
-		activities []node.TapegunVMActivity
-	}
 	results := make(chan struct {
 		nodeID string
 		acts   []node.TapegunVMActivity
