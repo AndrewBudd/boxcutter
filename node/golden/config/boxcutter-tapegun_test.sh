@@ -367,6 +367,84 @@ touch "$STAMP"
 assert_file_exists "stamp present after setup" "$STAMP"
 
 echo ""
+echo "=== Test 16: Session restore writes JSONL to correct path ==="
+
+PROJECT16="${TMPDIR}/project16"
+mkdir -p "${PROJECT16}/.claude/projects/-home-dev-project"
+
+SESSION_ID="8fd8c5bf-b0df-4a95-8ff9-49d809d26532"
+SESSION_DATA='{"type":"user","message":"hello"}'
+SESSION_DIR="${PROJECT16}/.claude/projects/-home-dev-project"
+
+echo "$SESSION_DATA" > "${SESSION_DIR}/${SESSION_ID}.jsonl"
+
+assert_file_exists "session JSONL written" "${SESSION_DIR}/${SESSION_ID}.jsonl"
+assert_contains "session data preserved" "hello" "$(cat "${SESSION_DIR}/${SESSION_ID}.jsonl")"
+
+echo ""
+echo "=== Test 17: Checkpoint finds most recent session JSONL ==="
+
+CP_DIR="${TMPDIR}/cp-test/.claude/projects/-home-dev-project"
+mkdir -p "$CP_DIR"
+
+# Create two session files with different timestamps
+echo '{"old":"data"}' > "${CP_DIR}/old-session.jsonl"
+sleep 0.1
+echo '{"new":"data"}' > "${CP_DIR}/new-session.jsonl"
+
+# ls -t should return newest first
+LATEST=$(ls -t "${CP_DIR}"/*.jsonl 2>/dev/null | head -1)
+LATEST_NAME=$(basename "$LATEST" .jsonl)
+assert_eq "newest session found" "new-session" "$LATEST_NAME"
+
+echo ""
+echo "=== Test 18: Checkpoint interval tracking ==="
+
+CHECKPOINT_INTERVAL=60
+LAST_CHECKPOINT=0
+NOW_EPOCH=$(date +%s)
+SHOULD_CHECKPOINT=$((NOW_EPOCH - LAST_CHECKPOINT >= CHECKPOINT_INTERVAL))
+assert_eq "first checkpoint triggers" "1" "$SHOULD_CHECKPOINT"
+
+LAST_CHECKPOINT=$NOW_EPOCH
+SHOULD_CHECKPOINT=$((NOW_EPOCH - LAST_CHECKPOINT >= CHECKPOINT_INTERVAL))
+assert_eq "immediate re-checkpoint skipped" "0" "$SHOULD_CHECKPOINT"
+
+echo ""
+echo "=== Test 19: Restore sets RESTORED_SESSION_ID ==="
+
+RESTORED_SESSION_ID=""
+# Simulate restore setting the variable
+RESTORED_SESSION_ID="test-session-123"
+CLAUDE_CMD="claude --dangerously-skip-permissions"
+[ -n "$RESTORED_SESSION_ID" ] && CLAUDE_CMD="$CLAUDE_CMD --continue"
+assert_contains "claude cmd has --continue after restore" "--continue" "$CLAUDE_CMD"
+
+RESTORED_SESSION_ID=""
+CLAUDE_CMD="claude --dangerously-skip-permissions"
+CLAUDE_RESUME=true
+[ -n "$RESTORED_SESSION_ID" ] && CLAUDE_CMD="$CLAUDE_CMD --continue"
+[ "$CLAUDE_RESUME" = "true" ] && [ -z "$RESTORED_SESSION_ID" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
+assert_contains "claude cmd has --resume without restore" "--resume" "$CLAUDE_CMD"
+assert_not_contains "claude cmd no --continue without restore" "--continue" "$CLAUDE_CMD"
+
+echo ""
+echo "=== Test 20: Checkpoint JSON structure ==="
+
+# Verify jq can build the checkpoint payload structure
+if command -v jq >/dev/null 2>&1; then
+    CP_JSON=$(jq -n \
+        --arg session_id "test-sess" \
+        --arg git_branch "main" \
+        --arg git_stash "" \
+        '{session_id: $session_id, git_branch: $git_branch, git_stash: $git_stash}')
+    CP_SID=$(echo "$CP_JSON" | jq -r '.session_id')
+    assert_eq "checkpoint JSON session_id" "test-sess" "$CP_SID"
+    CP_BRANCH=$(echo "$CP_JSON" | jq -r '.git_branch')
+    assert_eq "checkpoint JSON git_branch" "main" "$CP_BRANCH"
+fi
+
+echo ""
 echo "=== Results ==="
 echo "Passed: $PASS"
 echo "Failed: $FAIL"

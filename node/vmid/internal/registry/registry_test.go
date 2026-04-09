@@ -225,3 +225,64 @@ func TestZeroMarkNotIndexed(t *testing.T) {
 		t.Fatal("LookupID should still work")
 	}
 }
+
+func TestCheckpointSetGet(t *testing.T) {
+	r := New()
+	r.Register(&VMRecord{VMID: "cp-vm", IP: "10.0.0.2", Mark: 99, Mode: "normal"})
+
+	// No checkpoint initially
+	cp, ok := r.GetCheckpoint("cp-vm")
+	if !ok {
+		t.Fatal("GetCheckpoint should return ok=true for existing VM")
+	}
+	if cp != nil {
+		t.Fatal("expected nil checkpoint initially")
+	}
+
+	// Set checkpoint
+	ok = r.SetCheckpoint("cp-vm", &CheckpointData{
+		SessionID: "sess-abc",
+		GitBranch: "feat/test",
+		Timestamp: "2026-04-09T12:00:00Z",
+		SizeBytes: 1024,
+		FilePath:  "/var/lib/vmid/checkpoints/cp-vm/sess-abc.jsonl",
+	})
+	if !ok {
+		t.Fatal("SetCheckpoint failed")
+	}
+
+	// Get checkpoint
+	cp, ok = r.GetCheckpoint("cp-vm")
+	if !ok || cp == nil {
+		t.Fatal("expected checkpoint after set")
+	}
+	if cp.SessionID != "sess-abc" {
+		t.Errorf("SessionID = %q, want %q", cp.SessionID, "sess-abc")
+	}
+	if cp.GitBranch != "feat/test" {
+		t.Errorf("GitBranch = %q, want %q", cp.GitBranch, "feat/test")
+	}
+	if cp.SizeBytes != 1024 {
+		t.Errorf("SizeBytes = %d, want 1024", cp.SizeBytes)
+	}
+
+	// Overwrite checkpoint
+	r.SetCheckpoint("cp-vm", &CheckpointData{
+		SessionID: "sess-def",
+		Timestamp: "2026-04-09T13:00:00Z",
+	})
+	cp, _ = r.GetCheckpoint("cp-vm")
+	if cp.SessionID != "sess-def" {
+		t.Errorf("expected overwritten session, got %q", cp.SessionID)
+	}
+
+	// Nonexistent VM
+	ok = r.SetCheckpoint("nonexistent", &CheckpointData{SessionID: "x"})
+	if ok {
+		t.Error("SetCheckpoint should fail for nonexistent VM")
+	}
+	_, ok = r.GetCheckpoint("nonexistent")
+	if ok {
+		t.Error("GetCheckpoint should fail for nonexistent VM")
+	}
+}

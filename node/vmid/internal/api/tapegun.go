@@ -2,20 +2,27 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/middleware"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/registry"
 )
 
-// TapegunHandler serves VM-facing tapegun endpoints (activity reporting, inbox).
+// TapegunHandler serves VM-facing tapegun endpoints (activity reporting, inbox, checkpoints).
 type TapegunHandler struct {
-	reg *registry.Registry
+	reg           *registry.Registry
+	checkpointDir string // directory for checkpoint session files
 }
 
 func NewTapegunHandler(reg *registry.Registry) *TapegunHandler {
-	return &TapegunHandler{reg: reg}
+	cpDir := "/var/lib/vmid/checkpoints"
+	os.MkdirAll(cpDir, 0755)
+	return &TapegunHandler{reg: reg, checkpointDir: cpDir}
 }
 
 func (h *TapegunHandler) Register(mux *http.ServeMux) {
@@ -24,6 +31,8 @@ func (h *TapegunHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /tapegun/health", h.handlePostHealth)
 	mux.HandleFunc("GET /tapegun/inbox", h.handleGetInbox)
 	mux.HandleFunc("POST /tapegun/inbox/ack", h.handleAckInbox)
+	mux.HandleFunc("POST /tapegun/checkpoint", h.handlePostCheckpoint)
+	mux.HandleFunc("GET /tapegun/checkpoint", h.handleGetCheckpoint)
 }
 
 func (h *TapegunHandler) handlePostActivity(w http.ResponseWriter, r *http.Request) {
@@ -119,4 +128,121 @@ func (h *TapegunHandler) handleAckInbox(w http.ResponseWriter, r *http.Request) 
 
 	h.reg.AckMessages(rec.VMID, req.MessageIDs)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+const maxCheckpointSize = 20 * 1024 * 1024 // 20MB
+
+// handlePostCheckpoint stores a session checkpoint (conversation JSONL + git state).
+// The session data is stored as a file on disk; metadata is kept in the registry.
+func (h *TapegunHandler) handlePostCheckpoint(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+
+	// Read body with size limit
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxCheckpointSize+1))
+	if err != nil {
+		http.Error(w, "read error: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxCheckpointSize {
+		http.Error(w, "checkpoint too large (max 20MB)", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	var req struct {
+		SessionID   string `json:"session_id"`
+		GitBranch   string `json:"git_branch"`
+		GitStash    string `json:"git_stash"`
+		SessionData string `json:"session_data"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.SessionID == "" {
+		http.Error(w, "session_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Write session data to disk
+	vmDir := filepath.Join(h.checkpointDir, rec.VMID)
+	os.MkdirAll(vmDir, 0755)
+	sessionFile := filepath.Join(vmDir, req.SessionID+".jsonl")
+	if err := os.WriteFile(sessionFile, []byte(req.SessionData), 0644); err != nil {
+		http.Error(w, "write error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Update registry metadata
+	cp := &registry.CheckpointData{
+		SessionID: req.SessionID,
+		GitBranch: req.GitBranch,
+		GitStash:  req.GitStash,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		SizeBytes: len(req.SessionData),
+		FilePath:  sessionFile,
+	}
+	h.reg.SetCheckpoint(rec.VMID, cp)
+
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, map[string]interface{}{
+		"status":     "stored",
+		"session_id": req.SessionID,
+		"size_bytes": len(req.SessionData),
+	})
+}
+
+// handleGetCheckpoint retrieves the latest checkpoint for the requesting VM.
+func (h *TapegunHandler) handleGetCheckpoint(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+
+	cp, _ := h.reg.GetCheckpoint(rec.VMID)
+	if cp == nil || cp.FilePath == "" {
+		writeJSON(w, map[string]interface{}{})
+		return
+	}
+
+	// Read session data from disk
+	data, err := os.ReadFile(cp.FilePath)
+	if err != nil {
+		// Metadata exists but file is gone — stale checkpoint
+		writeJSON(w, map[string]interface{}{})
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"session_id":   cp.SessionID,
+		"git_branch":   cp.GitBranch,
+		"git_stash":    cp.GitStash,
+		"timestamp":    cp.Timestamp,
+		"session_data": string(data),
+		"size_bytes":   len(data),
+	})
+}
+
+// HandleGetCheckpointByVM retrieves a checkpoint for a specific VM (admin API).
+func (h *TapegunHandler) HandleGetCheckpointByVM(vmID string) (map[string]interface{}, error) {
+	cp, ok := h.reg.GetCheckpoint(vmID)
+	if !ok || cp == nil || cp.FilePath == "" {
+		return nil, fmt.Errorf("no checkpoint for %s", vmID)
+	}
+	data, err := os.ReadFile(cp.FilePath)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint file missing: %w", err)
+	}
+	return map[string]interface{}{
+		"session_id":   cp.SessionID,
+		"git_branch":   cp.GitBranch,
+		"git_stash":    cp.GitStash,
+		"timestamp":    cp.Timestamp,
+		"session_data": string(data),
+		"size_bytes":   len(data),
+	}, nil
 }

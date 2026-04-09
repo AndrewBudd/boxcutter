@@ -19,12 +19,16 @@ HOME_DIR="/home/dev"
 PROJECT_DIR="${HOME_DIR}/project"
 CLAUDE_DIR="${HOME_DIR}/.claude"
 SETUP_STAMP="${HOME_DIR}/.tapegun-setup-done"
+CHECKPOINT_INTERVAL=60
+LAST_CHECKPOINT=0
+RESTORED_SESSION_ID=""
 
 mkdir -p "$INBOX_DIR"
 
 # --- Stop hook: notify metadata service on shutdown ---
 cleanup() {
-    echo "tapegun: shutting down, posting final status"
+    echo "tapegun: shutting down, posting final checkpoint and status"
+    checkpoint_session 2>/dev/null || true
     curl -sf -X POST "${METADATA}/tapegun/activity" \
         -H "Content-Type: application/json" \
         -d '{"pane_content":"","status":"stopped"}' \
@@ -151,6 +155,80 @@ install_persona() {
     fi
 }
 
+restore_session() {
+    local checkpoint
+    checkpoint=$(curl -sf --max-time 10 "${METADATA}/tapegun/checkpoint" 2>/dev/null || echo "")
+    if [ -z "$checkpoint" ] || [ "$checkpoint" = "null" ] || [ "$checkpoint" = "{}" ]; then
+        return 1
+    fi
+
+    local session_id session_data git_branch
+    session_id=$(echo "$checkpoint" | jq -r '.session_id // empty' 2>/dev/null)
+    session_data=$(echo "$checkpoint" | jq -r '.session_data // empty' 2>/dev/null)
+    git_branch=$(echo "$checkpoint" | jq -r '.git_branch // empty' 2>/dev/null)
+
+    [ -z "$session_id" ] || [ -z "$session_data" ] && return 1
+
+    log "restoring session $session_id"
+
+    # Restore conversation history JSONL
+    local session_dir="${CLAUDE_DIR}/projects/-home-dev-project"
+    mkdir -p "$session_dir"
+    echo "$session_data" > "${session_dir}/${session_id}.jsonl"
+    log "session JSONL restored ($(echo "$session_data" | wc -c) bytes)"
+
+    # Restore git branch if specified
+    if [ -n "$git_branch" ] && [ -d "${PROJECT_DIR}/.git" ]; then
+        cd "$PROJECT_DIR"
+        git checkout "$git_branch" 2>/dev/null || git checkout -b "$git_branch" 2>/dev/null || true
+        log "checked out branch $git_branch"
+        cd - >/dev/null
+    fi
+
+    RESTORED_SESSION_ID="$session_id"
+    return 0
+}
+
+checkpoint_session() {
+    # Find the most recent session JSONL
+    local session_dir="${CLAUDE_DIR}/projects/-home-dev-project"
+    [ ! -d "$session_dir" ] && return
+
+    local session_file
+    session_file=$(ls -t "$session_dir"/*.jsonl 2>/dev/null | head -1)
+    [ -z "$session_file" ] && return
+
+    local session_id
+    session_id=$(basename "$session_file" .jsonl)
+    local size
+    size=$(wc -c < "$session_file" 2>/dev/null || echo "0")
+
+    # Skip if file is too large (>20MB) or empty
+    [ "$size" -eq 0 ] && return
+    [ "$size" -gt 20971520 ] && { log "WARNING: session too large for checkpoint ($size bytes)"; return; }
+
+    # Capture git state
+    local git_branch="" git_stash=""
+    if [ -d "${PROJECT_DIR}/.git" ]; then
+        git_branch=$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || echo "")
+        git_stash=$(git -C "$PROJECT_DIR" stash create 2>/dev/null || echo "")
+    fi
+
+    # POST checkpoint to metadata service
+    if command -v jq >/dev/null 2>&1; then
+        jq -n \
+            --arg session_id "$session_id" \
+            --arg git_branch "$git_branch" \
+            --arg git_stash "$git_stash" \
+            --rawfile session_data "$session_file" \
+            '{session_id: $session_id, git_branch: $git_branch, git_stash: $git_stash, session_data: $session_data}' | \
+        curl -sf -X POST "${METADATA}/tapegun/checkpoint" \
+            -H "Content-Type: application/json" \
+            -d @- \
+            --max-time 15 2>/dev/null || true
+    fi
+}
+
 setup_workspace() {
     # Idempotency: skip if already completed this boot
     if [ -f "$SETUP_STAMP" ]; then
@@ -220,6 +298,11 @@ setup_workspace() {
 
     # Install persona files at .claude/personas/ path
     install_persona "$target_dir" "$persona_claude_md" "$persona_instructions" "$team_persona_files"
+
+    # Attempt session restore from checkpoint
+    if restore_session; then
+        log "session restored, will launch with --continue"
+    fi
 
     # Update tapegun config variables for Claude Code launch
     [ -n "$claude_flags" ] && CLAUDE_FLAGS="$claude_flags"
@@ -319,9 +402,14 @@ EOSETTINGS
         # Start Claude Code
         CLAUDE_CMD="claude"
         [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-        [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
+        if [ -n "$RESTORED_SESSION_ID" ]; then
+            CLAUDE_CMD="$CLAUDE_CMD --continue"
+            echo "tapegun: resuming session $RESTORED_SESSION_ID"
+        elif [ "$CLAUDE_RESUME" = "true" ]; then
+            CLAUDE_CMD="$CLAUDE_CMD --resume"
+        fi
         tmux send-keys -t main "$CLAUDE_CMD" Enter
-        echo "tapegun: Claude Code started (flags: $CLAUDE_FLAGS, resume: $CLAUDE_RESUME)"
+        echo "tapegun: Claude Code started (flags: $CLAUDE_FLAGS, resume: $CLAUDE_RESUME, restored: ${RESTORED_SESSION_ID:-none})"
     else
         echo "tapegun: tmux session 'main' already exists, skipping autostart"
     fi
@@ -432,6 +520,13 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             2>/dev/null || true
+    fi
+
+    # --- Periodic session checkpoint ---
+    NOW_EPOCH=$(date +%s)
+    if [ $((NOW_EPOCH - LAST_CHECKPOINT)) -ge $CHECKPOINT_INTERVAL ]; then
+        checkpoint_session
+        LAST_CHECKPOINT=$NOW_EPOCH
     fi
 
     # --- Check inbox ---
