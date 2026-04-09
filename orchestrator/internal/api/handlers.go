@@ -345,17 +345,18 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 // --- VM handlers ---
 
 type vmCreateRequest struct {
-	Name             string   `json:"name"`
-	Type             string   `json:"type,omitempty"`
-	Description      string   `json:"description,omitempty"`
-	VCPU             int      `json:"vcpu,omitempty"`
-	RAMMIB           int      `json:"ram_mib,omitempty"`
-	Disk             string   `json:"disk,omitempty"`
-	CloneURL         string   `json:"clone_url,omitempty"`
-	CloneURLs        []string `json:"clone_urls,omitempty"`
-	Mode             string   `json:"mode,omitempty"`
-	NodeID           string   `json:"node_id,omitempty"`
-	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
+	Name             string            `json:"name"`
+	Type             string            `json:"type,omitempty"`
+	Description      string            `json:"description,omitempty"`
+	VCPU             int               `json:"vcpu,omitempty"`
+	RAMMIB           int               `json:"ram_mib,omitempty"`
+	Disk             string            `json:"disk,omitempty"`
+	CloneURL         string            `json:"clone_url,omitempty"`
+	CloneURLs        []string          `json:"clone_urls,omitempty"`
+	Mode             string            `json:"mode,omitempty"`
+	NodeID           string            `json:"node_id,omitempty"`
+	TailscaleAuthkey string            `json:"tailscale_authkey,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
 }
 
 // nodeToScheduler converts a state.Node to the db.Node type used by the scheduler.
@@ -534,6 +535,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 		Name:   nodeResp.Name,
 		NodeID: targetNode.ID,
 		Status: nodeResp.Status,
+		Labels: req.Labels,
 	})
 
 	log.Printf("VM created: %s on node %s", nodeResp.Name, targetNode.ID)
