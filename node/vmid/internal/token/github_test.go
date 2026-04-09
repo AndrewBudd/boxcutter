@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/config"
+	"github.com/AndrewBudd/boxcutter/node/vmid/internal/registry"
 )
 
 func writeTestPEM(t *testing.T, dir string) string {
