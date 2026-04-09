@@ -1,23 +1,33 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import type { TapegunActivity } from '@/lib/types'
 
 export default function ActivityPage() {
   const [activities, setActivities] = useState<TapegunActivity[]>([])
+  const paneRefs = useRef<Map<string, HTMLDivElement>>(new Map())
 
   useEffect(() => {
     const poll = async () => {
       try {
         const data = await fetch('/api/tapegun/activity').then(r => r.json())
-        setActivities(Array.isArray(data) ? data : [])
+        const sorted = Array.isArray(data)
+          ? [...data].sort((a, b) => a.name.localeCompare(b.name))
+          : []
+        setActivities(sorted)
       } catch {}
     }
     poll()
     const interval = setInterval(poll, 5000)
     return () => clearInterval(interval)
   }, [])
+
+  useEffect(() => {
+    paneRefs.current.forEach(el => {
+      el.scrollTop = el.scrollHeight
+    })
+  }, [activities])
 
   return (
     <div>
@@ -44,6 +54,7 @@ export default function ActivityPage() {
               </div>
             </div>
             <div className="p-3 font-mono text-xs whitespace-pre-wrap max-h-[280px] overflow-y-auto bg-[#0d1117] text-green-400/90 leading-relaxed"
+                 ref={el => { if (el) paneRefs.current.set(act.name, el); else paneRefs.current.delete(act.name); }}
                  style={{ fontFamily: "'JetBrains Mono', monospace" }}>
               {act.activity?.pane_content || (
                 <span className="text-gray-700">No activity data</span>
