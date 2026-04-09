@@ -459,32 +459,6 @@ func runDaemon() {
 	}
 }
 
-// reconcileTrackedPIDs verifies that PIDs in cluster state still belong to the
-// expected QEMU processes. After a host restart or binary upgrade, a saved PID
-// may no longer exist or may have been reused by an unrelated process. Clear
-// stale PIDs so bootRecover will relaunch VMs from disk rather than skipping
-// them as "already running".
-func reconcileTrackedPIDs(state *cluster.State) {
-	changed := false
-	if state.Orchestrator != nil && state.Orchestrator.PID > 0 {
-		if !isQEMUProcess(state.Orchestrator.PID) {
-			log.Printf("  orchestrator PID %d is stale (not a QEMU process), clearing for relaunch", state.Orchestrator.PID)
-			state.SetPID(state.Orchestrator.ID, 0)
-			changed = true
-		}
-	}
-	for _, node := range state.Nodes {
-		if node.PID > 0 && !isQEMUProcess(node.PID) {
-			log.Printf("  %s PID %d is stale (not a QEMU process), clearing for relaunch", node.ID, node.PID)
-			state.SetPID(node.ID, 0)
-			changed = true
-		}
-	}
-	if changed {
-		state.Save()
-	}
-}
-
 // isQEMUProcess checks whether the given PID is a running qemu-system process
 // by inspecting /proc/<pid>/cmdline. Returns false if the process doesn't exist
 // or is not QEMU.
@@ -497,26 +471,16 @@ func isQEMUProcess(pid int) bool {
 	return len(args) > 0 && strings.HasSuffix(args[0], "qemu-system-x86_64")
 }
 
-// discoverOrphanedVMs scans /proc for running qemu-system-x86_64 processes
-// that are not tracked in the cluster state. This handles the case where
-// cluster.json was lost or corrupted but VMs are still running.
-func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
+// scanRunningVMs scans /proc for all running qemu-system-x86_64 processes
+// and returns VMEntry structs parsed from their command lines. This is the
+// ground truth — what is actually running on the host right now.
+func scanRunningVMs(cfg HostConfig) (orch *cluster.VMEntry, nodes []cluster.VMEntry) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		log.Printf("WARNING: cannot scan /proc: %v", err)
-		return
+		log.Printf("WARNING: cannot scan /proc for running VMs: %v", err)
+		return nil, nil
 	}
 
-	// Build set of PIDs already tracked
-	knownPIDs := map[int]bool{}
-	if state.Orchestrator != nil {
-		knownPIDs[state.Orchestrator.PID] = true
-	}
-	for _, n := range state.Nodes {
-		knownPIDs[n.PID] = true
-	}
-
-	discovered := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -525,11 +489,7 @@ func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		if knownPIDs[pid] {
-			continue
-		}
 
-		// Read cmdline
 		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 		if err != nil {
 			continue
@@ -539,44 +499,136 @@ func discoverOrphanedVMs(cfg HostConfig, state *cluster.State) {
 			continue
 		}
 
-		// Parse QEMU args to extract VM identity
 		vmEntry := parseQEMUArgs(args, pid, cfg)
 		if vmEntry == nil {
 			continue
 		}
 
 		if vmEntry.Type == "orchestrator" {
-			if state.Orchestrator != nil && qemu.IsRunning(state.Orchestrator.PID) {
-				continue // already have a running orchestrator
+			if orch != nil {
+				log.Printf("WARNING: multiple orchestrator QEMU processes found (PID %d and %d)", orch.PID, pid)
+				continue
 			}
-			log.Printf("  Discovered orphaned orchestrator (PID %d, disk %s) — recovering", pid, vmEntry.Disk)
-			state.SetOrchestrator(*vmEntry)
-			discovered++
+			orch = vmEntry
 		} else if vmEntry.Type == "node" {
-			existing := state.GetNode(vmEntry.ID)
-			if existing != nil && qemu.IsRunning(existing.PID) {
-				continue // already tracked and running
-			}
-			if existing != nil {
-				// Entry exists but PID changed — update it
-				log.Printf("  Discovered orphaned node %s (PID %d, disk %s) — recovering", vmEntry.ID, pid, vmEntry.Disk)
-			} else {
-				// Unknown QEMU process not in cluster state — adopt it.
-				// These are likely live nodes whose state wasn't persisted
-				// (e.g. upgrade reconciler updated in-memory state but
-				// crashed before flushing cluster.json). Killing them would
-				// destroy any VMs running on the node. See issue #85.
-				log.Printf("  Found unknown QEMU node %s (PID %d, disk %s) not in cluster state — adopting", vmEntry.ID, pid, vmEntry.Disk)
-			}
-			state.AddNode(*vmEntry)
-			discovered++
+			nodes = append(nodes, *vmEntry)
+		}
+	}
+	return orch, nodes
+}
+
+// reconcileFromReality builds cluster state from running QEMU processes (the
+// ground truth), then merges in metadata from cluster.json that cannot be
+// derived from process inspection (UpgradeGoal, image versions/digests,
+// drain status). This implements the principle from issue #135: "Reality is
+// the source of truth. cluster.json is a cache."
+//
+// The merge rules:
+//   - A running QEMU process is ALWAYS adopted into state, even if cluster.json
+//     has no entry for it. Never kill a VM because it's not in the file.
+//   - A cluster.json entry with no running QEMU process is removed (stale),
+//     UNLESS its status is "draining"/"upgrading" and the disk still exists
+//     (the VM may be intentionally stopped during an upgrade cycle).
+//   - For entries that exist in both reality and cluster.json, reality wins for
+//     PID/TAP/MAC/RAM/VCPU; cluster.json wins for image metadata and status.
+func reconcileFromReality(cfg HostConfig, state *cluster.State) {
+	log.Println("Reconciling state from running QEMU processes...")
+
+	realOrch, realNodes := scanRunningVMs(cfg)
+
+	// Build lookup of real nodes by ID
+	realNodeMap := make(map[string]*cluster.VMEntry)
+	for i := range realNodes {
+		realNodeMap[realNodes[i].ID] = &realNodes[i]
+	}
+
+	// --- Orchestrator reconciliation ---
+	if realOrch != nil {
+		if state.Orchestrator != nil {
+			// Merge: reality wins for runtime fields, keep metadata from state
+			log.Printf("  orchestrator: running (PID %d), merging with cached state", realOrch.PID)
+			mergeVMEntry(state.Orchestrator, realOrch)
+		} else {
+			log.Printf("  orchestrator: running (PID %d) but not in cluster.json — adopting", realOrch.PID)
+			realOrch.Status = "active"
+			state.SetOrchestrator(*realOrch)
+		}
+	} else if state.Orchestrator != nil {
+		if state.Orchestrator.Status == "upgrading" && fileExists(state.Orchestrator.Disk) {
+			log.Printf("  orchestrator: not running but status=upgrading with disk present — keeping for upgrade cycle")
+		} else {
+			log.Printf("  orchestrator: in cluster.json (PID %d) but no QEMU process — clearing stale entry", state.Orchestrator.PID)
+			state.Orchestrator.PID = 0
 		}
 	}
 
-	if discovered > 0 {
-		log.Printf("  Recovered %d orphaned VM(s) from running QEMU processes", discovered)
-		state.Save()
+	// --- Node reconciliation ---
+	// 1. Update/adopt nodes that are actually running
+	for id, realNode := range realNodeMap {
+		existing := state.GetNode(id)
+		if existing != nil {
+			log.Printf("  %s: running (PID %d), merging with cached state", id, realNode.PID)
+			mergeVMEntry(existing, realNode)
+			state.AddNode(*existing)
+		} else {
+			log.Printf("  %s: running (PID %d) but not in cluster.json — adopting", id, realNode.PID)
+			realNode.Status = "active"
+			state.AddNode(*realNode)
+		}
 	}
+
+	// 2. Remove stale nodes from cluster.json that have no running QEMU process
+	var staleNodeIDs []string
+	for _, node := range state.Nodes {
+		if _, running := realNodeMap[node.ID]; running {
+			continue // backed by a real process
+		}
+		// Not running. Keep if mid-upgrade/drain with disk still on disk.
+		if (node.Status == "draining" || node.Status == "upgrading") && fileExists(node.Disk) {
+			log.Printf("  %s: not running but status=%s with disk present — keeping for lifecycle completion", node.ID, node.Status)
+			node.PID = 0
+			state.AddNode(node) // update PID=0
+			continue
+		}
+		log.Printf("  %s: in cluster.json (PID %d) but no QEMU process — removing stale entry", node.ID, node.PID)
+		staleNodeIDs = append(staleNodeIDs, node.ID)
+	}
+	for _, id := range staleNodeIDs {
+		state.RemoveNode(id)
+	}
+
+	state.Save()
+	log.Printf("Reconciliation complete: orchestrator=%v, nodes=%d (removed %d stale)",
+		state.Orchestrator != nil, state.NodeCount(), len(staleNodeIDs))
+}
+
+// mergeVMEntry updates a cached VMEntry with runtime values from a running
+// QEMU process, keeping metadata that can only come from cluster.json.
+func mergeVMEntry(cached, real *cluster.VMEntry) {
+	// Reality wins for runtime fields
+	cached.PID = real.PID
+	if real.TAP != "" {
+		cached.TAP = real.TAP
+	}
+	if real.MAC != "" {
+		cached.MAC = real.MAC
+	}
+	if real.VCPU > 0 {
+		cached.VCPU = real.VCPU
+	}
+	if real.RAM != "" {
+		cached.RAM = real.RAM
+	}
+	if real.Disk != "" {
+		cached.Disk = real.Disk
+	}
+	if real.ISO != "" {
+		cached.ISO = real.ISO
+	}
+	if real.BridgeIP != "" {
+		cached.BridgeIP = real.BridgeIP
+	}
+	// Keep from cache: Status, ImageVersion, ImageCommit, ImageDigest, DrainFailCount
 }
 
 // parseQEMUArgs extracts VM identity from QEMU command-line arguments.
@@ -651,12 +703,11 @@ func parseQEMUArgs(args []string, pid int, cfg HostConfig) *cluster.VMEntry {
 }
 
 func bootRecover(cfg HostConfig, state *cluster.State) {
-	// Reconcile tracked PIDs: verify each PID is actually a QEMU process,
-	// not a reused PID from another process after a host restart.
-	reconcileTrackedPIDs(state)
-
-	// Then discover any running QEMU VMs not tracked in state
-	discoverOrphanedVMs(cfg, state)
+	// Phase 1: Reconcile state from reality. Scan running QEMU processes,
+	// adopt unknown VMs, remove stale entries, merge metadata from cluster.json.
+	// This replaces the old reconcileTrackedPIDs + discoverOrphanedVMs flow.
+	// See issue #135: "Reality is the source of truth. cluster.json is a cache."
+	reconcileFromReality(cfg, state)
 
 	currentUser, _ := user.Current()
 	username := "root"
@@ -2569,6 +2620,25 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 
 	log.Printf("Drain: stopping %s", nodeID)
 
+	// Issue #138: final safety check — confirm node agent reports 0 VMs
+	// before destroying the QEMU node. A node with VMs must NEVER be destroyed.
+	if node.BridgeIP != "" {
+		safetyClient := &http.Client{Timeout: 5 * time.Second}
+		safetyResp, safetyErr := safetyClient.Get(fmt.Sprintf("http://%s:8800/api/vms", node.BridgeIP))
+		if safetyErr == nil {
+			var remainingVMs []interface{}
+			json.NewDecoder(safetyResp.Body).Decode(&remainingVMs)
+			safetyResp.Body.Close()
+			if len(remainingVMs) > 0 {
+				log.Printf("Drain: ABORTING stop of %s — node still has %d VM(s) after drain", nodeID, len(remainingVMs))
+				state.SetNodeStatus(nodeID, "active")
+				state.Save()
+				return
+			}
+		}
+		// If node is unreachable, proceed — it was already drained
+	}
+
 	// Clear drain target tracking on success
 	if goal := state.UpgradeGoal; goal != nil {
 		goal.DrainTargetNodeID = ""
@@ -4478,7 +4548,7 @@ func cliRecover() {
 	}
 
 	fmt.Println("Scanning for running QEMU VMs...")
-	discoverOrphanedVMs(cfg, state)
+	reconcileFromReality(cfg, state)
 
 	// Print what we found
 	if state.Orchestrator != nil {
