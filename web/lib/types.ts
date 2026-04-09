@@ -40,3 +40,11 @@ export interface Node {
   registered_at: string
   last_heartbeat: string
 }
+
+export interface AlertEvent {
+  timestamp: string
+  name: string
+  type: 'crash' | 'idle' | 'degraded' | 'unhealthy' | 'unresponsive' | 'error' | 'recovery'
+  message: string
+  team?: string
+}
