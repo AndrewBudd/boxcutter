@@ -3645,6 +3645,28 @@ func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
 	var cleaned []string
 	nodeClient := &http.Client{Timeout: 5 * time.Second}
 
+	// Issue #128: Never remove nodes that are part of an active upgrade.
+	// During rolling upgrades, the replacement node has 0 VMs while
+	// migrations are in-flight — killing it would abort the drain.
+	upgradeProtected := make(map[string]bool)
+	if g := state.UpgradeGoal; g != nil {
+		if g.DrainTargetNodeID != "" {
+			upgradeProtected[g.DrainTargetNodeID] = true
+		}
+		if g.DeployedNodeID != "" {
+			upgradeProtected[g.DeployedNodeID] = true
+		}
+	}
+	// Also protect any node that is an active drain target: if any node
+	// has status "draining", migrations may be landing on another node.
+	hasDrainingNode := false
+	for _, n := range state.Nodes {
+		if n.Status == "draining" {
+			hasDrainingNode = true
+			break
+		}
+	}
+
 	// Count how many nodes have VMs — we need at least one node with VMs
 	// If no VMs exist at all, keep the first active node
 	nodesWithVMs := 0
@@ -3670,6 +3692,20 @@ func cleanupOrphanNodes(cfg HostConfig, state *cluster.State) []string {
 		// Keep at least one node
 		if len(state.Nodes)-len(cleaned) <= 1 {
 			break
+		}
+
+		// Issue #128: skip nodes protected by upgrade goal
+		if upgradeProtected[n.ID] {
+			log.Printf("Skipping orphan cleanup of %s: node is upgrade drain target", n.ID)
+			continue
+		}
+
+		// Issue #128: if a drain is in progress, don't remove any node
+		// with 0 VMs — it may be the migration target even if not
+		// explicitly tracked in DrainTargetNodeID (e.g. manual drain).
+		if hasDrainingNode && n.IsActive() {
+			log.Printf("Skipping orphan cleanup of %s: drain in progress on another node", n.ID)
+			continue
 		}
 
 		// Check if this node has VMs
