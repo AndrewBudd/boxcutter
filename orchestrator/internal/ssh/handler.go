@@ -210,6 +210,14 @@ func (h *Handler) cmdNew(args []string) int {
 				body["tailscale_authkey"] = args[i+1]
 				i++
 			}
+		case "--agent-config":
+			if i+1 < len(args) {
+				var raw json.RawMessage
+				if err := json.Unmarshal([]byte(args[i+1]), &raw); err == nil {
+					body["agent_config"] = raw
+				}
+				i++
+			}
 		}
 	}
 

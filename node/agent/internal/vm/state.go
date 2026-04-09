@@ -27,9 +27,10 @@ type VMState struct {
 	GitHubRepo  string   `json:"github_repo,omitempty"`  // backwards compat — single repo
 	GitHubRepos    []string `json:"github_repos,omitempty"`    // all GitHub repos (owner/repo)
 	GitHubProjects []string `json:"github_projects,omitempty"` // GitHub projects (owner/number)
-	TailscaleIP      string `json:"tailscale_ip,omitempty"`
-	TailscaleAuthkey string `json:"tailscale_authkey,omitempty"`
-	GoldenVer        string `json:"golden_version,omitempty"`
+	TailscaleIP      string          `json:"tailscale_ip,omitempty"`
+	TailscaleAuthkey string          `json:"tailscale_authkey,omitempty"`
+	GoldenVer        string          `json:"golden_version,omitempty"`
+	AgentConfig      json.RawMessage `json:"agent_config,omitempty"` // opaque JSON blob forwarded to vmid
 }
 
 // AllGitHubRepos returns the list of GitHub repos, falling back to the single

@@ -89,6 +89,24 @@ func (h *AdminHandler) handleRegister(w http.ResponseWriter, r *http.Request) {
 		GitHubRepos: req.GitHubRepos,
 		AgentConfig: req.AgentConfig,
 	}
+
+	// Merge labels from agent_config into VM labels
+	if len(req.AgentConfig) > 0 {
+		var ac struct {
+			Labels map[string]string `json:"labels"`
+		}
+		if json.Unmarshal(req.AgentConfig, &ac) == nil && len(ac.Labels) > 0 {
+			if rec.Labels == nil {
+				rec.Labels = make(map[string]string)
+			}
+			for k, v := range ac.Labels {
+				if _, exists := rec.Labels[k]; !exists {
+					rec.Labels[k] = v
+				}
+			}
+		}
+	}
+
 	h.reg.Register(rec)
 
 	w.WriteHeader(http.StatusCreated)
