@@ -8,8 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/AndrewBudd/boxcutter/orchestrator/internal/team"
 )
 
 // Handler dispatches SSH ForceCommand actions to the orchestrator HTTP API.
@@ -137,6 +140,8 @@ func (h *Handler) Run(args []string) int {
 			return 1
 		}
 		return h.cmdCopyFrom(args[1], args[2], args[3])
+	case "team":
+		return h.cmdTeam(args[1:])
 	case "help":
 		h.printHelp()
 		return 0
@@ -876,6 +881,332 @@ echo "ok"`
 	return 0
 }
 
+// --- Team commands ---
+
+func (h *Handler) cmdTeam(args []string) int {
+	if len(args) == 0 {
+		fmt.Println(`Usage: ssh <host> team <subcommand>
+
+Subcommands:
+  apply -f -          Create/update team from YAML (reads stdin)
+  destroy <name>      Destroy all VMs for a team
+  list                List active teams
+  status <name>       Show status of team VMs`)
+		return 1
+	}
+
+	switch args[0] {
+	case "apply":
+		return h.teamApply(args[1:])
+	case "destroy":
+		return h.teamDestroy(args[1:])
+	case "list":
+		return h.teamList(args[1:])
+	case "status":
+		return h.teamStatus(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown team subcommand: %s\n", args[0])
+		return 1
+	}
+}
+
+func (h *Handler) teamApply(args []string) int {
+	// Parse -f flag. Only -f - (stdin) is supported.
+	file := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-f" && i+1 < len(args) {
+			file = args[i+1]
+			i++
+		}
+	}
+	if file == "" {
+		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team apply -f -\n")
+		fmt.Fprintf(os.Stderr, "  Reads team YAML from stdin. Pipe with: cat team.yaml | ssh <host> team apply -f -\n")
+		return 1
+	}
+
+	var data []byte
+	var err error
+	if file == "-" {
+		data, err = io.ReadAll(os.Stdin)
+	} else {
+		fmt.Fprintf(os.Stderr, "Error: only -f - (stdin) is supported. File paths are not available on the orchestrator.\n")
+		fmt.Fprintf(os.Stderr, "Usage: cat team.yaml | ssh <host> team apply -f -\n")
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+		return 1
+	}
+
+	ts, err := team.Parse(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	agents := ts.Resolve()
+	fmt.Printf("Team: %s\n", ts.Metadata.Name)
+	fmt.Printf("Agents: %d definitions → %d VMs\n\n", len(ts.Spec.Agents), len(agents))
+
+	// Fetch existing VMs to determine create vs noop
+	existingVMs := make(map[string]bool)
+	resp, err := h.get("/api/vms")
+	if err == nil {
+		var vms []map[string]interface{}
+		json.Unmarshal(resp, &vms)
+		for _, vm := range vms {
+			if name, ok := vm["name"].(string); ok {
+				existingVMs[name] = true
+			}
+		}
+	}
+
+	// Compute diff
+	var toCreate []team.ResolvedAgent
+	var existing []string
+	for _, a := range agents {
+		if existingVMs[a.VMName] {
+			existing = append(existing, a.VMName)
+		} else {
+			toCreate = append(toCreate, a)
+		}
+	}
+
+	// Find VMs to destroy (scale-down): existing team VMs not in the spec
+	wantVMs := make(map[string]bool)
+	for _, a := range agents {
+		wantVMs[a.VMName] = true
+	}
+	var toDestroy []string
+	if resp != nil {
+		var vms []map[string]interface{}
+		json.Unmarshal(resp, &vms)
+		for _, vm := range vms {
+			name, _ := vm["name"].(string)
+			// Check if this VM belongs to this team by name prefix
+			if strings.HasPrefix(name, ts.Metadata.Name+"-") && !wantVMs[name] {
+				toDestroy = append(toDestroy, name)
+			}
+		}
+	}
+	// Destroy highest-indexed first
+	sort.Sort(sort.Reverse(sort.StringSlice(toDestroy)))
+
+	// Report plan
+	for _, name := range existing {
+		fmt.Printf("  ok       %s\n", name)
+	}
+
+	// Create new VMs
+	created := 0
+	for _, a := range toCreate {
+		body := map[string]interface{}{
+			"name":    a.VMName,
+			"type":    a.Type,
+			"vcpu":    a.VCPU,
+			"ram_mib": a.RAMMiB(),
+			"disk":    a.Disk,
+			"mode":    a.Mode,
+			"labels":  a.Labels(ts.Metadata.Name),
+		}
+		if a.Description != "" {
+			body["description"] = a.Description
+		}
+		urls := a.CloneURLs()
+		if len(urls) == 1 {
+			body["clone_url"] = urls[0]
+		} else if len(urls) > 1 {
+			body["clone_urls"] = urls
+		}
+
+		fmt.Printf("  create   %s ...", a.VMName)
+		_, err := h.postStream("/api/vms", body, func(evt map[string]interface{}) {
+			// suppress progress for batch creation
+		})
+		if err != nil {
+			fmt.Printf(" FAILED: %v\n", err)
+			continue
+		}
+		fmt.Printf(" ok\n")
+		created++
+	}
+
+	// Destroy scale-down VMs
+	destroyed := 0
+	for _, name := range toDestroy {
+		fmt.Printf("  destroy  %s ...", name)
+		_, err := h.delete("/api/vms/" + name)
+		if err != nil {
+			fmt.Printf(" FAILED: %v\n", err)
+			continue
+		}
+		fmt.Printf(" ok\n")
+		destroyed++
+	}
+
+	fmt.Printf("\nResult: %d created, %d existing, %d destroyed\n", created, len(existing), destroyed)
+	return 0
+}
+
+func (h *Handler) teamDestroy(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team destroy <team-name>\n")
+		return 1
+	}
+	teamName := args[0]
+
+	// Find all VMs for this team by name prefix
+	resp, err := h.get("/api/vms")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing VMs: %v\n", err)
+		return 1
+	}
+
+	var vms []map[string]interface{}
+	json.Unmarshal(resp, &vms)
+
+	var targets []string
+	prefix := teamName + "-"
+	for _, vm := range vms {
+		name, _ := vm["name"].(string)
+		if strings.HasPrefix(name, prefix) {
+			targets = append(targets, name)
+		}
+	}
+
+	if len(targets) == 0 {
+		fmt.Printf("No VMs found for team %q\n", teamName)
+		return 0
+	}
+
+	// Destroy highest-indexed first
+	sort.Sort(sort.Reverse(sort.StringSlice(targets)))
+
+	fmt.Printf("Destroying %d VMs for team %q:\n\n", len(targets), teamName)
+	destroyed := 0
+	for _, name := range targets {
+		fmt.Printf("  destroy  %s ...", name)
+		_, err := h.delete("/api/vms/" + name)
+		if err != nil {
+			fmt.Printf(" FAILED: %v\n", err)
+			continue
+		}
+		fmt.Printf(" ok\n")
+		destroyed++
+	}
+
+	fmt.Printf("\nDestroyed %d/%d VMs\n", destroyed, len(targets))
+	return 0
+}
+
+func (h *Handler) teamList(_ []string) int {
+	resp, err := h.get("/api/vms")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing VMs: %v\n", err)
+		return 1
+	}
+
+	var vms []map[string]interface{}
+	json.Unmarshal(resp, &vms)
+
+	// Group VMs by team name prefix heuristic:
+	// team VMs are named {team}-{agent}-{N}
+	teams := make(map[string][]string)
+	for _, vm := range vms {
+		name, _ := vm["name"].(string)
+		parts := strings.Split(name, "-")
+		if len(parts) >= 3 {
+			// Check if last part is a number (replica index)
+			last := parts[len(parts)-1]
+			isNum := true
+			for _, c := range last {
+				if c < '0' || c > '9' {
+					isNum = false
+					break
+				}
+			}
+			if isNum && len(last) > 0 {
+				// Team name is everything before the last two segments
+				teamName := strings.Join(parts[:len(parts)-2], "-")
+				teams[teamName] = append(teams[teamName], name)
+			}
+		}
+	}
+
+	if len(teams) == 0 {
+		fmt.Println("No teams found")
+		return 0
+	}
+
+	// Sort team names
+	var teamNames []string
+	for name := range teams {
+		teamNames = append(teamNames, name)
+	}
+	sort.Strings(teamNames)
+
+	fmt.Printf("%-30s  %s\n", "TEAM", "VMs")
+	for _, name := range teamNames {
+		fmt.Printf("%-30s  %d\n", name, len(teams[name]))
+	}
+	return 0
+}
+
+func (h *Handler) teamStatus(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, "Usage: ssh <host> team status <team-name>\n")
+		return 1
+	}
+	teamName := args[0]
+
+	resp, err := h.get("/api/vms")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error listing VMs: %v\n", err)
+		return 1
+	}
+
+	var vms []map[string]interface{}
+	json.Unmarshal(resp, &vms)
+
+	prefix := teamName + "-"
+	var teamVMs []map[string]interface{}
+	for _, vm := range vms {
+		name, _ := vm["name"].(string)
+		if strings.HasPrefix(name, prefix) {
+			teamVMs = append(teamVMs, vm)
+		}
+	}
+
+	if len(teamVMs) == 0 {
+		fmt.Printf("No VMs found for team %q\n", teamName)
+		return 0
+	}
+
+	fmt.Printf("Team: %s (%d VMs)\n\n", teamName, len(teamVMs))
+	fmt.Printf("%-35s  %-12s  %-12s  %-6s  %-5s  %s\n",
+		"NAME", "STATUS", "NODE", "TYPE", "VCPU", "RAM")
+	for _, vm := range teamVMs {
+		name, _ := vm["name"].(string)
+		status, _ := vm["status"].(string)
+		nodeName, _ := vm["node_name"].(string)
+		vmType, _ := vm["type"].(string)
+		vcpu, _ := vm["vcpu"].(float64)
+		ramMIB, _ := vm["ram_mib"].(float64)
+
+		if vmType == "" || vmType == "firecracker" {
+			vmType = "fc"
+		}
+		if status == "" {
+			status = "unknown"
+		}
+
+		fmt.Printf("%-35s  %-12s  %-12s  %-6s  %-5.0f  %s\n",
+			name, status, nodeName, vmType, vcpu, formatRAM(ramMIB))
+	}
+	return 0
+}
+
 func (h *Handler) printHelp() {
 	fmt.Print(`Boxcutter — ephemeral dev environments
 
@@ -927,6 +1258,10 @@ Commands:
                           Copy a file into a VM (use - for stdin)
   cp-from <name> <src> <dst>
                           Copy a file out of a VM (use - for stdout)
+  team apply -f -         Create/update team from YAML (stdin)
+  team destroy <name>     Destroy all VMs for a team
+  team list               List active teams
+  team status <name>      Show status of team VMs
   help                    Show this help
 
 Usage: ssh <host> <command> [args]

@@ -28,9 +28,10 @@ type Node struct {
 
 // VM is a lightweight record mapping a VM name to its node.
 type VM struct {
-	Name   string `json:"name"`
-	NodeID string `json:"node_id"`
-	Status string `json:"status"`
+	Name   string            `json:"name"`
+	NodeID string            `json:"node_id"`
+	Status string            `json:"status"`
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // GoldenImage tracks which golden image versions exist on which nodes.
@@ -164,6 +165,20 @@ func (s *Store) ListVMs() []*VM {
 	return vms
 }
 
+// ListVMsByLabel returns all VMs matching the given label key=value.
+func (s *Store) ListVMsByLabel(key, value string) []*VM {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*VM
+	for _, v := range s.vms {
+		if v.Labels != nil && v.Labels[key] == value {
+			copy := *v
+			out = append(out, &copy)
+		}
+	}
+	return out
+}
+
 // DeleteVM removes a VM from the store.
 func (s *Store) DeleteVM(name string) {
 	s.mu.Lock()
@@ -186,20 +201,28 @@ func (s *Store) SyncNodeVMs(nodeID string, vms []VM) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Remove existing VMs for this node
+	// Save existing VMs' labels before removal
+	old := make(map[string]*VM)
 	for name, v := range s.vms {
 		if v.NodeID == nodeID {
+			old[name] = v
 			delete(s.vms, name)
 		}
 	}
 
-	// Add the current VMs
+	// Add the current VMs, preserving labels from previous state
 	for i := range vms {
-		s.vms[vms[i].Name] = &VM{
+		vm := &VM{
 			Name:   vms[i].Name,
 			NodeID: vms[i].NodeID,
 			Status: vms[i].Status,
 		}
+		if vms[i].Labels != nil {
+			vm.Labels = vms[i].Labels
+		} else if prev, ok := old[vms[i].Name]; ok {
+			vm.Labels = prev.Labels
+		}
+		s.vms[vms[i].Name] = vm
 	}
 }
 
