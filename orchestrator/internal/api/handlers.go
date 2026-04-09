@@ -68,6 +68,48 @@ type Handler struct {
 	// SSE subscribers
 	sseClients   map[chan AlertEvent]bool
 	sseClientsMu sync.Mutex
+
+	// Token usage metrics per VM
+	vmMetrics   map[string]*VMMetrics
+	vmMetricsMu sync.RWMutex
+}
+
+// VMMetrics stores token usage and utilization data for a single VM.
+type VMMetrics struct {
+	VMName           string  `json:"name"`
+	Team             string  `json:"team,omitempty"`
+	APICalls         int     `json:"api_calls"`
+	InputTokens      int     `json:"input_tokens"`
+	CacheReadTokens  int     `json:"cache_read_tokens"`
+	CacheCreateTokens int    `json:"cache_create_tokens"`
+	OutputTokens     int     `json:"output_tokens"`
+	Model            string  `json:"model"`
+	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
+	LastUpdated      string  `json:"last_updated,omitempty"`
+}
+
+type modelPricing struct {
+	InputPerM      float64
+	OutputPerM     float64
+	CacheReadPerM  float64
+	CacheWritePerM float64
+}
+
+var pricing = map[string]modelPricing{
+	"claude-opus-4-6":   {15.0, 75.0, 1.5, 15.0},
+	"claude-sonnet-4-6": {3.0, 15.0, 0.3, 3.0},
+	"claude-haiku-4-5":  {0.80, 4.0, 0.08, 0.80},
+}
+
+func estimateCost(m *VMMetrics) float64 {
+	p, ok := pricing[m.Model]
+	if !ok {
+		p = pricing["claude-sonnet-4-6"] // default
+	}
+	return (float64(m.InputTokens)*p.InputPerM +
+		float64(m.OutputTokens)*p.OutputPerM +
+		float64(m.CacheReadTokens)*p.CacheReadPerM +
+		float64(m.CacheCreateTokens)*p.CacheWritePerM) / 1e6
 }
 
 func NewHandler(database *db.DB, store *state.Store) *Handler {
@@ -83,6 +125,7 @@ func NewHandler(database *db.DB, store *state.Store) *Handler {
 		prevHealth:  make(map[string]string),
 		lastReport:  make(map[string]time.Time),
 		sseClients:  make(map[chan AlertEvent]bool),
+		vmMetrics:   make(map[string]*VMMetrics),
 	}
 	h.discoverNodes()
 	go h.healthMonitorLoop()
@@ -294,6 +337,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// Dashboard: SSE stream + alerts
 	mux.HandleFunc("GET /api/alerts", h.handleAlerts)
 	mux.HandleFunc("GET /api/alerts/stream", h.handleAlertStream)
+
+	// Metrics: token usage and cost
+	mux.HandleFunc("GET /api/metrics", h.handleMetrics)
+	mux.HandleFunc("POST /api/metrics/{name}", h.handleMetricsUpdate)
 
 	// VM exec
 	mux.HandleFunc("POST /api/vms/{name}/exec", h.handleVMExec)
@@ -2208,4 +2255,59 @@ func (h *Handler) handleAlertStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// --- Metrics handlers ---
+
+// handleMetrics returns token usage and cost metrics for all VMs.
+func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	h.vmMetricsMu.RLock()
+	all := make([]*VMMetrics, 0, len(h.vmMetrics))
+	for _, m := range h.vmMetrics {
+		copy := *m
+		all = append(all, &copy)
+	}
+	h.vmMetricsMu.RUnlock()
+	writeJSON(w, all)
+}
+
+// handleMetricsUpdate receives token usage metrics from a VM (via node agent proxy).
+func (h *Handler) handleMetricsUpdate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		http.Error(w, "VM name required", http.StatusBadRequest)
+		return
+	}
+
+	var incoming struct {
+		APICalls          int    `json:"api_calls"`
+		InputTokens       int    `json:"input_tokens"`
+		CacheReadTokens   int    `json:"cache_read_tokens"`
+		CacheCreateTokens int    `json:"cache_create_tokens"`
+		OutputTokens      int    `json:"output_tokens"`
+		Model             string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	h.vmMetricsMu.Lock()
+	m := h.vmMetrics[name]
+	if m == nil {
+		m = &VMMetrics{VMName: name, Team: teamForVM(name)}
+		h.vmMetrics[name] = m
+	}
+	m.APICalls = incoming.APICalls
+	m.InputTokens = incoming.InputTokens
+	m.CacheReadTokens = incoming.CacheReadTokens
+	m.CacheCreateTokens = incoming.CacheCreateTokens
+	m.OutputTokens = incoming.OutputTokens
+	m.Model = incoming.Model
+	m.EstimatedCostUSD = estimateCost(m)
+	m.LastUpdated = time.Now().Format(time.RFC3339)
+	h.vmMetricsMu.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+	writeJSON(w, m)
 }
