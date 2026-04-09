@@ -63,6 +63,7 @@ type HostConfig struct {
 	MinFreeMemoryMB       int           // Hard floor: never scale up if host has less than this free
 	DiskUsageThresholdPct int           // Scale up when node disk usage > this %
 	MinFreeDiskMB         int           // Hard floor: never scale up if host has less than this free disk
+	MinNodes              int           // Minimum node count for migration headroom (default 3)
 	MaxNodes              int           // Hard cap on node count (0 = limited only by resources)
 	MaxVMSizeMB           int           // Headroom: scale up if no node has this much free RAM (MiB)
 	MemPressureThresholdPct int         // Actual memory usage % that triggers proactive drain (default 90)
@@ -228,6 +229,10 @@ func defaultConfig() HostConfig {
 	if v := os.Getenv("MEM_PRESSURE_THRESHOLD_PCT"); v != "" {
 		fmt.Sscanf(v, "%d", &memPressurePct)
 	}
+	minNodes := 3
+	if v := os.Getenv("MIN_NODES"); v != "" {
+		fmt.Sscanf(v, "%d", &minNodes)
+	}
 
 	return HostConfig{
 		ClusterPrefix:      clusterPrefix,
@@ -259,6 +264,7 @@ func defaultConfig() HostConfig {
 		MinFreeMemoryMB:       minFreeMB,
 		DiskUsageThresholdPct: 85,    // Scale up when any node's disk > 85% full
 		MinFreeDiskMB:         20480, // 20GB — never launch a node if host has less than this free disk
+		MinNodes:                minNodes, // minimum 3 nodes for migration headroom during upgrades
 		MaxNodes:                0,     // 0 = no hard cap, limited only by host resources
 		MaxVMSizeMB:             maxVMSizeMB,
 		MemPressureThresholdPct: memPressurePct,
@@ -886,8 +892,12 @@ type nodeCapacity struct {
 
 // scaleDownCandidate evaluates whether to scale down and returns the node ID to drain.
 // Returns empty string if no scale-down should happen.
-func scaleDownCandidate(nodes []nodeCapacity, totalRAM, usedRAM, scaleDownPct, scaleUpPct int) string {
+func scaleDownCandidate(nodes []nodeCapacity, totalRAM, usedRAM, scaleDownPct, scaleUpPct, minNodes int) string {
 	if len(nodes) <= 1 || totalRAM == 0 {
+		return ""
+	}
+	// Never scale below MinNodes — ensures migration headroom during upgrades
+	if minNodes > 0 && len(nodes) <= minNodes {
 		return ""
 	}
 
@@ -961,9 +971,29 @@ func memPressureCandidate(nodes []nodeCapacity, thresholdPct int) (string, int) 
 	return worstID, worstPct
 }
 
+// ensureMinNodes scales the cluster up to MinNodes if below.
+// Called once at auto-scaler startup to guarantee migration headroom.
+func ensureMinNodes(cfg HostConfig, state *cluster.State) {
+	if cfg.MinNodes <= 0 {
+		return
+	}
+	for state.NodeCount() < cfg.MinNodes {
+		ok, reason := canScaleUp(cfg, state.NodeCount())
+		if !ok {
+			log.Printf("Cannot reach MinNodes=%d (currently %d): %s", cfg.MinNodes, state.NodeCount(), reason)
+			break
+		}
+		log.Printf("Below MinNodes (%d/%d), adding node for migration headroom...", state.NodeCount(), cfg.MinNodes)
+		addNode(cfg, state)
+	}
+}
+
 func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 	// Wait for VMs to boot before polling
 	time.Sleep(30 * time.Second)
+
+	// Ensure minimum node count for migration headroom
+	ensureMinNodes(cfg, state)
 
 	ticker := time.NewTicker(cfg.ScalePollInterval)
 	defer ticker.Stop()
@@ -1127,7 +1157,7 @@ func autoScaleLoop(cfg HostConfig, state *cluster.State) {
 					lastScaleEvent = time.Now()
 				}
 			}
-		} else if candidateID := scaleDownCandidate(nodes, totalRAM, usedRAM, cfg.ScaleDownThresholdPct, cfg.ScaleUpThresholdPct); candidateID != "" {
+		} else if candidateID := scaleDownCandidate(nodes, totalRAM, usedRAM, cfg.ScaleDownThresholdPct, cfg.ScaleUpThresholdPct, cfg.MinNodes); candidateID != "" {
 			// Find the candidate's info for logging
 			var candidateBridgeIP string
 			for _, nc := range nodes {

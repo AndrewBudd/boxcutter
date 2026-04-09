@@ -102,10 +102,73 @@ func TestScaleDownCandidate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := scaleDownCandidate(tt.nodes, tt.totalRAM, tt.usedRAM, tt.scaleDownPct, tt.scaleUpPct)
+			got := scaleDownCandidate(tt.nodes, tt.totalRAM, tt.usedRAM, tt.scaleDownPct, tt.scaleUpPct, 0)
 			if got != tt.wantNodeID {
 				t.Errorf("scaleDownCandidate() = %q, want %q", got, tt.wantNodeID)
 			}
 		})
+	}
+}
+
+func TestScaleDownRespectsMinNodes(t *testing.T) {
+	nodes := []nodeCapacity{
+		{nodeID: "node-1", totalRAM: 10000, usedRAM: 500},
+		{nodeID: "node-2", totalRAM: 10000, usedRAM: 500},
+		{nodeID: "node-3", totalRAM: 10000, usedRAM: 500},
+	}
+	totalRAM := 30000
+	usedRAM := 1500 // 5% — well below scale-down threshold
+
+	// With minNodes=0, should allow scale-down
+	got := scaleDownCandidate(nodes, totalRAM, usedRAM, 30, 80, 0)
+	if got == "" {
+		t.Error("minNodes=0 should allow scale-down but got empty")
+	}
+
+	// With minNodes=3 (equal to current count), should block scale-down
+	got = scaleDownCandidate(nodes, totalRAM, usedRAM, 30, 80, 3)
+	if got != "" {
+		t.Errorf("minNodes=3 with 3 nodes should block scale-down, got %q", got)
+	}
+
+	// With minNodes=2 (below current count), should allow scale-down
+	got = scaleDownCandidate(nodes, totalRAM, usedRAM, 30, 80, 2)
+	if got == "" {
+		t.Error("minNodes=2 with 3 nodes should allow scale-down but got empty")
+	}
+
+	// With minNodes=4 (above current count), should block scale-down
+	got = scaleDownCandidate(nodes, totalRAM, usedRAM, 30, 80, 4)
+	if got != "" {
+		t.Errorf("minNodes=4 with 3 nodes should block scale-down, got %q", got)
+	}
+}
+
+func TestScaleDownMinNodesWithTwoNodes(t *testing.T) {
+	nodes := []nodeCapacity{
+		{nodeID: "node-1", totalRAM: 12000, usedRAM: 1000},
+		{nodeID: "node-2", totalRAM: 12000, usedRAM: 1000},
+	}
+	totalRAM := 24000
+	usedRAM := 2000 // ~8%
+
+	// minNodes=3 blocks scale-down from 2 nodes
+	got := scaleDownCandidate(nodes, totalRAM, usedRAM, 30, 80, 3)
+	if got != "" {
+		t.Errorf("minNodes=3 with 2 nodes should block scale-down, got %q", got)
+	}
+
+	// minNodes=1 allows scale-down from 2 nodes
+	got = scaleDownCandidate(nodes, totalRAM, usedRAM, 30, 80, 1)
+	if got == "" {
+		t.Error("minNodes=1 with 2 nodes should allow scale-down")
+	}
+}
+
+func TestDefaultMinNodesIs3(t *testing.T) {
+	// Verify the default configuration
+	cfg := defaultConfig()
+	if cfg.MinNodes != 3 {
+		t.Errorf("default MinNodes = %d, want 3", cfg.MinNodes)
 	}
 }
