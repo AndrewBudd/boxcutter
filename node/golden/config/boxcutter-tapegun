@@ -686,6 +686,12 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
                 if [ -n "$line" ]; then
                     if [ "$no_enter" = "true" ]; then
                         $TMUX_CMD send-keys -t 0 "$line"
+                    elif case "$line" in *$'\n'*) true ;; *) false ;; esac; then
+                        # Multi-line: send text first, then Enter separately
+                        # after a delay so Claude Code processes the paste.
+                        $TMUX_CMD send-keys -t 0 "$line"
+                        sleep 0.5
+                        $TMUX_CMD send-keys -t 0 Enter
                     else
                         $TMUX_CMD send-keys -t 0 "$line" Enter
                     fi
