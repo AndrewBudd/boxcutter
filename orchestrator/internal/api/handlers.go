@@ -268,6 +268,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/projects", h.handleVMAddProject)
 	mux.HandleFunc("DELETE /api/vms/{name}/projects/{project...}", h.handleVMRemoveProject)
 	mux.HandleFunc("GET /api/vms/{name}/projects", h.handleVMListProjects)
+	mux.HandleFunc("PUT /api/vms/{name}/agent-config", h.handleVMUpdateAgentConfig)
 
 	// Golden images
 	mux.HandleFunc("GET /api/golden", h.handleGoldenList)
@@ -395,18 +396,19 @@ func (h *Handler) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 // --- VM handlers ---
 
 type vmCreateRequest struct {
-	Name             string            `json:"name"`
-	Type             string            `json:"type,omitempty"`
-	Description      string            `json:"description,omitempty"`
-	VCPU             int               `json:"vcpu,omitempty"`
-	RAMMIB           int               `json:"ram_mib,omitempty"`
-	Disk             string            `json:"disk,omitempty"`
-	CloneURL         string            `json:"clone_url,omitempty"`
-	CloneURLs        []string          `json:"clone_urls,omitempty"`
-	Mode             string            `json:"mode,omitempty"`
-	NodeID           string            `json:"node_id,omitempty"`
-	TailscaleAuthkey string            `json:"tailscale_authkey,omitempty"`
-	Labels           map[string]string `json:"labels,omitempty"`
+	Name             string                 `json:"name"`
+	Type             string                 `json:"type,omitempty"`
+	Description      string                 `json:"description,omitempty"`
+	VCPU             int                    `json:"vcpu,omitempty"`
+	RAMMIB           int                    `json:"ram_mib,omitempty"`
+	Disk             string                 `json:"disk,omitempty"`
+	CloneURL         string                 `json:"clone_url,omitempty"`
+	CloneURLs        []string               `json:"clone_urls,omitempty"`
+	Mode             string                 `json:"mode,omitempty"`
+	NodeID           string                 `json:"node_id,omitempty"`
+	TailscaleAuthkey string                 `json:"tailscale_authkey,omitempty"`
+	Labels           map[string]string      `json:"labels,omitempty"`
+	AgentConfig      map[string]interface{} `json:"agent_config,omitempty"`
 }
 
 // nodeToScheduler converts a state.Node to the db.Node type used by the scheduler.
@@ -553,6 +555,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 			Mode:             req.Mode,
 			AuthorizedKeys:   sshKeys,
 			TailscaleAuthkey: req.TailscaleAuthkey,
+			AgentConfig:      req.AgentConfig,
 		}, func(evt *node.ProgressEvent) {
 			line, _ := json.Marshal(evt)
 			fmt.Fprintf(w, "%s\n", line)
@@ -801,6 +804,42 @@ func (h *Handler) handleVMUpdate(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// handleVMUpdateAgentConfig forwards an agent-config update to the VM's node.
+func (h *Handler) handleVMUpdateAgentConfig(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+	}
+
+	vm := h.state.GetVM(name)
+	if vm == nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+
+	n := h.state.GetNode(vm.NodeID)
+	if n == nil {
+		http.Error(w, "node not found", http.StatusNotFound)
+		return
+	}
+
+	body, _ := io.ReadAll(r.Body)
+	url := fmt.Sprintf("http://%s/api/vms/%s/agent-config", n.APIAddr, name)
+	req, _ := http.NewRequest("PUT", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "node unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }

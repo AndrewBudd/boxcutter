@@ -69,6 +69,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/vms/{name}/projects", h.handleListProjects)
 	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleLogs)
 	mux.HandleFunc("PATCH /api/vms/{name}", h.handleUpdate)
+	mux.HandleFunc("PUT /api/vms/{name}/agent-config", h.handleUpdateAgentConfig)
 	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
 	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
@@ -1137,4 +1138,29 @@ func (h *Handler) lookupVMLocation(vmName string) (string, error) {
 		return "", fmt.Errorf("no node_addr for %q", vmName)
 	}
 	return loc.NodeAddr, nil
+}
+
+// handleUpdateAgentConfig forwards an agent-config update to the vmid service.
+func (h *Handler) handleUpdateAgentConfig(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	if h.vmidClient == nil {
+		http.Error(w, "vmid client not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "reading body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := h.vmidClient.SetAgentConfig(name, body); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

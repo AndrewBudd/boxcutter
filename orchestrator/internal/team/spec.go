@@ -158,6 +158,45 @@ func (r *ResolvedAgent) Labels(teamName string) map[string]string {
 	return labels
 }
 
+// AgentConfigJSON builds the agent-config JSON blob sent to the vmid metadata
+// service. This is what the tapegun setup phase reads on boot to configure the
+// workspace (persona, repos, etc.).
+func (r *ResolvedAgent) AgentConfigJSON(teamName string) map[string]interface{} {
+	cfg := map[string]interface{}{
+		"team":  teamName,
+		"agent": r.AgentName,
+	}
+	if r.ReplicaNum > 0 {
+		cfg["replica_index"] = r.ReplicaNum
+	}
+	if r.Persona != nil {
+		p := map[string]interface{}{}
+		if r.Persona.Role != "" {
+			p["role"] = r.Persona.Role
+		}
+		if r.Persona.ClaudeMD != "" {
+			p["claude_md"] = r.Persona.ClaudeMD
+		}
+		if r.Persona.Instructions != "" {
+			p["instructions"] = r.Persona.Instructions
+		}
+		cfg["persona"] = p
+	}
+	if len(r.Repos) > 0 {
+		cfg["repos"] = r.Repos
+	}
+	if len(r.Access) > 0 {
+		cfg["access"] = r.Access
+	}
+	if r.Authorized {
+		cfg["authorized"] = true
+	}
+	if len(r.Tapegun) > 0 {
+		cfg["tapegun"] = r.Tapegun
+	}
+	return cfg
+}
+
 // Resolve applies defaults and expands replicas into concrete VM definitions.
 func (ts *TeamSpec) Resolve() []ResolvedAgent {
 	var out []ResolvedAgent

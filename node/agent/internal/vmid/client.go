@@ -314,3 +314,18 @@ func (c *Client) Healthy() bool {
 	defer resp.Body.Close()
 	return resp.StatusCode == 200
 }
+
+// SetAgentConfig updates a VM's agent-config in the vmid registry.
+func (c *Client) SetAgentConfig(vmID string, cfg json.RawMessage) error {
+	req, _ := http.NewRequest("PUT", "http://localhost/internal/vms/"+vmID+"/agent-config", bytes.NewReader(cfg))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("vmid set agent-config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("vmid set agent-config: status %d", resp.StatusCode)
+	}
+	return nil
+}

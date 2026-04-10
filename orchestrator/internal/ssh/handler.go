@@ -978,12 +978,20 @@ func (h *Handler) teamApply(args []string) int {
 		}
 	}
 
-	// Compute diff
+	// Build agent lookup by name
+	agentByName := make(map[string]team.ResolvedAgent)
+	for _, a := range agents {
+		agentByName[a.VMName] = a
+	}
+
+	// Compute diff: create, update, or ok
 	var toCreate []team.ResolvedAgent
+	var toUpdate []team.ResolvedAgent
 	var existing []string
 	for _, a := range agents {
 		if existingVMs[a.VMName] {
 			existing = append(existing, a.VMName)
+			toUpdate = append(toUpdate, a)
 		} else {
 			toCreate = append(toCreate, a)
 		}
@@ -1009,22 +1017,36 @@ func (h *Handler) teamApply(args []string) int {
 	// Destroy highest-indexed first
 	sort.Sort(sort.Reverse(sort.StringSlice(toDestroy)))
 
-	// Report plan
-	for _, name := range existing {
-		fmt.Printf("  ok       %s\n", name)
+	// Update existing VMs: push agent-config changes
+	updated := 0
+	for _, a := range toUpdate {
+		agentCfg := a.AgentConfigJSON(ts.Metadata.Name)
+		cfgJSON, _ := json.Marshal(agentCfg)
+
+		// Push updated agent-config to the VM's node via orchestrator API
+		fmt.Printf("  update   %s ...", a.VMName)
+		_, err := h.put("/api/vms/"+a.VMName+"/agent-config", cfgJSON)
+		if err != nil {
+			fmt.Printf(" FAILED: %v\n", err)
+			continue
+		}
+		fmt.Printf(" ok\n")
+		updated++
 	}
 
 	// Create new VMs
 	created := 0
 	for _, a := range toCreate {
+		agentCfg := a.AgentConfigJSON(ts.Metadata.Name)
 		body := map[string]interface{}{
-			"name":    a.VMName,
-			"type":    a.Type,
-			"vcpu":    a.VCPU,
-			"ram_mib": a.RAMMiB(),
-			"disk":    a.Disk,
-			"mode":    a.Mode,
-			"labels":  a.Labels(ts.Metadata.Name),
+			"name":         a.VMName,
+			"type":         a.Type,
+			"vcpu":         a.VCPU,
+			"ram_mib":      a.RAMMiB(),
+			"disk":         a.Disk,
+			"mode":         a.Mode,
+			"labels":       a.Labels(ts.Metadata.Name),
+			"agent_config": agentCfg,
 		}
 		if a.Description != "" {
 			body["description"] = a.Description
@@ -1061,7 +1083,7 @@ func (h *Handler) teamApply(args []string) int {
 		destroyed++
 	}
 
-	fmt.Printf("\nResult: %d created, %d existing, %d destroyed\n", created, len(existing), destroyed)
+	fmt.Printf("\nResult: %d created, %d updated, %d destroyed\n", created, updated, destroyed)
 	return 0
 }
 
@@ -1731,6 +1753,21 @@ func (h *Handler) post(path string, data interface{}) ([]byte, error) {
 
 func (h *Handler) delete(path string) ([]byte, error) {
 	req, _ := http.NewRequest("DELETE", h.apiBase+path, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func (h *Handler) put(path string, data []byte) ([]byte, error) {
+	req, _ := http.NewRequest("PUT", h.apiBase+path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err

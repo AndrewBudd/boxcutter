@@ -26,17 +26,18 @@ func NewClient(apiAddr string) *Client {
 }
 
 type CreateRequest struct {
-	Name             string   `json:"name"`
-	Type             string   `json:"type,omitempty"`        // "firecracker" (default) or "qemu"
-	Description      string   `json:"description,omitempty"` // user-provided description
-	VCPU             int      `json:"vcpu,omitempty"`
-	RAMMIB           int      `json:"ram_mib,omitempty"`
-	Disk             string   `json:"disk,omitempty"`
-	CloneURL         string   `json:"clone_url,omitempty"`
-	CloneURLs        []string `json:"clone_urls,omitempty"`
-	Mode             string   `json:"mode,omitempty"`
-	AuthorizedKeys   []string `json:"authorized_keys,omitempty"`
-	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
+	Name             string                 `json:"name"`
+	Type             string                 `json:"type,omitempty"`         // "firecracker" (default) or "qemu"
+	Description      string                 `json:"description,omitempty"` // user-provided description
+	VCPU             int                    `json:"vcpu,omitempty"`
+	RAMMIB           int                    `json:"ram_mib,omitempty"`
+	Disk             string                 `json:"disk,omitempty"`
+	CloneURL         string                 `json:"clone_url,omitempty"`
+	CloneURLs        []string               `json:"clone_urls,omitempty"`
+	Mode             string                 `json:"mode,omitempty"`
+	AuthorizedKeys   []string               `json:"authorized_keys,omitempty"`
+	TailscaleAuthkey string                 `json:"tailscale_authkey,omitempty"`
+	AgentConfig      map[string]interface{} `json:"agent_config,omitempty"`
 }
 
 type CreateResponse struct {
@@ -634,6 +635,23 @@ func (c *FastClient) GetAllActivity() []TapegunVMActivity {
 	var activity []TapegunVMActivity
 	json.NewDecoder(resp.Body).Decode(&activity)
 	return activity
+}
+
+// UpdateAgentConfig pushes a new agent-config to a running VM via the node agent.
+func (c *Client) UpdateAgentConfig(vmName string, cfg map[string]interface{}) error {
+	body, _ := json.Marshal(cfg)
+	req, _ := http.NewRequest("PUT", c.baseURL+"/api/vms/"+vmName+"/agent-config", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("update agent-config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("update agent-config: %s", string(errBody))
+	}
+	return nil
 }
 
 // SendTapegunMessage sends a message to a specific VM on the node.
