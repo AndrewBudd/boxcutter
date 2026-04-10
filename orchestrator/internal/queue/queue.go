@@ -78,6 +78,10 @@ func (q *Queue) Add(item *WorkItem) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return 0, nil // duplicate source_ref, insert was ignored
+	}
 	id, _ := res.LastInsertId()
 	return id, nil
 }
