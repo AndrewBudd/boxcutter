@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"strconv"
+
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/collab"
 	"github.com/AndrewBudd/boxcutter/orchestrator/internal/db"
 	orchmqtt "github.com/AndrewBudd/boxcutter/orchestrator/internal/mqtt"
@@ -1800,6 +1802,9 @@ func (h *Handler) messageDeliveryLoop() {
 
 func (h *Handler) initWorkQueue() {
 	repo := os.Getenv("QUEUE_REPO")
+	if repo == "" {
+		return
+	}
 	label := os.Getenv("QUEUE_LABEL")
 	if label == "" {
 		label = "ready"
@@ -1929,88 +1934,121 @@ func (h *Handler) assignWorkToVM(vmName, messageBody string) error {
 
 func (h *Handler) handleQueueList(w http.ResponseWriter, r *http.Request) {
 	if h.workQueue == nil {
-		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		http.Error(w, `{"error":"work queue not enabled (set QUEUE_REPO)"}`, http.StatusServiceUnavailable)
 		return
 	}
 	statusFilter := r.URL.Query().Get("status")
-	items := h.workQueue.List(statusFilter)
+	var items []*queue.WorkItem
+	var err error
+	if statusFilter != "" {
+		items, err = h.workQueue.ListByStatus(queue.WorkItemStatus(statusFilter))
+	} else {
+		items, err = h.workQueue.ListAll()
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if items == nil {
+		items = []*queue.WorkItem{}
+	}
 	writeJSON(w, items)
 }
 
 func (h *Handler) handleQueueAdd(w http.ResponseWriter, r *http.Request) {
 	if h.workQueue == nil {
-		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		http.Error(w, `{"error":"work queue not enabled (set QUEUE_REPO)"}`, http.StatusServiceUnavailable)
 		return
 	}
-
 	var item queue.WorkItem
 	if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if item.Title == "" {
-		http.Error(w, "title is required", http.StatusBadRequest)
+		http.Error(w, `{"error":"title is required"}`, http.StatusBadRequest)
 		return
 	}
 	if item.Source == "" {
 		item.Source = "manual"
 	}
-
-	if err := h.workQueue.Enqueue(&item); err != nil {
+	if item.SourceRef == "" {
+		item.SourceRef = fmt.Sprintf("manual-%d", time.Now().UnixNano())
+	}
+	id, err := h.workQueue.Add(&item)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	w.WriteHeader(http.StatusCreated)
-	writeJSON(w, item)
+	writeJSON(w, map[string]interface{}{"id": id, "status": "queued"})
 }
 
 func (h *Handler) handleQueueStats(w http.ResponseWriter, r *http.Request) {
-	if h.workQueue == nil || h.dispatcher == nil {
-		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+	if h.workQueue == nil {
+		http.Error(w, `{"error":"work queue not enabled (set QUEUE_REPO)"}`, http.StatusServiceUnavailable)
 		return
 	}
-	stats := h.dispatcher.Stats()
+	stats, err := h.workQueue.Stats()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, stats)
 }
 
 func (h *Handler) handleQueueComplete(w http.ResponseWriter, r *http.Request) {
 	if h.workQueue == nil {
-		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		http.Error(w, `{"error":"work queue not enabled (set QUEUE_REPO)"}`, http.StatusServiceUnavailable)
 		return
 	}
-	id := r.PathValue("id")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
 	if err := h.workQueue.Complete(id); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"status": "completed", "id": id})
+	writeJSON(w, map[string]string{"status": "completed"})
 }
 
 func (h *Handler) handleQueueReassign(w http.ResponseWriter, r *http.Request) {
 	if h.workQueue == nil {
-		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		http.Error(w, `{"error":"work queue not enabled (set QUEUE_REPO)"}`, http.StatusServiceUnavailable)
 		return
 	}
-	id := r.PathValue("id")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return
+	}
 	if err := h.workQueue.Reassign(id); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"status": "reassigned", "id": id})
+	writeJSON(w, map[string]string{"status": "queued"})
 }
 
 func (h *Handler) handleQueueSync(w http.ResponseWriter, r *http.Request) {
 	if h.workQueue == nil {
-		http.Error(w, "work queue not initialized", http.StatusServiceUnavailable)
+		http.Error(w, `{"error":"work queue not enabled (set QUEUE_REPO)"}`, http.StatusServiceUnavailable)
 		return
 	}
-	n, err := h.workQueue.SyncGitHubIssues()
+	repo := os.Getenv("QUEUE_REPO")
+	label := os.Getenv("QUEUE_LABEL")
+	if label == "" {
+		label = "ready"
+	}
+	count, err := queue.SyncFromGitHub(h.workQueue, repo, label)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]interface{}{"synced": n})
+	writeJSON(w, map[string]interface{}{"synced": count})
 }
 
 // --- Alert detection and SSE ---
