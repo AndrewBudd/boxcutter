@@ -22,6 +22,8 @@ SETUP_STAMP="${HOME_DIR}/.tapegun-setup-done"
 CHECKPOINT_INTERVAL=60
 LAST_CHECKPOINT=0
 RESTORED_SESSION_ID=""
+TAPEGUN_SEQUENCES=""
+SEQUENCES_EXECUTED=false
 
 mkdir -p "$INBOX_DIR"
 
@@ -72,6 +74,26 @@ fi
 
 log() { echo "tapegun: $*"; }
 
+setup_claude_credentials() {
+    local cred_file="${CLAUDE_DIR}/.credentials.json"
+    # boxcutter-fetch-metadata may have already installed credentials at boot.
+    # Verify they exist; if not, fetch from metadata as a fallback.
+    if [ -f "$cred_file" ]; then
+        log "Claude credentials already present"
+        return 0
+    fi
+    local resp
+    resp=$(curl -sf --max-time 5 "${METADATA}/metadata/claude-credentials" 2>/dev/null || echo "")
+    if [ -n "$resp" ] && [ "$resp" != "null" ]; then
+        mkdir -p "$CLAUDE_DIR"
+        printf '%s' "$resp" > "$cred_file"
+        chmod 600 "$cred_file"
+        log "Claude credentials installed from metadata"
+    else
+        log "WARNING: Claude credentials not available — Claude Code will prompt for OAuth"
+    fi
+}
+
 setup_git_credentials() {
     local resp token
     resp=$(curl -sf --max-time 5 "${METADATA}/token/github" 2>/dev/null || echo "")
@@ -79,7 +101,9 @@ setup_git_credentials() {
     if [ -n "$token" ]; then
         git config --global credential.helper \
             '!f() { echo "username=x-access-token"; echo "password='"$token"'"; }; f'
-        log "git credentials configured"
+        # Also authenticate gh CLI so `gh auth status` works
+        echo "$token" | gh auth login --with-token 2>/dev/null || true
+        log "git + gh credentials configured"
     else
         log "WARNING: no GitHub token available, clones may fail"
     fi
@@ -247,8 +271,16 @@ setup_workspace() {
 
     log "agent config received"
 
+    # Agent-config presence triggers autostart — the VM was configured by
+    # team apply and should launch Claude Code automatically.
+    AUTOSTART_CLAUDE=true
+
+    # Provision Claude credentials before anything else — must be in place
+    # before Claude Code launches so it doesn't prompt for OAuth.
+    setup_claude_credentials
+
     # Parse config fields
-    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files
+    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files tapegun_sequences
     repos=$(echo "$agent_config" | jq -r '.repos // [] | .[]' 2>/dev/null)
     persona_claude_md=$(echo "$agent_config" | jq -r '.persona.claude_md // empty' 2>/dev/null)
     persona_instructions=$(echo "$agent_config" | jq -r '.persona.instructions // empty' 2>/dev/null)
@@ -256,6 +288,7 @@ setup_workspace() {
     claude_resume=$(echo "$agent_config" | jq -r '.claude_resume // empty' 2>/dev/null)
     working_dir=$(echo "$agent_config" | jq -r '.working_dir // empty' 2>/dev/null)
     team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
+    tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
 
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
@@ -325,6 +358,12 @@ setup_workspace() {
 }
 EOSETTINGS
         log "pre-trusted directory ${working_dir:-$PROJECT_DIR}"
+    fi
+
+    # Save tapegun sequences for execution after Claude Code starts
+    if [ -n "$tapegun_sequences" ]; then
+        TAPEGUN_SEQUENCES="$tapegun_sequences"
+        log "tapegun sequences queued: $(echo "$tapegun_sequences" | tr '\n' ', ')"
     fi
 
     touch "$SETUP_STAMP"
@@ -656,6 +695,27 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
                 -H "Content-Type: application/json" \
                 -d @- \
                 --max-time 2 2>/dev/null || true
+        fi
+    fi
+
+    # --- Execute tapegun sequences (one-time, after Claude Code is running) ---
+    if [ "$SEQUENCES_EXECUTED" = "false" ] && [ -n "$TAPEGUN_SEQUENCES" ] && $TMUX_CMD has-session 2>/dev/null; then
+        # Wait for Claude Code process to be running before injecting sequences
+        if pgrep -f 'claude' -u "$(id -u)" >/dev/null 2>&1; then
+            log "executing tapegun sequences"
+            # Give Claude Code a moment to fully initialize
+            sleep 3
+            while IFS= read -r seq_line; do
+                [ -z "$seq_line" ] && continue
+                log "sequence: $seq_line"
+                $TMUX_CMD send-keys -t 0 "$seq_line"
+                sleep 0.5
+                $TMUX_CMD send-keys -t 0 Enter
+                # Wait between sequences for Claude to process each one
+                sleep 5
+            done <<< "$TAPEGUN_SEQUENCES"
+            SEQUENCES_EXECUTED=true
+            log "tapegun sequences complete"
         fi
     fi
 
