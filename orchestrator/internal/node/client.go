@@ -164,6 +164,22 @@ func (c *Client) SendChannelEvent(name string, event []byte) error {
 	return nil
 }
 
+// UpdateAgentConfig pushes an updated agent-config to a VM via the node agent.
+func (c *Client) UpdateAgentConfig(name string, config []byte) error {
+	req, _ := http.NewRequest("PUT", c.baseURL+"/api/vms/"+name+"/agent-config", bytes.NewReader(config))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("node update agent-config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("node update agent-config: %s", string(errBody))
+	}
+	return nil
+}
+
 // ExecResult holds the output and exit code from a VM exec.
 type ExecResult struct {
 	Output   string `json:"output"`

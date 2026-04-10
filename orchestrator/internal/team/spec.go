@@ -104,6 +104,45 @@ type ResolvedAgent struct {
 	Tapegun     []string
 }
 
+// AgentConfig builds the agent-config JSON for this VM, used by the metadata
+// service to configure tapegun on boot (persona, repos, working dir, etc.).
+func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) map[string]interface{} {
+	cfg := map[string]interface{}{
+		"team":          teamName,
+		"agent":         r.AgentName,
+		"replica_index": r.ReplicaNum,
+	}
+	if len(r.Repos) > 0 {
+		cfg["repos"] = r.Repos
+	}
+	if r.Persona != nil {
+		persona := map[string]interface{}{}
+		if r.Persona.Role != "" {
+			persona["role"] = r.Persona.Role
+		}
+		if r.Persona.ClaudeMD != "" {
+			persona["claude_md"] = r.Persona.ClaudeMD
+		}
+		if r.Persona.Instructions != "" {
+			persona["instructions"] = r.Persona.Instructions
+		}
+		cfg["persona"] = persona
+	}
+	if r.Authorized {
+		cfg["authorized"] = true
+	}
+	if len(r.Tapegun) > 0 {
+		cfg["tapegun"] = r.Tapegun
+	}
+	if len(r.Access) > 0 {
+		cfg["access"] = r.Access
+	}
+	if len(allPersonaFiles) > 0 {
+		cfg["team_persona_files"] = allPersonaFiles
+	}
+	return cfg
+}
+
 // RAMMiB parses the human-readable RAM string (e.g. "4G", "2048M") to MiB.
 func (r *ResolvedAgent) RAMMiB() int {
 	return ParseRAMMiB(r.RAM)
