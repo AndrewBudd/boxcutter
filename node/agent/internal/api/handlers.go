@@ -524,15 +524,29 @@ func (h *Handler) handleMigrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Start migration in background — caller polls GET /api/vms/{name} for status
+	// Start migration in background — caller polls GET /api/vms/{name} for status.
+	// Issue #154: 5-minute timeout prevents zombie VMs on network failure.
 	go func() {
-		// Use defer to guarantee cleanup even if MigrateVM panics.
-		// EndMigration clears both in-memory set and filesystem marker.
-		// On success, MigrateVM already removed vmDir, so SetMigrating is a no-op.
 		defer h.mgr.EndMigration(name)
-		_, err := h.mgr.MigrateVM(name, req.TargetAddr, req.TargetBridgeIP)
-		if err != nil {
-			log.Printf("Migration failed for %s: %v", name, err)
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := h.mgr.MigrateVM(name, req.TargetAddr, req.TargetBridgeIP)
+			done <- err
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				log.Printf("Migration failed for %s: %v", name, err)
+			}
+		case <-time.After(5 * time.Minute):
+			log.Printf("ALERT: Migration timeout for %s after 5 minutes — clearing migration marker", name)
+			log.Printf("The VM may need manual restart: the source may be paused/stopped and the target may have partial state.")
+			// EndMigration (deferred) clears the in-memory and filesystem
+			// migration markers so the VM is no longer stuck in "migrating" state.
+			// The underlying rsync/scp may still be running — it will fail
+			// harmlessly once the SSH control socket is cleaned up.
 		}
 	}()
 
