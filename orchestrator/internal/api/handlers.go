@@ -359,10 +359,6 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// VM-to-VM messaging: lookup which node a VM is on
 	mux.HandleFunc("GET /api/vms/{name}/location", h.handleVMLocation)
 
-	// Dashboard: SSE stream + alerts
-	mux.HandleFunc("GET /api/alerts", h.handleAlerts)
-	mux.HandleFunc("GET /api/alerts/stream", h.handleAlertStream)
-
 	// Team collaboration
 	mux.HandleFunc("POST /api/team/{team}/message", h.handleTeamMessage)
 	mux.HandleFunc("GET /api/team/{team}/messages", h.handleTeamMessages)
