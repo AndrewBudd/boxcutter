@@ -79,10 +79,31 @@ setup_git_credentials() {
     if [ -n "$token" ]; then
         git config --global credential.helper \
             '!f() { echo "username=x-access-token"; echo "password='"$token"'"; }; f'
+        # Configure gh CLI authentication
+        echo "$token" | gh auth login --with-token 2>/dev/null && \
+            log "gh CLI authenticated" || true
         log "git credentials configured"
     else
         log "WARNING: no GitHub token available, clones may fail"
     fi
+}
+
+setup_claude_credentials() {
+    local creds_dir="${HOME_DIR}/.claude"
+    local creds_file="${creds_dir}/.credentials.json"
+
+    local resp
+    resp=$(curl -sf --max-time 5 "${METADATA}/metadata/claude-credentials" 2>/dev/null || echo "")
+    if [ -z "$resp" ] || [ "$resp" = "null" ]; then
+        log "WARNING: no Claude credentials available, Claude Code will prompt for OAuth"
+        return
+    fi
+
+    mkdir -p "$creds_dir"
+    echo "$resp" > "$creds_file"
+    chmod 600 "$creds_file"
+    chown "$(id -u):$(id -g)" "$creds_file"
+    log "Claude credentials installed"
 }
 
 clone_repo() {
@@ -241,6 +262,8 @@ setup_workspace() {
     agent_config=$(curl -sf --max-time 5 "${METADATA}/metadata/agent-config" 2>/dev/null || echo "")
     if [ -z "$agent_config" ] || [ "$agent_config" = "null" ] || [ "$agent_config" = "{}" ]; then
         log "no agent-config available, using defaults"
+        # Still provision credentials if available (credentials are separate from agent-config)
+        setup_claude_credentials
         touch "$SETUP_STAMP"
         return 0
     fi
@@ -256,6 +279,9 @@ setup_workspace() {
     claude_resume=$(echo "$agent_config" | jq -r '.claude_resume // empty' 2>/dev/null)
     working_dir=$(echo "$agent_config" | jq -r '.working_dir // empty' 2>/dev/null)
     team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
+
+    # Provision Claude Code credentials (before launch, so no OAuth prompt)
+    setup_claude_credentials
 
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
