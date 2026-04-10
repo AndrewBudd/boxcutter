@@ -376,6 +376,8 @@ func main() {
 }
 
 func runDaemon() {
+	checkRuntimeDeps()
+
 	cfg := defaultConfig()
 
 	// Acquire exclusive lock to prevent multiple control plane instances.
@@ -5067,7 +5069,58 @@ func ensureBaseImage(cfg HostConfig, vmType string, tag string) (string, *oci.Im
 	return basePath, meta, nil
 }
 
+// checkRuntimeDeps verifies that required external tools are installed.
+// Called early in bootstrap and daemon startup to fail fast with clear
+// instructions instead of cryptic "exit 127" errors mid-operation.
+func checkRuntimeDeps() {
+	required := []struct {
+		binary  string
+		pkg     string // apt package that provides it
+		purpose string
+	}{
+		{"qemu-system-x86_64", "qemu-system-x86", "launching VMs"},
+		{"qemu-img", "qemu-utils", "creating and managing VM disks"},
+		{"genisoimage", "genisoimage", "creating cloud-init ISOs"},
+		{"mosquitto", "mosquitto", "MQTT broker for golden image distribution"},
+		{"iptables", "iptables", "NAT and firewall rules"},
+		{"ip", "iproute2", "bridge and network configuration"},
+		{"zstd", "zstd", "decompressing OCI images"},
+		{"mksquashfs", "squashfs-tools", "building tools.img for VMs"},
+		{"ssh", "openssh-client", "node VM management"},
+		{"scp", "openssh-client", "file transfer to nodes"},
+	}
+
+	var missing []struct{ binary, pkg, purpose string }
+	for _, dep := range required {
+		if _, err := exec.LookPath(dep.binary); err != nil {
+			missing = append(missing, dep)
+		}
+	}
+
+	if len(missing) > 0 {
+		log.Println("ERROR: Missing required runtime dependencies:")
+		for _, m := range missing {
+			log.Printf("  - %s (%s) — needed for %s", m.binary, m.pkg, m.purpose)
+		}
+		// Deduplicate package names for the install command
+		pkgSet := make(map[string]bool)
+		for _, m := range missing {
+			pkgSet[m.pkg] = true
+		}
+		var pkgs []string
+		for p := range pkgSet {
+			pkgs = append(pkgs, p)
+		}
+		sort.Strings(pkgs)
+		log.Printf("")
+		log.Printf("Install with: sudo apt-get install -y %s", strings.Join(pkgs, " "))
+		log.Fatalf("Bootstrap aborted: missing %d runtime dependencies", len(missing))
+	}
+}
+
 func runBootstrap() {
+	checkRuntimeDeps()
+
 	cfg := defaultConfig()
 	os.MkdirAll(cfg.ImagesDir, 0755)
 
