@@ -889,8 +889,11 @@ func healthLoop(cfg HostConfig, state *cluster.State, hs *healthState) {
 	for range ticker.C {
 		hs.mu.Lock()
 
-		// Check orchestrator (skip if draining/upgrading)
-		if state.Orchestrator != nil && state.Orchestrator.IsActive() {
+		// Check orchestrator (skip if draining/upgrading or reconciler owns lifecycle)
+		upgradingOrchMu.Lock()
+		orchUpgradeActive := upgradingOrch
+		upgradingOrchMu.Unlock()
+		if state.Orchestrator != nil && state.Orchestrator.IsActive() && !orchUpgradeActive {
 			if !qemu.IsRunning(state.Orchestrator.PID) {
 				log.Printf("ALERT: orchestrator not running, restarting...")
 				currentUser, _ := user.Current()
@@ -1582,29 +1585,33 @@ func addNode(cfg HostConfig, state *cluster.State) {
 	}()
 }
 
-// getNodeRunningVMs queries the node agent health endpoint and returns the number
-// of running VMs. Returns 0 if the agent is unreachable or the response can't be parsed.
+// getNodeRunningVMs queries a node agent's health endpoint and returns the
+// number of running VMs. Returns -1 if the node is unreachable or returns
+// an error, so callers can distinguish "0 VMs" from "unknown".
 func getNodeRunningVMs(bridgeIP string) int {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(fmt.Sprintf("http://%s:8800/api/health", bridgeIP))
 	if err != nil {
-		return 0
+		return -1
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return -1
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0
+		return -1
 	}
 	var health map[string]interface{}
 	if err := json.Unmarshal(body, &health); err != nil {
-		return 0
+		return -1
 	}
 	if v, ok := health["vms_running"]; ok {
 		if n, ok := v.(float64); ok {
 			return int(n)
 		}
 	}
-	return 0
+	return -1
 }
 
 // waitForNodeVMs waits for the node agent to become healthy AND report at least
@@ -1712,8 +1719,12 @@ func deployNodeBinaryFromPeer(cfg HostConfig, peerBridgeIP, targetBridgeIP, targ
 		}
 	}
 
-	// Record pre-restart VM count so we can wait for them to come back
+	// Record pre-restart VM count so we can wait for them to come back.
+	// Clamp to 0 if unreachable (-1) — waitForNodeVMs just checks >= N.
 	preRestartVMs := getNodeRunningVMs(targetBridgeIP)
+	if preRestartVMs < 0 {
+		preRestartVMs = 0
+	}
 	log.Printf("Deploy %s: %d VMs running before restart", targetNodeID, preRestartVMs)
 
 	// Install and restart
@@ -1814,8 +1825,12 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 		}
 	}
 
-	// Record pre-restart VM count so we can wait for them to come back
+	// Record pre-restart VM count so we can wait for them to come back.
+	// Clamp to 0 if unreachable (-1) — waitForNodeVMs just checks >= N.
 	preRestartVMs := getNodeRunningVMs(bridgeIP)
+	if preRestartVMs < 0 {
+		preRestartVMs = 0
+	}
 	log.Printf("Deploy %s: %d VMs running before restart", nodeID, preRestartVMs)
 
 	// Install and restart
@@ -2096,6 +2111,13 @@ func buildStatus(cfg HostConfig, state *cluster.State, hs *healthState) map[stri
 
 	return result
 }
+
+// upgradingOrchMu protects upgradingOrch. The upgrade reconciler sets this
+// flag before stopping/launching the orchestrator so the health monitor
+// backs off entirely — preventing the race in issue #136 where both the
+// reconciler and health monitor fight over the TAP device and disk.
+var upgradingOrchMu sync.Mutex
+var upgradingOrch bool
 
 // drainMu prevents concurrent drains. Multiple drains could race when the
 // API handler, auto-scaler, and upgrade reconciler all call drainNode. Without
@@ -3266,6 +3288,14 @@ func cliUpgradeCancel(cfg HostConfig) {
 // runReconcileLoop runs the upgrade reconciler in a background goroutine
 // until the goal is satisfied, cancelled, or auto-aborted after too many failures.
 func runReconcileLoop(cfg HostConfig, state *cluster.State, cancelCh chan struct{}) {
+	// Always release the orchestrator upgrade flag when the loop exits,
+	// regardless of how (cancel, auto-abort, success). Issue #136.
+	defer func() {
+		upgradingOrchMu.Lock()
+		upgradingOrch = false
+		upgradingOrchMu.Unlock()
+	}()
+
 	const autoAbortThreshold = 50 // ~4 minutes at 5s interval
 	const insufficientMemoryPauseThreshold = 3
 	consecutiveFailures := 0
@@ -3399,10 +3429,21 @@ func reconcileUpgradeStep(cfg HostConfig, state *cluster.State) (done bool, acti
 	// --- Step 3: Orchestrator upgrade ---
 
 	if needsOrch && orchNeedsUpgrade(state, goal) {
+		// Issue #136: tell health monitor to back off while we own the
+		// orchestrator lifecycle. Flag stays set across reconcile steps
+		// until the upgrade completes, fails terminally, or is cancelled.
+		upgradingOrchMu.Lock()
+		upgradingOrch = true
+		upgradingOrchMu.Unlock()
+
 		stepDone, stepAction, stepErr := reconcileOrchUpgrade(cfg, state, goal)
 		if stepErr != nil || !stepDone {
 			return false, stepAction, stepErr
 		}
+		// Orchestrator upgrade complete — release to health monitor
+		upgradingOrchMu.Lock()
+		upgradingOrch = false
+		upgradingOrchMu.Unlock()
 	}
 
 	// --- All done ---
@@ -3522,7 +3563,20 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	availMB := getAvailableMemoryMB()
 	upgradeReserveMB := 1024 // 1GB buffer during upgrade (old node frees RAM after drain)
 	if nodeRAMMB > 0 && availMB > 0 && availMB < nodeRAMMB+upgradeReserveMB {
-		return false, "", fmt.Errorf("insufficient memory to launch replacement node (%dMB available, need %dMB + %dMB reserve)", availMB, nodeRAMMB, upgradeReserveMB)
+		// Issue #137: drain-first strategy — when side-by-side doesn't fit,
+		// drain the least-loaded old node to free its RAM, then launch the
+		// replacement in the freed space. This has brief VM downtime during
+		// stop-copy but requires zero manual intervention.
+		drainTarget := leastLoadedOldNode(state, goal)
+		if drainTarget == nil {
+			return false, "", fmt.Errorf("insufficient memory to launch replacement node (%dMB available, need %dMB + %dMB reserve) and no old node available to drain-first", availMB, nodeRAMMB, upgradeReserveMB)
+		}
+		log.Printf("Drain-first upgrade: insufficient RAM for side-by-side (%dMB available, need %dMB) — draining %s to free memory",
+			availMB, nodeRAMMB+upgradeReserveMB, drainTarget.ID)
+		state.SetNodeStatus(drainTarget.ID, "draining")
+		state.Save()
+		drainNode(cfg, state, drainTarget.ID)
+		return false, fmt.Sprintf("Drain-first: drained %s to free RAM for replacement node", drainTarget.ID), nil
 	}
 
 	// No pending replacement — launch one
@@ -3533,8 +3587,34 @@ func reconcileNodeUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 	return false, fmt.Sprintf("Launched replacement node %s for %s", newEntry.ID, oldNode.ID), nil
 }
 
+// leastLoadedOldNode returns the old (not matching goal) active node with the
+// fewest running VMs. Used by drain-first upgrade (issue #137) to pick which
+// node to drain when there isn't enough RAM for side-by-side replacement.
+func leastLoadedOldNode(state *cluster.State, goal *cluster.UpgradeGoal) *cluster.VMEntry {
+	var best *cluster.VMEntry
+	bestVMs := int(^uint(0) >> 1) // max int
+
+	for _, n := range state.Nodes {
+		if !n.IsActive() || n.MatchesImage(goal.NodeImage) {
+			continue // skip upgraded or non-active nodes
+		}
+		vms := getNodeRunningVMs(n.BridgeIP)
+		if vms < 0 {
+			log.Printf("leastLoadedOldNode: skipping %s — unreachable", n.ID)
+			continue // skip unreachable nodes (review feedback PR #139)
+		}
+		if vms < bestVMs {
+			bestVMs = vms
+			cp := n
+			best = &cp
+		}
+	}
+	return best
+}
+
 // reconcileOrchUpgrade handles one step of orchestrator upgrade.
 // Strategy: stop old orchestrator, launch new one at the same IP/TAP.
+// Caller must set upgradingOrch=true before calling (issue #136).
 func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.UpgradeGoal) (done bool, action string, err error) {
 	oldOrch := state.Orchestrator
 
