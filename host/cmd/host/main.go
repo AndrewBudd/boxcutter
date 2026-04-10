@@ -2251,7 +2251,20 @@ func drainNode(cfg HostConfig, state *cluster.State, nodeID string) {
 	}
 
 	if len(toMigrate) == 0 {
-		log.Printf("Drain: all VMs already migrated from %s", nodeID)
+		log.Printf("Drain: no VMs to migrate from %s (all stopped or already migrated), stopping node", nodeID)
+		// Clear drain target tracking on success
+		if goal := state.UpgradeGoal; goal != nil {
+			goal.DrainTargetNodeID = ""
+		}
+		state.RemoveNode(nodeID)
+		state.Save()
+		qemu.Stop(nodeID, node.PID)
+		if node.TAP != "" {
+			bridge.DeleteTAP(node.TAP)
+		}
+		cleanupNodeArtifacts(cfg, nodeID)
+		log.Printf("Drain: %s complete (no migratable VMs)", nodeID)
+		return
 	} else {
 		// QEMU VMs now support live migration via QMP state save/restore.
 		// No need to stop them before drain — the node agent handles it.
