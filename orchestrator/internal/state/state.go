@@ -226,6 +226,18 @@ func (s *Store) SyncNodeVMs(nodeID string, vms []VM) {
 	}
 }
 
+// NodeHasVMs returns true if any VM in the store is assigned to the given node.
+func (s *Store) NodeHasVMs(nodeID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, v := range s.vms {
+		if v.NodeID == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
 // --- Golden image operations ---
 
 // SetGoldenImages replaces all golden image records for a node.

@@ -692,74 +692,95 @@ type vmListEntry struct {
 }
 
 func (h *Handler) handleVMList(w http.ResponseWriter, r *http.Request) {
-	vms := h.state.ListVMs()
+	// Issue #138: nodes are the source of truth. Query ALL active nodes
+	// for their VM inventory, then merge with orchestrator state for labels
+	// and other metadata. This ensures ghost VMs are always visible.
+	activeNodes := h.state.ListNodes()
 
-	// Group VMs by node so we make one request per node
-	nodeVMs := make(map[string][]*state.VM)
-	for _, v := range vms {
-		nodeVMs[v.NodeID] = append(nodeVMs[v.NodeID], v)
-	}
-
-	// Fetch details from each node in parallel
 	type nodeResult struct {
 		nodeID string
-		vms    map[string]*node.VMDetail
+		vms    []node.VMDetail
 	}
-	results := make(chan nodeResult, len(nodeVMs))
+	results := make(chan nodeResult, len(activeNodes))
 
-	for nodeID := range nodeVMs {
-		go func(nid string) {
-			nr := nodeResult{nodeID: nid, vms: make(map[string]*node.VMDetail)}
-			n := h.state.GetNode(nid)
-			if n == nil || n.APIAddr == "" {
+	for _, n := range activeNodes {
+		go func(nid, addr string) {
+			nr := nodeResult{nodeID: nid}
+			if addr == "" {
 				results <- nr
 				return
 			}
-			fc := node.NewFastClient(n.APIAddr)
-			vmList := fc.ListVMs()
-			for i := range vmList {
-				nr.vms[vmList[i].Name] = &vmList[i]
-			}
+			fc := node.NewFastClient(addr)
+			nr.vms = fc.ListVMs()
 			results <- nr
-		}(nodeID)
+		}(n.ID, n.APIAddr)
 	}
 
+	// Collect node responses — these are the real VMs
+	// Map: nodeID -> (vmName -> VMDetail)
 	detailsByNode := make(map[string]map[string]*node.VMDetail)
-	for range nodeVMs {
+	for range activeNodes {
 		nr := <-results
-		detailsByNode[nr.nodeID] = nr.vms
+		m := make(map[string]*node.VMDetail)
+		for i := range nr.vms {
+			m[nr.vms[i].Name] = &nr.vms[i]
+		}
+		detailsByNode[nr.nodeID] = m
 	}
 
+	// Build entries from node reality, enriched with orchestrator metadata
+	seen := make(map[string]bool)
 	var entries []vmListEntry
-	for _, v := range vms {
+
+	for nodeID, nodeVMs := range detailsByNode {
+		n := h.state.GetNode(nodeID)
+		nodeName := nodeID
+		if n != nil {
+			nodeName = n.TailscaleName
+		}
+
+		for vmName, detail := range nodeVMs {
+			seen[vmName] = true
+			orchVM := h.state.GetVM(vmName)
+
+			entry := vmListEntry{
+				Name:        vmName,
+				NodeID:      nodeID,
+				NodeName:    nodeName,
+				Type:        detail.Type,
+				Description: detail.Description,
+				TailscaleIP: detail.TailscaleIP,
+				Mode:        detail.Mode,
+				VCPU:        detail.VCPU,
+				RAMMIB:      detail.RAMMIB,
+				Disk:        detail.Disk,
+				Status:      detail.Status,
+			}
+			if orchVM != nil {
+				entry.Labels = orchVM.Labels
+			}
+			entries = append(entries, entry)
+		}
+	}
+
+	// Include VMs from orchestrator state on unreachable nodes (so they
+	// don't vanish from the list when a node is temporarily down).
+	for _, v := range h.state.ListVMs() {
+		if seen[v.Name] {
+			continue
+		}
 		n := h.state.GetNode(v.NodeID)
 		nodeName := v.NodeID
 		if n != nil {
 			nodeName = n.TailscaleName
 		}
-
-		entry := vmListEntry{
+		entries = append(entries, vmListEntry{
 			Name:     v.Name,
 			NodeID:   v.NodeID,
 			NodeName: nodeName,
 			Status:   v.Status,
 			Labels:   v.Labels,
-		}
-
-		if nodeDetail, ok := detailsByNode[v.NodeID]; ok {
-			if detail, ok := nodeDetail[v.Name]; ok {
-				entry.Type = detail.Type
-				entry.Description = detail.Description
-				entry.TailscaleIP = detail.TailscaleIP
-				entry.Mode = detail.Mode
-				entry.VCPU = detail.VCPU
-				entry.RAMMIB = detail.RAMMIB
-				entry.Disk = detail.Disk
-				entry.Status = detail.Status
-			}
-		}
-
-		entries = append(entries, entry)
+		})
 	}
 
 	writeJSON(w, entries)
@@ -885,18 +906,27 @@ func (h *Handler) handleVMDestroy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	n := h.state.GetNode(vm.NodeID)
+	if n == nil {
+		http.Error(w, "node not found for VM", http.StatusInternalServerError)
+		return
+	}
+
+	// Issue #138: the node agent is the source of truth. We must confirm
+	// destruction on the node before removing from orchestrator state.
+	// Never delete state if the node call fails — that creates ghost VMs.
 	h.state.UpdateVMStatus(name, "destroying")
 
-	n := h.state.GetNode(vm.NodeID)
-	if n != nil {
-		client := node.NewClient(n.APIAddr)
-		if err := client.Destroy(name); err != nil {
-			log.Printf("Node destroy failed for %s: %v (cleaning up state anyway)", name, err)
-		}
+	client := node.NewClient(n.APIAddr)
+	if err := client.Destroy(name); err != nil {
+		h.state.UpdateVMStatus(name, vm.Status) // revert status
+		log.Printf("Node destroy failed for %s on %s: %v", name, vm.NodeID, err)
+		http.Error(w, fmt.Sprintf("node agent destroy failed: %v", err), http.StatusBadGateway)
+		return
 	}
 
 	h.state.DeleteVM(name)
-	log.Printf("VM destroyed: %s", name)
+	log.Printf("VM destroyed: %s (confirmed by node %s)", name, vm.NodeID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
