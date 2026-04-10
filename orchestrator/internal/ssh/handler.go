@@ -923,6 +923,14 @@ Subcommands:
 		return h.teamMetrics(args[1:])
 	case "status":
 		return h.teamStatus(args[1:])
+	case "message", "msg":
+		return h.teamMsg(args[1:])
+	case "files":
+		return h.teamFilesCmd(args[1:])
+	case "conflicts":
+		return h.teamConflictsCmd(args[1:])
+	case "scratchpad", "scratch":
+		return h.teamScratchpadCmd(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown team subcommand: %s\n", args[0])
 		return 1
@@ -1694,6 +1702,205 @@ func (h *Handler) teamStatus(args []string) int {
 
 		fmt.Printf("%-35s  %-12s  %-12s  %-6s  %-5.0f  %s\n",
 			name, status, nodeName, vmType, vcpu, formatRAM(ramMIB))
+	}
+	return 0
+}
+
+// --- Team collaboration commands ---
+
+func (h *Handler) teamMsg(args []string) int {
+	if len(args) < 2 {
+		fmt.Println("Usage: ssh <host> team message <team-name> <message...>")
+		fmt.Println("       ssh <host> team message <team-name> --to <agent> <message...>")
+		return 1
+	}
+
+	teamName := args[0]
+	var to, msgType, subject string
+	var msgParts []string
+
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--to":
+			if i+1 < len(args) {
+				to = args[i+1]
+				i++
+			}
+		case "--type":
+			if i+1 < len(args) {
+				msgType = args[i+1]
+				i++
+			}
+		case "--subject":
+			if i+1 < len(args) {
+				subject = args[i+1]
+				i++
+			}
+		default:
+			msgParts = append(msgParts, args[i])
+		}
+	}
+
+	if len(msgParts) == 0 {
+		fmt.Println("Error: message body is required")
+		return 1
+	}
+
+	if msgType == "" {
+		msgType = "notification"
+	}
+
+	body := map[string]interface{}{
+		"from":    "operator",
+		"to":      to,
+		"type":    msgType,
+		"subject": subject,
+		"body":    strings.Join(msgParts, " "),
+	}
+	bodyJSON, _ := json.Marshal(body)
+
+	resp, err := h.post("/api/team/"+teamName+"/message", bodyJSON)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	json.Unmarshal(resp, &result)
+
+	if to != "" {
+		fmt.Printf("  Sent to %s (id: %s)\n", to, result.ID)
+	} else {
+		fmt.Printf("  Broadcast to team %s (id: %s)\n", teamName, result.ID)
+	}
+	return 0
+}
+
+func (h *Handler) teamFilesCmd(args []string) int {
+	if len(args) < 1 {
+		fmt.Println("Usage: ssh <host> team files <team-name>")
+		return 1
+	}
+
+	body, err := h.get("/api/team/" + args[0] + "/files")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+
+	var reports []struct {
+		Agent  string   `json:"agent"`
+		Branch string   `json:"branch"`
+		Files  []string `json:"files"`
+	}
+	json.Unmarshal(body, &reports)
+
+	if len(reports) == 0 {
+		fmt.Println("  No file reports for this team")
+		return 0
+	}
+
+	for _, r := range reports {
+		fmt.Printf("  %s (branch: %s)\n", r.Agent, r.Branch)
+		for _, f := range r.Files {
+			fmt.Printf("    - %s\n", f)
+		}
+	}
+	return 0
+}
+
+func (h *Handler) teamConflictsCmd(args []string) int {
+	if len(args) < 1 {
+		fmt.Println("Usage: ssh <host> team conflicts <team-name>")
+		return 1
+	}
+
+	body, err := h.get("/api/team/" + args[0] + "/conflicts")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+
+	var conflicts []struct {
+		File    string `json:"file"`
+		AgentA  string `json:"agent_a"`
+		BranchA string `json:"branch_a"`
+		AgentB  string `json:"agent_b"`
+		BranchB string `json:"branch_b"`
+	}
+	json.Unmarshal(body, &conflicts)
+
+	if len(conflicts) == 0 {
+		fmt.Println("  No file conflicts detected")
+		return 0
+	}
+
+	fmt.Printf("  %d conflict(s) detected:\n", len(conflicts))
+	for _, c := range conflicts {
+		fmt.Printf("  %s\n", c.File)
+		fmt.Printf("    %s (branch: %s)\n", c.AgentA, c.BranchA)
+		fmt.Printf("    %s (branch: %s)\n", c.AgentB, c.BranchB)
+	}
+	return 0
+}
+
+func (h *Handler) teamScratchpadCmd(args []string) int {
+	if len(args) < 1 {
+		fmt.Println("Usage: ssh <host> team scratchpad <team-name> [--add <type> <message>]")
+		return 1
+	}
+
+	teamName := args[0]
+
+	// Check if adding an entry
+	if len(args) > 1 && args[1] == "--add" {
+		if len(args) < 4 {
+			fmt.Println("Usage: ssh <host> team scratchpad <team-name> --add <type> <message>")
+			fmt.Println("  Types: decision, discovery, warning, blocker")
+			return 1
+		}
+		entryType := args[2]
+		entryBody := strings.Join(args[3:], " ")
+
+		body := map[string]interface{}{
+			"from": "operator",
+			"type": entryType,
+			"body": entryBody,
+		}
+		bodyJSON, _ := json.Marshal(body)
+
+		_, err := h.post("/api/team/"+teamName+"/scratchpad", bodyJSON)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		fmt.Printf("  Added %s entry to %s scratchpad\n", entryType, teamName)
+		return 0
+	}
+
+	// List scratchpad
+	body, err := h.get("/api/team/" + teamName + "/scratchpad")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return 1
+	}
+
+	var entries []struct {
+		From      string `json:"from"`
+		Type      string `json:"type"`
+		Body      string `json:"body"`
+		Timestamp string `json:"timestamp"`
+	}
+	json.Unmarshal(body, &entries)
+
+	if len(entries) == 0 {
+		fmt.Println("  Scratchpad is empty")
+		return 0
+	}
+
+	for _, e := range entries {
+		fmt.Printf("  [%s] %s (%s): %s\n", e.Type, e.From, e.Timestamp, e.Body)
 	}
 	return 0
 }

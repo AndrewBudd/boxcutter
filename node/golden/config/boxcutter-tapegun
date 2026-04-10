@@ -643,6 +643,22 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
         LAST_CHECKPOINT=$NOW_EPOCH
     fi
 
+    # --- Report changed files (for cross-agent conflict detection) ---
+    if [ -d "${CLAUDE_WORKING_DIR:-$PROJECT_DIR}/.git" ] && command -v jq >/dev/null 2>&1; then
+        CHANGED_FILES=$(cd "${CLAUDE_WORKING_DIR:-$PROJECT_DIR}" && git diff --name-only HEAD 2>/dev/null | head -20)
+        if [ -n "$CHANGED_FILES" ]; then
+            GIT_BRANCH=$(cd "${CLAUDE_WORKING_DIR:-$PROJECT_DIR}" && git branch --show-current 2>/dev/null || echo "")
+            jq -n \
+                --arg branch "$GIT_BRANCH" \
+                --argjson files "$(echo "$CHANGED_FILES" | jq -R -s 'split("\n") | map(select(length > 0))')" \
+                '{branch: $branch, files: $files}' | \
+            curl -sf -X POST "${METADATA}/tapegun/files" \
+                -H "Content-Type: application/json" \
+                -d @- \
+                --max-time 2 2>/dev/null || true
+        fi
+    fi
+
     # --- Check inbox ---
     MSGS=$(curl -sf "${METADATA}/tapegun/inbox" 2>/dev/null)
     if [ -n "$MSGS" ] && [ "$MSGS" != "[]" ] && [ "$MSGS" != "null" ]; then

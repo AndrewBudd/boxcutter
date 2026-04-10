@@ -111,6 +111,13 @@ type CheckpointData struct {
 	FilePath   string `json:"-"` // internal: path to session JSONL on disk
 }
 
+// FileTracking records which files an agent is currently modifying.
+type FileTracking struct {
+	Branch    string   `json:"branch"`
+	Files     []string `json:"files"`
+	Timestamp string   `json:"timestamp"`
+}
+
 type VMRecord struct {
 	VMID        string            `json:"vm_id"`
 	VMType      string            `json:"vm_type,omitempty"` // "firecracker" or "qemu"
@@ -128,6 +135,7 @@ type VMRecord struct {
 	LastStatus     *StatusReport     `json:"last_status,omitempty"`
 	LastHealth     *HealthReport     `json:"last_health,omitempty"`
 	LastCheckpoint *CheckpointData   `json:"last_checkpoint,omitempty"`
+	LastFiles      *FileTracking     `json:"last_files,omitempty"`
 	Inbox          []*Message        `json:"inbox,omitempty"`
 	Mailbox        []*MailboxMessage `json:"mailbox,omitempty"`
 }
@@ -461,6 +469,29 @@ func (r *Registry) GetHealth(vmID string) (*HealthReport, bool) {
 		return nil, false
 	}
 	return rec.LastHealth, true
+}
+
+// SetFiles stores a VM's current file tracking data.
+func (r *Registry) SetFiles(vmID string, ft *FileTracking) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.LastFiles = ft
+	return true
+}
+
+// GetFiles returns a VM's file tracking data.
+func (r *Registry) GetFiles(vmID string) (*FileTracking, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	return rec.LastFiles, true
 }
 
 // PushMessage adds a message to a VM's inbox under the registry lock.

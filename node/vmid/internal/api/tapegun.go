@@ -33,6 +33,8 @@ func (h *TapegunHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /tapegun/inbox/ack", h.handleAckInbox)
 	mux.HandleFunc("POST /tapegun/checkpoint", h.handlePostCheckpoint)
 	mux.HandleFunc("GET /tapegun/checkpoint", h.handleGetCheckpoint)
+	mux.HandleFunc("POST /tapegun/files", h.handlePostFiles)
+	mux.HandleFunc("GET /tapegun/files", h.handleGetFiles)
 }
 
 func (h *TapegunHandler) handlePostActivity(w http.ResponseWriter, r *http.Request) {
@@ -245,4 +247,38 @@ func (h *TapegunHandler) HandleGetCheckpointByVM(vmID string) (map[string]interf
 		"session_data": string(data),
 		"size_bytes":   len(data),
 	}, nil
+}
+
+func (h *TapegunHandler) handlePostFiles(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+
+	var ft registry.FileTracking
+	if err := json.NewDecoder(r.Body).Decode(&ft); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if ft.Timestamp == "" {
+		ft.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	h.reg.SetFiles(rec.VMID, &ft)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *TapegunHandler) handleGetFiles(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+
+	ft, _ := h.reg.GetFiles(rec.VMID)
+	if ft == nil {
+		ft = &registry.FileTracking{}
+	}
+	writeJSON(w, ft)
 }
