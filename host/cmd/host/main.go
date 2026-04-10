@@ -3678,12 +3678,16 @@ func reconcileOrchUpgrade(cfg HostConfig, state *cluster.State, goal *cluster.Up
 			if currentUser != nil {
 				username = currentUser.Username
 			}
-			if err := bridge.EnsureTAP(orchTAP, cfg.BridgeDevice, username); err != nil {
-				os.Remove(orchDisk)
-				state.SetNodeStatus("orchestrator", "active")
-				state.Save()
-				return false, "", fmt.Errorf("creating TAP: %w", err)
-			}
+			// Delete stale TAP first — the old QEMU process may have left it
+				// open, causing "Device or resource busy" on the next launch.
+				bridge.DeleteTAP(orchTAP)
+				time.Sleep(500 * time.Millisecond)
+				if err := bridge.EnsureTAP(orchTAP, cfg.BridgeDevice, username); err != nil {
+					os.Remove(orchDisk)
+					state.SetNodeStatus("orchestrator", "active")
+					state.Save()
+					return false, "", fmt.Errorf("creating TAP: %w", err)
+				}
 
 			pid, err := qemu.Launch(qemu.VMConfig{
 				Name: "orchestrator",
