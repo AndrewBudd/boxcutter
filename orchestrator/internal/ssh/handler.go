@@ -1110,7 +1110,11 @@ func (h *Handler) teamApply(args []string) int {
 		updated++
 	}
 
-	// Create new VMs
+	// Create new VMs, waiting for node capacity when necessary.
+	const (
+		capacityPollInterval = 10 * time.Second
+		capacityTimeout      = 5 * time.Minute
+	)
 	created := 0
 	for _, a := range toCreate {
 		agentCfg := a.AgentConfig(ts.Metadata.Name, allPersonaFiles)
@@ -1137,15 +1141,26 @@ func (h *Handler) teamApply(args []string) int {
 		}
 
 		fmt.Printf("  create   %s ...", a.VMName)
-		_, err := h.postStream("/api/vms", body, func(evt map[string]interface{}) {
-			// suppress progress for batch creation
-		})
-		if err != nil {
-			fmt.Printf(" FAILED: %v\n", err)
-			continue
+		deadline := time.Now().Add(capacityTimeout)
+		var lastErr error
+		for {
+			_, err := h.postStream("/api/vms", body, func(evt map[string]interface{}) {
+				// suppress progress for batch creation
+			})
+			if err == nil {
+				fmt.Printf(" ok\n")
+				created++
+				break
+			}
+			lastErr = err
+			if !isCapacityError(err) || time.Now().After(deadline) {
+				fmt.Printf(" FAILED: %v\n", lastErr)
+				break
+			}
+			fmt.Printf(" waiting for capacity (retry in 10s)\n")
+			time.Sleep(capacityPollInterval)
+			fmt.Printf("  create   %s ...", a.VMName)
 		}
-		fmt.Printf(" ok\n")
-		created++
 	}
 
 	// Destroy scale-down VMs
@@ -1163,6 +1178,15 @@ func (h *Handler) teamApply(args []string) int {
 
 	fmt.Printf("\nResult: %d created, %d updated, %d unchanged, %d destroyed\n", created, updated, len(unchanged), destroyed)
 	return 0
+}
+
+// isCapacityError returns true if the error indicates no node has capacity,
+// meaning a retry after auto-scaler adds nodes may succeed.
+func isCapacityError(err error) bool {
+	msg := err.Error()
+	return msg == "all nodes failed" ||
+		msg == "no active nodes" ||
+		msg == "no reachable nodes"
 }
 
 func (h *Handler) teamDiff(args []string) int {
