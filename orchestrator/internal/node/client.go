@@ -150,6 +150,20 @@ func (c *Client) Destroy(name string) error {
 	return nil
 }
 
+// SendChannelEvent pushes a channel event to a VM via the node agent.
+func (c *Client) SendChannelEvent(name string, event []byte) error {
+	resp, err := c.http.Post(c.baseURL+"/api/vms/"+name+"/channel/send", "application/json", bytes.NewReader(event))
+	if err != nil {
+		return fmt.Errorf("node channel send: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("node channel send: %s", string(errBody))
+	}
+	return nil
+}
+
 // ExecResult holds the output and exit code from a VM exec.
 type ExecResult struct {
 	Output   string `json:"output"`

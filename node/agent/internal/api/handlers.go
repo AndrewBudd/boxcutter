@@ -87,6 +87,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/vms/{name}/activity", h.handleGetActivity)
 	mux.HandleFunc("POST /api/vms/{name}/inbox", h.handlePostInbox)
 	mux.HandleFunc("GET /api/tapegun/activity", h.handleTapegunActivity)
+
+	// Channel events
+	mux.HandleFunc("POST /api/vms/{name}/channel/send", h.handleChannelSend)
 }
 
 // progressEvent is a NDJSON line streamed during VM creation.
@@ -956,6 +959,32 @@ func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, activity)
+}
+
+// handleChannelSend pushes a channel event to a VM via the vmid admin socket.
+func (h *Handler) handleChannelSend(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		http.Error(w, "VM name required", http.StatusBadRequest)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+
+	if h.vmidClient == nil {
+		http.Error(w, "vmid client not configured", http.StatusInternalServerError)
+		return
+	}
+
+	if err := h.vmidClient.SendChannelEvent(name, body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
 }
 
 func (h *Handler) handleExec(w http.ResponseWriter, r *http.Request) {

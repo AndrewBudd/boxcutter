@@ -35,6 +35,8 @@ func (h *TapegunHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /tapegun/checkpoint", h.handleGetCheckpoint)
 	mux.HandleFunc("POST /tapegun/files", h.handlePostFiles)
 	mux.HandleFunc("GET /tapegun/files", h.handleGetFiles)
+	mux.HandleFunc("GET /channel/events", h.handleChannelEvents)
+	mux.HandleFunc("POST /channel/reply", h.handleChannelReply)
 }
 
 func (h *TapegunHandler) handlePostActivity(w http.ResponseWriter, r *http.Request) {
@@ -281,4 +283,71 @@ func (h *TapegunHandler) handleGetFiles(w http.ResponseWriter, r *http.Request) 
 		ft = &registry.FileTracking{}
 	}
 	writeJSON(w, ft)
+}
+
+// handleChannelEvents serves an SSE stream of channel events for the requesting VM.
+// The MCP channel server connects here and forwards events to Claude Code.
+func (h *TapegunHandler) handleChannelEvents(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	ch, cancel, ok := h.reg.SubscribeChannel(rec.VMID)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	defer cancel()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher.Flush()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case evt, ok := <-ch:
+			if !ok {
+				return
+			}
+			data, _ := json.Marshal(evt)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+// handleChannelReply receives an outbound reply from the agent's MCP channel server.
+func (h *TapegunHandler) handleChannelReply(w http.ResponseWriter, r *http.Request) {
+	rec, ok := middleware.VMFromContext(r.Context())
+	if !ok {
+		http.Error(w, "no VM context", http.StatusInternalServerError)
+		return
+	}
+
+	var reply registry.ChannelReply
+	if err := json.NewDecoder(r.Body).Decode(&reply); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if reply.Timestamp == "" {
+		reply.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	if !h.reg.PostChannelReply(rec.VMID, &reply) {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
 }

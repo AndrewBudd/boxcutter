@@ -97,6 +97,19 @@ func (c *Client) RemoveProject(vmID, project string) {
 	c.http.Do(req)
 }
 
+// SendChannelEvent pushes a channel event to a VM via the vmid admin API.
+func (c *Client) SendChannelEvent(vmID string, event []byte) error {
+	resp, err := c.http.Post("http://localhost/internal/vms/"+vmID+"/channel/send", "application/json", bytes.NewReader(event))
+	if err != nil {
+		return fmt.Errorf("vmid channel send: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("vmid channel send: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *Client) Register(req *RegisterRequest) error {
 	body, _ := json.Marshal(req)
 	resp, err := c.http.Post("http://localhost/internal/vms", "application/json", bytes.NewReader(body))
