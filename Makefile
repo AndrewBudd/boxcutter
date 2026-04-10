@@ -1,7 +1,8 @@
 .PHONY: help provision-node provision-orchestrator launch-node launch-orchestrator \
        stop-node stop-orchestrator ssh-node ssh-orchestrator status clean \
        build-host install-host deb-host \
-       build-image pull upgrade version provision-from-image
+       build-image pull upgrade version provision-from-image \
+       rebuild-tools deploy-tools
 
 # --- Orchestrator ---
 
@@ -115,6 +116,14 @@ next-tag:                 ## Show next version tag (usage: make next-tag BUMP=pa
 
 install-tag-hook:         ## Install git pre-push hook to prevent tag regression
 	@bash scripts/check-version-tag --install-hook
+
+# --- Tools Image ---
+
+rebuild-tools:            ## Rebuild tools.img (tapegun + CLI) without full reprovision
+	@bash host/rebuild-tools.sh
+
+deploy-tools:             ## Rebuild tools.img and deploy to all running nodes
+	@bash host/rebuild-tools.sh --deploy
 
 help:                     ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
