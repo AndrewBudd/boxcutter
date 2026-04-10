@@ -378,6 +378,18 @@ func main() {
 func runDaemon() {
 	cfg := defaultConfig()
 
+	// Acquire exclusive lock to prevent multiple control plane instances.
+	// Two instances modifying cluster.json concurrently causes corruption.
+	lockPath := "/run/boxcutter-host.lock"
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		log.Fatalf("Cannot open lock file %s: %v", lockPath, err)
+	}
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		log.Fatalf("Another boxcutter-host instance is already running (lock: %s)", lockPath)
+	}
+	defer lockFile.Close()
+
 	log.Println("boxcutter-host starting...")
 
 	// 0. Start mosquitto broker
