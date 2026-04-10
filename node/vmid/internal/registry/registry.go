@@ -118,6 +118,33 @@ type FileTracking struct {
 	Timestamp string   `json:"timestamp"`
 }
 
+// ChannelEvent is a structured event pushed to a VM via the channel system.
+// Events are delivered as <channel> tags in Claude Code's context.
+type ChannelEvent struct {
+	ID        string            `json:"id"`
+	Type      string            `json:"type"`                // upgrade_starting, ci_failure, message, etc.
+	Source    string            `json:"source"`              // "boxcutter", "ci-watcher", sender name
+	Urgency   string            `json:"urgency,omitempty"`   // normal, high, critical
+	Body      string            `json:"body"`                // human-readable event body
+	Attrs     map[string]string `json:"attrs,omitempty"`     // typed attributes (pr_number, run_id, etc.)
+	Timestamp string            `json:"timestamp"`
+}
+
+// ChannelReply is an outbound reply from an agent via the channel system.
+type ChannelReply struct {
+	ChatID    string `json:"chat_id,omitempty"` // correlates to inbound event ID
+	Text      string `json:"text"`
+	Status    string `json:"status,omitempty"`    // active, idle, blocked, etc.
+	Summary   string `json:"summary,omitempty"`   // what the agent is working on
+	Timestamp string `json:"timestamp"`
+}
+
+// channelSub is an SSE subscriber waiting for channel events.
+type channelSub struct {
+	ch   chan *ChannelEvent
+	done chan struct{}
+}
+
 type VMRecord struct {
 	VMID        string            `json:"vm_id"`
 	VMType      string            `json:"vm_type,omitempty"` // "firecracker" or "qemu"
@@ -138,6 +165,11 @@ type VMRecord struct {
 	LastFiles      *FileTracking     `json:"last_files,omitempty"`
 	Inbox          []*Message        `json:"inbox,omitempty"`
 	Mailbox        []*MailboxMessage `json:"mailbox,omitempty"`
+
+	// Channel event subscribers (not serialized — ephemeral SSE connections)
+	channelSubs []*channelSub `json:"-"`
+	// Channel replies from the agent (collected by orchestrator)
+	ChannelReplies []*ChannelReply `json:"channel_replies,omitempty"`
 }
 
 // AllGitHubRepos returns the list of repos, falling back to single GitHubRepo.
@@ -626,6 +658,82 @@ func (r *Registry) ImportMailbox(vmID string, msgs []*MailboxMessage) bool {
 		rec.PushMailbox(m)
 	}
 	return true
+}
+
+// SubscribeChannel returns a channel that receives events for a VM.
+// The caller must call the returned cancel function when done.
+func (r *Registry) SubscribeChannel(vmID string) (<-chan *ChannelEvent, func(), bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, func() {}, false
+	}
+	sub := &channelSub{
+		ch:   make(chan *ChannelEvent, 32),
+		done: make(chan struct{}),
+	}
+	rec.channelSubs = append(rec.channelSubs, sub)
+	cancel := func() {
+		close(sub.done)
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for i, s := range rec.channelSubs {
+			if s == sub {
+				rec.channelSubs = append(rec.channelSubs[:i], rec.channelSubs[i+1:]...)
+				break
+			}
+		}
+	}
+	return sub.ch, cancel, true
+}
+
+// PushChannelEvent sends an event to all SSE subscribers for a VM.
+func (r *Registry) PushChannelEvent(vmID string, evt *ChannelEvent) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	for _, sub := range rec.channelSubs {
+		select {
+		case sub.ch <- evt:
+		case <-sub.done:
+		default:
+			// subscriber buffer full, drop event
+		}
+	}
+	return true
+}
+
+// PostChannelReply stores an outbound reply from an agent.
+func (r *Registry) PostChannelReply(vmID string, reply *ChannelReply) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return false
+	}
+	rec.ChannelReplies = append(rec.ChannelReplies, reply)
+	// Keep at most 50 replies
+	if len(rec.ChannelReplies) > 50 {
+		rec.ChannelReplies = rec.ChannelReplies[len(rec.ChannelReplies)-50:]
+	}
+	return true
+}
+
+// PopChannelReplies returns and removes all pending replies for a VM.
+func (r *Registry) PopChannelReplies(vmID string) ([]*ChannelReply, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.byID[vmID]
+	if !ok {
+		return nil, false
+	}
+	replies := rec.ChannelReplies
+	rec.ChannelReplies = nil
+	return replies, true
 }
 
 func (r *Registry) MarshalJSON() ([]byte, error) {

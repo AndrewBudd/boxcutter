@@ -137,6 +137,11 @@ if [ "$VM_TYPE" = "node" ]; then
     cp -r "${REPO_DIR}/plugins/tapegun-guest" "${TOOLS_STAGE}/plugins/tapegun-guest"
     echo "  tapegun-guest plugin included"
   fi
+  if [ -d "${REPO_DIR}/channel" ]; then
+    mkdir -p "${TOOLS_STAGE}/channel"
+    cp -r "${REPO_DIR}/channel/." "${TOOLS_STAGE}/channel/"
+    echo "  boxcutter-channel MCP server included"
+  fi
   mksquashfs "${TOOLS_STAGE}" "${BUILD_DIR}/tools.img" -noappend -comp gzip -quiet
   echo "  tools.img: $(du -h "${BUILD_DIR}/tools.img" | cut -f1)"
 else

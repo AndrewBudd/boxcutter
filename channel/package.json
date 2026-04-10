@@ -1,0 +1,16 @@
+{
+  "name": "boxcutter-channel",
+  "version": "0.1.0",
+  "description": "Claude Code channel MCP server for Boxcutter VM infrastructure events",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "start": "bun run index.ts",
+    "build": "bun build index.ts --outdir dist --target node"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "eventsource": "^3.0.0"
+  }
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/registry"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/sentinel"
@@ -50,6 +51,10 @@ func (h *AdminHandler) Register(mux *http.ServeMux) {
 	// VM-to-VM mailbox (used by node agent for relay + migration)
 	mux.HandleFunc("POST /internal/vms/{id}/mailbox", h.handlePushMailbox)
 	mux.HandleFunc("GET /internal/vms/{id}/mailbox", h.handleExportMailbox)
+
+	// Channel events (pushed by node agent / orchestrator)
+	mux.HandleFunc("POST /internal/vms/{id}/channel/send", h.handleChannelSend)
+	mux.HandleFunc("GET /internal/vms/{id}/channel/replies", h.handleChannelReplies)
 }
 
 type registerRequest struct {
@@ -433,6 +438,50 @@ func (h *AdminHandler) handleGetAgentConfig(w http.ResponseWriter, r *http.Reque
 		cfg = &registry.AgentConfig{}
 	}
 	writeJSON(w, cfg)
+}
+
+// handleChannelSend pushes a channel event to a VM's SSE subscribers.
+func (h *AdminHandler) handleChannelSend(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+
+	var evt registry.ChannelEvent
+	if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if evt.Timestamp == "" {
+		evt.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+	if evt.Source == "" {
+		evt.Source = "boxcutter"
+	}
+
+	if !h.reg.PushChannelEvent(id, &evt) {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+// handleChannelReplies returns and removes pending channel replies from a VM.
+func (h *AdminHandler) handleChannelReplies(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		id = extractPathID(r.URL.Path, "/internal/vms/")
+	}
+
+	replies, ok := h.reg.PopChannelReplies(id)
+	if !ok {
+		http.Error(w, "vm not found", http.StatusNotFound)
+		return
+	}
+	if replies == nil {
+		replies = []*registry.ChannelReply{}
+	}
+	writeJSON(w, replies)
 }
 
 func extractPathID(path, prefix string) string {
