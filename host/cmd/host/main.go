@@ -364,7 +364,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  pull <type> [--tag TAG]      Pull a VM image from OCI registry\n")
 		fmt.Fprintf(os.Stderr, "  upgrade <type> [--tag TAG]   Rolling upgrade of VMs\n")
 		fmt.Fprintf(os.Stderr, "  stop-node <id> [--force] [--delete-disk]  Stop a node and remove from state\n")
-		fmt.Fprintf(os.Stderr, "  remove-node <id>             Remove a node entry (kills QEMU if running)\n")
+		fmt.Fprintf(os.Stderr, "  remove-node <id> [--force]    Remove a node entry (kills QEMU if running)\n")
 		fmt.Fprintf(os.Stderr, "  list-orphans                 Show nodes with 0 VMs (cleanup candidates)\n")
 		fmt.Fprintf(os.Stderr, "  cleanup-nodes                Remove all orphan nodes\n")
 		fmt.Fprintf(os.Stderr, "  team apply -f team.yaml      Create/update team from YAML spec\n")
@@ -1318,6 +1318,22 @@ func queryNodeVMs(bridgeIP string) []map[string]interface{} {
 	var result []map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 	return result
+}
+
+// queryNodeVMNames returns the names of VMs on a node, or nil if unreachable.
+// Used by stop-node and remove-node safety checks (issue #145).
+func queryNodeVMNames(bridgeIP string) []string {
+	vms := queryNodeVMs(bridgeIP)
+	if len(vms) == 0 {
+		return nil
+	}
+	var names []string
+	for _, vm := range vms {
+		if name, ok := vm["name"].(string); ok {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 func canScaleUp(cfg HostConfig, currentNodeCount int) (bool, string) {
@@ -3000,18 +3016,17 @@ func cliStopNode() {
 		os.Exit(1)
 	}
 
-	// Check for VMs unless --force
+	// Check for VMs unless --force (issue #145: prevent accidental data loss)
 	if !force {
-		nodeClient := &http.Client{Timeout: 5 * time.Second}
-		resp, err := nodeClient.Get(fmt.Sprintf("http://%s:8800/api/vms", node.BridgeIP))
-		if err == nil {
-			var vms []interface{}
-			json.NewDecoder(resp.Body).Decode(&vms)
-			resp.Body.Close()
-			if len(vms) > 0 {
-				fmt.Fprintf(os.Stderr, "Node '%s' has %d running VM(s). Use --force to stop anyway.\n", nodeID, len(vms))
-				os.Exit(1)
+		vmNames := queryNodeVMNames(node.BridgeIP)
+		if len(vmNames) > 0 {
+			fmt.Fprintf(os.Stderr, "ERROR: Node '%s' has %d VM(s) that would be DESTROYED:\n", nodeID, len(vmNames))
+			for _, name := range vmNames {
+				fmt.Fprintf(os.Stderr, "  - %s\n", name)
 			}
+			fmt.Fprintf(os.Stderr, "\nUse --force to stop anyway, or drain the node first:\n")
+			fmt.Fprintf(os.Stderr, "  boxcutter-host drain %s\n", nodeID)
+			os.Exit(1)
 		}
 	}
 
@@ -3053,10 +3068,17 @@ func cliStopNode() {
 func cliRemoveNode() {
 	cfg := defaultConfig()
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: boxcutter-host remove-node <node-id>")
+		fmt.Println("Usage: boxcutter-host remove-node <node-id> [--force]")
 		os.Exit(1)
 	}
 	nodeID := os.Args[2]
+
+	force := false
+	for _, arg := range os.Args[3:] {
+		if arg == "--force" {
+			force = true
+		}
+	}
 
 	state, err := cluster.Load(cfg.StatePath)
 	if err != nil {
@@ -3068,6 +3090,20 @@ func cliRemoveNode() {
 	if node == nil {
 		fmt.Fprintf(os.Stderr, "Node '%s' not found in cluster state\n", nodeID)
 		os.Exit(1)
+	}
+
+	// Issue #145: refuse to remove a node with VMs unless --force
+	if !force && qemu.IsRunning(node.PID) {
+		vmNames := queryNodeVMNames(node.BridgeIP)
+		if len(vmNames) > 0 {
+			fmt.Fprintf(os.Stderr, "ERROR: Node '%s' has %d VM(s) that would be DESTROYED:\n", nodeID, len(vmNames))
+			for _, name := range vmNames {
+				fmt.Fprintf(os.Stderr, "  - %s\n", name)
+			}
+			fmt.Fprintf(os.Stderr, "\nUse --force to remove anyway, or drain the node first:\n")
+			fmt.Fprintf(os.Stderr, "  boxcutter-host drain %s\n", nodeID)
+			os.Exit(1)
+		}
 	}
 
 	// Kill QEMU if running (prevents ghost re-adoption on daemon restart)
