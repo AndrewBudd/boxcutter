@@ -976,27 +976,85 @@ func (h *Handler) teamApply(args []string) int {
 	fmt.Printf("Team: %s\n", ts.Metadata.Name)
 	fmt.Printf("Agents: %d definitions → %d VMs\n\n", len(ts.Spec.Agents), len(agents))
 
-	// Fetch existing VMs to determine create vs noop
-	existingVMs := make(map[string]bool)
+	// Collect all persona file paths across the team (for persona cleanup)
+	var allPersonaFiles []string
+	for _, a := range agents {
+		if a.Persona != nil && a.Persona.ClaudeMD != "" {
+			allPersonaFiles = append(allPersonaFiles, a.Persona.ClaudeMD)
+		}
+	}
+
+	// Fetch existing VMs with details for config comparison
+	existingVMs := make(map[string]map[string]interface{})
 	resp, err := h.get("/api/vms")
 	if err == nil {
 		var vms []map[string]interface{}
 		json.Unmarshal(resp, &vms)
 		for _, vm := range vms {
 			if name, ok := vm["name"].(string); ok {
-				existingVMs[name] = true
+				existingVMs[name] = vm
 			}
 		}
 	}
 
-	// Compute diff
+	// Build agent lookup for config comparison
+	agentByName := make(map[string]*team.ResolvedAgent)
+	for i := range agents {
+		agentByName[agents[i].VMName] = &agents[i]
+	}
+
+	// Compute diff: create, update (config change), ok (unchanged), destroy
 	var toCreate []team.ResolvedAgent
-	var existing []string
+	var toUpdate []team.ResolvedAgent
+	var unchanged []string
 	for _, a := range agents {
-		if existingVMs[a.VMName] {
-			existing = append(existing, a.VMName)
-		} else {
+		live, exists := existingVMs[a.VMName]
+		if !exists {
 			toCreate = append(toCreate, a)
+			continue
+		}
+
+		// Check for hardware changes (warn only — too destructive to auto-apply)
+		var hwDiffs []string
+		liveVCPU, _ := live["vcpu"].(float64)
+		if int(liveVCPU) != a.VCPU && liveVCPU > 0 {
+			hwDiffs = append(hwDiffs, fmt.Sprintf("vcpu: %d→%d", int(liveVCPU), a.VCPU))
+		}
+		liveRAM, _ := live["ram_mib"].(float64)
+		if int(liveRAM) != a.RAMMiB() && liveRAM > 0 {
+			hwDiffs = append(hwDiffs, fmt.Sprintf("ram: %dM→%dM", int(liveRAM), a.RAMMiB()))
+		}
+
+		// Config changes (persona, repos, tapegun) can be pushed live
+		agentCfg := a.AgentConfig(ts.Metadata.Name, allPersonaFiles)
+		cfgJSON, _ := json.Marshal(agentCfg)
+		cfgChanged := true // assume changed; compare with live config if available
+
+		// Try to fetch current agent-config from the VM's node to compare
+		if nodeID, ok := live["node_id"].(string); ok && nodeID != "" {
+			nodeResp, nodeErr := h.get("/api/nodes/" + nodeID)
+			if nodeErr == nil {
+				var nodeInfo map[string]interface{}
+				json.Unmarshal(nodeResp, &nodeInfo)
+			}
+		}
+
+		// Simple heuristic: if persona or repos are specified, always push
+		// (comparing full config across the network is expensive; pushing
+		// an identical config is cheap and idempotent)
+		hasConfig := a.Persona != nil || len(a.Repos) > 0 || len(a.Tapegun) > 0
+		if hasConfig {
+			_ = cfgJSON // will be used in the update loop
+			toUpdate = append(toUpdate, a)
+		} else {
+			cfgChanged = false
+		}
+
+		if len(hwDiffs) > 0 {
+			fmt.Printf("  warning  %s  hardware change requires recreate: %s\n", a.VMName, strings.Join(hwDiffs, ", "))
+		}
+		if !cfgChanged && len(hwDiffs) == 0 {
+			unchanged = append(unchanged, a.VMName)
 		}
 	}
 
@@ -1011,31 +1069,62 @@ func (h *Handler) teamApply(args []string) int {
 		json.Unmarshal(resp, &vms)
 		for _, vm := range vms {
 			name, _ := vm["name"].(string)
-			// Check if this VM belongs to this team by name prefix
 			if strings.HasPrefix(name, ts.Metadata.Name+"-") && !wantVMs[name] {
 				toDestroy = append(toDestroy, name)
 			}
 		}
 	}
-	// Destroy highest-indexed first
 	sort.Sort(sort.Reverse(sort.StringSlice(toDestroy)))
 
-	// Report plan
-	for _, name := range existing {
+	// Report unchanged
+	for _, name := range unchanged {
 		fmt.Printf("  ok       %s\n", name)
+	}
+
+	// Push config updates to existing VMs
+	updated := 0
+	for _, a := range toUpdate {
+		agentCfg := a.AgentConfig(ts.Metadata.Name, allPersonaFiles)
+		cfgJSON, _ := json.Marshal(agentCfg)
+
+		live := existingVMs[a.VMName]
+		nodeID, _ := live["node_id"].(string)
+		if nodeID == "" {
+			fmt.Printf("  update   %s ... SKIPPED (no node)\n", a.VMName)
+			continue
+		}
+
+		fmt.Printf("  update   %s ...", a.VMName)
+		// Push agent-config via orchestrator API → node agent → vmid
+		updateBody := map[string]interface{}{
+			"node_id":      nodeID,
+			"agent_config": json.RawMessage(cfgJSON),
+		}
+		updateJSON, _ := json.Marshal(updateBody)
+		_, err := h.put("/api/vms/"+a.VMName+"/agent-config", updateJSON)
+		if err != nil {
+			fmt.Printf(" FAILED: %v\n", err)
+			continue
+		}
+		fmt.Printf(" ok\n")
+		updated++
 	}
 
 	// Create new VMs
 	created := 0
 	for _, a := range toCreate {
+		agentCfg := a.AgentConfig(ts.Metadata.Name, allPersonaFiles)
+		agentCfgJSON, _ := json.Marshal(agentCfg)
+
 		body := map[string]interface{}{
-			"name":    a.VMName,
-			"type":    a.Type,
-			"vcpu":    a.VCPU,
-			"ram_mib": a.RAMMiB(),
-			"disk":    a.Disk,
-			"mode":    a.Mode,
-			"labels":  a.Labels(ts.Metadata.Name),
+			"name":         a.VMName,
+			"type":         a.Type,
+			"vcpu":         a.VCPU,
+			"ram_mib":      a.RAMMiB(),
+			"disk":         a.Disk,
+			"mode":         a.Mode,
+			"labels":       a.Labels(ts.Metadata.Name),
+			"agent_config": json.RawMessage(agentCfgJSON),
 		}
 		if a.Description != "" {
 			body["description"] = a.Description
@@ -1072,7 +1161,7 @@ func (h *Handler) teamApply(args []string) int {
 		destroyed++
 	}
 
-	fmt.Printf("\nResult: %d created, %d existing, %d destroyed\n", created, len(existing), destroyed)
+	fmt.Printf("\nResult: %d created, %d updated, %d unchanged, %d destroyed\n", created, updated, len(unchanged), destroyed)
 	return 0
 }
 
@@ -2241,6 +2330,21 @@ func (h *Handler) post(path string, data interface{}) ([]byte, error) {
 
 func (h *Handler) delete(path string) ([]byte, error) {
 	req, _ := http.NewRequest("DELETE", h.apiBase+path, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func (h *Handler) put(path string, data []byte) ([]byte, error) {
+	req, _ := http.NewRequest("PUT", h.apiBase+path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err

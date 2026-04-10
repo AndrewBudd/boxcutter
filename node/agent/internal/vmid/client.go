@@ -110,6 +110,21 @@ func (c *Client) SendChannelEvent(vmID string, event []byte) error {
 	return nil
 }
 
+// SetAgentConfig updates the agent-config for an existing VM via the vmid admin API.
+func (c *Client) SetAgentConfig(vmID string, config json.RawMessage) error {
+	req, _ := http.NewRequest("PUT", "http://localhost/internal/vms/"+vmID+"/agent-config", bytes.NewReader(config))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("vmid set agent-config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("vmid set agent-config: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *Client) Register(req *RegisterRequest) error {
 	body, _ := json.Marshal(req)
 	resp, err := c.http.Post("http://localhost/internal/vms", "application/json", bytes.NewReader(body))

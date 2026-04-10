@@ -319,6 +319,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms/{name}/projects", h.handleVMAddProject)
 	mux.HandleFunc("DELETE /api/vms/{name}/projects/{project...}", h.handleVMRemoveProject)
 	mux.HandleFunc("GET /api/vms/{name}/projects", h.handleVMListProjects)
+	mux.HandleFunc("PUT /api/vms/{name}/agent-config", h.handleVMUpdateAgentConfig)
 
 	// Golden images
 	mux.HandleFunc("GET /api/golden", h.handleGoldenList)
@@ -871,6 +872,47 @@ func (h *Handler) handleVMUpdate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// handleVMUpdateAgentConfig pushes an updated agent-config to a running VM.
+// The orchestrator proxies to the node agent, which updates vmid's metadata.
+func (h *Handler) handleVMUpdateAgentConfig(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+	}
+
+	vm := h.state.GetVM(name)
+	if vm == nil {
+		http.Error(w, "VM not found", http.StatusNotFound)
+		return
+	}
+
+	n := h.state.GetNode(vm.NodeID)
+	if n == nil {
+		http.Error(w, "node not found for VM", http.StatusInternalServerError)
+		return
+	}
+
+	body, _ := io.ReadAll(r.Body)
+
+	// Extract agent_config from the request body if wrapped
+	var wrapper struct {
+		AgentConfig json.RawMessage `json:"agent_config"`
+	}
+	if err := json.Unmarshal(body, &wrapper); err == nil && wrapper.AgentConfig != nil {
+		body = wrapper.AgentConfig
+	}
+
+	client := node.NewClient(n.APIAddr)
+	if err := client.UpdateAgentConfig(name, body); err != nil {
+		log.Printf("Failed to update agent-config for %s on %s: %v", name, vm.NodeID, err)
+		http.Error(w, fmt.Sprintf("node agent update failed: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	log.Printf("Updated agent-config for %s on node %s", name, vm.NodeID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) handleVMDestroy(w http.ResponseWriter, r *http.Request) {

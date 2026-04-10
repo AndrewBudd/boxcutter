@@ -69,6 +69,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/vms/{name}/projects", h.handleListProjects)
 	mux.HandleFunc("GET /api/vms/{name}/logs", h.handleLogs)
 	mux.HandleFunc("PATCH /api/vms/{name}", h.handleUpdate)
+	mux.HandleFunc("PUT /api/vms/{name}/agent-config", h.handleSetAgentConfig)
 	mux.HandleFunc("GET /api/golden/versions", h.handleGoldenVersions)
 	mux.HandleFunc("GET /api/golden/{version}", h.handleGoldenCheck)
 	mux.HandleFunc("POST /api/golden/build", h.handleGoldenBuild)
@@ -214,6 +215,43 @@ func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, map[string]interface{}{"status": "updated", "vm": st})
+}
+
+func (h *Handler) handleSetAgentConfig(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		name = extractName(r.URL.Path, "/api/vms/")
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Verify VM exists
+	vmDir := vm.VMDir(name)
+	st, err := vm.LoadVMState(vmDir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("VM '%s' not found", name), http.StatusNotFound)
+		return
+	}
+
+	// Update agent-config in VM state
+	st.AgentConfig = json.RawMessage(body)
+	if err := vm.SaveVMState(vmDir, st); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Push to vmid so the metadata service reflects the update
+	if h.vmidClient != nil {
+		if err := h.vmidClient.SetAgentConfig(name, body); err != nil {
+			log.Printf("WARNING: failed to push agent-config to vmid for %s: %v", name, err)
+		}
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) handleDestroy(w http.ResponseWriter, r *http.Request) {
