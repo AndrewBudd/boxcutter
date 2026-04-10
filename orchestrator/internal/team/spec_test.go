@@ -216,6 +216,134 @@ func TestResolve_CloneURLs(t *testing.T) {
 	}
 }
 
+func TestResolve_PersonaParsed(t *testing.T) {
+	ts, err := Parse([]byte(exampleYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	agents := ts.Resolve()
+
+	// eng-manager has persona with role, claude_md, and instructions
+	em := agents[0]
+	if em.Persona == nil {
+		t.Fatal("eng-manager persona is nil")
+	}
+	if em.Persona.Role != "engineering-manager" {
+		t.Errorf("role = %q, want engineering-manager", em.Persona.Role)
+	}
+	if em.Persona.ClaudeMD != ".claude/personas/eng-manager.md" {
+		t.Errorf("claude_md = %q", em.Persona.ClaudeMD)
+	}
+	if !strings.Contains(em.Persona.Instructions, "coordinate dev workers") {
+		t.Errorf("instructions = %q, want to contain 'coordinate dev workers'", em.Persona.Instructions)
+	}
+
+	// dev-worker has persona with role + claude_md but no instructions
+	dw := agents[1]
+	if dw.Persona == nil {
+		t.Fatal("dev-worker persona is nil")
+	}
+	if dw.Persona.Role != "developer" {
+		t.Errorf("role = %q, want developer", dw.Persona.Role)
+	}
+	if dw.Persona.ClaudeMD != ".claude/personas/developer.md" {
+		t.Errorf("claude_md = %q", dw.Persona.ClaudeMD)
+	}
+	if dw.Persona.Instructions != "" {
+		t.Errorf("dev-worker should have no instructions, got %q", dw.Persona.Instructions)
+	}
+}
+
+func TestResolve_PersonaInAgentConfig(t *testing.T) {
+	ts, _ := Parse([]byte(exampleYAML))
+	agents := ts.Resolve()
+
+	cfg := agents[0].AgentConfig("platform-team", nil)
+
+	persona, ok := cfg["persona"].(map[string]interface{})
+	if !ok {
+		t.Fatal("agent-config missing persona block")
+	}
+	if persona["role"] != "engineering-manager" {
+		t.Errorf("agent-config persona.role = %v", persona["role"])
+	}
+	if persona["claude_md"] != ".claude/personas/eng-manager.md" {
+		t.Errorf("agent-config persona.claude_md = %v", persona["claude_md"])
+	}
+	if _, ok := persona["instructions"]; !ok {
+		t.Error("agent-config persona missing instructions")
+	}
+}
+
+func TestResolve_PersonaDefaultInheritance(t *testing.T) {
+	yaml := `
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: test
+spec:
+  defaults:
+    persona:
+      role: default-role
+      claude_md: .claude/personas/default.md
+      instructions: default instructions
+  agents:
+    - name: inherits-all
+    - name: overrides-role
+      persona:
+        role: custom-role
+        claude_md: .claude/personas/custom.md
+`
+	ts, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	agents := ts.Resolve()
+
+	// First agent inherits defaults
+	a := agents[0]
+	if a.Persona == nil {
+		t.Fatal("inherits-all: persona is nil")
+	}
+	if a.Persona.Role != "default-role" {
+		t.Errorf("inherits-all: role = %q, want default-role", a.Persona.Role)
+	}
+	if a.Persona.ClaudeMD != ".claude/personas/default.md" {
+		t.Errorf("inherits-all: claude_md = %q", a.Persona.ClaudeMD)
+	}
+	if a.Persona.Instructions != "default instructions" {
+		t.Errorf("inherits-all: instructions = %q", a.Persona.Instructions)
+	}
+
+	// Second agent overrides persona entirely (replace, not merge)
+	b := agents[1]
+	if b.Persona == nil {
+		t.Fatal("overrides-role: persona is nil")
+	}
+	if b.Persona.Role != "custom-role" {
+		t.Errorf("overrides-role: role = %q, want custom-role", b.Persona.Role)
+	}
+	if b.Persona.Instructions != "" {
+		t.Errorf("overrides-role: instructions should be empty (override replaces), got %q", b.Persona.Instructions)
+	}
+}
+
+func TestResolve_TeamPersonaFiles(t *testing.T) {
+	ts, _ := Parse([]byte(exampleYAML))
+	agents := ts.Resolve()
+
+	allFiles := []string{".claude/personas/eng-manager.md", ".claude/personas/developer.md", ".claude/personas/product-manager.md"}
+	cfg := agents[0].AgentConfig("platform-team", allFiles)
+
+	files, ok := cfg["team_persona_files"].([]string)
+	if !ok {
+		t.Fatal("agent-config missing team_persona_files")
+	}
+	if len(files) != 3 {
+		t.Errorf("team_persona_files = %d, want 3", len(files))
+	}
+}
+
 func TestResolve_Idempotent(t *testing.T) {
 	ts, _ := Parse([]byte(exampleYAML))
 	a1 := ts.Resolve()
