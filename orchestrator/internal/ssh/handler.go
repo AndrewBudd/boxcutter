@@ -2107,6 +2107,11 @@ func (h *Handler) postStream(path string, data interface{}, onProgress func(map[
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s", strings.TrimSpace(string(errBody)))
+	}
+
 	decoder := json.NewDecoder(resp.Body)
 	var last map[string]interface{}
 	for decoder.More() {
