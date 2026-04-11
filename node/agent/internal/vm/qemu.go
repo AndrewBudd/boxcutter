@@ -378,102 +378,57 @@ WantedBy=multi-user.target
 	os.Symlink("/etc/systemd/system/boxcutter-qemu-firstboot.service",
 		filepath.Join(wantsDir, "boxcutter-qemu-firstboot.service"))
 
-	// Write agent configuration for tapegun
-	m.writeAgentConfig(st)
+	// Write agent configuration for tapegun (uses already-mounted rootfs)
+	writeAgentConfig(mountPoint, st.AgentConfig)
 
 	log.Printf("QEMU VM %s: rootfs prepared (modules, iptables-legacy, docker config)", st.Name)
 }
 
-// writeAgentConfig writes the tapegun agent config file to the VM rootfs.
-// It reads the agent_config JSON from VMState and converts it to key=value pairs
-// in a file that tapegun can parse.
-func (m *Manager) writeAgentConfig(st *VMState) {
-	if len(st.AgentConfig) == 0 {
+// writeAgentConfig writes tapegun config to an already-mounted VM rootfs.
+// Maps agent_config JSON fields to tapegun config variable names.
+// Called from prepareQEMURootfs while the rootfs is mounted.
+func writeAgentConfig(mountPoint string, agentConfig json.RawMessage) {
+	if len(agentConfig) == 0 {
 		return
 	}
 
-	vmDir := VMDir(st.Name)
-	rootfs := RootfsPath(vmDir)
-	mountPoint := filepath.Join(vmDir, "mnt")
-	os.MkdirAll(mountPoint, 0755)
-
-	format := DiskFormat(vmDir)
-	var nbdDev string
-	var cleanup func()
-	if format == "qcow2" {
-		// Use qemu-nbd to expose QCOW2 as block device
-		exec.Command("modprobe", "nbd", "max_part=8").Run()
-		// Find a free nbd device
-		for i := 0; i < 16; i++ {
-			dev := fmt.Sprintf("/dev/nbd%d", i)
-			if out, err := exec.Command("qemu-nbd", "-c", dev, rootfs).CombinedOutput(); err == nil {
-				nbdDev = dev
-				break
-			} else {
-				_ = out // device busy, try next
-			}
-		}
-		if nbdDev == "" {
-			log.Printf("Warning: could not find free nbd device for agent config prep")
-			return
-		}
-		time.Sleep(500 * time.Millisecond) // let kernel discover partition
-		if out, err := exec.Command("mount", nbdDev, mountPoint).CombinedOutput(); err != nil {
-			log.Printf("Warning: could not mount qcow2 via nbd for agent config prep: %s: %v", string(out), err)
-			exec.Command("qemu-nbd", "-d", nbdDev).Run()
-			return
-		}
-		cleanup = func() {
-			exec.Command("umount", mountPoint).Run()
-			exec.Command("qemu-nbd", "-d", nbdDev).Run()
-			os.Remove(mountPoint)
-		}
-	} else {
-		if out, err := exec.Command("mount", "-o", "loop", rootfs, mountPoint).CombinedOutput(); err != nil {
-			log.Printf("Warning: could not mount rootfs for agent config prep: %s: %v", string(out), err)
-			return
-		}
-		cleanup = func() {
-			exec.Command("umount", mountPoint).Run()
-			os.Remove(mountPoint)
-		}
-	}
-	defer cleanup()
-
-	// Convert JSON agent_config to key=value pairs in a config file
-	// The config file should be placed at /home/dev/.tapegun/config
 	configDir := filepath.Join(mountPoint, "home", "dev", ".tapegun")
-	os.MkdirAll(configDir, 0755)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		log.Printf("Warning: could not create tapegun config dir: %v", err)
+		return
+	}
 	configPath := filepath.Join(configDir, "config")
 
-	// Write the agent config as key=value pairs
-	configContent := ""
-	if len(st.AgentConfig) > 0 {
-		// Parse the JSON
-		var configMap map[string]interface{}
-		if err := json.Unmarshal(st.AgentConfig, &configMap); err == nil {
-			// Convert each key-value pair to a key=value format
-			for key, value := range configMap {
-				// Convert different value types to strings
-				var strValue string
-				switch v := value.(type) {
-				case string:
-					strValue = v
-				case float64:
-					// JSON numbers are float64, but we treat them as strings for config
-					strValue = fmt.Sprintf("%.0f", v)
-				default:
-					strValue = fmt.Sprintf("%v", v)
-				}
-				configContent += fmt.Sprintf("%s=%s\n", key, strValue)
+	var configMap map[string]interface{}
+	var lines []string
+	if err := json.Unmarshal(agentConfig, &configMap); err == nil {
+		if tool, ok := configMap["tool"].(string); ok {
+			lines = append(lines, fmt.Sprintf("AGENT_TOOL=%s", tool))
+		}
+		if inf, ok := configMap["inference"].(map[string]interface{}); ok {
+			if model, ok := inf["model"].(string); ok {
+				lines = append(lines, fmt.Sprintf("AGENT_MODEL=%s", model))
+			}
+			if provider, ok := inf["provider"].(string); ok {
+				lines = append(lines, fmt.Sprintf("INFERENCE_PROVIDER=%s", provider))
+			}
+			if endpoint, ok := inf["endpoint"].(string); ok {
+				lines = append(lines, fmt.Sprintf("INFERENCE_ENDPOINT=%s", endpoint))
+			}
+			if apiKey, ok := inf["api_key"].(string); ok {
+				lines = append(lines, fmt.Sprintf("INFERENCE_API_KEY=%s", apiKey))
 			}
 		}
 	}
 
-	// Write the config file (owned by dev user, uid/gid 1000)
-	os.WriteFile(configPath, []byte(configContent), 0644)
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		log.Printf("Warning: could not write tapegun config: %v", err)
+		return
+	}
 	os.Chown(configPath, 1000, 1000)
 	os.Chown(configDir, 1000, 1000)
+	log.Printf("QEMU VM: wrote tapegun config (%d vars) to %s", len(lines), configPath)
 }
 
 // kernelVersion returns the running kernel version.
