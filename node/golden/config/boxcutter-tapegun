@@ -830,9 +830,7 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
             while IFS= read -r seq_line; do
                 [ -z "$seq_line" ] && continue
                 log "sequence: $seq_line"
-                $TMUX_CMD send-keys -t 0 "$seq_line"
-                sleep 0.5
-                $TMUX_CMD send-keys -t 0 Enter
+                opencode_send_message "$seq_line"
                 # Wait between sequences for Claude to process each one
                 sleep 5
             done <<< "$TAPEGUN_SEQUENCES"
@@ -866,17 +864,7 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
                 line=$(echo "$msg_obj" | jq -r '.body')
                 no_enter=$(echo "$msg_obj" | jq -r '.no_enter // false')
                 if [ -n "$line" ]; then
-                    if [ "$no_enter" = "true" ]; then
-                        $TMUX_CMD send-keys -t 0 "$line"
-                    elif case "$line" in *$'\n'*) true ;; *) false ;; esac; then
-                        # Multi-line: send text first, then Enter separately
-                        # after a delay so Claude Code processes the paste.
-                        $TMUX_CMD send-keys -t 0 "$line"
-                        sleep 0.5
-                        $TMUX_CMD send-keys -t 0 Enter
-                    else
-                        $TMUX_CMD send-keys -t 0 "$line" Enter
-                    fi
+                    opencode_send_message "$line" "$no_enter"
                 fi
             done
         fi
@@ -964,16 +952,26 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
     sleep "$POLL_INTERVAL"
 done
 
-# --- OpenCode server API helper ---
-# Send a message to the OpenCode server running on this VM.
-# Usage: opencode_send_message "your prompt here"
+# Function to send messages to the terminal (replaces tmux send-keys)
 opencode_send_message() {
     local message="$1"
-    local port="${OPENCODE_SERVER_PORT:-4096}"
-    local password="${OPENCODE_SERVER_PASSWORD:-tapegun}"
-    curl -sf -X POST "http://localhost:${port}/session/default/message" \
-        -u "opencode:${password}" \
-        -H "Content-Type: application/json" \
-        -d "$(jq -n --arg msg "$message" '{parts:[{type:"text",text:$msg}]}')" \
-        --max-time 300 2>/dev/null
+    local no_enter="${2:-false}"
+    
+    if [ -z "$message" ]; then
+        return
+    fi
+    
+    if [ "$no_enter" = "true" ]; then
+        # Send text without pressing Enter
+        $TMUX_CMD send-keys -t 0 "$message"
+    elif case "$message" in *$'\n'*) true ;; *) false ;; esac; then
+        # Multi-line: send text first, then Enter separately
+        # after a delay so the terminal processes the paste.
+        $TMUX_CMD send-keys -t 0 "$message"
+        sleep 0.5
+        $TMUX_CMD send-keys -t 0 Enter
+    else
+        # Single line: send text with Enter at the end
+        $TMUX_CMD send-keys -t 0 "$message" Enter
+    fi
 }
