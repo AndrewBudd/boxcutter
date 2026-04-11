@@ -759,6 +759,39 @@ compute_token_usage() {
         --max-time 5 2>/dev/null || true
 }
 
+# --- Helper: send message to OpenCode server or tmux fallback ---
+opencode_send_message() {
+    local message="$1"
+    local port="${OPENCODE_SERVER_PORT:-4096}"
+    local password="${OPENCODE_SERVER_PASSWORD:-tapegun}"
+
+    if [ -z "$message" ]; then
+        return
+    fi
+
+    # Try OpenCode server API first (reliable, no TUI timing issues)
+    if curl -sf "http://localhost:${port}/global/health" -u "opencode:${password}" --max-time 1 >/dev/null 2>&1; then
+        local session_id
+        session_id=$(curl -sf "http://localhost:${port}/session" -u "opencode:${password}" --max-time 2 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null)
+        if [ -z "$session_id" ]; then
+            session_id=$(curl -sf "http://localhost:${port}/session" -X POST -u "opencode:${password}" -H "Content-Type: application/json" -d '{}' --max-time 5 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
+        fi
+        if [ -n "$session_id" ]; then
+            curl -sf "http://localhost:${port}/session/${session_id}/message" -X POST \
+                -u "opencode:${password}" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg msg "$message" '{parts:[{type:"text",text:$msg}]}')" \
+                --max-time 300 2>/dev/null
+            return
+        fi
+    fi
+
+    # Fallback to tmux send-keys (for claude-code or when server unavailable)
+    if [ -n "$TMUX_CMD" ] && $TMUX_CMD has-session 2>/dev/null; then
+        $TMUX_CMD send-keys -t 0 "$message" Enter
+    fi
+}
+
 while true; do
     # --- Post health ---
     HEALTH_PAYLOAD=$(run_health_checks)
@@ -970,37 +1003,3 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
 
     sleep "$POLL_INTERVAL"
 done
-
-# Function to send messages to the terminal (replaces tmux send-keys)
-opencode_send_message() {
-    local message="$1"
-    local port="${OPENCODE_SERVER_PORT:-4096}"
-    local password="${OPENCODE_SERVER_PASSWORD:-tapegun}"
-
-    if [ -z "$message" ]; then
-        return
-    fi
-
-    # Try OpenCode server API first (reliable, no TUI timing issues)
-    if curl -sf "http://localhost:${port}/global/health" -u "opencode:${password}" --max-time 1 >/dev/null 2>&1; then
-        # Get or create a session
-        local session_id
-        session_id=$(curl -sf "http://localhost:${port}/session" -u "opencode:${password}" --max-time 2 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null)
-        if [ -z "$session_id" ]; then
-            session_id=$(curl -sf "http://localhost:${port}/session" -X POST -u "opencode:${password}" -H "Content-Type: application/json" -d '{}' --max-time 5 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
-        fi
-        if [ -n "$session_id" ]; then
-            curl -sf "http://localhost:${port}/session/${session_id}/message" -X POST \
-                -u "opencode:${password}" \
-                -H "Content-Type: application/json" \
-                -d "$(jq -n --arg msg "$message" '{parts:[{type:"text",text:$msg}]}')" \
-                --max-time 300 2>/dev/null
-            return
-        fi
-    fi
-
-    # Fallback to tmux send-keys (for claude-code or when server unavailable)
-    if [ -n "$TMUX_CMD" ] && $TMUX_CMD has-session 2>/dev/null; then
-        $TMUX_CMD send-keys -t 0 "$message" Enter
-    fi
-}

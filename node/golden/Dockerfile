@@ -180,8 +180,7 @@ RUN mkdir -p /opt/boxcutter/tools && \
     ln -sf /opt/boxcutter/tools/bin/boxcutter-tapegun /usr/local/bin/boxcutter-tapegun && \
     ln -sf /opt/boxcutter/tools/etc/systemd/boxcutter-tapegun.service /etc/systemd/system/boxcutter-tapegun.service && \
     ln -sf /etc/systemd/system/boxcutter-tapegun.service \
-      /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service && \
-    systemctl enable opt-boxcutter-tools.automount
+      /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service
 
 # --- Claude Code plugin directory (tapegun-guest plugin injected by docker-to-ext4.sh) ---
 RUN mkdir -p /home/dev/.claude/plugins && chown -R 1000:1000 /home/dev/.claude
