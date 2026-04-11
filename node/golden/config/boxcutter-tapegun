@@ -14,6 +14,8 @@ INBOX_DIR="/home/dev/.tapegun"
 INBOX_FILE="${INBOX_DIR}/inbox.json"
 CONFIG_FILE="${INBOX_DIR}/config"
 POLL_INTERVAL=5
+INFERENCE_ENDPOINT="http://192.168.50.1:11430/v1"
+INFERENCE_API_KEY="dummy"
 
 HOME_DIR="/home/dev"
 PROJECT_DIR="${HOME_DIR}/project"
@@ -324,7 +326,7 @@ setup_workspace() {
     setup_claude_credentials
 
     # Parse config fields
-    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files tapegun_sequences agent_tool agent_model inference_endpoint inference_api_key
+    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files tapegun_sequences agent_tool agent_model
     repos=$(echo "$agent_config" | jq -r '.repos // [] | .[]' 2>/dev/null)
     persona_claude_md=$(echo "$agent_config" | jq -r '.persona.claude_md // empty' 2>/dev/null)
     persona_instructions=$(echo "$agent_config" | jq -r '.persona.instructions // empty' 2>/dev/null)
@@ -337,8 +339,6 @@ setup_workspace() {
     # Tool selection: which coding agent to launch (default: claude-code)
     agent_tool=$(echo "$agent_config" | jq -r '.tool // "claude-code"' 2>/dev/null)
     agent_model=$(echo "$agent_config" | jq -r '.inference.model // "qwen3-coder:30b"' 2>/dev/null)
-    inference_endpoint=$(echo "$agent_config" | jq -r '.inference.endpoint // empty' 2>/dev/null)
-    inference_api_key=$(echo "$agent_config" | jq -r '.inference.api_key // empty' 2>/dev/null)
     AGENT_TOOL="$agent_tool"
     AGENT_MODEL="$agent_model"
 
@@ -512,16 +512,15 @@ EOSETTINGS
 
             # Write opencode.json config in the project directory
             OPENCODE_CONFIG="${WORKDIR}/opencode.json"
-            if [ -n "$inference_endpoint" ]; then
-              cat > "$OPENCODE_CONFIG" <<OCJSON
+            cat > "$OPENCODE_CONFIG" <<OCJSON
 {
   "provider": {
     "local": {
       "npm": "@ai-sdk/openai",
       "name": "Local Ollama",
       "options": {
-        "baseURL": "$inference_endpoint",
-        "apiKey": "$inference_api_key",
+        "baseURL": "$INFERENCE_ENDPOINT",
+        "apiKey": "$INFERENCE_API_KEY",
         "compatibility": "compatible"
       },
       "models": {
@@ -536,55 +535,21 @@ EOSETTINGS
   "permission": { "*": "allow" }
 }
 OCJSON
-            else
-              cat > "$OPENCODE_CONFIG" <<OCJSON
-{
-  "provider": {
-    "local": {
-      "npm": "@ai-sdk/openai",
-      "name": "Local Ollama",
-      "options": {
-        "baseURL": "http://169.254.169.254/v1",
-        "apiKey": "dummy"
-      },
-      "models": {
-        "${AGENT_MODEL}": {
-          "name": "${AGENT_MODEL}",
-          "tools": true
-        }
-      }
-    }
-  },
-  "model": "local/${AGENT_MODEL}",
-  "permission": { "*": "allow" }
-}
-OCJSON
-            fi
             chown 1000:1000 "$OPENCODE_CONFIG" 2>/dev/null || true
 
             # Set environment variables for OpenCode
-            if [ -n "$inference_endpoint" ]; then
-              tmux send-keys -t main "export OPENAI_BASE_URL='$inference_endpoint'" Enter
-              tmux send-keys -t main "export OPENAI_API_KEY='$inference_api_key'" Enter
-            else
-              tmux send-keys -t main "export OPENAI_BASE_URL='http://169.254.169.254/v1'" Enter
-              tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
-            fi
+            tmux send-keys -t main "export OPENAI_BASE_URL='$INFERENCE_ENDPOINT'" Enter
+            tmux send-keys -t main "export OPENAI_API_KEY='$INFERENCE_API_KEY'" Enter
             sleep 0.5
 
-            tmux send-keys -t main "opencode" Enter
+            tmux send-keys -t main "opencode serve --port 4096" Enter
             echo "tapegun: OpenCode started (model: ${AGENT_MODEL})"
             ;;
 
           aider)
             # --- Aider launch (local inference via Ollama) ---
-            if [ -n "$inference_endpoint" ]; then
-              tmux send-keys -t main "export OPENAI_API_BASE='$inference_endpoint'" Enter
-              tmux send-keys -t main "export OPENAI_API_KEY='$inference_api_key'" Enter
-            else
-              tmux send-keys -t main "export OPENAI_API_BASE='http://169.254.169.254/v1'" Enter
-              tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
-            fi
+            tmux send-keys -t main "export OPENAI_API_BASE='http://169.254.169.254/v1'" Enter
+            tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
             sleep 0.5
 
             tmux send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
@@ -998,3 +963,17 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
 
     sleep "$POLL_INTERVAL"
 done
+
+# --- OpenCode server API helper ---
+# Send a message to the OpenCode server running on this VM.
+# Usage: opencode_send_message "your prompt here"
+opencode_send_message() {
+    local message="$1"
+    local port="${OPENCODE_SERVER_PORT:-4096}"
+    local password="${OPENCODE_SERVER_PASSWORD:-tapegun}"
+    curl -sf -X POST "http://localhost:${port}/session/default/message" \
+        -u "opencode:${password}" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg msg "$message" '{parts:[{type:"text",text:$msg}]}')" \
+        --max-time 300 2>/dev/null
+}
