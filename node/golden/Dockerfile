@@ -38,7 +38,8 @@ RUN echo "boxcutter-vm" > /etc/hostname.boxcutter && \
     printf '127.0.0.1 localhost\n127.0.1.1 boxcutter-vm\n' > /etc/hosts.boxcutter
 
 # --- fstab ---
-RUN echo "/dev/vda / ext4 defaults 0 1" > /etc/fstab
+RUN printf '/dev/vda / ext4 defaults 0 1\n/dev/vdb /opt/boxcutter/tools squashfs ro,nofail 0 0\n' > /etc/fstab && \
+    mkdir -p /opt/boxcutter/tools
 
 # --- Auto-grow root filesystem to fill disk on first boot ---
 COPY config/boxcutter-growfs.service /etc/systemd/system/boxcutter-growfs.service
