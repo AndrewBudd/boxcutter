@@ -518,12 +518,11 @@ EOSETTINGS
 {
   "provider": {
     "local": {
-      "npm": "@ai-sdk/openai",
+      "npm": "@ai-sdk/openai-compatible",
       "name": "Local Ollama",
       "options": {
         "baseURL": "$INFERENCE_ENDPOINT",
-        "apiKey": "$INFERENCE_API_KEY",
-        "compatibility": "compatible"
+        "apiKey": "$INFERENCE_API_KEY"
       },
       "models": {
         "${AGENT_MODEL}": {
@@ -549,8 +548,9 @@ OCJSON
             tmux send-keys -t main "export OPENAI_API_KEY='$INFERENCE_API_KEY'" Enter
             sleep 0.5
 
-            tmux send-keys -t main "opencode" Enter
-            echo "tapegun: OpenCode started in TUI mode (model: ${AGENT_MODEL})"
+            # Launch opencode in headless run mode for each inbox message.
+            # The TUI is not used — opencode run executes and exits per task.
+            echo "tapegun: OpenCode configured (model: ${AGENT_MODEL}, headless run mode)"
             ;;
 
           aider)
@@ -765,35 +765,26 @@ compute_token_usage() {
 }
 
 # --- Helper: send message to coding agent ---
-# Uses OpenCode server API if available, falls back to tmux send-keys.
+# Uses opencode run for headless execution (no TUI, no server needed).
+# Falls back to tmux send-keys for claude-code.
 opencode_send_message() {
     local message="$1"
-    local port="${OPENCODE_SERVER_PORT:-4096}"
-    local password="${OPENCODE_SERVER_PASSWORD:-tapegun}"
 
     if [ -z "$message" ]; then
         return
     fi
 
-    # Try OpenCode server API first
-    if curl -sf "http://localhost:${port}/global/health" -u "opencode:${password}" --max-time 1 >/dev/null 2>&1; then
-        local session_id
-        session_id=$(curl -sf "http://localhost:${port}/session" -u "opencode:${password}" --max-time 2 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null)
-        if [ -z "$session_id" ]; then
-            session_id=$(curl -sf "http://localhost:${port}/session" -X POST -u "opencode:${password}" -H "Content-Type: application/json" -d '{}' --max-time 5 2>/dev/null | jq -r '.id // empty' 2>/dev/null)
-        fi
-        if [ -n "$session_id" ]; then
-            curl -sf "http://localhost:${port}/session/${session_id}/message" -X POST \
-                -u "opencode:${password}" \
-                -H "Content-Type: application/json" \
-                -d "$(jq -n --arg msg "$message" '{parts:[{type:"text",text:$msg}]}')" \
-                --max-time 300 2>/dev/null
-            return
-        fi
-    fi
-
-    # Fallback to tmux send-keys
-    if [ -n "$TMUX_CMD" ] && $TMUX_CMD has-session 2>/dev/null; then
+    if [ "$AGENT_TOOL" = "opencode" ]; then
+        # Headless: opencode run executes the task and exits
+        cd "${CLAUDE_WORKING_DIR:-$PROJECT_DIR}" 2>/dev/null
+        OPENAI_API_KEY="${INFERENCE_API_KEY}" \
+            ~/.opencode/bin/opencode run \
+            --dangerously-skip-permissions \
+            --continue \
+            "$message" 2>/dev/null &
+        echo "tapegun: dispatched opencode run task"
+    elif [ -n "$TMUX_CMD" ] && $TMUX_CMD has-session 2>/dev/null; then
+        # Claude Code: type into tmux TUI
         $TMUX_CMD send-keys -t 0 "$message"
         sleep 1
         $TMUX_CMD send-keys -t 0 Enter
