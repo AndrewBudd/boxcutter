@@ -771,7 +771,7 @@ while true; do
     # Prefer OpenCode server API if available, fall back to tmux capture
     if [ "$AGENT_TOOL" = "opencode" ] && curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/global/health" -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" --max-time 1 >/dev/null 2>&1; then
         # Get session status from OpenCode server
-        OC_STATUS=$(curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/session/status" \
+        OC_STATUS=$(curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/session" \
             -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" \
             --max-time 2 2>/dev/null)
         if [ -n "$OC_STATUS" ]; then
