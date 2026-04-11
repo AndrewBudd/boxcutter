@@ -1075,22 +1075,27 @@ func (m *Manager) Health() map[string]interface{} {
 		}
 	}
 
+	// Check if tools.img is present (required for QEMU VMs)
+	_, toolsErr := os.Stat(toolsImagePath)
+	toolsImgPresent := toolsErr == nil
+
 	return map[string]interface{}{
-		"hostname":          hostname,
-		"vcpu_total":        cpuCount,
-		"vcpu_allocated":    allocatedVCPU,
-		"ram_total_mib":     sysRAM,
-		"ram_allocated_mib": totalRAM,
-		"ram_available_mib": availRAM,
-		"ram_free_mib":      sysRAM - totalRAM,
-		"disk_total_mb":     diskTotalMB,
-		"disk_used_mb":      diskUsedMB,
-		"disk_vms_mb":       diskVMsMB,
-		"vms_total":         len(vms),
-		"vms_running":       running,
-		"golden_ready":      goldenReady,
-		"qemu_version":      qemuVersion,
-		"status":            "active",
+		"hostname":           hostname,
+		"vcpu_total":         cpuCount,
+		"vcpu_allocated":     allocatedVCPU,
+		"ram_total_mib":      sysRAM,
+		"ram_allocated_mib":  totalRAM,
+		"ram_available_mib":  availRAM,
+		"ram_free_mib":       sysRAM - totalRAM,
+		"disk_total_mb":      diskTotalMB,
+		"disk_used_mb":       diskUsedMB,
+		"disk_vms_mb":        diskVMsMB,
+		"vms_total":          len(vms),
+		"vms_running":        running,
+		"golden_ready":       goldenReady,
+		"qemu_version":       qemuVersion,
+		"tools_img_present":  toolsImgPresent,
+		"status":             "active",
 	}
 }
 

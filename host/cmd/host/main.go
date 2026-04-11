@@ -1835,6 +1835,25 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 	}
 	log.Printf("Deploy %s: %d VMs running before restart", nodeID, preRestartVMs)
 
+	// Deploy tools.img if present on host (needed for QEMU VMs to have tapegun daemon)
+	toolsImgPath := "/var/lib/boxcutter/tools.img"
+	if fileExists(toolsImgPath) {
+		scpTools := exec.Command("scp", append(sshOpts, toolsImgPath, "ubuntu@"+bridgeIP+":/tmp/tools.img")...)
+		if out, err := scpTools.CombinedOutput(); err != nil {
+			log.Printf("Deploy %s: tools.img SCP failed (non-fatal): %v\n%s", nodeID, err, string(out))
+		} else {
+			mvTools := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP,
+				"sudo", "mv", "/tmp/tools.img", "/var/lib/boxcutter/tools.img")...)
+			if out, err := mvTools.CombinedOutput(); err != nil {
+				log.Printf("Deploy %s: tools.img install failed (non-fatal): %v\n%s", nodeID, err, string(out))
+			} else {
+				log.Printf("Deploy %s: tools.img deployed successfully", nodeID)
+			}
+		}
+	} else {
+		log.Printf("Deploy %s: tools.img not found at %s on host — skipping", nodeID, toolsImgPath)
+	}
+
 	// Install and restart
 	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP,
 		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
