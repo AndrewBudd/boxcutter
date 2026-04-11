@@ -50,6 +50,8 @@ AUTOSTART_CLAUDE=true
 CLAUDE_FLAGS="--dangerously-skip-permissions"
 CLAUDE_RESUME=false
 CLAUDE_WORKING_DIR="/home/dev/project"
+AGENT_TOOL="claude-code"
+AGENT_MODEL=""
 
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
@@ -322,7 +324,7 @@ setup_workspace() {
     setup_claude_credentials
 
     # Parse config fields
-    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files tapegun_sequences
+    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files tapegun_sequences agent_tool agent_model
     repos=$(echo "$agent_config" | jq -r '.repos // [] | .[]' 2>/dev/null)
     persona_claude_md=$(echo "$agent_config" | jq -r '.persona.claude_md // empty' 2>/dev/null)
     persona_instructions=$(echo "$agent_config" | jq -r '.persona.instructions // empty' 2>/dev/null)
@@ -331,6 +333,12 @@ setup_workspace() {
     working_dir=$(echo "$agent_config" | jq -r '.working_dir // empty' 2>/dev/null)
     team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
     tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
+
+    # Tool selection: which coding agent to launch (default: claude-code)
+    agent_tool=$(echo "$agent_config" | jq -r '.tool // "claude-code"' 2>/dev/null)
+    agent_model=$(echo "$agent_config" | jq -r '.inference.model // "qwen3-coder:30b"' 2>/dev/null)
+    AGENT_TOOL="$agent_tool"
+    AGENT_MODEL="$agent_model"
 
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
@@ -415,16 +423,16 @@ EOSETTINGS
 setup_workspace
 
 # =============================================================================
-# Claude Code auto-start
+# Agent tool auto-start (Claude Code, OpenCode, or Aider)
 # =============================================================================
 
 if [ "$AUTOSTART_CLAUDE" = "true" ]; then
-    echo "tapegun: auto-starting Claude Code under tmux"
+    echo "tapegun: auto-starting agent tool '$AGENT_TOOL' under tmux"
 
     # Pre-trust the working directory so Claude doesn't prompt on first launch.
     # The --dangerously-skip-permissions flag handles tool permissions, but
     # Claude still prompts to trust the project directory on first use.
-    if [ -n "$CLAUDE_WORKING_DIR" ]; then
+    if [ -n "$CLAUDE_WORKING_DIR" ] && [ "$AGENT_TOOL" = "claude-code" ]; then
         TRUST_DIR="$HOME/.claude"
         mkdir -p "$TRUST_DIR"
         # Write settings that pre-trust the working directory
@@ -469,28 +477,90 @@ EOSETTINGS
             sleep 0.5
         fi
 
-        # Install tapegun-guest plugin so inbox, stop notifications, and
-        # status reporting hooks are active in the Claude Code session.
-        PLUGIN_DIR="$HOME/.claude/plugins/tapegun-guest"
-        if [ -d "$PLUGIN_DIR" ]; then
-            tmux send-keys -t main "claude plugin install $PLUGIN_DIR 2>/dev/null" Enter
-            sleep 2
-            echo "tapegun: installed tapegun-guest plugin"
-        else
-            echo "tapegun: WARNING: plugin not found at $PLUGIN_DIR"
-        fi
+        case "$AGENT_TOOL" in
+          claude-code)
+            # --- Claude Code launch (existing behavior, unchanged) ---
+            # Install tapegun-guest plugin so inbox, stop notifications, and
+            # status reporting hooks are active in the Claude Code session.
+            PLUGIN_DIR="$HOME/.claude/plugins/tapegun-guest"
+            if [ -d "$PLUGIN_DIR" ]; then
+                tmux send-keys -t main "claude plugin install $PLUGIN_DIR 2>/dev/null" Enter
+                sleep 2
+                echo "tapegun: installed tapegun-guest plugin"
+            else
+                echo "tapegun: WARNING: plugin not found at $PLUGIN_DIR"
+            fi
 
-        # Start Claude Code
-        CLAUDE_CMD="claude"
-        [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-        if [ -n "$RESTORED_SESSION_ID" ]; then
-            CLAUDE_CMD="$CLAUDE_CMD --continue"
-            echo "tapegun: resuming session $RESTORED_SESSION_ID"
-        elif [ "$CLAUDE_RESUME" = "true" ]; then
-            CLAUDE_CMD="$CLAUDE_CMD --resume"
-        fi
-        tmux send-keys -t main "$CLAUDE_CMD" Enter
-        echo "tapegun: Claude Code started (flags: $CLAUDE_FLAGS, resume: $CLAUDE_RESUME, restored: ${RESTORED_SESSION_ID:-none})"
+            # Start Claude Code
+            CLAUDE_CMD="claude"
+            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+            if [ -n "$RESTORED_SESSION_ID" ]; then
+                CLAUDE_CMD="$CLAUDE_CMD --continue"
+                echo "tapegun: resuming session $RESTORED_SESSION_ID"
+            elif [ "$CLAUDE_RESUME" = "true" ]; then
+                CLAUDE_CMD="$CLAUDE_CMD --resume"
+            fi
+            tmux send-keys -t main "$CLAUDE_CMD" Enter
+            echo "tapegun: Claude Code started (flags: $CLAUDE_FLAGS, resume: $CLAUDE_RESUME, restored: ${RESTORED_SESSION_ID:-none})"
+            ;;
+
+          opencode)
+            # --- OpenCode launch (local inference via Ollama) ---
+            WORKDIR="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
+
+            # Write opencode.json config in the project directory
+            OPENCODE_CONFIG="${WORKDIR}/opencode.json"
+            cat > "$OPENCODE_CONFIG" <<OCJSON
+{
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local Ollama",
+      "options": {
+        "baseURL": "http://169.254.169.254/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "${AGENT_MODEL}": {
+          "name": "${AGENT_MODEL}"
+        }
+      }
+    }
+  },
+  "model": "local/${AGENT_MODEL}",
+  "permission": { "*": "allow" }
+}
+OCJSON
+            chown 1000:1000 "$OPENCODE_CONFIG" 2>/dev/null || true
+
+            # Set environment variables for OpenCode
+            tmux send-keys -t main "export OPENAI_BASE_URL='http://169.254.169.254/v1'" Enter
+            tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
+            sleep 0.5
+
+            tmux send-keys -t main "opencode" Enter
+            echo "tapegun: OpenCode started (model: ${AGENT_MODEL})"
+            ;;
+
+          aider)
+            # --- Aider launch (local inference via Ollama) ---
+            tmux send-keys -t main "export OPENAI_API_BASE='http://169.254.169.254/v1'" Enter
+            tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
+            sleep 0.5
+
+            tmux send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
+            echo "tapegun: Aider started (model: ${AGENT_MODEL})"
+            ;;
+
+          *)
+            echo "tapegun: WARNING: unknown agent tool '$AGENT_TOOL', falling back to claude-code"
+            AGENT_TOOL="claude-code"
+            CLAUDE_CMD="claude"
+            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+            tmux send-keys -t main "$CLAUDE_CMD" Enter
+            echo "tapegun: Claude Code started (fallback)"
+            ;;
+        esac
     else
         echo "tapegun: tmux session 'main' already exists, skipping autostart"
     fi
@@ -742,8 +812,14 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
 
     # --- Execute tapegun sequences (one-time, after Claude Code is running) ---
     if [ "$SEQUENCES_EXECUTED" = "false" ] && [ -n "$TAPEGUN_SEQUENCES" ] && $TMUX_CMD has-session 2>/dev/null; then
-        # Wait for Claude Code process to be running before injecting sequences
-        if pgrep -f 'claude' -u "$(id -u)" >/dev/null 2>&1; then
+        # Determine process pattern for the active agent tool
+        case "$AGENT_TOOL" in
+          opencode) _SEQ_PROC='opencode' ;;
+          aider)    _SEQ_PROC='aider' ;;
+          *)        _SEQ_PROC='claude' ;;
+        esac
+        # Wait for agent process to be running before injecting sequences
+        if pgrep -f "$_SEQ_PROC" -u "$(id -u)" >/dev/null 2>&1; then
             log "executing tapegun sequences"
             # Give Claude Code a moment to fully initialize
             sleep 3
@@ -815,11 +891,24 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
     fi
 
     # --- Crash detection & auto-restart ---
-    # If autostart is enabled, ensure tmux session and Claude Code stay alive.
+    # If autostart is enabled, ensure tmux session and agent tool stay alive.
     if [ "$AUTOSTART_CLAUDE" = "true" ]; then
+        # Determine the process name to watch and restart command based on tool
+        case "$AGENT_TOOL" in
+          opencode)
+            AGENT_PROC_PATTERN='opencode'
+            ;;
+          aider)
+            AGENT_PROC_PATTERN='aider'
+            ;;
+          *)
+            AGENT_PROC_PATTERN='claude'
+            ;;
+        esac
+
         if ! $TMUX_CMD has-session -t main 2>/dev/null; then
             # Session gone entirely — recreate and relaunch
-            echo "tapegun: tmux session 'main' gone, restarting"
+            echo "tapegun: tmux session 'main' gone, restarting $AGENT_TOOL"
             $TMUX_CMD new-session -d -s main
             sleep 1
             $TMUX_CMD send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
@@ -828,19 +917,43 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
                 $TMUX_CMD send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
                 sleep 0.5
             fi
-            CLAUDE_CMD="claude"
-            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-            [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
-            $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
-            echo "tapegun: Claude Code restarted (session recreated)"
-        elif ! pgrep -f 'claude' -u "$(id -u)" >/dev/null 2>&1; then
-            # Session exists but Claude Code process died — relaunch in existing session
-            echo "tapegun: Claude Code process not found, restarting"
-            CLAUDE_CMD="claude"
-            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-            [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
-            $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
-            echo "tapegun: Claude Code restarted (in existing session)"
+            case "$AGENT_TOOL" in
+              claude-code)
+                CLAUDE_CMD="claude"
+                [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+                [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
+                $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
+                ;;
+              opencode)
+                $TMUX_CMD send-keys -t main "export OPENAI_BASE_URL='http://169.254.169.254/v1' OPENAI_API_KEY='dummy'" Enter
+                sleep 0.5
+                $TMUX_CMD send-keys -t main "opencode" Enter
+                ;;
+              aider)
+                $TMUX_CMD send-keys -t main "export OPENAI_API_BASE='http://169.254.169.254/v1' OPENAI_API_KEY='dummy'" Enter
+                sleep 0.5
+                $TMUX_CMD send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
+                ;;
+            esac
+            echo "tapegun: $AGENT_TOOL restarted (session recreated)"
+        elif ! pgrep -f "$AGENT_PROC_PATTERN" -u "$(id -u)" >/dev/null 2>&1; then
+            # Session exists but agent process died — relaunch in existing session
+            echo "tapegun: $AGENT_TOOL process not found, restarting"
+            case "$AGENT_TOOL" in
+              claude-code)
+                CLAUDE_CMD="claude"
+                [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+                [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
+                $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
+                ;;
+              opencode)
+                $TMUX_CMD send-keys -t main "opencode" Enter
+                ;;
+              aider)
+                $TMUX_CMD send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
+                ;;
+            esac
+            echo "tapegun: $AGENT_TOOL restarted (in existing session)"
         fi
     fi
 
