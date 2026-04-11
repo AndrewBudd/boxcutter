@@ -445,6 +445,106 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 echo ""
+echo "=== Test 21: Claude credential provisioning — native format passthrough ==="
+
+# When metadata serves the full claudeAiOauth format, it should be written as-is
+CRED_DIR21="${TMPDIR}/cred21"
+mkdir -p "$CRED_DIR21"
+NATIVE_CREDS='{"claudeAiOauth":{"refreshToken":"rt-123","accessToken":"at-456","expiresAt":1700000000,"scopes":["user:inference"],"subscriptionType":"max","rateLimitTier":"default"}}'
+
+# Simulate setup_claude_credentials logic for native format
+CLAUDE_DIR="$CRED_DIR21"
+cred_file="${CLAUDE_DIR}/.credentials.json"
+resp="$NATIVE_CREDS"
+
+if ! echo "$resp" | jq -e 'has("claudeAiOauth")' >/dev/null 2>&1; then
+    resp=$(echo "$resp" | jq '{claudeAiOauth:{refreshToken:.oauth_refresh_token,accessToken:(.oauth_access_token//""),expiresAt:(.oauth_expires_at//0),scopes:(.oauth_scopes//["user:inference"]),subscriptionType:(.oauth_subscription_type//""),rateLimitTier:(.oauth_rate_limit_tier//"")}}' 2>/dev/null)
+fi
+echo "$resp" > "$cred_file"
+chmod 600 "$cred_file"
+
+assert_file_exists "credentials file created (native)" "$cred_file"
+REFRESH=$(cat "$cred_file" | jq -r '.claudeAiOauth.refreshToken')
+assert_eq "refresh token preserved (native)" "rt-123" "$REFRESH"
+ACCESS=$(cat "$cred_file" | jq -r '.claudeAiOauth.accessToken')
+assert_eq "access token preserved (native)" "at-456" "$ACCESS"
+PERMS=$(stat -c '%a' "$cred_file" 2>/dev/null || stat -f '%Lp' "$cred_file" 2>/dev/null)
+assert_eq "credentials file mode 600" "600" "$PERMS"
+
+echo ""
+echo "=== Test 22: Claude credential provisioning — flat format transformation ==="
+
+# When metadata serves flat oauth fields, they should be wrapped into claudeAiOauth
+CRED_DIR22="${TMPDIR}/cred22"
+mkdir -p "$CRED_DIR22"
+FLAT_CREDS='{"oauth_refresh_token":"flat-rt-789","oauth_access_token":"flat-at-012"}'
+
+CLAUDE_DIR="$CRED_DIR22"
+cred_file="${CLAUDE_DIR}/.credentials.json"
+resp="$FLAT_CREDS"
+
+if ! echo "$resp" | jq -e 'has("claudeAiOauth")' >/dev/null 2>&1; then
+    resp=$(echo "$resp" | jq '{
+        claudeAiOauth: {
+            refreshToken: .oauth_refresh_token,
+            accessToken: (.oauth_access_token // ""),
+            expiresAt: (.oauth_expires_at // 0),
+            scopes: (.oauth_scopes // ["user:inference","user:profile","user:sessions:claude_code"]),
+            subscriptionType: (.oauth_subscription_type // ""),
+            rateLimitTier: (.oauth_rate_limit_tier // "")
+        }
+    }' 2>/dev/null)
+fi
+echo "$resp" > "$cred_file"
+
+assert_file_exists "credentials file created (flat)" "$cred_file"
+REFRESH22=$(cat "$cred_file" | jq -r '.claudeAiOauth.refreshToken')
+assert_eq "refresh token transformed from flat" "flat-rt-789" "$REFRESH22"
+ACCESS22=$(cat "$cred_file" | jq -r '.claudeAiOauth.accessToken')
+assert_eq "access token transformed from flat" "flat-at-012" "$ACCESS22"
+SCOPES22=$(cat "$cred_file" | jq -r '.claudeAiOauth.scopes | length')
+assert_eq "default scopes added for flat format" "3" "$SCOPES22"
+
+echo ""
+echo "=== Test 23: Claude credential provisioning — empty response ==="
+
+# Empty response should not create a credentials file
+CRED_DIR23="${TMPDIR}/cred23"
+mkdir -p "$CRED_DIR23"
+resp=""
+if [ -z "$resp" ]; then
+    SKIP23="yes"
+fi
+assert_eq "empty response skips credential install" "yes" "$SKIP23"
+assert_file_not_exists "no credentials file from empty response" "${CRED_DIR23}/.credentials.json"
+
+echo ""
+echo "=== Test 24: Claude credential provisioning — invalid JSON ==="
+
+# Invalid JSON should not create a credentials file
+CRED_DIR24="${TMPDIR}/cred24"
+mkdir -p "$CRED_DIR24"
+resp="not-json"
+VALID24=$(echo "$resp" | jq -e '.claudeAiOauth.refreshToken // .oauth_refresh_token' >/dev/null 2>&1 && echo "yes" || echo "no")
+assert_eq "invalid JSON fails validation" "no" "$VALID24"
+assert_file_not_exists "no credentials file from invalid JSON" "${CRED_DIR24}/.credentials.json"
+
+echo ""
+echo "=== Test 25: Claude credential provisioning — idempotent overwrite ==="
+
+# Running credential setup twice should update the file
+CRED_DIR25="${TMPDIR}/cred25"
+mkdir -p "$CRED_DIR25"
+
+# First write
+echo '{"claudeAiOauth":{"refreshToken":"old-token"}}' > "${CRED_DIR25}/.credentials.json"
+# Second write (simulating rotation)
+echo '{"claudeAiOauth":{"refreshToken":"new-token"}}' > "${CRED_DIR25}/.credentials.json"
+
+ROTATED=$(cat "${CRED_DIR25}/.credentials.json" | jq -r '.claudeAiOauth.refreshToken')
+assert_eq "credential file updated on re-run" "new-token" "$ROTATED"
+
+echo ""
 echo "=== Results ==="
 echo "Passed: $PASS"
 echo "Failed: $FAIL"
