@@ -1,0 +1,36 @@
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: platform-opencode
+spec:
+  defaults:
+    type: qemu
+    mode: normal
+    tool: opencode
+    inference:
+      provider: local
+      model: qwen3-coder:30b
+      fallback: anthropic
+    repos:
+      - AndrewBudd/boxcutter
+  agents:
+    - name: dev-worker
+      replicas: 2
+      ram: 4G
+      vcpu: 2
+      description: "Developer - implements features and fixes"
+    - name: eng-manager
+      replicas: 1
+      ram: 4G
+      vcpu: 2
+      description: "Engineering manager - reviews PRs, coordinates workers"
+    - name: product-manager
+      replicas: 1
+      ram: 4G
+      vcpu: 2
+      description: "Product manager - specs, design, prioritization"
+    - name: qa
+      replicas: 1
+      ram: 8G
+      vcpu: 4
+      description: "QA - e2e testing with nested dev clusters"
