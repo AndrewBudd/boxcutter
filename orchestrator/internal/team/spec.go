@@ -26,35 +26,45 @@ type Spec struct {
 	Agents   []AgentSpec    `yaml:"agents"`
 }
 
+// InferenceSpec configures the inference backend for non-Claude tools.
+type InferenceSpec struct {
+	Provider string `yaml:"provider,omitempty"` // "local", "openrouter"
+	Model    string `yaml:"model,omitempty"`    // Ollama model tag or OpenRouter model ID
+}
+
 // AgentDefaults holds shared defaults inherited by all agents.
 // Agent-level values override defaults. List fields (repos, access, tapegun)
 // are replaced, not merged.
 type AgentDefaults struct {
-	Type       string   `yaml:"type,omitempty"`
-	RAM        string   `yaml:"ram,omitempty"`
-	VCPU       int      `yaml:"vcpu,omitempty"`
-	Disk       string   `yaml:"disk,omitempty"`
-	Mode       string   `yaml:"mode,omitempty"`
-	Repos      []string `yaml:"repos,omitempty"`
-	Authorized bool     `yaml:"authorized,omitempty"`
-	Persona    *Persona `yaml:"persona,omitempty"`
-	Tapegun    []string `yaml:"tapegun,omitempty"`
+	Type       string         `yaml:"type,omitempty"`
+	RAM        string         `yaml:"ram,omitempty"`
+	VCPU       int            `yaml:"vcpu,omitempty"`
+	Disk       string         `yaml:"disk,omitempty"`
+	Mode       string         `yaml:"mode,omitempty"`
+	Tool       string         `yaml:"tool,omitempty"`      // "claude-code", "opencode", "aider"
+	Inference  *InferenceSpec `yaml:"inference,omitempty"`
+	Repos      []string       `yaml:"repos,omitempty"`
+	Authorized bool           `yaml:"authorized,omitempty"`
+	Persona    *Persona       `yaml:"persona,omitempty"`
+	Tapegun    []string       `yaml:"tapegun,omitempty"`
 }
 
 type AgentSpec struct {
-	Name        string   `yaml:"name"`
-	Replicas    int      `yaml:"replicas,omitempty"`
-	RAM         string   `yaml:"ram,omitempty"`
-	VCPU        int      `yaml:"vcpu,omitempty"`
-	Disk        string   `yaml:"disk,omitempty"`
-	Type        string   `yaml:"type,omitempty"`
-	Mode        string   `yaml:"mode,omitempty"`
-	Description string   `yaml:"description,omitempty"`
-	Persona     *Persona `yaml:"persona,omitempty"`
-	Repos       []string `yaml:"repos,omitempty"`
-	Access      []string `yaml:"access,omitempty"`
-	Authorized  *bool    `yaml:"authorized,omitempty"`
-	Tapegun     []string `yaml:"tapegun,omitempty"`
+	Name        string         `yaml:"name"`
+	Replicas    int            `yaml:"replicas,omitempty"`
+	RAM         string         `yaml:"ram,omitempty"`
+	VCPU        int            `yaml:"vcpu,omitempty"`
+	Disk        string         `yaml:"disk,omitempty"`
+	Type        string         `yaml:"type,omitempty"`
+	Mode        string         `yaml:"mode,omitempty"`
+	Tool        string         `yaml:"tool,omitempty"`      // "claude-code", "opencode", "aider"
+	Inference   *InferenceSpec `yaml:"inference,omitempty"`
+	Description string         `yaml:"description,omitempty"`
+	Persona     *Persona       `yaml:"persona,omitempty"`
+	Repos       []string       `yaml:"repos,omitempty"`
+	Access      []string       `yaml:"access,omitempty"`
+	Authorized  *bool          `yaml:"authorized,omitempty"`
+	Tapegun     []string       `yaml:"tapegun,omitempty"`
 }
 
 type Persona struct {
@@ -96,6 +106,8 @@ type ResolvedAgent struct {
 	VCPU        int
 	Disk        string
 	Mode        string
+	Tool        string
+	Inference   *InferenceSpec
 	Description string
 	Persona     *Persona
 	Repos       []string
@@ -111,6 +123,21 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 		"team":          teamName,
 		"agent":         r.AgentName,
 		"replica_index": r.ReplicaNum,
+	}
+	if r.Tool != "" && r.Tool != "claude-code" {
+		cfg["tool"] = r.Tool
+	}
+	if r.Inference != nil {
+		inf := map[string]interface{}{}
+		if r.Inference.Provider != "" {
+			inf["provider"] = r.Inference.Provider
+		}
+		if r.Inference.Model != "" {
+			inf["model"] = r.Inference.Model
+		}
+		if len(inf) > 0 {
+			cfg["inference"] = inf
+		}
 	}
 	if len(r.Repos) > 0 {
 		cfg["repos"] = r.Repos
@@ -221,6 +248,7 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 			r.VCPU = 4
 			r.Disk = "50G"
 			r.Mode = "normal"
+			r.Tool = "claude-code"
 
 			if d != nil {
 				if d.Type != "" {
@@ -237,6 +265,13 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 				}
 				if d.Mode != "" {
 					r.Mode = d.Mode
+				}
+				if d.Tool != "" {
+					r.Tool = d.Tool
+				}
+				if d.Inference != nil {
+					inf := *d.Inference
+					r.Inference = &inf
 				}
 				r.Repos = d.Repos
 				r.Authorized = d.Authorized
@@ -262,6 +297,12 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 			}
 			if a.Mode != "" {
 				r.Mode = a.Mode
+			}
+			if a.Tool != "" {
+				r.Tool = a.Tool
+			}
+			if a.Inference != nil {
+				r.Inference = a.Inference
 			}
 			if a.Repos != nil {
 				r.Repos = a.Repos

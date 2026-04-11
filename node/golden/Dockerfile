@@ -122,6 +122,11 @@ RUN apt-get update -qq && \
 # --- Claude Code (native installer) ---
 RUN su - dev -c 'curl -fsSL https://claude.ai/install.sh | bash'
 
+# --- OpenCode (open-source coding agent for local inference) ---
+RUN su - dev -c 'npm install -g @anthropic-ai/opencode' || \
+    su - dev -c 'curl -fsSL https://opencode.ai/install | bash' || \
+    echo "WARNING: OpenCode install failed — will install at first boot"
+
 # --- PATH: ensure ~/.local/bin and mise shims are available for non-interactive SSH ---
 # .bashrc has a guard that exits early for non-interactive shells. The PATH export
 # must be inserted BEFORE this guard (line 2) so non-interactive SSH commands like
