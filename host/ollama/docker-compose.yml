@@ -20,7 +20,7 @@ services:
     volumes:
       - ollama-a-data:/root/.ollama
     environment:
-      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=1
       - OLLAMA_KEEP_ALIVE=-1
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_MAX_LOADED_MODELS=1
@@ -29,10 +29,10 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['0']
+              device_ids: ['1']
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -46,7 +46,7 @@ services:
     volumes:
       - ollama-b-data:/root/.ollama
     environment:
-      - NVIDIA_VISIBLE_DEVICES=2
+      - NVIDIA_VISIBLE_DEVICES=3
       - OLLAMA_KEEP_ALIVE=-1
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_MAX_LOADED_MODELS=1
@@ -55,10 +55,10 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['2']
+              device_ids: ['3']
               capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 10s
       retries: 3
