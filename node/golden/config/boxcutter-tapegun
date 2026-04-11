@@ -534,7 +534,12 @@ EOSETTINGS
     }
   },
   "model": "local/${AGENT_MODEL}",
-  "permission": { "*": "allow" }
+  "permission": {
+    "*": "allow",
+    "doom_loop": "allow",
+    "external_directory": "allow",
+    "read": { "*": "allow", "*.env": "allow", "*.env.*": "allow" }
+  }
 }
 OCJSON
             chown 1000:1000 "$OPENCODE_CONFIG" 2>/dev/null || true
@@ -544,8 +549,8 @@ OCJSON
             tmux send-keys -t main "export OPENAI_API_KEY='$INFERENCE_API_KEY'" Enter
             sleep 0.5
 
-            tmux send-keys -t main "OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD} opencode serve --port ${OPENCODE_SERVER_PORT} --hostname 0.0.0.0" Enter
-            echo "tapegun: OpenCode server started on port ${OPENCODE_SERVER_PORT} (model: ${AGENT_MODEL})"
+            tmux send-keys -t main "opencode" Enter
+            echo "tapegun: OpenCode started in TUI mode (model: ${AGENT_MODEL})"
             ;;
 
           aider)
@@ -759,7 +764,8 @@ compute_token_usage() {
         --max-time 5 2>/dev/null || true
 }
 
-# --- Helper: send message to OpenCode server or tmux fallback ---
+# --- Helper: send message to coding agent ---
+# Uses OpenCode server API if available, falls back to tmux send-keys.
 opencode_send_message() {
     local message="$1"
     local port="${OPENCODE_SERVER_PORT:-4096}"
@@ -769,7 +775,7 @@ opencode_send_message() {
         return
     fi
 
-    # Try OpenCode server API first (reliable, no TUI timing issues)
+    # Try OpenCode server API first
     if curl -sf "http://localhost:${port}/global/health" -u "opencode:${password}" --max-time 1 >/dev/null 2>&1; then
         local session_id
         session_id=$(curl -sf "http://localhost:${port}/session" -u "opencode:${password}" --max-time 2 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null)
@@ -786,9 +792,11 @@ opencode_send_message() {
         fi
     fi
 
-    # Fallback to tmux send-keys (for claude-code or when server unavailable)
+    # Fallback to tmux send-keys
     if [ -n "$TMUX_CMD" ] && $TMUX_CMD has-session 2>/dev/null; then
-        $TMUX_CMD send-keys -t 0 "$message" Enter
+        $TMUX_CMD send-keys -t 0 "$message"
+        sleep 1
+        $TMUX_CMD send-keys -t 0 Enter
     fi
 }
 
@@ -803,12 +811,11 @@ while true; do
     # --- Post activity ---
     # Prefer OpenCode server API if available, fall back to tmux capture
     if [ "$AGENT_TOOL" = "opencode" ] && curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/global/health" -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" --max-time 1 >/dev/null 2>&1; then
-        # Get session status from OpenCode server
+        # Get session info from OpenCode server
         OC_SESSIONS=$(curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/session" \
             -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" \
             --max-time 2 2>/dev/null)
         if [ -n "$OC_SESSIONS" ] && [ "$OC_SESSIONS" != "[]" ]; then
-            # Extract useful info: title, file changes, last activity time
             PANE_CONTENT=$(echo "$OC_SESSIONS" | jq -r '
                 .[0] | "Session: \(.title // "untitled")\n" +
                 "Files: +\(.summary.additions // 0)/-\(.summary.deletions // 0) in \(.summary.files // 0) files"
@@ -817,7 +824,7 @@ while true; do
             PAYLOAD=$(jq -n --arg content "$PANE_CONTENT" --arg status "$STATUS" \
                 '{pane_content: $content, status: $status}')
         else
-            PAYLOAD='{"pane_content":"opencode server idle (no sessions)","status":"idle"}'
+            PAYLOAD='{"pane_content":"opencode server idle","status":"idle"}'
         fi
         curl -sf -X POST "${METADATA}/tapegun/activity" \
             -H "Content-Type: application/json" \
