@@ -14,7 +14,7 @@ INBOX_DIR="/home/dev/.tapegun"
 INBOX_FILE="${INBOX_DIR}/inbox.json"
 CONFIG_FILE="${INBOX_DIR}/config"
 POLL_INTERVAL=5
-INFERENCE_ENDPOINT="http://192.168.50.1/v1"
+INFERENCE_ENDPOINT="http://192.168.50.1:11430/v1"
 
 HOME_DIR="/home/dev"
 PROJECT_DIR="${HOME_DIR}/project"
