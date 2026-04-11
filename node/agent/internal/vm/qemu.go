@@ -470,8 +470,10 @@ func (m *Manager) writeAgentConfig(st *VMState) {
 		}
 	}
 
-	// Write the config file
+	// Write the config file (owned by dev user, uid/gid 1000)
 	os.WriteFile(configPath, []byte(configContent), 0644)
+	os.Chown(configPath, 1000, 1000)
+	os.Chown(configDir, 1000, 1000)
 }
 
 // kernelVersion returns the running kernel version.
