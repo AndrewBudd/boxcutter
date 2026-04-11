@@ -9,12 +9,18 @@ import (
 )
 
 type Config struct {
-	Listen   ListenConfig        `yaml:"listen"`
-	JWT      JWTConfig           `yaml:"jwt"`
-	GitHub   *GitHubConfig       `yaml:"github,omitempty"`
-	Policies []Policy            `yaml:"policies,omitempty"`
-	Metadata MetadataFilesConfig `yaml:"metadata"`
-	Log      LogConfig           `yaml:"log"`
+	Listen    ListenConfig        `yaml:"listen"`
+	JWT       JWTConfig           `yaml:"jwt"`
+	GitHub    *GitHubConfig       `yaml:"github,omitempty"`
+	Policies  []Policy            `yaml:"policies,omitempty"`
+	Metadata  MetadataFilesConfig `yaml:"metadata"`
+	Log       LogConfig           `yaml:"log"`
+	Inference InferenceGlobalConfig `yaml:"inference"`
+}
+
+// InferenceGlobalConfig holds node-level inference proxy settings.
+type InferenceGlobalConfig struct {
+	LocalEndpoint string `yaml:"local_endpoint"` // Ollama endpoint, e.g. "http://192.168.50.1:11434"
 }
 
 type ListenConfig struct {
@@ -133,6 +139,9 @@ func Load(path string) (*Config, error) {
 		Log: LogConfig{
 			Level:  "info",
 			Format: "json",
+		},
+		Inference: InferenceGlobalConfig{
+			LocalEndpoint: "http://192.168.50.1:11434",
 		},
 	}
 
