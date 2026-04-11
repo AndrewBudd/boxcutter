@@ -321,9 +321,10 @@ func launchQEMUIncoming(vmDir string, st *VMState) (int, error) {
 	}
 
 	// Attach tools.img — must match source VM's device topology for migration.
-	if _, err := os.Stat(toolsImagePath); err == nil {
-		args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
+	if _, err := os.Stat(toolsImagePath); err != nil {
+		return 0, fmt.Errorf("tools.img not found at %s: %w (QEMU VMs require tools.img for tapegun daemon)", toolsImagePath, err)
 	}
+	args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
 
 	log.Printf("Launching QEMU VM %s (incoming migration mode)", st.Name)
 
@@ -441,10 +442,11 @@ func launchQEMUIncomingTCP(vmDir string, st *VMState) (int, int, error) {
 	// Attach tools.img — must match source VM's device topology for live migration.
 	// QEMU rejects incoming migration if the target has fewer virtio drives than
 	// the source, causing silent fallback to stop+relocate.
-	if _, err := os.Stat(toolsImagePath); err == nil {
-		args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
-		log.Printf("QEMU VM %s (incoming): attached tools.img as /dev/vdb", st.Name)
+	if _, err := os.Stat(toolsImagePath); err != nil {
+		return 0, 0, fmt.Errorf("tools.img not found at %s: %w (QEMU VMs require tools.img for tapegun daemon)", toolsImagePath, err)
 	}
+	args = append(args, "-drive", fmt.Sprintf("file=%s,format=raw,if=virtio,readonly=on", toolsImagePath))
+	log.Printf("QEMU VM %s (incoming): attached tools.img as /dev/vdb", st.Name)
 
 	log.Printf("Launching QEMU VM %s (incoming live migration on port %d)", st.Name, migratePort)
 
