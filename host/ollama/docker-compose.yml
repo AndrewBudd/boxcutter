@@ -1,0 +1,92 @@
+# Ollama + LiteLLM inference stack.
+#
+# Two local Ollama instances (one per GPU) fronted by LiteLLM for
+# least-busy routing with OpenRouter overflow. See issue #180.
+#
+# Deployed to /opt/ollama-docker-compose/ on the host.
+#
+# Usage:
+#   cp .env.example .env   # then fill in secrets
+#   docker compose up -d
+#   docker exec ollama-a ollama pull qwen3-coder
+#   docker exec ollama-b ollama pull qwen3-coder
+
+services:
+  ollama-a:
+    image: ollama/ollama:latest
+    container_name: ollama-a
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-a-data:/root/.ollama
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_MAX_LOADED_MODELS=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  ollama-b:
+    image: ollama/ollama:latest
+    container_name: ollama-b
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama-b-data:/root/.ollama
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=2
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_MAX_LOADED_MODELS=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm
+    ports:
+      - "11430:4000"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-litellm-master}
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    depends_on:
+      ollama-a:
+        condition: service_healthy
+      ollama-b:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  ollama-a-data:
+  ollama-b-data:

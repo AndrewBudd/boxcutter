@@ -1,0 +1,55 @@
+# LiteLLM proxy configuration — smart inference load balancer.
+#
+# Routes to local Ollama GPUs first (free), overflows to OpenRouter (paid)
+# when local capacity is exhausted. See issue #180 for design rationale.
+#
+# Deployed to /opt/ollama-docker-compose/litellm-config.yaml on the host.
+
+model_list:
+  # --- Local Ollama instances (free, preferred) ---
+  - model_name: "qwen3-coder"
+    litellm_params:
+      model: "ollama/qwen3-coder"
+      api_base: "http://ollama-a:11434"
+      timeout: 120
+      stream_timeout: 300
+    model_info:
+      id: "ollama-a"
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+  - model_name: "qwen3-coder"
+    litellm_params:
+      model: "ollama/qwen3-coder"
+      api_base: "http://ollama-b:11434"
+      timeout: 120
+      stream_timeout: 300
+    model_info:
+      id: "ollama-b"
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+
+  # --- OpenRouter cloud fallback (paid) ---
+  - model_name: "qwen3-coder-cloud"
+    litellm_params:
+      model: "openrouter/qwen/qwen3-coder"
+      api_key: "os.environ/OPENROUTER_API_KEY"
+      timeout: 120
+      stream_timeout: 300
+
+router_settings:
+  routing_strategy: "least-busy"
+  allowed_fails: 2
+  cooldown_time: 30
+  retry_after: 15
+  num_retries: 2
+
+  fallbacks:
+    - qwen3-coder: ["qwen3-coder-cloud"]
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
