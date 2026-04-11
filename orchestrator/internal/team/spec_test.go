@@ -344,6 +344,263 @@ func TestResolve_TeamPersonaFiles(t *testing.T) {
 	}
 }
 
+// =====================================================================
+// Tool + Inference field tests (PRs #178/#179)
+// =====================================================================
+
+func TestResolve_ToolDefaultsToClaudeCode(t *testing.T) {
+	ts, _ := Parse([]byte(exampleYAML))
+	agents := ts.Resolve()
+
+	for _, a := range agents {
+		if a.Tool != "claude-code" {
+			t.Errorf("agent %q tool = %q, want claude-code (default)", a.VMName, a.Tool)
+		}
+	}
+}
+
+func TestResolve_ToolDefaultFromDefaults(t *testing.T) {
+	yaml := `
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: local-team
+spec:
+  defaults:
+    tool: opencode
+    inference:
+      model: qwen3-coder:30b
+  agents:
+    - name: worker
+`
+	ts, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	agents := ts.Resolve()
+
+	if agents[0].Tool != "opencode" {
+		t.Errorf("tool = %q, want opencode (from defaults)", agents[0].Tool)
+	}
+}
+
+func TestResolve_ToolAgentOverridesDefault(t *testing.T) {
+	yaml := `
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: mixed-team
+spec:
+  defaults:
+    tool: claude-code
+  agents:
+    - name: lead
+    - name: worker
+      replicas: 3
+      tool: opencode
+      inference:
+        model: qwen3-coder:30b
+    - name: reviewer
+      tool: aider
+      inference:
+        provider: openrouter
+        model: deepseek/deepseek-coder
+`
+	ts, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	agents := ts.Resolve()
+
+	// lead: inherits default claude-code
+	if agents[0].Tool != "claude-code" {
+		t.Errorf("lead tool = %q, want claude-code", agents[0].Tool)
+	}
+
+	// workers: all get opencode
+	for i := 1; i <= 3; i++ {
+		if agents[i].Tool != "opencode" {
+			t.Errorf("worker replica %d tool = %q, want opencode", i, agents[i].Tool)
+		}
+		if agents[i].Inference == nil {
+			t.Fatalf("worker replica %d inference is nil", i)
+		}
+		if agents[i].Inference.Model != "qwen3-coder:30b" {
+			t.Errorf("worker replica %d model = %q, want qwen3-coder:30b", i, agents[i].Inference.Model)
+		}
+	}
+
+	// reviewer: aider with openrouter
+	reviewer := agents[4]
+	if reviewer.Tool != "aider" {
+		t.Errorf("reviewer tool = %q, want aider", reviewer.Tool)
+	}
+	if reviewer.Inference == nil {
+		t.Fatal("reviewer inference is nil")
+	}
+	if reviewer.Inference.Provider != "openrouter" {
+		t.Errorf("reviewer provider = %q, want openrouter", reviewer.Inference.Provider)
+	}
+	if reviewer.Inference.Model != "deepseek/deepseek-coder" {
+		t.Errorf("reviewer model = %q, want deepseek/deepseek-coder", reviewer.Inference.Model)
+	}
+}
+
+func TestResolve_InferenceDefaultCascade(t *testing.T) {
+	yaml := `
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: inference-team
+spec:
+  defaults:
+    tool: opencode
+    inference:
+      provider: local
+      model: qwen3-coder:30b
+  agents:
+    - name: inherits-inference
+    - name: overrides-model
+      inference:
+        model: qwen3-coder:8b
+    - name: overrides-provider
+      tool: aider
+      inference:
+        provider: openrouter
+        model: deepseek/deepseek-coder
+`
+	ts, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	agents := ts.Resolve()
+
+	// inherits-inference: gets default inference
+	a := agents[0]
+	if a.Inference == nil {
+		t.Fatal("inherits-inference: inference is nil")
+	}
+	if a.Inference.Provider != "local" {
+		t.Errorf("inherits-inference provider = %q, want local", a.Inference.Provider)
+	}
+	if a.Inference.Model != "qwen3-coder:30b" {
+		t.Errorf("inherits-inference model = %q, want qwen3-coder:30b", a.Inference.Model)
+	}
+
+	// overrides-model: agent-level inference replaces (not merges)
+	b := agents[1]
+	if b.Inference == nil {
+		t.Fatal("overrides-model: inference is nil")
+	}
+	if b.Inference.Model != "qwen3-coder:8b" {
+		t.Errorf("overrides-model model = %q, want qwen3-coder:8b", b.Inference.Model)
+	}
+	// Provider should be empty since agent-level replaces entirely
+	if b.Inference.Provider != "" {
+		t.Errorf("overrides-model provider = %q, want empty (agent replaces default)", b.Inference.Provider)
+	}
+
+	// overrides-provider: completely different provider
+	c := agents[2]
+	if c.Inference == nil {
+		t.Fatal("overrides-provider: inference is nil")
+	}
+	if c.Inference.Provider != "openrouter" {
+		t.Errorf("overrides-provider provider = %q, want openrouter", c.Inference.Provider)
+	}
+}
+
+func TestResolve_NoInferenceForClaudeCode(t *testing.T) {
+	yaml := `
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: claude-team
+spec:
+  agents:
+    - name: lead
+`
+	ts, _ := Parse([]byte(yaml))
+	agents := ts.Resolve()
+
+	if agents[0].Tool != "claude-code" {
+		t.Errorf("tool = %q, want claude-code", agents[0].Tool)
+	}
+	if agents[0].Inference != nil {
+		t.Errorf("claude-code agent should have nil inference, got %+v", agents[0].Inference)
+	}
+}
+
+func TestAgentConfig_ToolFieldOmittedForClaudeCode(t *testing.T) {
+	yaml := `
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: test
+spec:
+  agents:
+    - name: claude-agent
+    - name: opencode-agent
+      tool: opencode
+      inference:
+        model: qwen3-coder:30b
+`
+	ts, _ := Parse([]byte(yaml))
+	agents := ts.Resolve()
+
+	// Claude agent: tool field should be omitted from agent config
+	claudeCfg := agents[0].AgentConfig("test", nil)
+	if _, ok := claudeCfg["tool"]; ok {
+		t.Error("claude-code agent should not have 'tool' in agent config (it's the default)")
+	}
+	if _, ok := claudeCfg["inference"]; ok {
+		t.Error("claude-code agent should not have 'inference' in agent config")
+	}
+
+	// OpenCode agent: tool and inference should be present
+	ocCfg := agents[1].AgentConfig("test", nil)
+	if tool, ok := ocCfg["tool"]; !ok || tool != "opencode" {
+		t.Errorf("opencode agent config tool = %v, want opencode", ocCfg["tool"])
+	}
+	inf, ok := ocCfg["inference"].(map[string]interface{})
+	if !ok {
+		t.Fatal("opencode agent config missing inference block")
+	}
+	if inf["model"] != "qwen3-coder:30b" {
+		t.Errorf("inference model = %v, want qwen3-coder:30b", inf["model"])
+	}
+}
+
+func TestAgentConfig_InferenceProviderAndModel(t *testing.T) {
+	yaml := `
+apiVersion: boxcutter/v1
+kind: Team
+metadata:
+  name: test
+spec:
+  agents:
+    - name: openrouter-agent
+      tool: aider
+      inference:
+        provider: openrouter
+        model: deepseek/deepseek-coder
+`
+	ts, _ := Parse([]byte(yaml))
+	agents := ts.Resolve()
+	cfg := agents[0].AgentConfig("test", nil)
+
+	inf, ok := cfg["inference"].(map[string]interface{})
+	if !ok {
+		t.Fatal("agent config missing inference block")
+	}
+	if inf["provider"] != "openrouter" {
+		t.Errorf("provider = %v, want openrouter", inf["provider"])
+	}
+	if inf["model"] != "deepseek/deepseek-coder" {
+		t.Errorf("model = %v, want deepseek/deepseek-coder", inf["model"])
+	}
+}
+
 func TestResolve_Idempotent(t *testing.T) {
 	ts, _ := Parse([]byte(exampleYAML))
 	a1 := ts.Resolve()
