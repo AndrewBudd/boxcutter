@@ -14,6 +14,7 @@ INBOX_DIR="/home/dev/.tapegun"
 INBOX_FILE="${INBOX_DIR}/inbox.json"
 CONFIG_FILE="${INBOX_DIR}/config"
 POLL_INTERVAL=5
+INFERENCE_ENDPOINT="http://192.168.50.1/v1"
 
 HOME_DIR="/home/dev"
 PROJECT_DIR="${HOME_DIR}/project"
@@ -517,7 +518,7 @@ EOSETTINGS
       "npm": "@ai-sdk/openai",
       "name": "Local Ollama",
       "options": {
-        "baseURL": "http://169.254.169.254/v1",
+        "baseURL": "$INFERENCE_ENDPOINT",
         "apiKey": "dummy",
         "compatibility": "compatible"
       },
@@ -536,7 +537,7 @@ OCJSON
             chown 1000:1000 "$OPENCODE_CONFIG" 2>/dev/null || true
 
             # Set environment variables for OpenCode
-            tmux send-keys -t main "export OPENAI_BASE_URL='http://169.254.169.254/v1'" Enter
+            tmux send-keys -t main "export OPENAI_BASE_URL='$INFERENCE_ENDPOINT'" Enter
             tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
             sleep 0.5
 

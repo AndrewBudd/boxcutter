@@ -72,6 +72,49 @@ jobs:
           path: .images/${{ matrix.vm_type }}-image.qcow2.zst
           retention-days: 30
 
+  build-golden:
+    name: Build golden image
+    runs-on: [self-hosted, kvm]
+    needs: build
+    steps:
+      - name: Clean workspace
+        run: |
+          sudo pkill -f 'qemu.*build-' 2>/dev/null || true
+          sudo rm -rf "$GITHUB_WORKSPACE"/.images 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag_override }}" ]; then
+            echo "tag=${{ inputs.tag_override }}" >> $GITHUB_OUTPUT
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up bridge network
+        run: |
+          sudo ip link del tap-build 2>/dev/null || true
+          sudo bash host/setup.sh
+
+      - name: Build golden image
+        run: |
+          cd node/golden && chmod +x docker-to-ext4.sh && ./docker-to-ext4.sh
+
+      - name: Push golden image to OCI registry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd host && go build -ldflags "-X main.version=${{ steps.tag.outputs.tag }}" -o boxcutter-host ./cmd/host/
+          ./boxcutter-host push-golden --tag ${{ steps.tag.outputs.tag }}
+
   release-host:
     name: Release host binary
     runs-on: [self-hosted, kvm]
