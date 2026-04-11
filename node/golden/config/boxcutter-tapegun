@@ -15,6 +15,7 @@ INBOX_FILE="${INBOX_DIR}/inbox.json"
 CONFIG_FILE="${INBOX_DIR}/config"
 POLL_INTERVAL=5
 INFERENCE_ENDPOINT="http://192.168.50.1:11430/v1"
+INFERENCE_API_KEY="dummy"
 
 HOME_DIR="/home/dev"
 PROJECT_DIR="${HOME_DIR}/project"
@@ -341,6 +342,14 @@ setup_workspace() {
     AGENT_TOOL="$agent_tool"
     AGENT_MODEL="$agent_model"
 
+    # Set INFERENCE_ENDPOINT from agent_config if present
+    local inference_endpoint
+    inference_endpoint=$(echo "$agent_config" | jq -r '.inference.endpoint // empty' 2>/dev/null)
+    if [ -n "$inference_endpoint" ]; then
+        INFERENCE_ENDPOINT="$inference_endpoint"
+        echo "tapegun: INFERENCE_ENDPOINT set from agent-config: $inference_endpoint"
+    fi
+
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
 
@@ -519,7 +528,7 @@ EOSETTINGS
       "name": "Local Ollama",
       "options": {
         "baseURL": "$INFERENCE_ENDPOINT",
-        "apiKey": "dummy",
+        "apiKey": "$INFERENCE_API_KEY",
         "compatibility": "compatible"
       },
       "models": {
@@ -538,7 +547,7 @@ OCJSON
 
             # Set environment variables for OpenCode
             tmux send-keys -t main "export OPENAI_BASE_URL='$INFERENCE_ENDPOINT'" Enter
-            tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
+            tmux send-keys -t main "export OPENAI_API_KEY='$INFERENCE_API_KEY'" Enter
             sleep 0.5
 
             tmux send-keys -t main "opencode" Enter
