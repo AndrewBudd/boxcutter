@@ -30,6 +30,7 @@ type Spec struct {
 type InferenceSpec struct {
 	Provider string `yaml:"provider,omitempty"` // "local", "openrouter"
 	Model    string `yaml:"model,omitempty"`    // Ollama model tag or OpenRouter model ID
+	Endpoint string `yaml:"endpoint,omitempty"` // Inference endpoint URL
 }
 
 // AgentDefaults holds shared defaults inherited by all agents.
@@ -134,6 +135,9 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 		}
 		if r.Inference.Model != "" {
 			inf["model"] = r.Inference.Model
+		}
+		if r.Inference.Endpoint != "" {
+			inf["endpoint"] = r.Inference.Endpoint
 		}
 		if len(inf) > 0 {
 			cfg["inference"] = inf

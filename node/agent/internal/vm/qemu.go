@@ -441,10 +441,10 @@ func (m *Manager) writeAgentConfig(st *VMState) {
 	defer cleanup()
 
 	// Convert JSON agent_config to key=value pairs in a config file
-	// The config file should be placed at /etc/boxcutter/agent.conf
-	configDir := filepath.Join(mountPoint, "etc", "boxcutter")
+	// The config file should be placed at /home/dev/.tapegun/config
+	configDir := filepath.Join(mountPoint, "home", "dev", ".tapegun")
 	os.MkdirAll(configDir, 0755)
-	configPath := filepath.Join(configDir, "agent.conf")
+	configPath := filepath.Join(configDir, "config")
 
 	// Write the agent config as key=value pairs
 	configContent := ""
