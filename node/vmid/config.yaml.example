@@ -28,3 +28,7 @@ jwt:
 log:
   level: info
   format: json
+
+# Optional: inference proxy settings for local GPU / cloud inference
+# inference:
+#   local_endpoint: "http://192.168.50.1:11434"  # Host bridge IP + Ollama port

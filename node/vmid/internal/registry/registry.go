@@ -82,6 +82,14 @@ type VMConfigInfo struct {
 	DiskGB int    `json:"disk_gb,omitempty"`
 }
 
+// InferenceConfig describes the inference provider configuration for a VM.
+// This is passed as part of AgentConfig from the orchestrator.
+type InferenceConfig struct {
+	Provider string `json:"provider,omitempty"` // "local", "openrouter", or "anthropic"
+	Model    string `json:"model,omitempty"`    // e.g. "qwen3-coder:30b"
+	APIKey   string `json:"api_key,omitempty"`  // API key for cloud providers (e.g. OpenRouter)
+}
+
 // AgentConfig is the boot agent specification for a VM, derived from the
 // declarative team YAML. It tells the in-VM agent what persona to assume,
 // which repos to clone, what tapegun sequences to run, and access policy.
@@ -97,6 +105,7 @@ type AgentConfig struct {
 	VMConfig         *VMConfigInfo     `json:"vm_config,omitempty"`          // requested VM resource configuration
 	Labels           map[string]string `json:"labels,omitempty"`             // labels for the VM
 	TeamPersonaFiles []string          `json:"team_persona_files,omitempty"` // team-level persona file paths
+	Inference        *InferenceConfig  `json:"inference,omitempty"`          // inference provider config
 }
 
 // CheckpointData holds a session checkpoint for conversation persistence.

@@ -14,6 +14,7 @@ import (
 
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/api"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/config"
+	"github.com/AndrewBudd/boxcutter/node/vmid/internal/inference"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/middleware"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/registry"
 	"github.com/AndrewBudd/boxcutter/node/vmid/internal/sentinel"
@@ -110,6 +111,8 @@ func main() {
 	tapegunHandler.Register(vmMux)
 	messagingHandler := api.NewMessagingHandler(reg, cfg.Metadata.NodeAgentURL)
 	messagingHandler.Register(vmMux)
+	inferenceHandler := inference.NewHandler(cfg.Inference, reg)
+	inferenceHandler.Register(vmMux)
 
 	identityMiddleware := middleware.Identity(reg)
 
