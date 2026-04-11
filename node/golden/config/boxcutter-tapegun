@@ -514,15 +514,17 @@ EOSETTINGS
 {
   "provider": {
     "local": {
-      "npm": "@ai-sdk/openai-compatible",
+      "npm": "@ai-sdk/openai",
       "name": "Local Ollama",
       "options": {
         "baseURL": "http://169.254.169.254/v1",
-        "apiKey": "dummy"
+        "apiKey": "dummy",
+        "compatibility": "compatible"
       },
       "models": {
         "${AGENT_MODEL}": {
-          "name": "${AGENT_MODEL}"
+          "name": "${AGENT_MODEL}",
+          "tools": true
         }
       }
     }
