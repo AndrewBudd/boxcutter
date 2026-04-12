@@ -19,7 +19,7 @@ jobs:
     name: Build ${{ matrix.vm_type }} image
     runs-on: [self-hosted, kvm]
     strategy:
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         vm_type: [node, orchestrator]
     steps:
