@@ -50,6 +50,17 @@ func (ba *BootAgent) Setup() error {
 				lines = append(lines, fmt.Sprintf("INFERENCE_API_KEY=%s", apiKey))
 			}
 		}
+		if claude, ok := configMap["claude"].(map[string]interface{}); ok {
+			if auth, ok := claude["auth"].(string); ok {
+				lines = append(lines, fmt.Sprintf("CLAUDE_AUTH=%s", auth))
+			}
+			if oauthToken, ok := claude["oauth_token"].(string); ok {
+				lines = append(lines, fmt.Sprintf("CLAUDE_OAUTH_TOKEN=%s", oauthToken))
+			}
+			if apiKey, ok := claude["api_key"].(string); ok {
+				lines = append(lines, fmt.Sprintf("CLAUDE_API_KEY=%s", apiKey))
+			}
+		}
 	}
 
 	if len(lines) == 0 {

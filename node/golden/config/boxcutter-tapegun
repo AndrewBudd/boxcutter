@@ -56,6 +56,9 @@ CLAUDE_RESUME=false
 CLAUDE_WORKING_DIR="/home/dev/project"
 AGENT_TOOL="claude-code"
 AGENT_MODEL=""
+CLAUDE_AUTH=""
+CLAUDE_OAUTH_TOKEN=""
+CLAUDE_API_KEY=""
 
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
@@ -80,26 +83,6 @@ fi
 
 log() { echo "tapegun: $*"; }
 
-setup_claude_credentials() {
-    local cred_file="${CLAUDE_DIR}/.credentials.json"
-    # boxcutter-fetch-metadata may have already installed credentials at boot.
-    # Verify they exist; if not, fetch from metadata as a fallback.
-    if [ -f "$cred_file" ]; then
-        log "Claude credentials already present"
-        return 0
-    fi
-    local resp
-    resp=$(curl -sf --max-time 5 "${METADATA}/metadata/claude-credentials" 2>/dev/null || echo "")
-    if [ -n "$resp" ] && [ "$resp" != "null" ]; then
-        mkdir -p "$CLAUDE_DIR"
-        printf '%s' "$resp" > "$cred_file"
-        chmod 600 "$cred_file"
-        log "Claude credentials installed from metadata"
-    else
-        log "WARNING: Claude credentials not available — Claude Code will prompt for OAuth"
-    fi
-}
-
 setup_git_credentials() {
     local resp token
     resp=$(curl -sf --max-time 5 "${METADATA}/token/github" 2>/dev/null || echo "")
@@ -117,10 +100,59 @@ setup_git_credentials() {
 
 setup_claude_credentials() {
     local cred_file="${CLAUDE_DIR}/.credentials.json"
+    mkdir -p "$CLAUDE_DIR"
+
+    # Method 1: API key auth (ANTHROPIC_API_KEY) — simplest, no OAuth needed
+    if [ "${CLAUDE_AUTH:-}" = "api-key" ] && [ -n "${CLAUDE_API_KEY:-}" ]; then
+        # Claude Code reads ANTHROPIC_API_KEY from environment.
+        # Write it to the profile so tmux sessions pick it up.
+        local envfile="/home/dev/.claude_env"
+        printf 'export ANTHROPIC_API_KEY="%s"\n' "$CLAUDE_API_KEY" > "$envfile"
+        chmod 600 "$envfile"
+        # Also add to bashrc if not already there
+        if ! grep -q 'source.*\.claude_env' /home/dev/.bashrc 2>/dev/null; then
+            printf '\n[ -f ~/.claude_env ] && source ~/.claude_env\n' >> /home/dev/.bashrc
+        fi
+        log "Claude API key configured (api-key auth)"
+        return 0
+    fi
+
+    # Method 2: OAuth token from team YAML (oauth-token auth)
+    if [ "${CLAUDE_AUTH:-}" = "oauth-token" ] && [ -n "${CLAUDE_OAUTH_TOKEN:-}" ]; then
+        # Write the OAuth token in Claude Code's expected credentials format
+        jq -n --arg token "$CLAUDE_OAUTH_TOKEN" '{
+            claudeAiOauth: {
+                refreshToken: $token,
+                accessToken: "",
+                expiresAt: 0,
+                scopes: ["user:inference","user:profile","user:sessions:claude_code"],
+                subscriptionType: "",
+                rateLimitTier: ""
+            }
+        }' > "$cred_file"
+        chmod 600 "$cred_file"
+        log "Claude OAuth token installed (oauth-token auth)"
+        return 0
+    fi
+
+    # Method 3: API key helper (api-key-helper auth) — for external secret managers
+    if [ "${CLAUDE_AUTH:-}" = "api-key-helper" ] && [ -n "${CLAUDE_API_KEY:-}" ]; then
+        # CLAUDE_API_KEY contains the helper command, not a literal key
+        local envfile="/home/dev/.claude_env"
+        printf 'export ANTHROPIC_API_KEY_HELPER="%s"\n' "$CLAUDE_API_KEY" > "$envfile"
+        chmod 600 "$envfile"
+        if ! grep -q 'source.*\.claude_env' /home/dev/.bashrc 2>/dev/null; then
+            printf '\n[ -f ~/.claude_env ] && source ~/.claude_env\n' >> /home/dev/.bashrc
+        fi
+        log "Claude API key helper configured (api-key-helper auth)"
+        return 0
+    fi
+
+    # Method 4: Fetch from metadata service (legacy / fallback)
     local resp
     resp=$(curl -sf --max-time 5 "${METADATA}/metadata/claude-credentials" 2>/dev/null || echo "")
     if [ -z "$resp" ]; then
-        log "WARNING: no Claude credentials available (metadata returned empty)"
+        log "WARNING: no Claude credentials available (no config + metadata empty)"
         return 0
     fi
 
@@ -132,7 +164,6 @@ setup_claude_credentials() {
 
     # If the metadata serves raw oauth fields, wrap into Claude Code's expected format
     if ! echo "$resp" | jq -e 'has("claudeAiOauth")' >/dev/null 2>&1; then
-        # Convert flat format to Claude Code's expected format
         resp=$(echo "$resp" | jq '{
             claudeAiOauth: {
                 refreshToken: .oauth_refresh_token,
@@ -149,10 +180,9 @@ setup_claude_credentials() {
         fi
     fi
 
-    mkdir -p "$CLAUDE_DIR"
     echo "$resp" > "$cred_file"
     chmod 600 "$cred_file"
-    log "Claude Code credentials installed"
+    log "Claude Code credentials installed from metadata"
 }
 
 clone_repo() {
@@ -465,6 +495,8 @@ EOSETTINGS
 
         # Ensure PATH includes ~/.local/bin (where claude is installed via mise)
         tmux send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
+        # Source Claude env vars (API key, etc.) if present
+        tmux send-keys -t main '[ -f ~/.claude_env ] && source ~/.claude_env' Enter
         sleep 0.5
 
         # Wait for working directory to appear (repo clone may still be in progress).

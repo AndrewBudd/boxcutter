@@ -34,6 +34,13 @@ type InferenceSpec struct {
 	APIKey   string `yaml:"api_key,omitempty"`  // API key (for cloud providers)
 }
 
+// ClaudeSpec configures Claude Code authentication for VMs (#175).
+type ClaudeSpec struct {
+	Auth       string `yaml:"auth,omitempty"`        // "oauth-token", "api-key", "api-key-helper"
+	OAuthToken string `yaml:"oauth_token,omitempty"` // From `claude setup-token`
+	APIKey     string `yaml:"api_key,omitempty"`     // Anthropic API key
+}
+
 // AgentDefaults holds shared defaults inherited by all agents.
 // Agent-level values override defaults. List fields (repos, access, tapegun)
 // are replaced, not merged.
@@ -45,6 +52,7 @@ type AgentDefaults struct {
 	Mode       string         `yaml:"mode,omitempty"`
 	Tool       string         `yaml:"tool,omitempty"`      // "claude-code", "opencode", "aider"
 	Inference  *InferenceSpec `yaml:"inference,omitempty"`
+	Claude     *ClaudeSpec    `yaml:"claude,omitempty"`
 	Repos      []string       `yaml:"repos,omitempty"`
 	Authorized bool           `yaml:"authorized,omitempty"`
 	Persona    *Persona       `yaml:"persona,omitempty"`
@@ -61,6 +69,7 @@ type AgentSpec struct {
 	Mode        string         `yaml:"mode,omitempty"`
 	Tool        string         `yaml:"tool,omitempty"`      // "claude-code", "opencode", "aider"
 	Inference   *InferenceSpec `yaml:"inference,omitempty"`
+	Claude      *ClaudeSpec    `yaml:"claude,omitempty"`
 	Description string         `yaml:"description,omitempty"`
 	Persona     *Persona       `yaml:"persona,omitempty"`
 	Repos       []string       `yaml:"repos,omitempty"`
@@ -110,6 +119,7 @@ type ResolvedAgent struct {
 	Mode        string
 	Tool        string
 	Inference   *InferenceSpec
+	Claude      *ClaudeSpec
 	Description string
 	Persona     *Persona
 	Repos       []string
@@ -145,6 +155,21 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 		}
 		if len(inf) > 0 {
 			cfg["inference"] = inf
+		}
+	}
+	if r.Claude != nil {
+		claude := map[string]interface{}{}
+		if r.Claude.Auth != "" {
+			claude["auth"] = r.Claude.Auth
+		}
+		if r.Claude.OAuthToken != "" {
+			claude["oauth_token"] = r.Claude.OAuthToken
+		}
+		if r.Claude.APIKey != "" {
+			claude["api_key"] = r.Claude.APIKey
+		}
+		if len(claude) > 0 {
+			cfg["claude"] = claude
 		}
 	}
 	if len(r.Repos) > 0 {
@@ -281,6 +306,10 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 					inf := *d.Inference
 					r.Inference = &inf
 				}
+				if d.Claude != nil {
+					c := *d.Claude
+					r.Claude = &c
+				}
 				r.Repos = d.Repos
 				r.Authorized = d.Authorized
 				r.Tapegun = d.Tapegun
@@ -311,6 +340,9 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 			}
 			if a.Inference != nil {
 				r.Inference = a.Inference
+			}
+			if a.Claude != nil {
+				r.Claude = a.Claude
 			}
 			if a.Repos != nil {
 				r.Repos = a.Repos
