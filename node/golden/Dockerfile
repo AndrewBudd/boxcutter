@@ -37,9 +37,28 @@ RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
 RUN echo "boxcutter-vm" > /etc/hostname.boxcutter && \
     printf '127.0.0.1 localhost\n127.0.1.1 boxcutter-vm\n' > /etc/hosts.boxcutter
 
-# --- fstab ---
-RUN printf '/dev/vda / ext4 defaults 0 1\n/dev/vdb /opt/boxcutter/tools squashfs ro,nofail 0 0\n' > /etc/fstab && \
+# --- fstab (root only — tools.img mounted by dedicated service) ---
+RUN echo "/dev/vda / ext4 defaults 0 1" > /etc/fstab && \
     mkdir -p /opt/boxcutter/tools
+
+# --- tools.img mount service (mounts squashfs before tapegun) ---
+RUN printf '[Unit]\n\
+Description=Mount boxcutter tools squashfs\n\
+DefaultDependencies=no\n\
+After=local-fs.target\n\
+Before=boxcutter-tapegun.service\n\
+ConditionPathExists=/dev/vdb\n\
+\n\
+[Service]\n\
+Type=oneshot\n\
+RemainAfterExit=yes\n\
+ExecStart=/bin/mount -t squashfs -o ro /dev/vdb /opt/boxcutter/tools\n\
+ExecStop=/bin/umount /opt/boxcutter/tools\n\
+\n\
+[Install]\n\
+WantedBy=local-fs.target\n' > /etc/systemd/system/boxcutter-tools-mount.service && \
+    ln -sf /etc/systemd/system/boxcutter-tools-mount.service \
+      /etc/systemd/system/local-fs.target.wants/boxcutter-tools-mount.service
 
 # --- Auto-grow root filesystem to fill disk on first boot ---
 COPY config/boxcutter-growfs.service /etc/systemd/system/boxcutter-growfs.service
@@ -165,23 +184,15 @@ RUN chmod 755 /usr/local/bin/boxcutter-fetch-metadata && \
     ln -sf /etc/systemd/system/boxcutter-metadata.service \
       /etc/systemd/system/multi-user.target.wants/boxcutter-metadata.service
 
-# --- Boxcutter tools mount (squashfs on /dev/vdb → /opt/boxcutter/tools) ---
-# Explicit .mount + .automount units (fstab x-systemd.automount doesn't trigger on QEMU VMs).
-# The .automount always sets up the autofs trigger; the .mount uses After=dev-vdb.device
-# for ordering only (no hard Requires — device units can't be "started" by systemd).
-# tools.img contains: boxcutter CLI, boxcutter-tapegun daemon, systemd units
-COPY config/opt-boxcutter-tools.mount /etc/systemd/system/opt-boxcutter-tools.mount
-COPY config/opt-boxcutter-tools.automount /etc/systemd/system/opt-boxcutter-tools.automount
+# --- Boxcutter tools (symlinks to tools.img, mounted by boxcutter-tools-mount.service) ---
 RUN mkdir -p /opt/boxcutter/tools && \
-    mkdir -p /etc/systemd/system/local-fs.target.wants && \
-    ln -sf /etc/systemd/system/opt-boxcutter-tools.automount \
-      /etc/systemd/system/local-fs.target.wants/opt-boxcutter-tools.automount && \
     ln -sf /opt/boxcutter/tools/bin/boxcutter /usr/local/bin/boxcutter && \
     ln -sf /opt/boxcutter/tools/bin/boxcutter-tapegun /usr/local/bin/boxcutter-tapegun && \
     printf '[Unit]\n\
 Description=Tapegun agent communication daemon\n\
-After=network-online.target local-fs.target\n\
+After=network-online.target boxcutter-tools-mount.service\n\
 Wants=network-online.target\n\
+Requires=boxcutter-tools-mount.service\n\
 \n\
 [Service]\n\
 Type=simple\n\

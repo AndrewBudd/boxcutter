@@ -216,8 +216,13 @@ func (m *Manager) prepareRootfsForQEMU(st *VMState) {
 		}
 	}
 	defer func() {
+		// Sync filesystem before unmount to ensure all writes (including
+		// writeAgentConfig) are flushed to the QCOW2 backing store.
+		exec.Command("sync").Run()
 		exec.Command("umount", mountPoint).Run()
 		if nbdDev != "" {
+			// Give the kernel a moment to release the block device
+			time.Sleep(200 * time.Millisecond)
 			exec.Command("qemu-nbd", "-d", nbdDev).Run()
 		}
 		os.Remove(mountPoint)
