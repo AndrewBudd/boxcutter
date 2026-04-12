@@ -90,6 +90,13 @@ type InferenceConfig struct {
 	APIKey   string `json:"api_key,omitempty"`  // API key for cloud providers (e.g. OpenRouter)
 }
 
+// ClaudeConfig configures Claude Code authentication for VMs (#175).
+type ClaudeConfig struct {
+	Auth       string `json:"auth,omitempty"`        // "oauth-token", "api-key", "api-key-helper"
+	OAuthToken string `json:"oauth_token,omitempty"` // OAuth refresh token from `claude setup-token`
+	APIKey     string `json:"api_key,omitempty"`     // Anthropic API key
+}
+
 // AgentConfig is the boot agent specification for a VM, derived from the
 // declarative team YAML. It tells the in-VM agent what persona to assume,
 // which repos to clone, what tapegun sequences to run, and access policy.
@@ -106,6 +113,7 @@ type AgentConfig struct {
 	Labels           map[string]string `json:"labels,omitempty"`             // labels for the VM
 	TeamPersonaFiles []string          `json:"team_persona_files,omitempty"` // team-level persona file paths
 	Inference        *InferenceConfig  `json:"inference,omitempty"`          // inference provider config
+	Claude           *ClaudeConfig     `json:"claude,omitempty"`             // Claude Code auth config (#175)
 }
 
 // CheckpointData holds a session checkpoint for conversation persistence.

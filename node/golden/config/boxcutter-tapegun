@@ -353,6 +353,14 @@ setup_workspace() {
     # team apply and should launch Claude Code automatically.
     AUTOSTART_CLAUDE=true
 
+    # Parse Claude auth config from agent_config before provisioning credentials
+    local claude_auth_meta=$(echo "$agent_config" | jq -r '.claude.auth // empty' 2>/dev/null)
+    local claude_oauth_meta=$(echo "$agent_config" | jq -r '.claude.oauth_token // empty' 2>/dev/null)
+    local claude_apikey_meta=$(echo "$agent_config" | jq -r '.claude.api_key // empty' 2>/dev/null)
+    [ -n "$claude_auth_meta" ] && CLAUDE_AUTH="$claude_auth_meta"
+    [ -n "$claude_oauth_meta" ] && CLAUDE_OAUTH_TOKEN="$claude_oauth_meta"
+    [ -n "$claude_apikey_meta" ] && CLAUDE_API_KEY="$claude_apikey_meta"
+
     # Provision Claude credentials before anything else — must be in place
     # before Claude Code launches so it doesn't prompt for OAuth.
     setup_claude_credentials
@@ -368,12 +376,17 @@ setup_workspace() {
     team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
     tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
 
-    # Tool selection: which coding agent to launch
-    # Prefer metadata agent_config, fall back to config file values (set earlier via source)
+    # Tool and inference selection from agent_config
     local agent_tool_meta=$(echo "$agent_config" | jq -r '.tool // empty' 2>/dev/null)
     local agent_model_meta=$(echo "$agent_config" | jq -r '.inference.model // empty' 2>/dev/null)
+    local inf_provider_meta=$(echo "$agent_config" | jq -r '.inference.provider // empty' 2>/dev/null)
+    local inf_endpoint_meta=$(echo "$agent_config" | jq -r '.inference.endpoint // empty' 2>/dev/null)
+    local inf_apikey_meta=$(echo "$agent_config" | jq -r '.inference.api_key // empty' 2>/dev/null)
     [ -n "$agent_tool_meta" ] && AGENT_TOOL="$agent_tool_meta"
     [ -n "$agent_model_meta" ] && AGENT_MODEL="$agent_model_meta"
+    [ -n "$inf_provider_meta" ] && INFERENCE_PROVIDER="$inf_provider_meta"
+    [ -n "$inf_endpoint_meta" ] && INFERENCE_ENDPOINT="$inf_endpoint_meta"
+    [ -n "$inf_apikey_meta" ] && INFERENCE_API_KEY="$inf_apikey_meta"
 
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
