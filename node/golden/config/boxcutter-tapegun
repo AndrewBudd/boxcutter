@@ -83,6 +83,87 @@ fi
 
 log() { echo "tapegun: $*"; }
 
+# Launch the configured agent tool in the current tmux session.
+# Assumes tmux session 'main' exists and is cd'd to the working directory.
+launch_agent_tool() {
+    case "$AGENT_TOOL" in
+      claude-code)
+        CLAUDE_CMD="claude"
+        [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
+        if [ -n "$RESTORED_SESSION_ID" ]; then
+            CLAUDE_CMD="$CLAUDE_CMD --continue"
+        elif [ "$CLAUDE_RESUME" = "true" ]; then
+            CLAUDE_CMD="$CLAUDE_CMD --resume"
+        fi
+        $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
+        ;;
+      opencode)
+        local provider_id="${INFERENCE_PROVIDER:-local}"
+        local provider_name="Inference"
+        local base_url="${INFERENCE_ENDPOINT}"
+
+        case "$provider_id" in
+          openrouter)
+            provider_name="OpenRouter"
+            base_url="${INFERENCE_ENDPOINT:-https://openrouter.ai/api/v1}"
+            ;;
+          local|*)
+            provider_name="Local Ollama"
+            base_url="${INFERENCE_ENDPOINT:-http://192.168.50.1:11430/v1}"
+            ;;
+        esac
+
+        local workdir="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
+        local oc_config="${workdir}/opencode.json"
+        cat > "$oc_config" <<OCJSON
+{
+  "provider": {
+    "${provider_id}": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "${provider_name}",
+      "options": {
+        "baseURL": "${base_url}",
+        "apiKey": "${INFERENCE_API_KEY}"
+      },
+      "models": {
+        "${AGENT_MODEL}": {
+          "name": "${AGENT_MODEL}"
+        }
+      }
+    }
+  },
+  "model": "${provider_id}/${AGENT_MODEL}",
+  "permission": {
+    "*": "allow",
+    "doom_loop": "allow",
+    "external_directory": "allow",
+    "read": { "*": "allow", "*.env": "allow", "*.env.*": "allow" },
+    "write": { "*": "allow" },
+    "bash": { "*": "allow" }
+  }
+}
+OCJSON
+        chown 1000:1000 "$oc_config" 2>/dev/null || true
+
+        $TMUX_CMD send-keys -t main "export OPENAI_BASE_URL='${base_url}'" Enter
+        $TMUX_CMD send-keys -t main "export OPENAI_API_KEY='${INFERENCE_API_KEY}'" Enter
+        sleep 0.5
+        $TMUX_CMD send-keys -t main "OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD} opencode serve --port ${OPENCODE_SERVER_PORT} --hostname 0.0.0.0" Enter
+        ;;
+      aider)
+        $TMUX_CMD send-keys -t main "export OPENAI_API_BASE='http://169.254.169.254/v1'" Enter
+        $TMUX_CMD send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
+        sleep 0.5
+        $TMUX_CMD send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
+        ;;
+      *)
+        log "WARNING: unknown agent tool '$AGENT_TOOL', falling back to claude-code"
+        AGENT_TOOL="claude-code"
+        $TMUX_CMD send-keys -t main "claude ${CLAUDE_FLAGS}" Enter
+        ;;
+    esac
+}
+
 setup_git_credentials() {
     local resp token
     resp=$(curl -sf --max-time 5 "${METADATA}/token/github" 2>/dev/null || echo "")
@@ -99,6 +180,11 @@ setup_git_credentials() {
 }
 
 setup_claude_credentials() {
+    # Skip entirely if not using claude-code and no explicit auth configured
+    if [ "${AGENT_TOOL:-claude-code}" != "claude-code" ] && [ -z "${CLAUDE_AUTH:-}" ]; then
+        return 0
+    fi
+
     local cred_file="${CLAUDE_DIR}/.credentials.json"
     mkdir -p "$CLAUDE_DIR"
 
@@ -527,112 +613,20 @@ EOSETTINGS
             sleep 0.5
         fi
 
-        case "$AGENT_TOOL" in
-          claude-code)
-            # --- Claude Code launch (existing behavior, unchanged) ---
-            # Install tapegun-guest plugin so inbox, stop notifications, and
-            # status reporting hooks are active in the Claude Code session.
+        # Install tapegun-guest plugin for Claude Code
+        if [ "$AGENT_TOOL" = "claude-code" ]; then
             PLUGIN_DIR="$HOME/.claude/plugins/tapegun-guest"
             if [ -d "$PLUGIN_DIR" ]; then
                 tmux send-keys -t main "claude plugin install $PLUGIN_DIR 2>/dev/null" Enter
                 sleep 2
-                echo "tapegun: installed tapegun-guest plugin"
+                log "installed tapegun-guest plugin"
             else
-                echo "tapegun: WARNING: plugin not found at $PLUGIN_DIR"
+                log "WARNING: plugin not found at $PLUGIN_DIR"
             fi
+        fi
 
-            # Start Claude Code
-            CLAUDE_CMD="claude"
-            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-            if [ -n "$RESTORED_SESSION_ID" ]; then
-                CLAUDE_CMD="$CLAUDE_CMD --continue"
-                echo "tapegun: resuming session $RESTORED_SESSION_ID"
-            elif [ "$CLAUDE_RESUME" = "true" ]; then
-                CLAUDE_CMD="$CLAUDE_CMD --resume"
-            fi
-            tmux send-keys -t main "$CLAUDE_CMD" Enter
-            echo "tapegun: Claude Code started (flags: $CLAUDE_FLAGS, resume: $CLAUDE_RESUME, restored: ${RESTORED_SESSION_ID:-none})"
-            ;;
-
-          opencode)
-            # --- OpenCode launch (persistent server mode) ---
-            WORKDIR="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
-            provider_id="${INFERENCE_PROVIDER:-local}"
-            provider_name="Inference"
-            base_url="${INFERENCE_ENDPOINT}"
-
-            case "$provider_id" in
-              openrouter)
-                provider_name="OpenRouter"
-                base_url="${INFERENCE_ENDPOINT:-https://openrouter.ai/api/v1}"
-                ;;
-              local|*)
-                provider_name="Local Ollama"
-                base_url="${INFERENCE_ENDPOINT:-http://192.168.50.1:11430/v1}"
-                ;;
-            esac
-
-            # Write opencode.json config
-            OPENCODE_CONFIG="${WORKDIR}/opencode.json"
-            cat > "$OPENCODE_CONFIG" <<OCJSON
-{
-  "provider": {
-    "${provider_id}": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "${provider_name}",
-      "options": {
-        "baseURL": "${base_url}",
-        "apiKey": "${INFERENCE_API_KEY}"
-      },
-      "models": {
-        "${AGENT_MODEL}": {
-          "name": "${AGENT_MODEL}"
-        }
-      }
-    }
-  },
-  "model": "${provider_id}/${AGENT_MODEL}",
-  "permission": {
-    "*": "allow",
-    "doom_loop": "allow",
-    "external_directory": "allow",
-    "read": { "*": "allow", "*.env": "allow", "*.env.*": "allow" },
-    "write": { "*": "allow" },
-    "bash": { "*": "allow" }
-  }
-}
-OCJSON
-            chown 1000:1000 "$OPENCODE_CONFIG" 2>/dev/null || true
-
-            # Set environment variables for OpenCode
-            tmux send-keys -t main "export OPENAI_BASE_URL='${base_url}'" Enter
-            tmux send-keys -t main "export OPENAI_API_KEY='${INFERENCE_API_KEY}'" Enter
-            sleep 0.5
-
-            # Launch opencode serve as persistent server
-            tmux send-keys -t main "OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD} opencode serve --port ${OPENCODE_SERVER_PORT} --hostname 0.0.0.0" Enter
-            echo "tapegun: OpenCode server started on port ${OPENCODE_SERVER_PORT} (provider: ${provider_id}, model: ${AGENT_MODEL})"
-            ;;
-
-          aider)
-            # --- Aider launch (local inference via Ollama) ---
-            tmux send-keys -t main "export OPENAI_API_BASE='http://169.254.169.254/v1'" Enter
-            tmux send-keys -t main "export OPENAI_API_KEY='dummy'" Enter
-            sleep 0.5
-
-            tmux send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
-            echo "tapegun: Aider started (model: ${AGENT_MODEL})"
-            ;;
-
-          *)
-            echo "tapegun: WARNING: unknown agent tool '$AGENT_TOOL', falling back to claude-code"
-            AGENT_TOOL="claude-code"
-            CLAUDE_CMD="claude"
-            [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-            tmux send-keys -t main "$CLAUDE_CMD" Enter
-            echo "tapegun: Claude Code started (fallback)"
-            ;;
-        esac
+        launch_agent_tool
+        log "$AGENT_TOOL started (tool: $AGENT_TOOL, model: ${AGENT_MODEL:-default})"
     else
         echo "tapegun: tmux session 'main' already exists, skipping autostart"
     fi
@@ -1039,69 +1033,30 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
     fi
 
     # --- Crash detection & auto-restart ---
-    # If autostart is enabled, ensure tmux session and agent tool stay alive.
     if [ "$AUTOSTART_CLAUDE" = "true" ]; then
-        # Determine the process name to watch and restart command based on tool
         case "$AGENT_TOOL" in
-          opencode)
-            AGENT_PROC_PATTERN='opencode'
-            ;;
-          aider)
-            AGENT_PROC_PATTERN='aider'
-            ;;
-          *)
-            AGENT_PROC_PATTERN='claude'
-            ;;
+          opencode) AGENT_PROC_PATTERN='opencode' ;;
+          aider)    AGENT_PROC_PATTERN='aider' ;;
+          *)        AGENT_PROC_PATTERN='claude' ;;
         esac
 
         if ! $TMUX_CMD has-session -t main 2>/dev/null; then
-            # Session gone entirely — recreate and relaunch
-            echo "tapegun: tmux session 'main' gone, restarting $AGENT_TOOL"
+            log "tmux session 'main' gone, restarting $AGENT_TOOL"
             $TMUX_CMD new-session -d -s main
             sleep 1
             $TMUX_CMD send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
+            $TMUX_CMD send-keys -t main '[ -f ~/.claude_env ] && source ~/.claude_env' Enter
             sleep 0.5
             if [ -n "$CLAUDE_WORKING_DIR" ] && [ -d "$CLAUDE_WORKING_DIR" ]; then
                 $TMUX_CMD send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
                 sleep 0.5
             fi
-            case "$AGENT_TOOL" in
-              claude-code)
-                CLAUDE_CMD="claude"
-                [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-                [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
-                $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
-                ;;
-              opencode)
-                $TMUX_CMD send-keys -t main "export OPENAI_BASE_URL='http://169.254.169.254/v1' OPENAI_API_KEY='dummy'" Enter
-                sleep 0.5
-                $TMUX_CMD send-keys -t main "opencode" Enter
-                ;;
-              aider)
-                $TMUX_CMD send-keys -t main "export OPENAI_API_BASE='http://169.254.169.254/v1' OPENAI_API_KEY='dummy'" Enter
-                sleep 0.5
-                $TMUX_CMD send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
-                ;;
-            esac
-            echo "tapegun: $AGENT_TOOL restarted (session recreated)"
+            launch_agent_tool
+            log "$AGENT_TOOL restarted (session recreated)"
         elif ! pgrep -f "$AGENT_PROC_PATTERN" -u "$(id -u)" >/dev/null 2>&1; then
-            # Session exists but agent process died — relaunch in existing session
-            echo "tapegun: $AGENT_TOOL process not found, restarting"
-            case "$AGENT_TOOL" in
-              claude-code)
-                CLAUDE_CMD="claude"
-                [ -n "$CLAUDE_FLAGS" ] && CLAUDE_CMD="$CLAUDE_CMD $CLAUDE_FLAGS"
-                [ "$CLAUDE_RESUME" = "true" ] && CLAUDE_CMD="$CLAUDE_CMD --resume"
-                $TMUX_CMD send-keys -t main "$CLAUDE_CMD" Enter
-                ;;
-              opencode)
-                $TMUX_CMD send-keys -t main "opencode" Enter
-                ;;
-              aider)
-                $TMUX_CMD send-keys -t main "aider --model openai/${AGENT_MODEL} --yes" Enter
-                ;;
-            esac
-            echo "tapegun: $AGENT_TOOL restarted (in existing session)"
+            log "$AGENT_TOOL process not found, restarting"
+            launch_agent_tool
+            log "$AGENT_TOOL restarted (in existing session)"
         fi
     fi
 

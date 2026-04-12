@@ -30,11 +30,11 @@ else
 fi
 
 echo ""
-echo "=== Test 2: PostToolUse checks inbox after Bash ==="
+echo "=== Test 2: PostToolUse checks queue after Bash ==="
 MATCHER=$(jq -r '.hooks.PostToolUse[0].matcher' "$HOOKS_FILE")
 assert_eq "PostToolUse matcher is Bash" "Bash" "$MATCHER"
 CMD=$(jq -r '.hooks.PostToolUse[0].hooks[0].command' "$HOOKS_FILE")
-assert_eq "PostToolUse runs check-inbox" 'true' "$(echo "$CMD" | grep -q 'check-inbox' && echo true || echo false)"
+assert_eq "PostToolUse runs check-queue" 'true' "$(echo "$CMD" | grep -q 'check-queue' && echo true || echo false)"
 
 echo ""
 echo "=== Test 3: UserPromptSubmit reports status ==="
@@ -42,9 +42,9 @@ STATUS_CMD=$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].command' "$HOOKS_FILE")
 assert_eq "UserPromptSubmit reports working" 'true' "$(echo "$STATUS_CMD" | grep -q 'report-status.sh working' && echo true || echo false)"
 
 echo ""
-echo "=== Test 4: UserPromptSubmit also checks inbox ==="
-INBOX_CMD=$(jq -r '.hooks.UserPromptSubmit[0].hooks[1].command' "$HOOKS_FILE")
-assert_eq "UserPromptSubmit checks inbox" 'true' "$(echo "$INBOX_CMD" | grep -q 'check-inbox.sh' && echo true || echo false)"
+echo "=== Test 4: UserPromptSubmit also checks queue ==="
+QUEUE_CMD=$(jq -r '.hooks.UserPromptSubmit[0].hooks[1].command' "$HOOKS_FILE")
+assert_eq "UserPromptSubmit checks queue" 'true' "$(echo "$QUEUE_CMD" | grep -q 'check-queue.sh' && echo true || echo false)"
 PROMPT_HOOK_COUNT=$(jq '.hooks.UserPromptSubmit[0].hooks | length' "$HOOKS_FILE")
 assert_eq "UserPromptSubmit has 2 hooks" "2" "$PROMPT_HOOK_COUNT"
 
@@ -58,36 +58,28 @@ SUB_CMD=$(jq -r '.hooks.SubagentStop[0].hooks[0].command' "$HOOKS_FILE")
 assert_eq "SubagentStop reports idle" 'true' "$(echo "$SUB_CMD" | grep -q 'report-status.sh idle' && echo true || echo false)"
 
 echo ""
-echo "=== Test 6: All 5 hook events are configured ==="
+echo "=== Test 6: All 6 hook events are configured ==="
 EVENTS=$(jq -r '.hooks | keys[]' "$HOOKS_FILE" | sort | tr '\n' ',')
-assert_eq "All events present" "PostToolUse,Stop,StopFailure,SubagentStop,UserPromptSubmit," "$EVENTS"
+assert_eq "All events present" "Notification,PostToolUse,Stop,StopFailure,SubagentStop,UserPromptSubmit," "$EVENTS"
 
 echo ""
-echo "=== Test 7: check-inbox.sh is executable and exists ==="
-INBOX_SCRIPT="${SCRIPT_DIR}/check-inbox.sh"
-if [ -f "$INBOX_SCRIPT" ]; then
-    echo "  PASS: check-inbox.sh exists"
-    PASS=$((PASS + 1))
-else
-    echo "  FAIL: check-inbox.sh not found"
-    FAIL=$((FAIL + 1))
-fi
+echo "=== Test 7: Notification hook checks queue on idle ==="
+NOTIF_MATCHER=$(jq -r '.hooks.Notification[0].matcher' "$HOOKS_FILE")
+assert_eq "Notification matcher is idle_prompt" "idle_prompt" "$NOTIF_MATCHER"
+NOTIF_CMD=$(jq -r '.hooks.Notification[0].hooks[0].command' "$HOOKS_FILE")
+assert_eq "Notification runs check-queue" 'true' "$(echo "$NOTIF_CMD" | grep -q 'check-queue' && echo true || echo false)"
 
 echo ""
-echo "=== Test 8: check-inbox.sh handles missing inbox gracefully ==="
-# Run check-inbox with a nonexistent inbox — should exit 0
-INBOX="/nonexistent/path" bash -c '
-    INBOX="/nonexistent/path"
-    [ -f "$INBOX" ] || exit 0
-    exit 1
-' 2>/dev/null
-if [ $? -eq 0 ]; then
-    echo "  PASS: exits cleanly when inbox missing"
-    PASS=$((PASS + 1))
-else
-    echo "  FAIL: should exit 0 when inbox missing"
-    FAIL=$((FAIL + 1))
-fi
+echo "=== Test 8: All referenced scripts exist ==="
+for script in check-queue.sh report-status.sh; do
+    if [ -f "${SCRIPT_DIR}/${script}" ]; then
+        echo "  PASS: ${script} exists"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: ${script} not found"
+        FAIL=$((FAIL + 1))
+    fi
+done
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
