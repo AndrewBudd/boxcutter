@@ -87,6 +87,7 @@ type VMConfigInfo struct {
 type InferenceConfig struct {
 	Provider string `json:"provider,omitempty"` // "local", "openrouter", or "anthropic"
 	Model    string `json:"model,omitempty"`    // e.g. "qwen3-coder:30b"
+	Endpoint string `json:"endpoint,omitempty"` // Inference endpoint URL
 	APIKey   string `json:"api_key,omitempty"`  // API key for cloud providers (e.g. OpenRouter)
 }
 
@@ -104,6 +105,7 @@ type AgentConfig struct {
 	Team             string            `json:"team,omitempty"`               // team name from team YAML
 	Agent            string            `json:"agent,omitempty"`              // agent name within the team
 	ReplicaIndex     int               `json:"replica_index,omitempty"`      // replica index for scaled agents
+	Tool             string            `json:"tool,omitempty"`               // "claude-code", "opencode", "aider"
 	Persona          *PersonaConfig    `json:"persona,omitempty"`            // persona configuration
 	Repos            []string          `json:"repos,omitempty"`              // repos to clone on boot
 	Tapegun          []string          `json:"tapegun,omitempty"`            // tapegun sequences to run on boot
