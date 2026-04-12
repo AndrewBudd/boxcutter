@@ -31,6 +31,7 @@ type InferenceSpec struct {
 	Provider string `yaml:"provider,omitempty"` // "local", "openrouter"
 	Model    string `yaml:"model,omitempty"`    // Ollama model tag or OpenRouter model ID
 	Endpoint string `yaml:"endpoint,omitempty"` // Inference endpoint URL
+	APIKey   string `yaml:"api_key,omitempty"`  // API key (for cloud providers)
 }
 
 // AgentDefaults holds shared defaults inherited by all agents.
@@ -138,6 +139,9 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 		}
 		if r.Inference.Endpoint != "" {
 			inf["endpoint"] = r.Inference.Endpoint
+		}
+		if r.Inference.APIKey != "" {
+			inf["api_key"] = r.Inference.APIKey
 		}
 		if len(inf) > 0 {
 			cfg["inference"] = inf

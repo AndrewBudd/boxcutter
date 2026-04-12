@@ -8,9 +8,10 @@ spec:
     mode: normal
     tool: opencode
     inference:
-      provider: local
-      model: qwen3-coder:30b
-      fallback: anthropic
+      provider: openrouter
+      model: qwen/qwen3-coder
+      endpoint: https://openrouter.ai/api/v1
+      api_key: "${OPENROUTER_API_KEY}"
     repos:
       - AndrewBudd/boxcutter
   agents:
@@ -29,8 +30,3 @@ spec:
       ram: 4G
       vcpu: 2
       description: "Product manager - specs, design, prioritization"
-    - name: qa
-      replicas: 1
-      ram: 8G
-      vcpu: 4
-      description: "QA - e2e testing with nested dev clusters"

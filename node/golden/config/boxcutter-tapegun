@@ -509,48 +509,63 @@ EOSETTINGS
             ;;
 
           opencode)
-            # --- OpenCode launch (local inference via Ollama) ---
+            # --- OpenCode launch (persistent server mode) ---
             WORKDIR="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
+            local provider_id="${INFERENCE_PROVIDER:-local}"
+            local provider_name="Inference"
+            local base_url="${INFERENCE_ENDPOINT}"
 
-            # Write opencode.json config in the project directory
+            case "$provider_id" in
+              openrouter)
+                provider_name="OpenRouter"
+                base_url="${INFERENCE_ENDPOINT:-https://openrouter.ai/api/v1}"
+                ;;
+              local|*)
+                provider_name="Local Ollama"
+                base_url="${INFERENCE_ENDPOINT:-http://192.168.50.1:11430/v1}"
+                ;;
+            esac
+
+            # Write opencode.json config
             OPENCODE_CONFIG="${WORKDIR}/opencode.json"
             cat > "$OPENCODE_CONFIG" <<OCJSON
 {
   "provider": {
-    "local": {
+    "${provider_id}": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Local Ollama",
+      "name": "${provider_name}",
       "options": {
-        "baseURL": "$INFERENCE_ENDPOINT",
-        "apiKey": "$INFERENCE_API_KEY"
+        "baseURL": "${base_url}",
+        "apiKey": "${INFERENCE_API_KEY}"
       },
       "models": {
         "${AGENT_MODEL}": {
-          "name": "${AGENT_MODEL}",
-          "tools": true
+          "name": "${AGENT_MODEL}"
         }
       }
     }
   },
-  "model": "local/${AGENT_MODEL}",
+  "model": "${provider_id}/${AGENT_MODEL}",
   "permission": {
     "*": "allow",
     "doom_loop": "allow",
     "external_directory": "allow",
-    "read": { "*": "allow", "*.env": "allow", "*.env.*": "allow" }
+    "read": { "*": "allow", "*.env": "allow", "*.env.*": "allow" },
+    "write": { "*": "allow" },
+    "bash": { "*": "allow" }
   }
 }
 OCJSON
             chown 1000:1000 "$OPENCODE_CONFIG" 2>/dev/null || true
 
             # Set environment variables for OpenCode
-            tmux send-keys -t main "export OPENAI_BASE_URL='$INFERENCE_ENDPOINT'" Enter
-            tmux send-keys -t main "export OPENAI_API_KEY='$INFERENCE_API_KEY'" Enter
+            tmux send-keys -t main "export OPENAI_BASE_URL='${base_url}'" Enter
+            tmux send-keys -t main "export OPENAI_API_KEY='${INFERENCE_API_KEY}'" Enter
             sleep 0.5
 
             # Launch opencode serve as persistent server
             tmux send-keys -t main "OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD} opencode serve --port ${OPENCODE_SERVER_PORT} --hostname 0.0.0.0" Enter
-            echo "tapegun: OpenCode server started on port ${OPENCODE_SERVER_PORT} (model: ${AGENT_MODEL})"
+            echo "tapegun: OpenCode server started on port ${OPENCODE_SERVER_PORT} (provider: ${provider_id}, model: ${AGENT_MODEL})"
             ;;
 
           aider)
