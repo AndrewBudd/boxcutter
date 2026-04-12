@@ -178,7 +178,21 @@ RUN mkdir -p /opt/boxcutter/tools && \
       /etc/systemd/system/local-fs.target.wants/opt-boxcutter-tools.automount && \
     ln -sf /opt/boxcutter/tools/bin/boxcutter /usr/local/bin/boxcutter && \
     ln -sf /opt/boxcutter/tools/bin/boxcutter-tapegun /usr/local/bin/boxcutter-tapegun && \
-    ln -sf /opt/boxcutter/tools/etc/systemd/boxcutter-tapegun.service /etc/systemd/system/boxcutter-tapegun.service && \
+    printf '[Unit]\n\
+Description=Tapegun agent communication daemon\n\
+After=network-online.target local-fs.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+User=dev\n\
+Group=dev\n\
+ExecStart=/opt/boxcutter/tools/bin/boxcutter-tapegun\n\
+Restart=always\n\
+RestartSec=5\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n' > /etc/systemd/system/boxcutter-tapegun.service && \
     ln -sf /etc/systemd/system/boxcutter-tapegun.service \
       /etc/systemd/system/multi-user.target.wants/boxcutter-tapegun.service
 
