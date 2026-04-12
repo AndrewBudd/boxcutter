@@ -36,6 +36,17 @@ host/host
 # Bootstrap bundle (secrets)
 .boxcutter/
 
+# Build artifacts
+.build/
+tools/boxcutter
+
+# Compiled binaries (not caught by module-specific rules)
+host/cmd/dashboard/dashboard
+
+# Kernel build artifacts
+kernel/vmlinux.*
+kernel/linux-*/
+
 # OS
 .DS_Store
 .release/
