@@ -57,6 +57,7 @@ ExecStop=/bin/umount /opt/boxcutter/tools\n\
 \n\
 [Install]\n\
 WantedBy=local-fs.target\n' > /etc/systemd/system/boxcutter-tools-mount.service && \
+    mkdir -p /etc/systemd/system/local-fs.target.wants && \
     ln -sf /etc/systemd/system/boxcutter-tools-mount.service \
       /etc/systemd/system/local-fs.target.wants/boxcutter-tools-mount.service
 
