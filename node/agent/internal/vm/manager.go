@@ -3911,3 +3911,69 @@ func (m *Manager) AllActivity() ([]vmid.VMActivitySummary, error) {
 	}
 	return m.vmid.GetAllActivity()
 }
+
+// StartHealthMonitor starts a background goroutine that periodically checks
+// if vmid has restarted and re-registers all running VMs when that happens.
+func (m *Manager) StartHealthMonitor() {
+	if m.vmid == nil {
+		return
+	}
+	
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			// Check if vmid is healthy
+			if !m.vmid.Healthy() {
+				log.Printf("vmid health check: vmid is not responding")
+				continue
+			}
+			
+			// Check if vmid has restarted by getting the list of registered VMs
+			activity, err := m.vmid.GetAllActivity()
+			if err != nil {
+				log.Printf("vmid health check: failed to get activity: %v", err)
+				continue
+			}
+			
+			// If the activity list is empty but we have running VMs,
+			// vmid has likely restarted and lost its state
+			if len(activity) == 0 {
+				vms, err := ListVMs()
+				if err != nil {
+					log.Printf("vmid health check: failed to list VMs: %v", err)
+					continue
+				}
+				
+				runningCount := 0
+				for _, st := range vms {
+					if IsRunning(VMDir(st.Name)) {
+						runningCount++
+					}
+				}
+				
+				if runningCount > 0 {
+					log.Printf("vmid health check: detected vmid restart (0 registered VMs, %d running VMs) - re-registering all VMs", runningCount)
+					m.reRegisterAllVMs()
+				}
+			}
+		}
+	}()
+}
+
+// reRegisterAllVMs re-registers all running VMs with vmid.
+func (m *Manager) reRegisterAllVMs() {
+	vms, err := ListVMs()
+	if err != nil {
+		log.Printf("re-register VMs: failed to list VMs: %v", err)
+		return
+	}
+	
+	for _, st := range vms {
+		if IsRunning(VMDir(st.Name)) {
+			log.Printf("re-registering VM %s with vmid", st.Name)
+			m.registerWithVMID(st)
+		}
+	}
+}

@@ -84,6 +84,9 @@ func main() {
 	// Restart VMs that were running before node restarted
 	go mgr.RestartAll()
 
+	// Start vmid health monitoring
+	mgr.StartHealthMonitor()
+
 	// Golden image manager — handles OCI pulls and version switching
 	goldenMgr := golden.NewManager(golden.Config{
 		GoldenDir:     filepath.Dir(cfg.Storage.GoldenLocalPath),
