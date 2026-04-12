@@ -472,6 +472,7 @@ type vmCreateRequest struct {
 	NodeID           string            `json:"node_id,omitempty"`
 	TailscaleAuthkey string            `json:"tailscale_authkey,omitempty"`
 	Labels           map[string]string `json:"labels,omitempty"`
+	AgentConfig      json.RawMessage   `json:"agent_config,omitempty"`
 }
 
 // nodeToScheduler converts a state.Node to the db.Node type used by the scheduler.
@@ -618,6 +619,7 @@ func (h *Handler) handleVMCreate(w http.ResponseWriter, r *http.Request) {
 			Mode:             req.Mode,
 			AuthorizedKeys:   sshKeys,
 			TailscaleAuthkey: req.TailscaleAuthkey,
+			AgentConfig:      req.AgentConfig,
 		}, func(evt *node.ProgressEvent) {
 			line, _ := json.Marshal(evt)
 			fmt.Fprintf(w, "%s\n", line)

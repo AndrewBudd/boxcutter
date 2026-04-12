@@ -36,7 +36,8 @@ type CreateRequest struct {
 	CloneURLs        []string `json:"clone_urls,omitempty"`
 	Mode             string   `json:"mode,omitempty"`
 	AuthorizedKeys   []string `json:"authorized_keys,omitempty"`
-	TailscaleAuthkey string   `json:"tailscale_authkey,omitempty"`
+	TailscaleAuthkey string          `json:"tailscale_authkey,omitempty"`
+	AgentConfig      json.RawMessage `json:"agent_config,omitempty"`
 }
 
 type CreateResponse struct {

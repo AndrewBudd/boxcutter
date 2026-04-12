@@ -393,7 +393,9 @@ WantedBy=multi-user.target
 // Maps agent_config JSON fields to tapegun config variable names.
 // Called from prepareQEMURootfs while the rootfs is mounted.
 func writeAgentConfig(mountPoint string, agentConfig json.RawMessage) {
+	log.Printf("writeAgentConfig: mountPoint=%s agentConfig=%d bytes", mountPoint, len(agentConfig))
 	if len(agentConfig) == 0 {
+		log.Printf("writeAgentConfig: empty agent config, skipping")
 		return
 	}
 
