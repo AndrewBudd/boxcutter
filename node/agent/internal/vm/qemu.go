@@ -384,7 +384,10 @@ WantedBy=multi-user.target
 		filepath.Join(wantsDir, "boxcutter-qemu-firstboot.service"))
 
 	// Write agent configuration for tapegun (uses already-mounted rootfs)
-	writeAgentConfig(mountPoint, st.AgentConfig)
+	ba := &BootAgent{MountPoint: mountPoint, AgentConfig: st.AgentConfig}
+	if err := ba.Setup(); err != nil {
+		log.Printf("Warning: boot agent setup failed: %v", err)
+	}
 
 	log.Printf("QEMU VM %s: rootfs prepared (modules, iptables-legacy, docker config)", st.Name)
 }
