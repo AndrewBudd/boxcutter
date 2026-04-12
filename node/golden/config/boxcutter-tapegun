@@ -338,11 +338,12 @@ setup_workspace() {
     team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
     tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
 
-    # Tool selection: which coding agent to launch (default: claude-code)
-    agent_tool=$(echo "$agent_config" | jq -r '.tool // "claude-code"' 2>/dev/null)
-    agent_model=$(echo "$agent_config" | jq -r '.inference.model // "qwen3-coder:30b"' 2>/dev/null)
-    AGENT_TOOL="$agent_tool"
-    AGENT_MODEL="$agent_model"
+    # Tool selection: which coding agent to launch
+    # Prefer metadata agent_config, fall back to config file values (set earlier via source)
+    local agent_tool_meta=$(echo "$agent_config" | jq -r '.tool // empty' 2>/dev/null)
+    local agent_model_meta=$(echo "$agent_config" | jq -r '.inference.model // empty' 2>/dev/null)
+    [ -n "$agent_tool_meta" ] && AGENT_TOOL="$agent_tool_meta"
+    [ -n "$agent_model_meta" ] && AGENT_MODEL="$agent_model_meta"
 
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
