@@ -1,22 +1,20 @@
 #!/bin/bash
-# Report Claude Code agent status to tapegun metadata service.
+# Report Claude Code agent status to tapegun metadata service AND messaging topic.
 # Called by Stop, SubagentStop, StopFailure, and UserPromptSubmit hooks.
 #
 # Usage: report-status.sh <idle|working|error>
-#
-# Stop/SubagentStop  → "idle"    (agent finished a turn)
-# UserPromptSubmit   → "working" (user submitted a new prompt)
-# StopFailure        → "error"   (turn ended due to API error)
 
 METADATA="http://169.254.169.254"
+ORCHESTRATOR="${BOXCUTTER_ORCHESTRATOR:-http://192.168.50.2:8801}"
 STATUS_FILE="/home/dev/.tapegun/status.json"
 STATUS="${1:-idle}"
+QUEUE_NAME="${BOXCUTTER_QUEUE:-$(hostname).inbox}"
+TOPIC_NAME="${BOXCUTTER_STATUS_TOPIC:-status}"
 
 # Read hook input from stdin
 input=$(cat)
 
-# Guard against infinite loops — if stop_hook_active is true, the hook
-# itself triggered this invocation. Skip to avoid recursion.
+# Guard against infinite loops
 stop_active=$(echo "$input" | jq -r '.stop_hook_active // false' 2>/dev/null)
 if [ "$stop_active" = "true" ]; then
     exit 0
@@ -48,8 +46,15 @@ curl -sf -X POST "$METADATA/tapegun/activity" \
     -d "$(jq -n --arg status "$STATUS" \
                 --arg msg "$message" \
                 --arg ts "$TIMESTAMP" \
-                --arg sid "$session_id" \
-        '{status: $status, summary: $msg, timestamp: $ts, session_id: $sid}')" \
+        '{status: $status, summary: $msg, timestamp: $ts}')" \
+    --max-time 2 >/dev/null 2>&1 &
+
+# Publish to messaging topic (best-effort, non-blocking)
+curl -sf -X POST "${ORCHESTRATOR}/api/topics/${TOPIC_NAME}/publish" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg body "$STATUS" \
+                --arg from "$(hostname)" \
+        '{body: $body, from: $from, priority: "normal"}')" \
     --max-time 2 >/dev/null 2>&1 &
 
 exit 0
