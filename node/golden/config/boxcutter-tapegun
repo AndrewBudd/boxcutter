@@ -512,9 +512,9 @@ EOSETTINGS
           opencode)
             # --- OpenCode launch (persistent server mode) ---
             WORKDIR="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
-            local provider_id="${INFERENCE_PROVIDER:-local}"
-            local provider_name="Inference"
-            local base_url="${INFERENCE_ENDPOINT}"
+            provider_id="${INFERENCE_PROVIDER:-local}"
+            provider_name="Inference"
+            base_url="${INFERENCE_ENDPOINT}"
 
             case "$provider_id" in
               openrouter)
