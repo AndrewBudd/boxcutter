@@ -1152,6 +1152,9 @@ func (h *Handler) teamApply(args []string) int {
 			if err == nil {
 				fmt.Printf(" ok\n")
 				created++
+				// Auto-create messaging inbox queue for this agent (#190)
+				queueName := ts.Metadata.Name + "." + a.VMName + ".inbox"
+				h.post("/api/queues", map[string]string{"name": queueName})
 				break
 			}
 			lastErr = err
@@ -1176,6 +1179,13 @@ func (h *Handler) teamApply(args []string) int {
 		}
 		fmt.Printf(" ok\n")
 		destroyed++
+	}
+
+	// Auto-create team-level messaging topics (#190)
+	if created > 0 {
+		teamName := ts.Metadata.Name
+		h.post("/api/topics", map[string]string{"name": teamName + ".broadcast"})
+		h.post("/api/topics", map[string]string{"name": teamName + ".status"})
 	}
 
 	fmt.Printf("\nResult: %d created, %d updated, %d unchanged, %d destroyed\n", created, updated, len(unchanged), destroyed)
