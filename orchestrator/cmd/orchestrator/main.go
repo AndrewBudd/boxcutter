@@ -37,6 +37,11 @@ func main() {
 	}
 	defer database.Close()
 
+	// Initialize messaging tables (#190)
+	if err := database.CreateMessagingTables(); err != nil {
+		log.Printf("Warning: could not create messaging tables: %v", err)
+	}
+
 	// In-memory state store (nodes, VMs, golden images — rebuilt on startup)
 	store := state.New()
 

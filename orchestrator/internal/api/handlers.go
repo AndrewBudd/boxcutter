@@ -343,6 +343,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/tapegun/message/{name}", h.handleTapegunMessage)
 	mux.HandleFunc("POST /api/tapegun/broadcast", h.handleTapegunBroadcast)
 
+	// Messaging: topics, queues, subscriptions (#190)
+	h.registerMessagingRoutes(mux)
+
 	// Dashboard: SSE stream + alerts
 	mux.HandleFunc("GET /api/alerts", h.handleAlerts)
 	mux.HandleFunc("GET /api/alerts/stream", h.handleAlertStream)
