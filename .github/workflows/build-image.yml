@@ -106,7 +106,37 @@ jobs:
 
       - name: Build golden image
         run: |
-          cd node/golden && chmod +x docker-to-ext4.sh && ./docker-to-ext4.sh
+          # Build the Docker image
+          cd node/golden && docker build -t boxcutter-golden .
+          # Create ext4 without loop mount (works on unprivileged CI runners)
+          WORK=$(mktemp -d)
+          truncate -s 4G "$WORK/rootfs.ext4"
+          mkfs.ext4 -F -q "$WORK/rootfs.ext4"
+          # Export container filesystem and write directly using debugfs/e2cp
+          CONTAINER=$(docker create boxcutter-golden /bin/true)
+          docker export "$CONTAINER" > "$WORK/rootfs.tar"
+          docker rm "$CONTAINER"
+          # Use fuse2fs if available, otherwise e2tools
+          if command -v fuse2fs >/dev/null 2>&1; then
+            mkdir -p "$WORK/mnt"
+            fuse2fs -o fakeroot "$WORK/rootfs.ext4" "$WORK/mnt"
+            tar xf "$WORK/rootfs.tar" -C "$WORK/mnt"
+            fusermount -u "$WORK/mnt"
+          else
+            # Fallback: use sudo mount (may work on self-hosted runners)
+            sudo mkdir -p "$WORK/mnt"
+            sudo mount -o loop "$WORK/rootfs.ext4" "$WORK/mnt"
+            sudo tar xf "$WORK/rootfs.tar" -C "$WORK/mnt"
+            sudo umount "$WORK/mnt"
+          fi
+          # Install to golden dir
+          sudo mkdir -p /var/lib/boxcutter/golden
+          HASH=$(sha256sum "$WORK/rootfs.ext4" | cut -c1-12)
+          sudo mv "$WORK/rootfs.ext4" "/var/lib/boxcutter/golden/${HASH}.ext4"
+          sudo ln -sf "${HASH}.ext4" /var/lib/boxcutter/golden/rootfs.ext4
+          echo "$HASH" | sudo tee /var/lib/boxcutter/golden/current-version
+          rm -rf "$WORK"
+          echo "Golden image built: $HASH"
 
       - name: Push golden image to OCI registry
         env:
