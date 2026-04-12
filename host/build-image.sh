@@ -117,11 +117,11 @@ fi
 # --- Build Go binaries ---
 echo "--- Building Go binaries ---"
 if [ "$VM_TYPE" = "node" ]; then
-  (cd "${REPO_DIR}/node/vmid" && GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/vmid" ./cmd/vmid/)
+  (cd "${REPO_DIR}/node/vmid" && GOARCH=amd64 GOOS=linux CGO_ENABLED=0 go build -a -o "${BUILD_DIR}/vmid" ./cmd/vmid/)
   echo "  vmid"
-  (cd "${REPO_DIR}/node/proxy" && GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-proxy" ./cmd/proxy/)
+  (cd "${REPO_DIR}/node/proxy" && GOARCH=amd64 GOOS=linux CGO_ENABLED=0 go build -a -o "${BUILD_DIR}/boxcutter-proxy" ./cmd/proxy/)
   echo "  boxcutter-proxy"
-  (cd "${REPO_DIR}/node/agent" && GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-node" ./cmd/node/)
+  (cd "${REPO_DIR}/node/agent" && GOARCH=amd64 GOOS=linux CGO_ENABLED=0 go build -a -o "${BUILD_DIR}/boxcutter-node" ./cmd/node/)
   echo "  boxcutter-node"
   (cd "${REPO_DIR}/tools" && CGO_ENABLED=0 GOARCH=amd64 GOOS=linux go build -o "${BUILD_DIR}/boxcutter-cli" ./cmd/boxcutter/)
   echo "  boxcutter-cli (tools)"
