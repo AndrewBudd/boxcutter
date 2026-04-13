@@ -632,6 +632,9 @@ EOSETTINGS
     fi
 fi
 
+# tmux command -- set before any function uses it
+TMUX_CMD="tmux"
+
 # Wait for metadata service
 for i in $(seq 1 30); do
   if curl -sf -o /dev/null --max-time 2 "${METADATA}/identity" 2>/dev/null; then
@@ -642,9 +645,6 @@ for i in $(seq 1 30); do
 done
 
 echo "tapegun: daemon started (poll every ${POLL_INTERVAL}s)"
-
-# tmux command -- runs as the dev user (service runs as User=dev)
-TMUX_CMD="tmux"
 
 # --- Health check function ---
 run_health_checks() {
