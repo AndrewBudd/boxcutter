@@ -980,7 +980,7 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
         fi
     fi
 
-    # --- Check orchestrator message queue (for OpenCode API injection) ---
+    # --- Check orchestrator message queue and dispatch tasks ---
     ORCH_QUEUE="${BOXCUTTER_QUEUE:-$(hostname).inbox}"
     ORCH_URL="${BOXCUTTER_ORCHESTRATOR:-http://192.168.50.2:8801}"
     queue_response=$(curl -sf "${ORCH_URL}/api/queues/${ORCH_QUEUE}/messages" --max-time 3 2>/dev/null)
@@ -995,7 +995,29 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
 
             combined_msg=$(echo "$queue_response" | jq -r '.[] | "[from \(.from_agent // "unknown")] \(.body)"' 2>/dev/null)
 
-            # Try OpenCode API first
+            # Pre-task: sync to latest master so agents work on current code
+            _tq_workdir="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
+            if [ -d "$_tq_workdir/.git" ]; then
+                (cd "$_tq_workdir" && git stash 2>/dev/null; git checkout master 2>/dev/null; git pull --ff-only 2>/dev/null) && \
+                    log "synced to latest master before task" || \
+                    log "WARNING: git sync failed, proceeding with current state"
+
+                # Create a task branch so the agent's work is isolated
+                _tq_branch="agent/$(hostname)/$(date +%s)"
+                (cd "$_tq_workdir" && git checkout -b "$_tq_branch" 2>/dev/null) && \
+                    log "created branch $_tq_branch" || true
+            fi
+
+            # Wrap the user's message with workflow instructions
+            task_prompt="$combined_msg
+
+IMPORTANT WORKFLOW: When you finish the task above:
+1. Stage and commit your changes with a clear commit message
+2. Push your branch: git push origin HEAD
+3. Create a PR: gh pr create --title '<short title>' --body '<what you did and why>'
+Report the PR URL when done."
+
+            # Dispatch to OpenCode API or tmux fallback
             if [ "$AGENT_TOOL" = "opencode" ] && curl -sf -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" "http://localhost:${OPENCODE_SERVER_PORT:-4096}/session" --max-time 1 >/dev/null 2>&1; then
                 oc_session=$(curl -sf -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" "http://localhost:${OPENCODE_SERVER_PORT:-4096}/session" --max-time 2 2>/dev/null | jq -r '.[0].id // empty')
                 if [ -z "$oc_session" ]; then
@@ -1003,18 +1025,18 @@ print(json.dumps({'pane_content': sys.stdin.read(), 'status': '$STATUS'}))" <<< 
                         -H "Content-Type: application/json" -d '{}' --max-time 3 2>/dev/null | jq -r '.id // empty')
                 fi
                 if [ -n "$oc_session" ]; then
-                    oc_payload=$(jq -n --arg text "$combined_msg" '{parts: [{type: "text", text: $text}]}')
+                    oc_payload=$(jq -n --arg text "$task_prompt" '{parts: [{type: "text", text: $text}]}')
                     curl -sf -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" \
                         -X POST "http://localhost:${OPENCODE_SERVER_PORT:-4096}/session/${oc_session}/message" \
                         -H "Content-Type: application/json" \
                         -d "$oc_payload" \
                         --max-time 120 >/dev/null 2>&1 &
-                    log "forwarded $q_count queue message(s) to OpenCode API"
+                    log "dispatched task to OpenCode (branch, $q_count msg)"
                 fi
             else
                 # Fallback: inject into tmux
                 if $TMUX_CMD has-session 2>/dev/null; then
-                    opencode_send_message "$combined_msg" "false"
+                    opencode_send_message "$task_prompt" "false"
                 fi
             fi
         fi
