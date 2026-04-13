@@ -1153,7 +1153,7 @@ func (h *Handler) teamApply(args []string) int {
 				fmt.Printf(" ok\n")
 				created++
 				// Auto-create messaging inbox queue for this agent (#190)
-				queueName := ts.Metadata.Name + "." + a.VMName + ".inbox"
+				queueName := a.VMName + ".inbox"
 				h.post("/api/queues", map[string]string{"name": queueName})
 				break
 			}
