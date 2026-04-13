@@ -1050,7 +1050,7 @@ Report the PR URL when done."
                 # Run Claude Code headlessly — avoids interactive API key prompts
                 _claude_bin="$HOME/.local/bin/claude"
                 [ ! -x "$_claude_bin" ] && _claude_bin="$(which claude 2>/dev/null || echo claude)"
-                (cd "$_tq_workdir" && PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH" "$_claude_bin" -p --dangerously-skip-permissions "$task_prompt" > /tmp/claude-task-output.log 2>&1) &
+                ([ -f "$HOME/.claude_env" ] && . "$HOME/.claude_env"; cd "$_tq_workdir" && PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH" "$_claude_bin" -p --dangerously-skip-permissions "$task_prompt" > /tmp/claude-task-output.log 2>&1) &
                 log "dispatched task to Claude Code headless (branch, $q_count msg)"
                 ;;
               opencode)
