@@ -467,30 +467,7 @@ setup_workspace() {
     # team apply and should launch Claude Code automatically.
     AUTOSTART_CLAUDE=true
 
-    # Parse Claude auth config from agent_config before provisioning credentials
-    local claude_auth_meta=$(echo "$agent_config" | jq -r '.claude.auth // empty' 2>/dev/null)
-    local claude_oauth_meta=$(echo "$agent_config" | jq -r '.claude.oauth_token // empty' 2>/dev/null)
-    local claude_apikey_meta=$(echo "$agent_config" | jq -r '.claude.api_key // empty' 2>/dev/null)
-    [ -n "$claude_auth_meta" ] && CLAUDE_AUTH="$claude_auth_meta"
-    [ -n "$claude_oauth_meta" ] && CLAUDE_OAUTH_TOKEN="$claude_oauth_meta"
-    [ -n "$claude_apikey_meta" ] && CLAUDE_API_KEY="$claude_apikey_meta"
-
-    # Provision Claude credentials before anything else — must be in place
-    # before Claude Code launches so it doesn't prompt for OAuth.
-    setup_claude_credentials
-
-    # Parse config fields
-    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files tapegun_sequences agent_tool agent_model
-    repos=$(echo "$agent_config" | jq -r '.repos // [] | .[]' 2>/dev/null)
-    persona_claude_md=$(echo "$agent_config" | jq -r '.persona.claude_md // empty' 2>/dev/null)
-    persona_instructions=$(echo "$agent_config" | jq -r '.persona.instructions // empty' 2>/dev/null)
-    claude_flags=$(echo "$agent_config" | jq -r '.claude_flags // empty' 2>/dev/null)
-    claude_resume=$(echo "$agent_config" | jq -r '.claude_resume // empty' 2>/dev/null)
-    working_dir=$(echo "$agent_config" | jq -r '.working_dir // empty' 2>/dev/null)
-    team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
-    tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
-
-    # Tool and inference selection from agent_config
+    # Parse tool and inference FIRST — credential setup depends on these
     local agent_tool_meta=$(echo "$agent_config" | jq -r '.tool // empty' 2>/dev/null)
     local agent_model_meta=$(echo "$agent_config" | jq -r '.inference.model // empty' 2>/dev/null)
     local inf_provider_meta=$(echo "$agent_config" | jq -r '.inference.provider // empty' 2>/dev/null)
@@ -501,6 +478,28 @@ setup_workspace() {
     [ -n "$inf_provider_meta" ] && INFERENCE_PROVIDER="$inf_provider_meta"
     [ -n "$inf_endpoint_meta" ] && INFERENCE_ENDPOINT="$inf_endpoint_meta"
     [ -n "$inf_apikey_meta" ] && INFERENCE_API_KEY="$inf_apikey_meta"
+
+    # Parse Claude auth config
+    local claude_auth_meta=$(echo "$agent_config" | jq -r '.claude.auth // empty' 2>/dev/null)
+    local claude_oauth_meta=$(echo "$agent_config" | jq -r '.claude.oauth_token // empty' 2>/dev/null)
+    local claude_apikey_meta=$(echo "$agent_config" | jq -r '.claude.api_key // empty' 2>/dev/null)
+    [ -n "$claude_auth_meta" ] && CLAUDE_AUTH="$claude_auth_meta"
+    [ -n "$claude_oauth_meta" ] && CLAUDE_OAUTH_TOKEN="$claude_oauth_meta"
+    [ -n "$claude_apikey_meta" ] && CLAUDE_API_KEY="$claude_apikey_meta"
+
+    # Provision Claude credentials — must be in place before Claude Code launches
+    setup_claude_credentials
+
+    # Parse remaining config fields
+    local repos persona_claude_md persona_instructions claude_flags claude_resume working_dir team_persona_files tapegun_sequences
+    repos=$(echo "$agent_config" | jq -r '.repos // [] | .[]' 2>/dev/null)
+    persona_claude_md=$(echo "$agent_config" | jq -r '.persona.claude_md // empty' 2>/dev/null)
+    persona_instructions=$(echo "$agent_config" | jq -r '.persona.instructions // empty' 2>/dev/null)
+    claude_flags=$(echo "$agent_config" | jq -r '.claude_flags // empty' 2>/dev/null)
+    claude_resume=$(echo "$agent_config" | jq -r '.claude_resume // empty' 2>/dev/null)
+    working_dir=$(echo "$agent_config" | jq -r '.working_dir // empty' 2>/dev/null)
+    team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
+    tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
 
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
@@ -588,6 +587,9 @@ setup_workspace
 # Agent tool auto-start (Claude Code, OpenCode, or Aider)
 # =============================================================================
 
+# Set tmux command before any function uses it (launch_agent_tool etc.)
+TMUX_CMD="tmux"
+
 if [ "$AUTOSTART_CLAUDE" = "true" ]; then
     echo "tapegun: auto-starting agent tool '$AGENT_TOOL' under tmux"
 
@@ -659,9 +661,6 @@ EOSETTINGS
         echo "tapegun: tmux session 'main' already exists, skipping autostart"
     fi
 fi
-
-# tmux command -- set before any function uses it
-TMUX_CMD="tmux"
 
 # Wait for metadata service
 for i in $(seq 1 30); do
