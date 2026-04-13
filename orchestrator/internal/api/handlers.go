@@ -58,11 +58,12 @@ type Handler struct {
 	workQueue  *queue.Queue
 	dispatcher *queue.Dispatcher
 
-	// Alert state: previous activity status per VM for transition detection
-	prevStatus   map[string]string // vmName → last known activity status
-	prevStatusMu sync.RWMutex
-	prevHealth   map[string]string // vmName → last known health
-	lastReport   map[string]time.Time // vmName → last activity timestamp
+	// Alert state: previous activity status per VM for transition detection.
+	// All three maps are only accessed in detectAlerts() under prevStatusMu.
+	prevStatus   map[string]string     // vmName → last known activity status
+	prevStatusMu sync.RWMutex         // protects prevStatus, prevHealth, lastReport
+	prevHealth   map[string]string     // vmName → last known health (guarded by prevStatusMu)
+	lastReport   map[string]time.Time  // vmName → last activity timestamp (guarded by prevStatusMu)
 
 	// Alert ring buffer (last 200 events)
 	alerts   []AlertEvent
