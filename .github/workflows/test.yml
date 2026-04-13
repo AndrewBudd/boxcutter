@@ -20,6 +20,9 @@ jobs:
       fail-fast: false
 
     steps:
+      - name: Clean workspace
+        run: sudo rm -rf $GITHUB_WORKSPACE/.images $GITHUB_WORKSPACE/.build 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
@@ -33,6 +36,9 @@ jobs:
   lint:
     runs-on: self-hosted
     steps:
+      - name: Clean workspace
+        run: sudo rm -rf $GITHUB_WORKSPACE/.images $GITHUB_WORKSPACE/.build 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
