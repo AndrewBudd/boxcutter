@@ -435,19 +435,29 @@ func runDaemon() {
 	// 7. Start auto-scaler
 	go autoScaleLoop(cfg, state)
 
-	// 8. Clean up orphaned orchestrator-new from pre-simplification upgrades.
-	// Prior versions launched a second orchestrator at a temp IP ("orchestrator-new").
-	// If the daemon was upgraded mid-orchestrator-upgrade, that process is orphaned.
+	// 8. Clean up orphaned orchestrator-new from prior upgrades.
+	// Only clean up if the primary orchestrator is alive and reachable.
+	// If the primary is dead, orchestrator-new may be the valid replacement.
 	oldOrchNewDisk := fmt.Sprintf("%s/orchestrator-new.qcow2", cfg.ImagesDir)
 	if fileExists(oldOrchNewDisk) {
-		log.Printf("WARNING: found orphaned orchestrator-new disk %s from prior upgrade — cleaning up", oldOrchNewDisk)
-		if pid := findQEMUPID(oldOrchNewDisk); pid > 0 {
-			qemu.Stop("orchestrator-new", pid)
+		orchPID := 0
+		if state.Orchestrator != nil {
+			orchPID = state.Orchestrator.PID
 		}
-		os.Remove(oldOrchNewDisk)
-		os.Remove(fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir))
-		os.Remove(filepath.Join(cfg.ImagesDir, "orchestrator-new.pid"))
-		bridge.DeleteTAP("tap-orch-new")
+		orchAlive := orchPID > 0 && qemu.IsRunning(orchPID)
+		if orchAlive {
+			log.Printf("WARNING: found orphaned orchestrator-new disk %s — primary orchestrator alive (PID %d), cleaning up", oldOrchNewDisk, orchPID)
+			if pid := findQEMUPID(oldOrchNewDisk); pid > 0 {
+				qemu.Stop("orchestrator-new", pid)
+			}
+			os.Remove(oldOrchNewDisk)
+			os.Remove(fmt.Sprintf("%s/orchestrator-new-cloud-init.iso", cfg.ImagesDir))
+			os.Remove(filepath.Join(cfg.ImagesDir, "orchestrator-new.pid"))
+			bridge.DeleteTAP("tap-orch-new")
+		} else {
+			log.Printf("WARNING: found orchestrator-new disk %s — primary orchestrator DEAD (PID %d), keeping orchestrator-new as replacement", oldOrchNewDisk, orchPID)
+			// Promote orchestrator-new: the upgrade flow will handle finalization
+		}
 	}
 
 	// 9. Resume any interrupted upgrade in background
