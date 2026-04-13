@@ -181,12 +181,40 @@ setup_git_credentials() {
 
 setup_claude_credentials() {
     # Skip entirely if not using claude-code and no explicit auth configured
+    # EXCEPT: if using claude-code with an inference provider (e.g. openrouter),
+    # we can route Claude Code through that provider's API.
     if [ "${AGENT_TOOL:-claude-code}" != "claude-code" ] && [ -z "${CLAUDE_AUTH:-}" ]; then
         return 0
     fi
 
     local cred_file="${CLAUDE_DIR}/.credentials.json"
     mkdir -p "$CLAUDE_DIR"
+
+    # Method 0: Inference provider routing — use OpenRouter/other provider as Claude backend
+    # When tool=claude-code and inference.provider=openrouter, route Claude Code
+    # through OpenRouter's Anthropic-compatible API.
+    if [ "${AGENT_TOOL:-}" = "claude-code" ] && [ -z "${CLAUDE_AUTH:-}" ] && [ -n "${INFERENCE_API_KEY:-}" ]; then
+        local envfile="/home/dev/.claude_env"
+        case "${INFERENCE_PROVIDER:-}" in
+          openrouter)
+            printf 'export ANTHROPIC_API_KEY="%s"\nexport ANTHROPIC_BASE_URL="https://openrouter.ai/api"\n' "$INFERENCE_API_KEY" > "$envfile"
+            log "Claude Code configured via OpenRouter (ANTHROPIC_BASE_URL)"
+            ;;
+          *)
+            if [ -n "${INFERENCE_ENDPOINT:-}" ]; then
+                printf 'export ANTHROPIC_API_KEY="%s"\nexport ANTHROPIC_BASE_URL="%s"\n' "$INFERENCE_API_KEY" "$INFERENCE_ENDPOINT" > "$envfile"
+                log "Claude Code configured via custom endpoint ($INFERENCE_ENDPOINT)"
+            fi
+            ;;
+        esac
+        if [ -f "$envfile" ]; then
+            chmod 600 "$envfile"
+            if ! grep -q 'source.*\.claude_env' /home/dev/.bashrc 2>/dev/null; then
+                printf '\n[ -f ~/.claude_env ] && source ~/.claude_env\n' >> /home/dev/.bashrc
+            fi
+            return 0
+        fi
+    fi
 
     # Method 1: API key auth (ANTHROPIC_API_KEY) — simplest, no OAuth needed
     if [ "${CLAUDE_AUTH:-}" = "api-key" ] && [ -n "${CLAUDE_API_KEY:-}" ]; then
