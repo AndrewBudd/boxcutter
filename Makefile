@@ -2,7 +2,8 @@
        stop-node stop-orchestrator ssh-node ssh-orchestrator status clean \
        build-host install-host deb-host \
        build-image pull upgrade version provision-from-image \
-       rebuild-tools deploy-tools
+       rebuild-tools deploy-tools \
+       test vet check
 
 # --- Orchestrator ---
 
@@ -124,6 +125,34 @@ rebuild-tools:            ## Rebuild tools.img (tapegun + CLI) without full repr
 
 deploy-tools:             ## Rebuild tools.img and deploy to all running nodes
 	@bash host/rebuild-tools.sh --deploy
+
+# --- Testing and Validation ---
+
+test:                     ## Run tests for all Go modules
+	@echo "Running tests for orchestrator..."
+	@cd orchestrator && go test ./...
+	@echo "Running tests for node/agent..."
+	@cd node/agent && go test ./...
+	@echo "Running tests for node/vmid..."
+	@cd node/vmid && go test ./...
+	@echo "Running tests for node/proxy..."
+	@cd node/proxy && go test ./...
+	@echo "Running tests for host..."
+	@cd host && go test ./...
+
+vet:                      ## Run go vet for all Go modules
+	@echo "Running go vet for orchestrator..."
+	@cd orchestrator && go vet ./...
+	@echo "Running go vet for node/agent..."
+	@cd node/agent && go vet ./...
+	@echo "Running go vet for node/vmid..."
+	@cd node/vmid && go vet ./...
+	@echo "Running go vet for node/proxy..."
+	@cd node/proxy && go vet ./...
+	@echo "Running go vet for host..."
+	@cd host && go vet ./...
+
+check: test vet          ## Run both tests and vetting for all Go modules
 
 help:                     ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
