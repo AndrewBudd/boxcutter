@@ -21,6 +21,7 @@ Commands:
   msg subscribe <topic> <queue>    Subscribe queue to topic
   msg subscriptions                List all subscriptions
   msg inspect <queue>              Show queue depth
+  msg delete <queue>               Delete a queue
 
 Usage: ssh <host> msg <command> [args]
 `)
@@ -194,6 +195,19 @@ Usage: ssh <host> msg <command> [args]
 		}
 		fmt.Printf("Queue '%s' not found.\n", queue)
 		return 1
+
+	case "delete":
+		if len(args) < 2 {
+			fmt.Println("Usage: ssh <host> msg delete <queue>")
+			return 1
+		}
+		_, err := h.delete("/api/queues/" + args[1])
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return 1
+		}
+		fmt.Printf("Queue '%s' deleted.\n", args[1])
+		return 0
 
 	default:
 		fmt.Printf("Unknown msg command: %s\n", sub)

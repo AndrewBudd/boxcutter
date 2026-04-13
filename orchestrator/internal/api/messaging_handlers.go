@@ -22,6 +22,7 @@ func (h *Handler) registerMessagingRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/queues", h.handleCreateQueue)
 	mux.HandleFunc("GET /api/queues/{name}/messages", h.handleReceive)
 	mux.HandleFunc("POST /api/queues/{name}/ack", h.handleAck)
+	mux.HandleFunc("DELETE /api/queues/{name}", h.handleDeleteQueue)
 
 	// Subscriptions
 	mux.HandleFunc("POST /api/subscriptions", h.handleSubscribe)
@@ -132,6 +133,15 @@ func (h *Handler) handleAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.db.Ack(req.MessageIDs); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) handleDeleteQueue(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := h.db.DeleteQueue(name); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
