@@ -1854,10 +1854,32 @@ func deployNodeBinary(cfg HostConfig, bridgeIP, nodeID string) error {
 		log.Printf("Deploy %s: tools.img not found at %s on host — skipping", nodeID, toolsImgPath)
 	}
 
-	// Install and restart
-	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP,
-		"sudo", "mv", "/tmp/boxcutter-node", "/usr/local/bin/boxcutter-node",
-		"&&", "sudo", "systemctl", "restart", "boxcutter-node")...)
+	// Build and deploy vmid (same source tree, different module)
+	vmidDir := filepath.Join(cfg.RepoDir, "node", "vmid")
+	if _, err := os.Stat(vmidDir); err == nil {
+		tmpVmid := filepath.Join(os.TempDir(), fmt.Sprintf("vmid-%s", nodeID))
+		defer os.Remove(tmpVmid)
+		vmidBuild := exec.Command(goBin, "build", "-buildvcs=false", "-o", tmpVmid, "./cmd/vmid/")
+		vmidBuild.Dir = vmidDir
+		vmidBuild.Env = append(os.Environ(),
+			"CGO_ENABLED=0",
+			"PATH=/usr/local/go/bin:"+os.Getenv("PATH"),
+			"HOME="+os.TempDir())
+		if out, err := vmidBuild.CombinedOutput(); err != nil {
+			log.Printf("Deploy %s: vmid build failed (non-fatal): %v\n%s", nodeID, err, string(out))
+		} else {
+			scpVmid := exec.Command("scp", append(sshOpts, tmpVmid, "ubuntu@"+bridgeIP+":/tmp/vmid")...)
+			if out, err := scpVmid.CombinedOutput(); err != nil {
+				log.Printf("Deploy %s: vmid SCP failed (non-fatal): %v\n%s", nodeID, err, string(out))
+			}
+		}
+	}
+
+	// Install and restart (includes vmid if it was deployed)
+	installScript := "sudo mv /tmp/boxcutter-node /usr/local/bin/boxcutter-node && sudo systemctl restart boxcutter-node"
+	// Also install vmid if it was uploaded
+	installScript += " && if [ -f /tmp/vmid ]; then sudo mv /tmp/vmid /usr/local/bin/vmid && sudo systemctl restart vmid; fi"
+	installCmd := exec.Command("ssh", append(sshOpts, "ubuntu@"+bridgeIP, "bash", "-c", installScript)...)
 	if out, err := installCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("install failed: %v\n%s", err, string(out))
 	}
