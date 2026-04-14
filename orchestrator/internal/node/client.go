@@ -644,12 +644,29 @@ type TapegunStatusReport struct {
 	Status    string `json:"status"`
 }
 
+// TapegunFileTracking records which files an agent is modifying.
+type TapegunFileTracking struct {
+	Branch string   `json:"branch,omitempty"`
+	Files  []string `json:"files,omitempty"`
+}
+
+// TapegunCheckpointSummary is a summary of a session checkpoint.
+type TapegunCheckpointSummary struct {
+	SessionID string `json:"session_id,omitempty"`
+	GitBranch string `json:"git_branch,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+	SizeBytes int    `json:"size_bytes,omitempty"`
+}
+
 // TapegunVMActivity is a summary of a VM's tapegun state.
 type TapegunVMActivity struct {
-	VMID            string                 `json:"vm_id"`
-	LastActivity    *TapegunActivityReport `json:"last_activity,omitempty"`
-	LastStatus      *TapegunStatusReport   `json:"last_status,omitempty"`
-	PendingMessages int                    `json:"pending_messages"`
+	VMID            string                    `json:"vm_id"`
+	LastActivity    *TapegunActivityReport    `json:"last_activity,omitempty"`
+	LastStatus      *TapegunStatusReport      `json:"last_status,omitempty"`
+	LastFiles       *TapegunFileTracking      `json:"last_files,omitempty"`
+	LastCheckpoint  *TapegunCheckpointSummary `json:"last_checkpoint,omitempty"`
+	AgentConfig     json.RawMessage           `json:"agent_config,omitempty"`
+	PendingMessages int                       `json:"pending_messages"`
 }
 
 // GetAllActivity returns tapegun activity for all VMs on a node. Returns nil on error.

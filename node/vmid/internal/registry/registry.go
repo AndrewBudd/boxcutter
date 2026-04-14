@@ -59,12 +59,15 @@ type Message struct {
 	ReadAt    *time.Time `json:"read_at,omitempty"`
 }
 
-// VMActivitySummary is a lightweight view of a VM's tapegun state.
+// VMActivitySummary is a view of a VM's tapegun state including memory context.
 type VMActivitySummary struct {
-	VMID            string          `json:"vm_id"`
-	LastActivity    *ActivityReport `json:"last_activity,omitempty"`
-	LastStatus      *StatusReport   `json:"last_status,omitempty"`
-	PendingMessages int             `json:"pending_messages"`
+	VMID            string            `json:"vm_id"`
+	LastActivity    *ActivityReport   `json:"last_activity,omitempty"`
+	LastStatus      *StatusReport     `json:"last_status,omitempty"`
+	LastFiles       *FileTracking     `json:"last_files,omitempty"`
+	LastCheckpoint  *CheckpointData   `json:"last_checkpoint,omitempty"`
+	AgentConfig     *AgentConfig      `json:"agent_config,omitempty"`
+	PendingMessages int               `json:"pending_messages"`
 }
 
 // PersonaConfig describes the persona files and instructions for the in-VM agent.
@@ -614,6 +617,9 @@ func (r *Registry) AllActivity() []VMActivitySummary {
 			VMID:            rec.VMID,
 			LastActivity:    rec.LastActivity,
 			LastStatus:      rec.LastStatus,
+			LastFiles:       rec.LastFiles,
+			LastCheckpoint:  rec.LastCheckpoint,
+			AgentConfig:     rec.AgentConfig,
 			PendingMessages: rec.PendingCount(),
 		})
 	}

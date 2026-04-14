@@ -261,12 +261,29 @@ func (h *HealthReport) IsHealthy() bool {
 	return h != nil && h.Health == "healthy"
 }
 
+// FileTracking records which files an agent is modifying.
+type FileTracking struct {
+	Branch string   `json:"branch,omitempty"`
+	Files  []string `json:"files,omitempty"`
+}
+
+// CheckpointSummary is a summary of a session checkpoint.
+type CheckpointSummary struct {
+	SessionID string `json:"session_id,omitempty"`
+	GitBranch string `json:"git_branch,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+	SizeBytes int    `json:"size_bytes,omitempty"`
+}
+
 // VMActivitySummary mirrors the registry type.
 type VMActivitySummary struct {
-	VMID            string          `json:"vm_id"`
-	LastActivity    *ActivityReport `json:"last_activity,omitempty"`
-	LastStatus      *StatusReport   `json:"last_status,omitempty"`
-	PendingMessages int             `json:"pending_messages"`
+	VMID            string             `json:"vm_id"`
+	LastActivity    *ActivityReport    `json:"last_activity,omitempty"`
+	LastStatus      *StatusReport      `json:"last_status,omitempty"`
+	LastFiles       *FileTracking      `json:"last_files,omitempty"`
+	LastCheckpoint  *CheckpointSummary `json:"last_checkpoint,omitempty"`
+	AgentConfig     json.RawMessage    `json:"agent_config,omitempty"`
+	PendingMessages int                `json:"pending_messages"`
 }
 
 // GetVMActivity returns a VM's latest activity report.

@@ -1459,13 +1459,16 @@ func extractPathSegment(path, prefix, suffix string) string {
 // --- Tapegun handlers ---
 
 type tapegunActivityEntry struct {
-	Name        string                      `json:"name"`
-	NodeID      string                      `json:"node_id"`
-	NodeName    string                      `json:"node_name"`
-	VMStatus    string                      `json:"vm_status"`
-	Activity    *node.TapegunActivityReport `json:"activity,omitempty"`
-	AgentStatus *node.TapegunStatusReport   `json:"agent_status,omitempty"`
-	PendingMsgs int                         `json:"pending_messages"`
+	Name        string                          `json:"name"`
+	NodeID      string                          `json:"node_id"`
+	NodeName    string                          `json:"node_name"`
+	VMStatus    string                          `json:"vm_status"`
+	Activity    *node.TapegunActivityReport     `json:"activity,omitempty"`
+	AgentStatus *node.TapegunStatusReport       `json:"agent_status,omitempty"`
+	Files       *node.TapegunFileTracking       `json:"files,omitempty"`
+	Checkpoint  *node.TapegunCheckpointSummary  `json:"checkpoint,omitempty"`
+	AgentConfig json.RawMessage                 `json:"agent_config,omitempty"`
+	PendingMsgs int                             `json:"pending_messages"`
 }
 
 func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) {
@@ -1524,6 +1527,9 @@ func (h *Handler) handleTapegunActivity(w http.ResponseWriter, r *http.Request) 
 			if act, ok := nodeAct[v.Name]; ok {
 				entry.Activity = act.LastActivity
 				entry.AgentStatus = act.LastStatus
+				entry.Files = act.LastFiles
+				entry.Checkpoint = act.LastCheckpoint
+				entry.AgentConfig = act.AgentConfig
 				entry.PendingMsgs = act.PendingMessages
 			}
 		}
