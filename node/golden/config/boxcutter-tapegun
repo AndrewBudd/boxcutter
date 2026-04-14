@@ -541,10 +541,15 @@ setup_workspace() {
     repo_count=$(echo "$repos" | grep -c . || true)
 
     # Run bootstrap BEFORE cloning — may set up git credentials, install tools
+    # Sentinel substitution: ${GITHUB_TOKEN} is resolved from metadata service
     if [ -n "$bootstrap_cmds" ]; then
         log "running bootstrap commands"
+        # Pre-fetch sentinels from metadata
+        _gh_token=$(curl -sf --max-time 5 "${METADATA}/token/github" 2>/dev/null | jq -r '.token // empty' 2>/dev/null)
         while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
+            # Substitute sentinels
+            cmd="${cmd//\$\{GITHUB_TOKEN\}/$_gh_token}"
             log "bootstrap: $cmd"
             if eval "$cmd" 2>&1 | while IFS= read -r line; do log "  $line"; done; then
                 log "bootstrap: OK"
