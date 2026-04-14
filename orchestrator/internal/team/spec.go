@@ -41,8 +41,14 @@ type ClaudeSpec struct {
 	APIKey     string `yaml:"api_key,omitempty"`     // Anthropic API key
 }
 
+// PluginsSpec configures Claude Code plugin marketplaces and auto-installation.
+type PluginsSpec struct {
+	Marketplaces []string `yaml:"marketplaces,omitempty"` // GitHub repos or URLs to register as marketplaces
+	Install      []string `yaml:"install,omitempty"`      // Plugins to install (e.g. "superpowers@claude-plugins-official")
+}
+
 // AgentDefaults holds shared defaults inherited by all agents.
-// Agent-level values override defaults. List fields (repos, access, tapegun)
+// Agent-level values override defaults. List fields (repos, access, tapegun, plugins)
 // are replaced, not merged.
 type AgentDefaults struct {
 	Type       string         `yaml:"type,omitempty"`
@@ -53,6 +59,7 @@ type AgentDefaults struct {
 	Tool       string         `yaml:"tool,omitempty"`      // "claude-code", "opencode", "aider"
 	Inference  *InferenceSpec `yaml:"inference,omitempty"`
 	Claude     *ClaudeSpec    `yaml:"claude,omitempty"`
+	Plugins    *PluginsSpec   `yaml:"plugins,omitempty"`
 	Repos      []string       `yaml:"repos,omitempty"`
 	Authorized bool           `yaml:"authorized,omitempty"`
 	Persona    *Persona       `yaml:"persona,omitempty"`
@@ -70,6 +77,7 @@ type AgentSpec struct {
 	Tool        string         `yaml:"tool,omitempty"`      // "claude-code", "opencode", "aider"
 	Inference   *InferenceSpec `yaml:"inference,omitempty"`
 	Claude      *ClaudeSpec    `yaml:"claude,omitempty"`
+	Plugins     *PluginsSpec   `yaml:"plugins,omitempty"`
 	Description string         `yaml:"description,omitempty"`
 	Persona     *Persona       `yaml:"persona,omitempty"`
 	Repos       []string       `yaml:"repos,omitempty"`
@@ -120,6 +128,7 @@ type ResolvedAgent struct {
 	Tool        string
 	Inference   *InferenceSpec
 	Claude      *ClaudeSpec
+	Plugins     *PluginsSpec
 	Description string
 	Persona     *Persona
 	Repos       []string
@@ -170,6 +179,18 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 		}
 		if len(claude) > 0 {
 			cfg["claude"] = claude
+		}
+	}
+	if r.Plugins != nil {
+		plugins := map[string]interface{}{}
+		if len(r.Plugins.Marketplaces) > 0 {
+			plugins["marketplaces"] = r.Plugins.Marketplaces
+		}
+		if len(r.Plugins.Install) > 0 {
+			plugins["install"] = r.Plugins.Install
+		}
+		if len(plugins) > 0 {
+			cfg["plugins"] = plugins
 		}
 	}
 	if len(r.Repos) > 0 {
@@ -310,6 +331,10 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 					c := *d.Claude
 					r.Claude = &c
 				}
+				if d.Plugins != nil {
+					p := *d.Plugins
+					r.Plugins = &p
+				}
 				r.Repos = d.Repos
 				r.Authorized = d.Authorized
 				r.Tapegun = d.Tapegun
@@ -343,6 +368,9 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 			}
 			if a.Claude != nil {
 				r.Claude = a.Claude
+			}
+			if a.Plugins != nil {
+				r.Plugins = a.Plugins
 			}
 			if a.Repos != nil {
 				r.Repos = a.Repos

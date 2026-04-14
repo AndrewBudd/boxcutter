@@ -119,6 +119,13 @@ type AgentConfig struct {
 	TeamPersonaFiles []string          `json:"team_persona_files,omitempty"` // team-level persona file paths
 	Inference        *InferenceConfig  `json:"inference,omitempty"`          // inference provider config
 	Claude           *ClaudeConfig     `json:"claude,omitempty"`             // Claude Code auth config (#175)
+	Plugins          *PluginsConfig    `json:"plugins,omitempty"`            // Claude Code plugin auto-install
+}
+
+// PluginsConfig specifies marketplaces to register and plugins to install.
+type PluginsConfig struct {
+	Marketplaces []string `json:"marketplaces,omitempty"` // GitHub repos or URLs
+	Install      []string `json:"install,omitempty"`      // plugin@marketplace references
 }
 
 // CheckpointData holds a session checkpoint for conversation persistence.

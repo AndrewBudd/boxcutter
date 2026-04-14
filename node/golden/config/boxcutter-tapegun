@@ -83,6 +83,37 @@ fi
 
 log() { echo "tapegun: $*"; }
 
+# Install Claude Code plugins from agent config.
+# Adds marketplaces first, then installs plugins.
+install_plugins() {
+    local marketplaces="$1"
+    local plugins="$2"
+    local claude_bin="$HOME/.local/bin/claude"
+    [ ! -x "$claude_bin" ] && claude_bin="$(which claude 2>/dev/null || echo "")"
+    [ -z "$claude_bin" ] && { log "WARNING: claude not found, skipping plugin install"; return; }
+
+    # Add marketplaces
+    if [ -n "$marketplaces" ]; then
+        while IFS= read -r marketplace; do
+            [ -z "$marketplace" ] && continue
+            log "adding marketplace: $marketplace"
+            "$claude_bin" plugin marketplace add "$marketplace" 2>/dev/null || \
+                log "WARNING: failed to add marketplace $marketplace"
+        done <<< "$marketplaces"
+    fi
+
+    # Install plugins
+    if [ -n "$plugins" ]; then
+        while IFS= read -r plugin; do
+            [ -z "$plugin" ] && continue
+            log "installing plugin: $plugin"
+            "$claude_bin" plugin install "$plugin" 2>/dev/null || \
+                log "WARNING: failed to install plugin $plugin"
+        done <<< "$plugins"
+        log "plugin installation complete"
+    fi
+}
+
 # Launch the configured agent tool in the current tmux session.
 # Assumes tmux session 'main' exists and is cd'd to the working directory.
 launch_agent_tool() {
@@ -501,6 +532,11 @@ setup_workspace() {
     team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
     tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
 
+    # Parse plugins config
+    local plugin_marketplaces plugin_installs
+    plugin_marketplaces=$(echo "$agent_config" | jq -r '.plugins.marketplaces // [] | .[]' 2>/dev/null)
+    plugin_installs=$(echo "$agent_config" | jq -r '.plugins.install // [] | .[]' 2>/dev/null)
+
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
 
@@ -569,6 +605,11 @@ setup_workspace() {
 }
 EOSETTINGS
         log "pre-trusted directory ${working_dir:-$PROJECT_DIR}"
+    fi
+
+    # Install Claude Code plugins (marketplaces + plugins from agent config)
+    if [ -n "$plugin_marketplaces" ] || [ -n "$plugin_installs" ]; then
+        install_plugins "$plugin_marketplaces" "$plugin_installs"
     fi
 
     # Save tapegun sequences for execution after Claude Code starts
