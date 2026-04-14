@@ -42,6 +42,11 @@ func main() {
 		log.Printf("Warning: could not create messaging tables: %v", err)
 	}
 
+	// Initialize knowledge base table
+	if err := database.CreateKnowledgeTable(); err != nil {
+		log.Printf("Warning: could not create knowledge table: %v", err)
+	}
+
 	// In-memory state store (nodes, VMs, golden images — rebuilt on startup)
 	store := state.New()
 

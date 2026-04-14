@@ -145,6 +145,8 @@ func (h *Handler) Run(args []string) int {
 		return h.cmdTeam(args[1:])
 	case "queue":
 		return h.cmdQueue(args[1:])
+	case "knowledge":
+		return h.cmdKnowledge(args[1:])
 	case "help":
 		h.printHelp()
 		return 0

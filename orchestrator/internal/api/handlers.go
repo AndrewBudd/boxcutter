@@ -347,6 +347,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	// Messaging: topics, queues, subscriptions (#190)
 	h.registerMessagingRoutes(mux)
 
+	// Knowledge base: persistent per-agent key/value learnings
+	h.registerKnowledgeRoutes(mux)
+
 	// Dashboard: SSE stream + alerts
 	mux.HandleFunc("GET /api/alerts", h.handleAlerts)
 	mux.HandleFunc("GET /api/alerts/stream", h.handleAlertStream)
