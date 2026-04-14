@@ -121,6 +121,7 @@ type AgentConfig struct {
 	Claude           *ClaudeConfig     `json:"claude,omitempty"`             // Claude Code auth config (#175)
 	Plugins          *PluginsConfig    `json:"plugins,omitempty"`            // Claude Code plugin auto-install
 	Messaging        *MessagingConfig  `json:"messaging,omitempty"`          // Topic subscriptions and publish permissions
+	Bootstrap        []string          `json:"bootstrap,omitempty"`          // Shell commands to run before agent launch
 }
 
 // MessagingConfig declares the agent's messaging topology.

@@ -68,6 +68,7 @@ type AgentDefaults struct {
 	Claude     *ClaudeSpec    `yaml:"claude,omitempty"`
 	Plugins    *PluginsSpec   `yaml:"plugins,omitempty"`
 	Messaging  *MessagingSpec `yaml:"messaging,omitempty"`
+	Bootstrap  []string       `yaml:"bootstrap,omitempty"`
 	Repos      []string       `yaml:"repos,omitempty"`
 	Authorized bool           `yaml:"authorized,omitempty"`
 	Persona    *Persona       `yaml:"persona,omitempty"`
@@ -87,6 +88,7 @@ type AgentSpec struct {
 	Claude      *ClaudeSpec    `yaml:"claude,omitempty"`
 	Plugins     *PluginsSpec   `yaml:"plugins,omitempty"`
 	Messaging   *MessagingSpec `yaml:"messaging,omitempty"`
+	Bootstrap   []string       `yaml:"bootstrap,omitempty"`
 	Description string         `yaml:"description,omitempty"`
 	Persona     *Persona       `yaml:"persona,omitempty"`
 	Repos       []string       `yaml:"repos,omitempty"`
@@ -139,6 +141,7 @@ type ResolvedAgent struct {
 	Claude      *ClaudeSpec
 	Plugins     *PluginsSpec
 	Messaging   *MessagingSpec
+	Bootstrap   []string
 	Description string
 	Persona     *Persona
 	Repos       []string
@@ -214,6 +217,9 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 		if len(messaging) > 0 {
 			cfg["messaging"] = messaging
 		}
+	}
+	if len(r.Bootstrap) > 0 {
+		cfg["bootstrap"] = r.Bootstrap
 	}
 	if len(r.Repos) > 0 {
 		cfg["repos"] = r.Repos
@@ -376,6 +382,7 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 					m := *d.Messaging
 					r.Messaging = &m
 				}
+				r.Bootstrap = d.Bootstrap
 				r.Repos = d.Repos
 				r.Authorized = d.Authorized
 				r.Tapegun = d.Tapegun
@@ -424,6 +431,9 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 				if len(a.Messaging.Publish) > 0 {
 					r.Messaging.Publish = appendUnique(r.Messaging.Publish, a.Messaging.Publish...)
 				}
+			}
+			if a.Bootstrap != nil {
+				r.Bootstrap = a.Bootstrap
 			}
 			if a.Repos != nil {
 				r.Repos = a.Repos

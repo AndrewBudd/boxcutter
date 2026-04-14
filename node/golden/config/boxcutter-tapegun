@@ -528,6 +528,10 @@ setup_workspace() {
     team_persona_files=$(echo "$agent_config" | jq -r '.team_persona_files // [] | .[]' 2>/dev/null)
     tapegun_sequences=$(echo "$agent_config" | jq -r '.tapegun // [] | .[]' 2>/dev/null)
 
+    # Parse bootstrap commands
+    local bootstrap_cmds
+    bootstrap_cmds=$(echo "$agent_config" | jq -r '.bootstrap // [] | .[]' 2>/dev/null)
+
     # Parse plugins config
     local plugin_marketplaces plugin_installs
     plugin_marketplaces=$(echo "$agent_config" | jq -r '.plugins.marketplaces // [] | .[]' 2>/dev/null)
@@ -601,6 +605,21 @@ setup_workspace() {
 }
 EOSETTINGS
         log "pre-trusted directory ${working_dir:-$PROJECT_DIR}"
+    fi
+
+    # Run bootstrap shell commands (install dependencies, tools, etc.)
+    if [ -n "$bootstrap_cmds" ]; then
+        log "running bootstrap commands"
+        while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            log "bootstrap: $cmd"
+            if eval "$cmd" 2>&1 | while IFS= read -r line; do log "  $line"; done; then
+                log "bootstrap: OK"
+            else
+                log "WARNING: bootstrap command failed (exit $?): $cmd"
+            fi
+        done <<< "$bootstrap_cmds"
+        log "bootstrap complete"
     fi
 
     # Install Claude Code plugins (marketplaces + plugins from agent config)
