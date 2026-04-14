@@ -654,10 +654,13 @@ EOSETTINGS
         fi
     fi
 
-    # Queue-driven headless mode: when claude-code is routed through an inference
-    # provider (e.g. OpenRouter), tasks arrive via the message queue and execute
-    # headlessly via 'claude -p'. No interactive tmux session needed.
-    if [ "$AGENT_TOOL" = "claude-code" ] && [ -n "$INFERENCE_PROVIDER" ]; then
+    # Queue-driven headless mode: when claude-code has headless auth
+    # (inference provider OR subscription oauth token), tasks arrive via the
+    # message queue and execute headlessly via 'claude -p'.
+    _has_headless_auth=false
+    [ -n "$INFERENCE_PROVIDER" ] && _has_headless_auth=true
+    [ "${CLAUDE_AUTH:-}" = "oauth-token" ] && _has_headless_auth=true
+    if [ "$AGENT_TOOL" = "claude-code" ] && [ "$_has_headless_auth" = "true" ]; then
         log "headless queue mode — skipping interactive tmux launch"
         log "tasks will be dispatched via 'claude -p' when messages arrive"
         # Create tmux for SSH access but don't launch claude interactively
@@ -932,7 +935,7 @@ while true; do
 
     # --- Post activity ---
     # Headless mode: report based on running claude -p process and git state
-    if [ "$AGENT_TOOL" = "claude-code" ] && [ -n "$INFERENCE_PROVIDER" ]; then
+    if [ "$AGENT_TOOL" = "claude-code" ] && [ "$_has_headless_auth" = "true" ]; then
         _workdir="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
         if pgrep -f "claude.*-p" -u "$(id -u)" >/dev/null 2>&1; then
             # Claude headless is working — report git diff stats
@@ -1167,7 +1170,7 @@ Report the PR URL when done."
     # --- Crash detection & auto-restart ---
     # Skip for headless queue-driven mode — tasks are dispatched via claude -p,
     # not a persistent interactive session.
-    if [ "$AUTOSTART_CLAUDE" = "true" ] && ! ([ "$AGENT_TOOL" = "claude-code" ] && [ -n "$INFERENCE_PROVIDER" ]); then
+    if [ "$AUTOSTART_CLAUDE" = "true" ] && ! ([ "$AGENT_TOOL" = "claude-code" ] && [ "$_has_headless_auth" = "true" ]); then
         case "$AGENT_TOOL" in
           opencode) AGENT_PROC_PATTERN='opencode' ;;
           aider)    AGENT_PROC_PATTERN='aider' ;;
