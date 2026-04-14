@@ -262,21 +262,17 @@ setup_claude_credentials() {
         return 0
     fi
 
-    # Method 2: OAuth token from team YAML (oauth-token auth)
+    # Method 2: OAuth token from setup-token (oauth-token auth)
+    # Uses CLAUDE_CODE_OAUTH_TOKEN env var — the officially supported way
+    # for headless/CI auth with a Claude subscription.
     if [ "${CLAUDE_AUTH:-}" = "oauth-token" ] && [ -n "${CLAUDE_OAUTH_TOKEN:-}" ]; then
-        # Write the OAuth token in Claude Code's expected credentials format
-        jq -n --arg token "$CLAUDE_OAUTH_TOKEN" '{
-            claudeAiOauth: {
-                refreshToken: $token,
-                accessToken: "",
-                expiresAt: 0,
-                scopes: ["user:inference","user:profile","user:sessions:claude_code"],
-                subscriptionType: "",
-                rateLimitTier: ""
-            }
-        }' > "$cred_file"
-        chmod 600 "$cred_file"
-        log "Claude OAuth token installed (oauth-token auth)"
+        local envfile="/home/dev/.claude_env"
+        printf 'export CLAUDE_CODE_OAUTH_TOKEN="%s"\n' "$CLAUDE_OAUTH_TOKEN" > "$envfile"
+        chmod 600 "$envfile"
+        if ! grep -q 'source.*\.claude_env' /home/dev/.bashrc 2>/dev/null; then
+            printf '\n[ -f ~/.claude_env ] && source ~/.claude_env\n' >> /home/dev/.bashrc
+        fi
+        log "Claude subscription token configured (CLAUDE_CODE_OAUTH_TOKEN)"
         return 0
     fi
 
