@@ -540,6 +540,21 @@ setup_workspace() {
     local repo_count
     repo_count=$(echo "$repos" | grep -c . || true)
 
+    # Run bootstrap BEFORE cloning — may set up git credentials, install tools
+    if [ -n "$bootstrap_cmds" ]; then
+        log "running bootstrap commands"
+        while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            log "bootstrap: $cmd"
+            if eval "$cmd" 2>&1 | while IFS= read -r line; do log "  $line"; done; then
+                log "bootstrap: OK"
+            else
+                log "WARNING: bootstrap command failed (exit $?): $cmd"
+            fi
+        done <<< "$bootstrap_cmds"
+        log "bootstrap complete"
+    fi
+
     # Clone repos if specified
     if [ "$repo_count" -gt 0 ]; then
         setup_git_credentials
@@ -605,21 +620,6 @@ setup_workspace() {
 }
 EOSETTINGS
         log "pre-trusted directory ${working_dir:-$PROJECT_DIR}"
-    fi
-
-    # Run bootstrap shell commands (install dependencies, tools, etc.)
-    if [ -n "$bootstrap_cmds" ]; then
-        log "running bootstrap commands"
-        while IFS= read -r cmd; do
-            [ -z "$cmd" ] && continue
-            log "bootstrap: $cmd"
-            if eval "$cmd" 2>&1 | while IFS= read -r line; do log "  $line"; done; then
-                log "bootstrap: OK"
-            else
-                log "WARNING: bootstrap command failed (exit $?): $cmd"
-            fi
-        done <<< "$bootstrap_cmds"
-        log "bootstrap complete"
     fi
 
     # Install Claude Code plugins (marketplaces + plugins from agent config)
