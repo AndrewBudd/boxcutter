@@ -617,48 +617,59 @@ EOSETTINGS
         fi
     fi
 
-    # Create tmux session if not exists
-    if ! tmux has-session -t main 2>/dev/null; then
-        tmux new-session -d -s main
-        sleep 1
-
-        # Ensure PATH includes ~/.local/bin (where claude is installed via mise)
-        tmux send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
-        # Source Claude env vars (API key, etc.) if present
-        tmux send-keys -t main '[ -f ~/.claude_env ] && source ~/.claude_env' Enter
-        sleep 0.5
-
-        # Wait for working directory to appear (repo clone may still be in progress).
-        # Polls every 2s for up to 30s, then proceeds without it.
-        if [ -n "$CLAUDE_WORKING_DIR" ] && [ ! -d "$CLAUDE_WORKING_DIR" ]; then
-            echo "tapegun: waiting for $CLAUDE_WORKING_DIR to appear..."
-            for _i in $(seq 1 15); do
-                [ -d "$CLAUDE_WORKING_DIR" ] && break
-                sleep 2
-            done
+    # Queue-driven headless mode: when claude-code is routed through an inference
+    # provider (e.g. OpenRouter), tasks arrive via the message queue and execute
+    # headlessly via 'claude -p'. No interactive tmux session needed.
+    if [ "$AGENT_TOOL" = "claude-code" ] && [ -n "$INFERENCE_PROVIDER" ]; then
+        log "headless queue mode — skipping interactive tmux launch"
+        log "tasks will be dispatched via 'claude -p' when messages arrive"
+        # Create tmux for SSH access but don't launch claude interactively
+        if ! tmux has-session -t main 2>/dev/null; then
+            tmux new-session -d -s main
+            tmux send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
+            tmux send-keys -t main '[ -f ~/.claude_env ] && source ~/.claude_env' Enter
+            [ -n "$CLAUDE_WORKING_DIR" ] && [ -d "$CLAUDE_WORKING_DIR" ] && \
+                tmux send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
+            tmux send-keys -t main 'echo "Headless agent — waiting for tasks via message queue"' Enter
         fi
-
-        if [ -n "$CLAUDE_WORKING_DIR" ] && [ -d "$CLAUDE_WORKING_DIR" ]; then
-            tmux send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
-            sleep 0.5
-        fi
-
-        # Install tapegun-guest plugin for Claude Code
-        if [ "$AGENT_TOOL" = "claude-code" ]; then
-            PLUGIN_DIR="$HOME/.claude/plugins/tapegun-guest"
-            if [ -d "$PLUGIN_DIR" ]; then
-                tmux send-keys -t main "claude plugin install $PLUGIN_DIR 2>/dev/null" Enter
-                sleep 2
-                log "installed tapegun-guest plugin"
-            else
-                log "WARNING: plugin not found at $PLUGIN_DIR"
-            fi
-        fi
-
-        launch_agent_tool
-        log "$AGENT_TOOL started (tool: $AGENT_TOOL, model: ${AGENT_MODEL:-default})"
     else
-        echo "tapegun: tmux session 'main' already exists, skipping autostart"
+        # Interactive mode: launch the agent tool in tmux
+        if ! tmux has-session -t main 2>/dev/null; then
+            tmux new-session -d -s main
+            sleep 1
+            tmux send-keys -t main 'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"' Enter
+            tmux send-keys -t main '[ -f ~/.claude_env ] && source ~/.claude_env' Enter
+            sleep 0.5
+
+            if [ -n "$CLAUDE_WORKING_DIR" ] && [ ! -d "$CLAUDE_WORKING_DIR" ]; then
+                log "waiting for $CLAUDE_WORKING_DIR to appear..."
+                for _i in $(seq 1 15); do
+                    [ -d "$CLAUDE_WORKING_DIR" ] && break
+                    sleep 2
+                done
+            fi
+
+            if [ -n "$CLAUDE_WORKING_DIR" ] && [ -d "$CLAUDE_WORKING_DIR" ]; then
+                tmux send-keys -t main "cd $CLAUDE_WORKING_DIR" Enter
+                sleep 0.5
+            fi
+
+            if [ "$AGENT_TOOL" = "claude-code" ]; then
+                PLUGIN_DIR="$HOME/.claude/plugins/tapegun-guest"
+                if [ -d "$PLUGIN_DIR" ]; then
+                    tmux send-keys -t main "claude plugin install $PLUGIN_DIR 2>/dev/null" Enter
+                    sleep 2
+                    log "installed tapegun-guest plugin"
+                else
+                    log "WARNING: plugin not found at $PLUGIN_DIR"
+                fi
+            fi
+
+            launch_agent_tool
+            log "$AGENT_TOOL started (tool: $AGENT_TOOL, model: ${AGENT_MODEL:-default})"
+        else
+            log "tmux session 'main' already exists, skipping autostart"
+        fi
     fi
 fi
 
@@ -883,8 +894,30 @@ while true; do
         2>/dev/null || true
 
     # --- Post activity ---
-    # Prefer OpenCode server API if available, fall back to tmux capture
-    if [ "$AGENT_TOOL" = "opencode" ] && curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/global/health" -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" --max-time 1 >/dev/null 2>&1; then
+    # Headless mode: report based on running claude -p process and git state
+    if [ "$AGENT_TOOL" = "claude-code" ] && [ -n "$INFERENCE_PROVIDER" ]; then
+        _workdir="${CLAUDE_WORKING_DIR:-$PROJECT_DIR}"
+        if pgrep -f "claude.*-p" -u "$(id -u)" >/dev/null 2>&1; then
+            # Claude headless is working — report git diff stats
+            _branch=$(cd "$_workdir" && git branch --show-current 2>/dev/null || echo "?")
+            _changes=$(cd "$_workdir" && git diff --stat HEAD 2>/dev/null | tail -1)
+            _status_files=$(cd "$_workdir" && git status --short 2>/dev/null | wc -l)
+            PANE_CONTENT="Working on branch: ${_branch}\nChanged files: ${_status_files}\n${_changes}"
+            STATUS="active"
+        else
+            # Not running — check if last task produced output
+            _branch=$(cd "$_workdir" && git branch --show-current 2>/dev/null || echo "master")
+            _last_commit=$(cd "$_workdir" && git log --oneline -1 2>/dev/null)
+            PANE_CONTENT="Idle — waiting for task\nBranch: ${_branch}\nLast: ${_last_commit}"
+            STATUS="idle"
+        fi
+        PAYLOAD=$(jq -n --arg content "$PANE_CONTENT" --arg status "$STATUS" \
+            '{pane_content: $content, status: $status}')
+        curl -sf -X POST "${METADATA}/tapegun/activity" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            2>/dev/null || true
+    elif [ "$AGENT_TOOL" = "opencode" ] && curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/global/health" -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" --max-time 1 >/dev/null 2>&1; then
         # Get session info from OpenCode server
         OC_SESSIONS=$(curl -sf "http://localhost:${OPENCODE_SERVER_PORT:-4096}/session" \
             -u "opencode:${OPENCODE_SERVER_PASSWORD:-tapegun}" \
@@ -1095,7 +1128,9 @@ Report the PR URL when done."
     fi
 
     # --- Crash detection & auto-restart ---
-    if [ "$AUTOSTART_CLAUDE" = "true" ]; then
+    # Skip for headless queue-driven mode — tasks are dispatched via claude -p,
+    # not a persistent interactive session.
+    if [ "$AUTOSTART_CLAUDE" = "true" ] && ! ([ "$AGENT_TOOL" = "claude-code" ] && [ -n "$INFERENCE_PROVIDER" ]); then
         case "$AGENT_TOOL" in
           opencode) AGENT_PROC_PATTERN='opencode' ;;
           aider)    AGENT_PROC_PATTERN='aider' ;;
