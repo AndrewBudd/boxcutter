@@ -120,6 +120,13 @@ type AgentConfig struct {
 	Inference        *InferenceConfig  `json:"inference,omitempty"`          // inference provider config
 	Claude           *ClaudeConfig     `json:"claude,omitempty"`             // Claude Code auth config (#175)
 	Plugins          *PluginsConfig    `json:"plugins,omitempty"`            // Claude Code plugin auto-install
+	Messaging        *MessagingConfig  `json:"messaging,omitempty"`          // Topic subscriptions and publish permissions
+}
+
+// MessagingConfig declares the agent's messaging topology.
+type MessagingConfig struct {
+	Subscribe []string `json:"subscribe,omitempty"` // Topics to subscribe to
+	Publish   []string `json:"publish,omitempty"`   // Topics allowed to publish to
 }
 
 // PluginsConfig specifies marketplaces to register and plugins to install.

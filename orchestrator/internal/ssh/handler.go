@@ -1182,11 +1182,52 @@ func (h *Handler) teamApply(args []string) int {
 		destroyed++
 	}
 
-	// Auto-create team-level messaging topics (#190)
-	if created > 0 {
+	// Set up messaging topology from spec
+	{
 		teamName := ts.Metadata.Name
+		// Always create team-level topics
 		h.post("/api/topics", map[string]string{"name": teamName + ".broadcast"})
 		h.post("/api/topics", map[string]string{"name": teamName + ".status"})
+
+		// Collect all topics referenced in messaging specs and create them
+		allAgents := ts.Resolve()
+		topicsSeen := map[string]bool{}
+		for _, a := range allAgents {
+			if a.Messaging == nil {
+				continue
+			}
+			for _, t := range a.Messaging.Subscribe {
+				if !topicsSeen[t] {
+					h.post("/api/topics", map[string]string{"name": t})
+					topicsSeen[t] = true
+				}
+			}
+			for _, t := range a.Messaging.Publish {
+				if !topicsSeen[t] {
+					h.post("/api/topics", map[string]string{"name": t})
+					topicsSeen[t] = true
+				}
+			}
+		}
+
+		// Create subscriptions: agent inbox queue → subscribed topics
+		for _, a := range allAgents {
+			if a.Messaging == nil || len(a.Messaging.Subscribe) == 0 {
+				continue
+			}
+			queueName := a.VMName + ".inbox"
+			for _, topic := range a.Messaging.Subscribe {
+				h.post("/api/subscriptions", map[string]string{
+					"topic_name": topic,
+					"queue_name": queueName,
+				})
+			}
+		}
+
+		// Log topology
+		if len(topicsSeen) > 0 {
+			fmt.Printf("\nMessaging: %d topics, subscriptions configured\n", len(topicsSeen)+2)
+		}
 	}
 
 	fmt.Printf("\nResult: %d created, %d updated, %d unchanged, %d destroyed\n", created, updated, len(unchanged), destroyed)

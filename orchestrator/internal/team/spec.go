@@ -47,6 +47,13 @@ type PluginsSpec struct {
 	Install      []string `yaml:"install,omitempty"`      // Plugins to install (e.g. "superpowers@claude-plugins-official")
 }
 
+// MessagingSpec declares an agent's messaging topology — which topics it
+// subscribes to and which it can publish to.
+type MessagingSpec struct {
+	Subscribe []string `yaml:"subscribe,omitempty"` // Topics this agent's inbox subscribes to
+	Publish   []string `yaml:"publish,omitempty"`   // Topics this agent is allowed to publish to
+}
+
 // AgentDefaults holds shared defaults inherited by all agents.
 // Agent-level values override defaults. List fields (repos, access, tapegun, plugins)
 // are replaced, not merged.
@@ -60,6 +67,7 @@ type AgentDefaults struct {
 	Inference  *InferenceSpec `yaml:"inference,omitempty"`
 	Claude     *ClaudeSpec    `yaml:"claude,omitempty"`
 	Plugins    *PluginsSpec   `yaml:"plugins,omitempty"`
+	Messaging  *MessagingSpec `yaml:"messaging,omitempty"`
 	Repos      []string       `yaml:"repos,omitempty"`
 	Authorized bool           `yaml:"authorized,omitempty"`
 	Persona    *Persona       `yaml:"persona,omitempty"`
@@ -78,6 +86,7 @@ type AgentSpec struct {
 	Inference   *InferenceSpec `yaml:"inference,omitempty"`
 	Claude      *ClaudeSpec    `yaml:"claude,omitempty"`
 	Plugins     *PluginsSpec   `yaml:"plugins,omitempty"`
+	Messaging   *MessagingSpec `yaml:"messaging,omitempty"`
 	Description string         `yaml:"description,omitempty"`
 	Persona     *Persona       `yaml:"persona,omitempty"`
 	Repos       []string       `yaml:"repos,omitempty"`
@@ -129,6 +138,7 @@ type ResolvedAgent struct {
 	Inference   *InferenceSpec
 	Claude      *ClaudeSpec
 	Plugins     *PluginsSpec
+	Messaging   *MessagingSpec
 	Description string
 	Persona     *Persona
 	Repos       []string
@@ -193,6 +203,18 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 			cfg["plugins"] = plugins
 		}
 	}
+	if r.Messaging != nil {
+		messaging := map[string]interface{}{}
+		if len(r.Messaging.Subscribe) > 0 {
+			messaging["subscribe"] = r.Messaging.Subscribe
+		}
+		if len(r.Messaging.Publish) > 0 {
+			messaging["publish"] = r.Messaging.Publish
+		}
+		if len(messaging) > 0 {
+			cfg["messaging"] = messaging
+		}
+	}
 	if len(r.Repos) > 0 {
 		cfg["repos"] = r.Repos
 	}
@@ -222,6 +244,21 @@ func (r *ResolvedAgent) AgentConfig(teamName string, allPersonaFiles []string) m
 		cfg["team_persona_files"] = allPersonaFiles
 	}
 	return cfg
+}
+
+// appendUnique appends items to a slice, skipping duplicates.
+func appendUnique(base []string, items ...string) []string {
+	seen := make(map[string]bool, len(base))
+	for _, s := range base {
+		seen[s] = true
+	}
+	for _, s := range items {
+		if !seen[s] {
+			base = append(base, s)
+			seen[s] = true
+		}
+	}
+	return base
 }
 
 // RAMMiB parses the human-readable RAM string (e.g. "4G", "2048M") to MiB.
@@ -335,6 +372,10 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 					p := *d.Plugins
 					r.Plugins = &p
 				}
+				if d.Messaging != nil {
+					m := *d.Messaging
+					r.Messaging = &m
+				}
 				r.Repos = d.Repos
 				r.Authorized = d.Authorized
 				r.Tapegun = d.Tapegun
@@ -371,6 +412,18 @@ func (ts *TeamSpec) Resolve() []ResolvedAgent {
 			}
 			if a.Plugins != nil {
 				r.Plugins = a.Plugins
+			}
+			if a.Messaging != nil {
+				// Merge agent messaging with defaults (additive, not replace)
+				if r.Messaging == nil {
+					r.Messaging = &MessagingSpec{}
+				}
+				if len(a.Messaging.Subscribe) > 0 {
+					r.Messaging.Subscribe = appendUnique(r.Messaging.Subscribe, a.Messaging.Subscribe...)
+				}
+				if len(a.Messaging.Publish) > 0 {
+					r.Messaging.Publish = appendUnique(r.Messaging.Publish, a.Messaging.Publish...)
+				}
 			}
 			if a.Repos != nil {
 				r.Repos = a.Repos
